@@ -3,12 +3,12 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="Add text in any font to an STL model: emboss or engrave it, then download a print-ready STL. Runs entirely in your browser." />
+    <meta name="description" content="Add text in any font to an STL model: raised or cut in, following curved surfaces, with automatic mesh repair. Runs entirely in your browser." />
     <title>STL Text – custom fonts on STL models</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23ff7a1a'/%3E%3Ctext x='16' y='23' font-size='19' font-family='Arial Black,Arial' font-weight='900' text-anchor='middle' fill='white'%3EA%3C/text%3E%3C/svg%3E" />
     <link rel="stylesheet" href="/src/style.css" />
   </head>
-  <body>
+  <body data-engine="starting">
     <div class="app">
       <aside class="panel" aria-label="Controls">
         <header class="brand">
@@ -16,6 +16,7 @@
           <p>Put any font on your 3D model. Everything runs in your browser – files never leave your computer.</p>
         </header>
 
+        <!-- ============================================================ model -->
         <section class="card" aria-labelledby="h-model">
           <h2 id="h-model"><span class="step">1</span> Model</h2>
           <div class="row">
@@ -25,18 +26,59 @@
             <button type="button" id="clearBtn" class="btn ghost">No model</button>
           </div>
           <p class="hint" id="modelInfo">Drop an .stl file anywhere on the page.</p>
+          <ul class="notes" id="modelNotes" aria-live="polite"></ul>
+          <div id="modelSuggestions" class="suggestions"></div>
+          <details id="fixModel" class="disclosure">
+            <summary>Fix model</summary>
+            <div class="tools">
+              <div class="row">
+                <button type="button" class="btn small" data-fix="inches" title="Multiply all sizes by 25.4">Inches → mm</button>
+                <button type="button" class="btn small" data-fix="standUp" title="Rotate so Y-up becomes Z-up">Y-up → Z-up</button>
+                <button type="button" class="btn small" data-fix="center">Center on plate</button>
+              </div>
+              <div class="row">
+                <span class="label">Rotate 90° about</span>
+                <button type="button" class="btn small" data-fix="rotX">X</button>
+                <button type="button" class="btn small" data-fix="rotY">Y</button>
+                <button type="button" class="btn small" data-fix="rotZ">Z</button>
+              </div>
+              <div class="row">
+                <label class="field inline grow"><span>Scale</span><input type="number" id="scalePercent" value="100" min="1" max="10000" step="1" /><span class="unit">%</span></label>
+                <button type="button" class="btn small" id="scaleBtn">Apply</button>
+              </div>
+              <div class="row">
+                <label class="field inline grow" title="Merge triangles that are within this distance of a flat surface. Speeds up huge models."><span>Simplify</span><input type="number" id="simplifyTol" value="0.02" min="0.001" max="0.05" step="0.005" /><span class="unit">mm</span></label>
+                <button type="button" class="btn small" id="simplifyBtn">Simplify</button>
+              </div>
+              <div class="row">
+                <button type="button" class="btn small ghost" data-fix="reset">Reset model</button>
+              </div>
+            </div>
+          </details>
         </section>
 
-        <section class="card" aria-labelledby="h-text">
-          <h2 id="h-text"><span class="step">2</span> Text &amp; font</h2>
+        <!-- ============================================================ texts -->
+        <section class="card" aria-labelledby="h-texts">
+          <h2 id="h-texts"><span class="step">2</span> Texts</h2>
+          <ul id="itemList" class="items" role="listbox" aria-label="Text items"></ul>
+          <div class="row">
+            <button type="button" id="addTextBtn" class="btn">+ Add text</button>
+            <button type="button" id="duplicateBtn" class="btn">Duplicate</button>
+            <button type="button" id="deleteBtn" class="btn ghost">Delete</button>
+          </div>
+        </section>
+
+        <!-- ======================================================= text & font -->
+        <section class="card" aria-labelledby="h-text" id="textCard">
+          <h2 id="h-text"><span class="step">3</span> Text &amp; font</h2>
           <label class="field">
             <span>Text <small>(Enter for a new line)</small></span>
-            <textarea id="text" data-key="text" rows="2" spellcheck="false">STL Text</textarea>
+            <textarea id="text" data-key="text" rows="2" spellcheck="false" placeholder="Type your text…"></textarea>
           </label>
 
           <label class="field">
             <span>Font</span>
-            <select id="font" data-key="font"></select>
+            <select id="font" data-key="fontId"></select>
           </label>
           <div class="row">
             <button type="button" id="openFontBtn" class="btn">Upload font…</button>
@@ -47,13 +89,18 @@
             <span>Installed fonts</span>
             <select id="localFonts"></select>
           </label>
-          <p class="hint">Upload any <b>.ttf / .otf / .woff</b> file, or drop one on the page.</p>
+          <p class="hint">Any <b>.ttf / .otf / .woff</b> file works – upload it or drop it on the page.</p>
 
           <div class="grid2">
             <label class="field num">
               <span>Letter height <small>mm</small></span>
               <input type="number" data-key="size" min="0.5" max="500" step="0.5" value="10" />
               <input type="range" data-key="size" min="1" max="60" step="0.5" value="10" aria-label="Letter height" />
+            </label>
+            <label class="field num">
+              <span>Text width <small>mm</small></span>
+              <input type="number" id="widthInput" min="1" max="2000" step="0.5" value="0" />
+              <span class="hint tiny" id="widthHint">Edit to scale the letters</span>
             </label>
             <label class="field num">
               <span>Letter spacing <small>mm</small></span>
@@ -70,6 +117,14 @@
               <input type="number" data-key="weight" min="-2" max="4" step="0.05" value="0" />
               <input type="range" data-key="weight" min="-1" max="2" step="0.05" value="0" aria-label="Boldness" />
             </label>
+            <label class="field inline">
+              <span>Smoothness</span>
+              <select data-key="quality">
+                <option value="draft">Draft</option>
+                <option value="normal" selected>Normal</option>
+                <option value="fine">Fine</option>
+              </select>
+            </label>
           </div>
 
           <div class="row spread">
@@ -78,41 +133,46 @@
               <label><input type="radio" name="align" data-key="align" value="center" checked /><span>Center</span></label>
               <label><input type="radio" name="align" data-key="align" value="right" /><span>Right</span></label>
             </fieldset>
-            <label class="check"><input type="checkbox" data-key="mirror" /> Mirror</label>
+            <label class="check" title="For stamps: the print reads correctly when pressed"><input type="checkbox" data-key="mirror" /> Mirror</label>
           </div>
-          <label class="field inline">
-            <span>Smoothness</span>
-            <select data-key="quality">
-              <option value="draft">Draft (small file)</option>
-              <option value="normal" selected>Normal</option>
-              <option value="fine">Fine (large file)</option>
-            </select>
-          </label>
         </section>
 
+        <!-- ====================================================== raised / cut -->
         <section class="card" aria-labelledby="h-style">
-          <h2 id="h-style"><span class="step">3</span> Raised or cut</h2>
+          <h2 id="h-style"><span class="step">4</span> Raised or cut</h2>
           <fieldset class="seg wide" aria-label="Mode">
-            <label><input type="radio" name="mode" data-key="mode" value="emboss" checked /><span>Emboss <small>raised</small></span></label>
-            <label><input type="radio" name="mode" data-key="mode" value="engrave" /><span>Engrave <small>cut in</small></span></label>
+            <label><input type="radio" name="mode" data-key="mode" value="emboss" checked /><span>Raised <small>emboss</small></span></label>
+            <label><input type="radio" name="mode" data-key="mode" value="engrave" /><span>Cut in <small>engrave</small></span></label>
           </fieldset>
-          <div class="grid2">
-            <label class="field num">
-              <span id="depthLabel">Height <small>mm</small></span>
-              <input type="number" data-key="depth" min="0.1" max="100" step="0.1" value="1.5" />
-              <input type="range" data-key="depth" min="0.2" max="10" step="0.1" value="1.5" aria-label="Height or depth" />
-            </label>
-            <label class="field num" title="How far the text pokes into (emboss) or out of (engrave) the surface, so it fuses cleanly. Raise it on curved surfaces.">
-              <span>Overlap <small>mm</small></span>
-              <input type="number" data-key="overlap" min="0" max="20" step="0.1" value="0.4" />
-              <input type="range" data-key="overlap" min="0" max="5" step="0.1" value="0.4" aria-label="Overlap" />
-            </label>
-          </div>
+          <label class="field num">
+            <span id="depthLabel">Height <small>mm</small></span>
+            <input type="number" data-key="depth" min="0.1" max="100" step="0.1" value="1.5" />
+            <input type="range" data-key="depth" min="0.2" max="10" step="0.1" value="1.5" aria-label="Height or depth" />
+          </label>
+          <label class="check" title="Rounds sharp corners by half the nozzle width so they print cleanly"><input type="checkbox" id="roundCorners" /> Round sharp corners (printer-friendly)</label>
+          <ul class="notes" id="textNotes" aria-live="polite"></ul>
+          <details class="disclosure">
+            <summary>Advanced</summary>
+            <div class="tools">
+              <label class="check" title="Keeps the depth constant on mugs, rings and other curves"><input type="checkbox" data-key="conform" checked /> Follow curved surfaces</label>
+              <label class="field num">
+                <span>Corner radius <small>mm</small></span>
+                <input type="number" data-key="cornerRadius" min="0" max="3" step="0.05" value="0" />
+                <input type="range" data-key="cornerRadius" min="0" max="1.5" step="0.05" value="0" aria-label="Corner radius" />
+              </label>
+              <label class="field num" title="How far the text sinks into (raised) or pokes out of (cut) the surface so it fuses cleanly">
+                <span>Overlap <small>mm</small></span>
+                <input type="number" data-key="overlap" min="0" max="20" step="0.1" value="0.4" />
+                <input type="range" data-key="overlap" min="0" max="5" step="0.1" value="0.4" aria-label="Overlap" />
+              </label>
+            </div>
+          </details>
         </section>
 
+        <!-- ========================================================= placement -->
         <section class="card" aria-labelledby="h-place">
-          <h2 id="h-place"><span class="step">4</span> Placement</h2>
-          <p class="hint accent" id="placeHint"><b>Click the model</b> to put the text there. Drag to orbit, right-drag to pan, scroll to zoom.</p>
+          <h2 id="h-place"><span class="step">5</span> Placement</h2>
+          <p class="hint accent" id="placeHint"><b>Click the model</b> to put the text there, or drag the text. Drag empty space to orbit, right-drag to pan, scroll to zoom.</p>
           <div class="sides" role="group" aria-label="Snap to a side">
             <button type="button" class="btn small" data-side="top">Top</button>
             <button type="button" class="btn small" data-side="front">Front</button>
@@ -121,21 +181,42 @@
             <button type="button" class="btn small" data-side="right">Right</button>
             <button type="button" class="btn small" data-side="bottom">Bottom</button>
           </div>
-          <div class="grid3">
-            <label class="field"><span>X</span><input type="number" id="posX" step="0.1" value="0" /></label>
-            <label class="field"><span>Y</span><input type="number" id="posY" step="0.1" value="0" /></label>
-            <label class="field"><span>Z</span><input type="number" id="posZ" step="0.1" value="0" /></label>
+          <div class="row spread">
+            <div class="nudge" role="group" aria-label="Nudge (arrow keys)">
+              <button type="button" class="btn small" data-nudge="left" aria-label="Nudge left">←</button>
+              <button type="button" class="btn small" data-nudge="up" aria-label="Nudge up">↑</button>
+              <button type="button" class="btn small" data-nudge="down" aria-label="Nudge down">↓</button>
+              <button type="button" class="btn small" data-nudge="right" aria-label="Nudge right">→</button>
+            </div>
+            <label class="field inline"><span>Step</span><select id="nudgeStep"><option value="0.5">0.5 mm</option><option value="1" selected>1 mm</option><option value="5">5 mm</option></select></label>
           </div>
           <label class="field num">
             <span>Rotate <small>degrees</small></span>
             <input type="number" data-key="spin" min="-360" max="360" step="1" value="0" />
             <input type="range" data-key="spin" min="-180" max="180" step="1" value="0" aria-label="Rotate" />
           </label>
+          <details class="disclosure">
+            <summary>Exact position</summary>
+            <div class="grid3">
+              <label class="field"><span>X</span><input type="number" id="posX" step="0.1" value="0" /></label>
+              <label class="field"><span>Y</span><input type="number" id="posY" step="0.1" value="0" /></label>
+              <label class="field"><span>Z</span><input type="number" id="posZ" step="0.1" value="0" /></label>
+            </div>
+          </details>
         </section>
 
+        <!-- =========================================================== printing -->
+        <details class="card disclosure" id="printing">
+          <summary><b>Printing</b> <small>– used for the warnings</small></summary>
+          <div class="grid2">
+            <label class="field inline"><span>Nozzle</span><input type="number" id="nozzle" min="0.1" max="2" step="0.05" value="0.4" /><span class="unit">mm</span></label>
+            <label class="field inline"><span>Layer</span><input type="number" id="layerHeight" min="0.04" max="1" step="0.02" value="0.2" /><span class="unit">mm</span></label>
+          </div>
+        </details>
+
         <div class="actions">
-          <button type="button" id="applyBtn" class="btn primary">Apply to model</button>
-          <button type="button" id="undoBtn" class="btn" disabled>Undo</button>
+          <button type="button" id="undoBtn" class="btn" disabled title="Ctrl+Z">Undo</button>
+          <button type="button" id="redoBtn" class="btn" disabled title="Ctrl+Y">Redo</button>
           <button type="button" id="downloadBtn" class="btn accent">Download STL</button>
         </div>
         <p id="status" class="status" role="status" aria-live="polite"></p>
@@ -150,9 +231,14 @@
           <span><i class="dot model"></i> model</span>
           <span><i class="dot emboss"></i> raised text</span>
           <span><i class="dot engrave"></i> cut text</span>
+          <span id="legendPass" hidden><i class="dot pass"></i> unrepaired</span>
         </div>
-        <button type="button" id="frameBtn" class="btn small floating">Reset view</button>
-        <div id="busy" class="busy" hidden><div class="spinner"></div><span>Working…</span></div>
+        <div class="stage-tools">
+          <label class="check pill" title="Compute the real merged result (takes a moment on big models)"><input type="checkbox" id="resultToggle" /> Show final result</label>
+          <button type="button" id="frameBtn" class="btn small">Reset view</button>
+        </div>
+        <div id="progress" class="progress" hidden><div class="spinner"></div><span id="progressText">Working…</span></div>
+        <div id="toast" class="toast" hidden><span id="toastText"></span><button type="button" id="toastAction" class="btn small">Undo</button></div>
         <div id="dropHint" class="drop" hidden>Drop an STL or font file</div>
       </main>
     </div>

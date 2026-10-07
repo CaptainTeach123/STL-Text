@@ -2,12 +2,15 @@ import {
   AmbientLight,
   Box3,
   BufferGeometry,
+  CylinderGeometry,
   DirectionalLight,
   DoubleSide,
   GridHelper,
   Group,
   HemisphereLight,
+  Matrix4,
   Mesh,
+  MeshBasicMaterial,
   MeshStandardMaterial,
   PerspectiveCamera,
   Quaternion,
@@ -17,25 +20,36 @@ import {
   Vector2,
   Vector3,
   WebGLRenderer,
-  MeshBasicMaterial,
-  CylinderGeometry,
 } from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from 'three-mesh-bvh';
+import { MeshBVH, acceleratedRaycast } from 'three-mesh-bvh';
+import { geometryFromBuffers } from './mesh.js';
 
-BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
-BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 Mesh.prototype.raycast = acceleratedRaycast;
 
 const COLORS = {
   model: 0x8aa4c8,
+  passthrough: 0xe0a93a,
   emboss: 0xff8a2b,
   engrave: 0xff3b6b,
   marker: 0x22d3a6,
 };
 
+const CLICK_PX = 5;
+const CLICK_MS = 500;
+
 /**
  * Three.js scene for the editor. Z is up (like STL files and slicers).
+ *
+ *  - the model ("base") is drawn from buffers the worker prepared, with the
+ *    BVH it serialised, so picking is instant even on huge files
+ *  - every text item is its own overlay mesh; the selected one is drawn
+ *    solid, the others faded
+ *  - clicking an item selects it, clicking bare model moves the selected
+ *    item, dragging the selected item moves it live
+ *  - the "final result" mesh can replace the model on screen while picking
+ *    still happens on the (hidden) model
+ *
  * Renders on demand, so an idle page costs nothing.
  */
 export class Viewer {
@@ -61,25 +75,14 @@ export class Viewer {
     this.camera.add(key);
     this.scene.add(this.camera);
 
-    this.modelMaterial = new MeshStandardMaterial({
-      color: COLORS.model,
-      roughness: 0.55,
-      metalness: 0.05,
-      side: DoubleSide,
-    });
-    this.modelMesh = null;
-    this.textMesh = null;
-    this.textMaterials = {
-      emboss: new MeshStandardMaterial({ color: COLORS.emboss, roughness: 0.45, flatShading: true }),
-      engrave: new MeshStandardMaterial({
-        color: COLORS.engrave,
-        roughness: 0.6,
-        flatShading: true,
-        transparent: true,
-        opacity: 0.6,
-        depthTest: false,
-      }),
+    this.materials = {
+      model: new MeshStandardMaterial({ color: COLORS.model, roughness: 0.55, metalness: 0.05, side: DoubleSide }),
+      passthrough: new MeshStandardMaterial({ color: COLORS.passthrough, roughness: 0.6, metalness: 0.05, side: DoubleSide }),
     };
+    this.baseMesh = null;
+    this.resultMesh = null;
+    this.resultShown = false;
+    this.overlays = new Map(); // itemId -> { mesh, mode, selected, stale }
 
     this.marker = new Group();
     const ring = new Mesh(
@@ -101,7 +104,9 @@ export class Viewer {
 
     this.raycaster = new Raycaster();
     this.raycaster.firstHitOnly = true;
-    this.onPick = null;
+    this.onPick = null; // ({ point, normal }) clicked bare model
+    this.onSelectItem = null; // (itemId) clicked an item
+    this.onDrag = null; // ({ itemId, point, normal, done })
     this.hoverEnabled = true;
     this.#bindPointer();
 
@@ -121,20 +126,42 @@ export class Viewer {
     });
   }
 
-  /** Show `geometry` (with normals) as the model, or nothing for null. */
-  setModel(geometry) {
-    if (this.modelMesh) {
-      this.scene.remove(this.modelMesh);
-      this.modelMesh.geometry.disposeBoundsTree?.();
-      this.modelMesh.geometry.dispose();
-      this.modelMesh = null;
+  /* ------------------------------------------------------------- model */
+
+  /** Mesh from worker display buffers, split into model / passthrough groups. */
+  #meshFromDisplay(display) {
+    const geometry = geometryFromBuffers(display);
+    const total = display.index.length;
+    const split = display.passthroughStart * 3;
+    geometry.addGroup(0, split, 0);
+    if (split < total) geometry.addGroup(split, total - split, 1);
+    if (display.bvhRoots?.length) {
+      geometry.boundsTree = MeshBVH.deserialize(
+        { version: display.bvhVersion, roots: display.bvhRoots, index: display.index, indirectBuffer: null },
+        geometry,
+        { setIndex: true },
+      );
     }
-    if (geometry) {
-      geometry.computeBoundsTree();
-      geometry.computeBoundingBox();
-      this.modelMesh = new Mesh(geometry, this.modelMaterial);
-      this.scene.add(this.modelMesh);
-      this.bounds.copy(geometry.boundingBox);
+    geometry.computeBoundingBox();
+    return new Mesh(geometry, [this.materials.model, this.materials.passthrough]);
+  }
+
+  #disposeMesh(mesh) {
+    if (!mesh) return;
+    this.scene.remove(mesh);
+    mesh.geometry.boundsTree = null;
+    mesh.geometry.dispose();
+  }
+
+  /** Show the model (display buffers from the worker), or nothing for null. */
+  setBase(display) {
+    this.#disposeMesh(this.baseMesh);
+    this.baseMesh = null;
+    this.setResult(null);
+    if (display && display.index.length) {
+      this.baseMesh = this.#meshFromDisplay(display);
+      this.scene.add(this.baseMesh);
+      this.bounds.copy(this.baseMesh.geometry.boundingBox);
     } else {
       this.bounds.set(new Vector3(-50, -50, 0), new Vector3(50, 50, 10));
     }
@@ -143,30 +170,123 @@ export class Viewer {
     this.requestRender();
   }
 
-  /** Show the text solid: `matrix` is its placement, `mode` styles it. */
-  setText(geometry, matrix, mode) {
-    if (this.textMesh) {
-      this.scene.remove(this.textMesh);
-      this.textMesh.geometry.dispose();
-      this.textMesh = null;
+  /** Show (or clear) the final result in place of the model. */
+  setResult(display) {
+    this.#disposeMesh(this.resultMesh);
+    this.resultMesh = null;
+    if (display && display.index.length) {
+      this.resultMesh = this.#meshFromDisplay(display);
+      this.scene.add(this.resultMesh);
     }
-    if (geometry) {
-      const flat = geometry.toNonIndexed();
-      flat.computeVertexNormals();
-      this.textMesh = new Mesh(flat, this.textMaterials[mode] ?? this.textMaterials.emboss);
-      this.textMesh.renderOrder = mode === 'engrave' ? 5 : 0;
-      this.textMesh.matrixAutoUpdate = false;
-      this.textMesh.matrix.copy(matrix);
-      this.scene.add(this.textMesh);
+    this.showResult(this.resultShown);
+  }
+
+  showResult(on) {
+    this.resultShown = !!on && !!this.resultMesh;
+    if (this.resultMesh) this.resultMesh.visible = this.resultShown;
+    if (this.baseMesh) this.baseMesh.visible = !this.resultShown;
+    for (const o of this.overlays.values()) o.mesh.visible = !this.resultShown;
+    this.requestRender();
+  }
+
+  get hasModel() {
+    return !!this.baseMesh;
+  }
+
+  /* ---------------------------------------------------------- overlays */
+
+  #overlayMaterial(mode) {
+    return mode === 'engrave'
+      ? new MeshStandardMaterial({ color: COLORS.engrave, roughness: 0.6, flatShading: true, transparent: true, opacity: 0.6, depthTest: false })
+      : new MeshStandardMaterial({ color: COLORS.emboss, roughness: 0.45, flatShading: true, transparent: true, opacity: 1 });
+  }
+
+  #styleOverlay(o) {
+    const base = o.mode === 'engrave' ? 0.6 : 1;
+    const fade = o.selected ? 1 : 0.55;
+    const stale = o.stale ? 0.7 : 1;
+    o.mesh.material.opacity = base * fade * stale;
+    o.mesh.material.transparent = true;
+    o.mesh.renderOrder = o.mode === 'engrave' ? 5 : 0;
+    o.mesh.visible = !this.resultShown;
+  }
+
+  /**
+   * Create or replace the overlay for an item. `geometry` is
+   * { positions, index } in the item's local frame, `matrix` its placement.
+   */
+  setOverlay(itemId, { geometry, matrix, mode, selected = false }) {
+    let o = this.overlays.get(itemId);
+    const flat = geometryFromBuffers({ positions: geometry.positions, index: geometry.index }).toNonIndexed();
+    flat.computeVertexNormals();
+    if (o) {
+      o.mesh.geometry.dispose();
+      o.mesh.geometry = flat;
+      if (o.mode !== mode) {
+        o.mesh.material.dispose();
+        o.mesh.material = this.#overlayMaterial(mode);
+      }
+    } else {
+      const mesh = new Mesh(flat, this.#overlayMaterial(mode));
+      mesh.matrixAutoUpdate = false;
+      mesh.userData.itemId = itemId;
+      this.scene.add(mesh);
+      o = { mesh, mode, selected, stale: false };
+      this.overlays.set(itemId, o);
+    }
+    o.mode = mode;
+    o.selected = selected;
+    o.stale = false;
+    o.mesh.matrix.fromArray(matrix);
+    this.#styleOverlay(o);
+    this.requestRender();
+  }
+
+  removeOverlay(itemId) {
+    const o = this.overlays.get(itemId);
+    if (!o) return;
+    this.scene.remove(o.mesh);
+    o.mesh.geometry.dispose();
+    o.mesh.material.dispose();
+    this.overlays.delete(itemId);
+    this.requestRender();
+  }
+
+  /** Keep only the given item ids. */
+  pruneOverlays(keepIds) {
+    for (const id of [...this.overlays.keys()]) if (!keepIds.has(id)) this.removeOverlay(id);
+  }
+
+  setOverlaySelected(selectedId) {
+    for (const [id, o] of this.overlays) {
+      o.selected = id === selectedId;
+      this.#styleOverlay(o);
     }
     this.requestRender();
   }
 
-  setTextMatrix(matrix) {
-    if (!this.textMesh) return;
-    this.textMesh.matrix.copy(matrix);
+  /** Dim an overlay while new geometry is being computed for it. */
+  setOverlayStale(itemId, stale) {
+    const o = this.overlays.get(itemId);
+    if (!o || o.stale === stale) return;
+    o.stale = stale;
+    this.#styleOverlay(o);
     this.requestRender();
   }
+
+  /** Move an overlay without new geometry (placement-only change). */
+  setOverlayMatrix(itemId, matrix) {
+    const o = this.overlays.get(itemId);
+    if (!o) return;
+    o.mesh.matrix.fromArray(matrix instanceof Matrix4 ? matrix.toArray() : matrix);
+    this.requestRender();
+  }
+
+  hasOverlay(itemId) {
+    return this.overlays.has(itemId);
+  }
+
+  /* ----------------------------------------------------------- picking */
 
   setHoverEnabled(enabled) {
     this.hoverEnabled = enabled;
@@ -176,18 +296,17 @@ export class Viewer {
     }
   }
 
-  /** First surface hit by a ray from `origin` along `direction`, or null. */
+  /** First model surface hit by a ray from `origin` along `direction`, or null. */
   raycastFrom(origin, direction) {
-    if (!this.modelMesh) return null;
+    if (!this.baseMesh) return null;
     this.raycaster.set(new Vector3(...origin), new Vector3(...direction).normalize());
-    return this.#hit(this.raycaster.intersectObject(this.modelMesh, false));
+    return this.#hit(this.raycaster.intersectObject(this.baseMesh, false));
   }
 
   /** Fit the camera to the model (or the empty build plate). */
   frame() {
     const center = this.bounds.getCenter(new Vector3());
     const radius = Math.max(this.bounds.getSize(new Vector3()).length() / 2, 5);
-    // fit to whichever field of view is narrower (horizontal on portrait screens)
     const vFov = (this.camera.fov * Math.PI) / 180;
     const hFov = 2 * Math.atan(Math.tan(vFov / 2) * this.camera.aspect);
     const dist = radius / Math.sin(Math.min(vFov, hFov) / 2);
@@ -212,55 +331,113 @@ export class Viewer {
   #hit(hits) {
     const h = hits[0];
     if (!h?.face) return null;
-    return { point: h.point.toArray(), normal: h.face.normal.clone().normalize().toArray() };
+    const normal = h.face.normal.clone();
+    if (h.object.matrixWorld) normal.transformDirection(h.object.matrixWorld);
+    return { point: h.point.toArray(), normal: normal.normalize().toArray(), object: h.object };
   }
 
-  #pick(event) {
-    if (!this.modelMesh) return null;
+  #ndc(event) {
     const rect = this.renderer.domElement.getBoundingClientRect();
-    const ndc = new Vector2(
-      ((event.clientX - rect.left) / rect.width) * 2 - 1,
-      -((event.clientY - rect.top) / rect.height) * 2 + 1,
-    );
-    this.raycaster.setFromCamera(ndc, this.camera);
-    return this.#hit(this.raycaster.intersectObject(this.modelMesh, false));
+    return new Vector2(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
+  }
+
+  #pickModel(event) {
+    if (!this.baseMesh) return null;
+    this.raycaster.setFromCamera(this.#ndc(event), this.camera);
+    return this.#hit(this.raycaster.intersectObject(this.baseMesh, false));
+  }
+
+  #pickOverlay(event) {
+    const meshes = [...this.overlays.values()].filter((o) => o.mesh.visible).map((o) => o.mesh);
+    if (!meshes.length) return null;
+    this.raycaster.setFromCamera(this.#ndc(event), this.camera);
+    const hit = this.raycaster.intersectObjects(meshes, false)[0];
+    return hit ? hit.object.userData.itemId : null;
   }
 
   #bindPointer() {
     const el = this.renderer.domElement;
     let down = null;
+    let drag = null; // { itemId }
+
     el.addEventListener('pointerdown', (e) => {
-      down = { x: e.clientX, y: e.clientY, t: performance.now(), button: e.button };
+      if (e.button !== 0) return;
+      down = { x: e.clientX, y: e.clientY, t: performance.now() };
+      // pressing on the selected item arms a drag
+      const id = this.#pickOverlay(e);
+      const o = id ? this.overlays.get(id) : null;
+      if (o?.selected && this.onDrag) {
+        drag = { itemId: id, active: false };
+        el.setPointerCapture(e.pointerId);
+      }
     });
-    el.addEventListener('pointerup', (e) => {
-      const d = down;
-      down = null;
-      // a click, not an orbit/pan drag
-      if (!d || d.button !== 0 || !this.onPick) return;
-      if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 5 || performance.now() - d.t > 500) return;
-      const hit = this.#pick(e);
-      if (hit) this.onPick(hit);
-    });
-    let hoverQueued = false;
+
     el.addEventListener('pointermove', (e) => {
-      if (!this.hoverEnabled || !this.modelMesh || e.buttons || hoverQueued) return;
-      hoverQueued = true;
-      requestAnimationFrame(() => {
-        hoverQueued = false;
-        const hit = this.#pick(e);
-        this.marker.visible = !!hit;
-        if (hit) {
-          const radius = Math.max(this.bounds.getSize(new Vector3()).length() * 0.02, 0.5);
-          this.marker.position.set(...hit.point);
-          this.marker.scale.setScalar(radius);
-          this.marker.quaternion.copy(new Quaternion().setFromUnitVectors(new Vector3(0, 0, 1), new Vector3(...hit.normal)));
+      if (drag && down) {
+        if (!drag.active && Math.hypot(e.clientX - down.x, e.clientY - down.y) > CLICK_PX) {
+          drag.active = true;
+          this.controls.enabled = false;
+          el.style.cursor = 'grabbing';
         }
-        el.style.cursor = hit ? 'crosshair' : '';
-        this.requestRender();
-      });
+        if (drag.active) {
+          const hit = this.#pickModel(e);
+          if (hit) this.onDrag({ itemId: drag.itemId, point: hit.point, normal: hit.normal, done: false });
+        }
+        return;
+      }
+      this.#hover(e);
+    });
+
+    const finish = (e) => {
+      const d = down;
+      const dr = drag;
+      down = null;
+      drag = null;
+      this.controls.enabled = true;
+      el.style.cursor = '';
+      if (dr?.active) {
+        const hit = this.#pickModel(e);
+        this.onDrag({ itemId: dr.itemId, point: hit?.point, normal: hit?.normal, done: true });
+        return;
+      }
+      if (!d || Math.hypot(e.clientX - d.x, e.clientY - d.y) > CLICK_PX || performance.now() - d.t > CLICK_MS) return;
+      const itemId = this.#pickOverlay(e);
+      if (itemId) {
+        this.onSelectItem?.(itemId);
+        return;
+      }
+      const hit = this.#pickModel(e);
+      if (hit) this.onPick?.(hit);
+    };
+    el.addEventListener('pointerup', finish);
+    el.addEventListener('pointercancel', () => {
+      down = null;
+      drag = null;
+      this.controls.enabled = true;
+      el.style.cursor = '';
     });
     el.addEventListener('pointerleave', () => {
       this.marker.visible = false;
+      this.requestRender();
+    });
+  }
+
+  #hover(e) {
+    if (!this.hoverEnabled || !this.baseMesh || e.buttons || this.hoverQueued) return;
+    this.hoverQueued = true;
+    requestAnimationFrame(() => {
+      this.hoverQueued = false;
+      const overItem = this.#pickOverlay(e);
+      const hit = overItem ? null : this.#pickModel(e);
+      this.marker.visible = !!hit;
+      if (hit) {
+        const radius = Math.max(this.bounds.getSize(new Vector3()).length() * 0.02, 0.5);
+        this.marker.position.set(...hit.point);
+        this.marker.scale.setScalar(radius);
+        this.marker.quaternion.copy(new Quaternion().setFromUnitVectors(new Vector3(0, 0, 1), new Vector3(...hit.normal)));
+      }
+      const selectedOver = overItem && this.overlays.get(overItem)?.selected;
+      this.renderer.domElement.style.cursor = selectedOver ? 'grab' : overItem ? 'pointer' : hit ? 'crosshair' : '';
       this.requestRender();
     });
   }
@@ -291,3 +468,5 @@ export class Viewer {
     this.requestRender();
   }
 }
+
+export { BufferGeometry };

@@ -175,6 +175,9 @@ export class Document {
       s.base = kind === 'none' ? null : { kind, name, transforms: [], simplify: null };
       s.baseVersion += 1;
     });
+    // a new model starts a new history: the previous model's bytes are gone
+    this.history = [];
+    this.future = [];
   }
 
   /** Apply a 4x4 transform (16 numbers, column-major) to the model and carry the items along. */

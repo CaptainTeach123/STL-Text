@@ -38,6 +38,7 @@ describe('Document', () => {
   it('adds, selects, updates and deletes items with undo/redo', () => {
     const doc = new Document();
     doc.setBase('sample', 'plaque');
+    expect(doc.canUndo).toBe(false); // loading a model is not undoable
     const a = doc.addItem({ text: 'A' });
     const b = doc.addItem({ text: 'B' });
     expect(doc.selected.id).toBe(b.id);

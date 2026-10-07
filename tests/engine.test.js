@@ -56,6 +56,13 @@ describe('fonts and errors', () => {
   it('parses fonts and reports labels; rejects bad bytes with a code', async () => {
     const r = await client.addFont('pacifico', fontBytes('pacifico', 'pacifico-latin-400-normal.woff'));
     expect(r.label).toMatch(/Pacifico/);
+    // several fonts added at once all arrive (one scheduler channel per font)
+    const many = await Promise.all([
+      ['bebas', 'bebas-neue', 'bebas-neue-latin-400-normal.woff'],
+      ['slab', 'roboto-slab', 'roboto-slab-latin-700-normal.woff'],
+      ['orbitron', 'orbitron', 'orbitron-latin-700-normal.woff'],
+    ].map(([id, pkg, file]) => client.addFont(id, fontBytes(pkg, file))));
+    expect(many.map((m) => m.fontId)).toEqual(['bebas', 'slab', 'orbitron']);
     await expect(client.addFont('bad', new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]).buffer)).rejects.toMatchObject({ code: 'FONT_INVALID' });
     await expect(client.addFont('woff2', new TextEncoder().encode('wOF2xxxxxxxx').buffer)).rejects.toMatchObject({ code: 'FONT_INVALID', message: /WOFF2/ });
   });
@@ -247,7 +254,11 @@ describe('result and export', () => {
 describe('client scheduler', () => {
   it('supersedes queued previews: only the latest waiting one runs', async () => {
     await client.loadBase({ kind: 'sample', version: ++version });
-    const results = await Promise.all(['A', 'AB', 'ABC', 'ABCD'].map((t) => client.preview(topItem(t, { position: [0, 0, 4] }), version)));
+    const item = topItem('A', { position: [0, 0, 4] });
+    const results = await Promise.all(['A', 'AB', 'ABC', 'ABCD'].map((t) => client.preview({ ...item, text: t }, version)));
+    // a different item is never superseded by this one
+    const other = await client.preview(topItem('Other', { position: [10, 0, 4] }), version);
+    expect(other).toBeDefined();
     expect(results[0]).toBeDefined(); // in flight when the others arrived
     expect(results[1]).toBeUndefined();
     expect(results[2]).toBeUndefined();

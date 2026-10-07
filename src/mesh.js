@@ -204,5 +204,5 @@ export function geometryFromBuffers({ positions, normals, index }) {
 export function buildBVH(geometry) {
   const bvh = new MeshBVH(geometry, { indirect: false });
   const serialized = MeshBVH.serialize(bvh, { cloneBuffers: true });
-  return { bvh, roots: serialized.roots, index: serialized.index };
+  return { bvh, roots: serialized.roots, index: serialized.index, version: serialized.version };
 }

@@ -28,6 +28,10 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
   let nextId = 1;
   const live = new Map(); // id -> entry
   const channels = new Map(CHANNELS.map((c) => [c, { inFlight: null, waiting: null }]));
+  const channelFor = (name) => {
+    if (!channels.has(name)) channels.set(name, { inFlight: null, waiting: null }); // e.g. preview:item-7
+    return channels.get(name);
+  };
   const fonts = new Map(); // fontId -> ArrayBuffer (kept for rehydration)
   let base = null; // { kind, bytes, name, version, transforms, simplify }
   let fatalError = null;
@@ -66,7 +70,7 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
 
   function post(entry) {
     const w = spawn();
-    const channel = channels.get(entry.channel);
+    const channel = channelFor(entry.channel);
     channel.inFlight = entry;
     live.set(entry.request.id, entry);
     // never transfer buffers we still need (fonts / model bytes are kept here)
@@ -75,7 +79,7 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
   }
 
   function enqueue(entry) {
-    const channel = channels.get(entry.channel);
+    const channel = channelFor(entry.channel);
     if (channel.inFlight) {
       channel.waiting?.resolve(undefined); // superseded
       channel.waiting = entry;
@@ -86,7 +90,7 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
 
   function finish(entry) {
     live.delete(entry.request.id);
-    const channel = channels.get(entry.channel);
+    const channel = channelFor(entry.channel);
     if (channel.inFlight === entry) {
       channel.inFlight = null;
       if (channel.waiting) {
@@ -148,7 +152,7 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
   async function rehydrateFont(fontId) {
     const bytes = fonts.get(fontId);
     if (!bytes) throw new EngineError({ code: 'FONT_MISSING', message: `Font ${fontId} is not loaded`, details: { fontId } });
-    await request('font', 'font.add', { fontId, bytes: copy(bytes) });
+    await request(`font:${fontId}`, 'font.add', { fontId, bytes: copy(bytes) });
   }
 
   async function rehydrateBase() {
@@ -176,7 +180,8 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
     /** Register a font (bytes are kept on this side for restarts). */
     addFont(fontId, bytes) {
       fonts.set(fontId, bytes);
-      return request('font', 'font.add', { fontId, bytes: copy(bytes) });
+      // one channel per font: adding several fonts at once must not drop any
+      return request(`font:${fontId}`, 'font.add', { fontId, bytes: copy(bytes) });
     },
 
     /**
@@ -195,9 +200,13 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
       return request('base', 'base.update', { version, transforms, simplify });
     },
 
-    /** Conformed preview geometry + notes for one item. Superseded calls resolve to undefined. */
+    /**
+     * Conformed preview geometry + notes for one item. Each item has its own
+     * channel, so a newer request for the same item supersedes the older one
+     * (resolving it to undefined) while other items are unaffected.
+     */
     preview(item, baseVersion, options = {}) {
-      return request('preview', 'preview', { item, baseVersion, ...options });
+      return request(`preview:${item.id}`, 'preview', { item, baseVersion, ...options });
     },
 
     /** Display geometry of the final result. */

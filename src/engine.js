@@ -222,9 +222,11 @@ export function createEngine({ wasm }) {
     const buffers = displayBuffers(manifold, passthrough);
     const geometry = geometryFromBuffers({ positions: buffers.positions, index: buffers.index });
     let bvhRoots = [];
+    let bvhVersion = null;
     if (buffers.index.length) {
       const built = buildBVH(geometry); // reorders geometry.index in place
       bvhRoots = built.roots;
+      bvhVersion = built.version;
       buffers.index = built.index; // the reordered copy, for the main thread
       geometry.boundsTree = built.bvh;
     }
@@ -253,6 +255,7 @@ export function createEngine({ wasm }) {
       index: buffers.index,
       passthroughStart: buffers.passthroughStart,
       bvhRoots,
+      bvhVersion,
     };
     return {
       message: { info, report: base.original.report, display },

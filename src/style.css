@@ -502,6 +502,9 @@ input[type='range'] {
 .items li .glyph.engrave {
   background: #ff3b6b;
 }
+.items li .glyph.part {
+  background: #3b82f6;
+}
 .items li .name {
   flex: 1;
   min-width: 0;

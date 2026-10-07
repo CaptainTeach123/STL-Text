@@ -6,11 +6,11 @@ import { labelFor, parseFont } from './fontParse.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from './stl.js';
 import { buildBVH, concatSoups, displayBuffers, geometryFromBuffers, manifoldToSoup } from './mesh.js';
 import { placementMatrix, toMat4 } from './placement.js';
-import { fontIds, hasText, itemLabel, placeKey, shapeKey } from './document.js';
+import { baseMode, fontIds, hasText, isPart, itemLabel, placeKey, shapeKey } from './document.js';
 
 /**
  * The geometry engine: a pure request handler that owns Manifold objects,
- * parsed fonts and the loaded model. It runs inside the Web Worker
+ * parsed fonts, attached parts and the loaded model. It runs inside the Web Worker
  * (worker.js) and, for tests, directly in Node.
  *
  * Protocol — every request is `{ id, channel, type, ...payload }`, every
@@ -36,6 +36,10 @@ import { fontIds, hasText, itemLabel, placeKey, shapeKey } from './document.js';
 const FLAT_CACHE = 16;
 const CONFORM_CACHE = 16;
 const TINY_SHELL_FRACTION = 1e-3;
+// Models above this many triangles are shown (and sampled) through a simplified
+// copy so the view stays fluid; downloads always use the full-detail solid.
+const LOD_TRIANGLES = 400_000;
+const LOD_TOLERANCE = 0.02;
 
 export class EngineError extends Error {
   constructor(code, message, details) {
@@ -159,10 +163,67 @@ export function modelSuggestions({ size, triangles }) {
   return suggestions;
 }
 
-export function createEngine({ wasm }) {
+/**
+ * Rotation (degrees about X, Y, Z) that turns the chosen side of a part so it
+ * faces down (-Z), i.e. becomes the face that touches the model.
+ */
+export const ATTACH_ROTATIONS = {
+  bottom: [0, 0, 0],
+  top: [180, 0, 0],
+  front: [90, 0, 0], // -Y side down
+  back: [-90, 0, 0], // +Y side down
+  left: [0, -90, 0], // -X side down
+  right: [0, 90, 0], // +X side down
+};
+
+/** Outline of a backing plate centred on the origin. */
+export function plateShape(wasm, kind, width, height) {
+  const { CrossSection } = wasm;
+  if (kind === 'banner') {
+    // a ribbon with swallow-tailed ends: tails extend beyond the text, each end notched
+    const tail = Math.min(height * 0.8, Math.max(2, width * 0.12));
+    const notch = tail * 0.6;
+    const W = width / 2 + tail;
+    const H = height / 2;
+    return CrossSection.ofPolygons([[[-W, -H], [-W + notch, 0], [-W, H], [W, H], [W - notch, 0], [W, -H]]], 'NonZero');
+  }
+  const r = Math.min(height / 3, 4);
+  const inner = CrossSection.square([Math.max(0.1, width - 2 * r), Math.max(0.1, height - 2 * r)], true);
+  const plaque = inner.offset(r, 'Round', 2, 24);
+  inner.delete();
+  return plaque;
+}
+
+/** Centroid of a cross-section (area weighted over its polygons). */
+function centroidOf(cs) {
+  let a = 0;
+  let cx = 0;
+  let cy = 0;
+  for (const poly of cs.toPolygons()) {
+    for (let i = 0; i < poly.length; i++) {
+      const [x0, y0] = poly[i];
+      const [x1, y1] = poly[(i + 1) % poly.length];
+      const cross = x0 * y1 - x1 * y0;
+      a += cross;
+      cx += (x0 + x1) * cross;
+      cy += (y0 + y1) * cross;
+    }
+  }
+  if (Math.abs(a) < 1e-12) {
+    const { min, max } = cs.bounds();
+    return [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2];
+  }
+  return [cx / (3 * a), cy / (3 * a)];
+}
+
+export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance = LOD_TOLERANCE }) {
   const { Manifold } = wasm;
   const fonts = new Map(); // fontId -> { font, label, key }
-  const flat = new LRU(FLAT_CACHE, (v) => v.solid.delete());
+  const parts = new Map(); // partId -> { manifold, info, key }
+  const flat = new LRU(FLAT_CACHE, (v) => {
+    v.solid.delete();
+    v.cutter?.delete();
+  });
   const conformed = new LRU(CONFORM_CACHE, (v) => v.solid.delete());
   let result = null; // { key, solid, notes, skipped }
   let base = null;
@@ -187,8 +248,20 @@ export function createEngine({ wasm }) {
     }
   };
 
-  /** Cache key fragment covering every font an item uses (re-uploads change it). */
+  /** Fail once with ALL the parts the items need but the engine lacks. */
+  const requireParts = (items) => {
+    const missing = [...new Set(items.filter(isPart).map((i) => i.partId).filter((id) => id && !parts.has(id)))];
+    if (missing.length) {
+      fail('PART_MISSING', `Part "${missing[0]}" is not loaded`, { partId: missing[0], partIds: missing });
+    }
+  };
+
+  /** Cache key fragment covering every font (or the part) an item uses (re-uploads change it). */
   const fontKeyOf = (item) => {
+    if (isPart(item)) {
+      requireParts([item]);
+      return parts.get(item.partId).key;
+    }
     requireFonts([item]);
     return fontIds(item).map((id) => fontFor(id).key).join(',');
   };
@@ -207,16 +280,31 @@ export function createEngine({ wasm }) {
 
   function clearDerived() {
     conformed.clear();
-    if (result) result.solid?.delete();
+    if (result) {
+      result.solid?.delete();
+      result.separate?.forEach((p) => p.solid.delete());
+    }
     result = null;
   }
 
   function disposeCurrent() {
     if (!base?.current) return;
     base.current.manifold?.delete();
+    base.current.lod?.delete();
     base.current.geometry?.dispose?.();
     base.current.sampler?.dispose?.();
     base.current = null;
+  }
+
+  /** A lighter copy of a solid for display when it is very dense (null when not needed). */
+  function lodFor(solid) {
+    if (!solid || solid.numTri() <= lodTriangles) return null;
+    const simpler = solid.simplify(lodTolerance);
+    if (simpler.numTri() >= solid.numTri()) {
+      simpler.delete();
+      return null;
+    }
+    return simpler;
   }
 
   function disposeBase() {
@@ -257,7 +345,8 @@ export function createEngine({ wasm }) {
     }
     const passthrough = transformSoup(original.passthrough, matrix);
     progress?.('Preparing the view…');
-    const buffers = displayBuffers(manifold, passthrough);
+    const lod = lodFor(manifold);
+    const buffers = displayBuffers(lod ?? manifold, passthrough);
     const geometry = geometryFromBuffers({ positions: buffers.positions, index: buffers.index });
     let bvhRoots = [];
     let bvhVersion = null;
@@ -276,6 +365,7 @@ export function createEngine({ wasm }) {
     const triangles = buffers.index.length / 3;
     base.current = {
       manifold,
+      lod,
       passthrough,
       geometry,
       bounds: buffers.index.length ? { min: bb.min.toArray(), max: bb.max.toArray() } : null,
@@ -287,7 +377,9 @@ export function createEngine({ wasm }) {
       version: base.version,
       size,
       bounds: base.current.bounds,
-      triangles,
+      triangles: (manifold ? manifold.numTri() : 0) + passthrough.length / 9,
+      displayTriangles: triangles,
+      simplifiedView: !!lod,
       originalTriangles: original.inputTriangles,
       watertight: !!manifold,
       repaired: !!original.report?.repaired,
@@ -361,25 +453,130 @@ export function createEngine({ wasm }) {
   /** Without a model there is nothing to sink into: text sits on the plate. */
   const effective = (item) => (base?.kind === 'none' && item.mode !== 'engrave' ? { ...item, overlap: 0 } : item);
 
-  /** Flat (un-conformed) text solid in the item's local frame, cached by shape. */
+  /**
+   * Flat (un-conformed) solid of an item in its local frame, cached by shape:
+   * the extruded text, text on a backing plate, or an attached part with its
+   * join geometry. `cutter` (parts joined with pegs) is what the model loses.
+   */
   function flatFor(item) {
     const key = shapeKey(item, fontKeyOf(item));
     let entry = flat.get(key);
     if (entry) return entry;
+    entry = isPart(item) ? partSolidFor(item) : textSolidFor(item);
+    flat.set(key, entry);
+    return entry;
+  }
+
+  function textSolidFor(item) {
     const info = buildCrossSectionInfo(linesWithFonts(item), item);
     if (!info.cs) fail('FONT_NO_OUTLINES', 'The font has no outlines for those characters.');
+    const temps = scope();
     try {
-      const [z0, z1] = textZRange(item);
-      if (!(z1 - z0 > 0)) fail('EMPTY_RESULT', 'Height or depth must be greater than zero.');
-      const { min, max } = info.cs.bounds();
-      const extruded = Manifold.extrude(info.cs, z1 - z0);
-      const solid = extruded.translate(0, 0, z0);
-      extruded.delete();
-      entry = { solid, size: [max[0] - min[0], max[1] - min[1]], rounding: info.rounding };
-      flat.set(key, entry);
-      return entry;
+      const cs = info.cs;
+      const { min, max } = cs.bounds();
+      let solid;
+      let size = [max[0] - min[0], max[1] - min[1]];
+      if (item.plate && item.plate !== 'none') {
+        // text on a plaque or banner: the plate is what meets the model
+        const pad = Math.max(0, item.platePadding ?? 3);
+        const thickness = Math.max(0.2, item.plateThickness ?? 2);
+        const outline = temps.add(plateShape(wasm, item.plate, size[0] + 2 * pad, size[1] + 2 * pad));
+        const plate = temps.add(Manifold.extrude(outline, thickness + item.overlap).translate(0, 0, -item.overlap));
+        if (item.mode === 'engrave') {
+          const depth = Math.max(0.1, item.depth);
+          const text = temps.add(Manifold.extrude(cs, depth + 0.4).translate(0, 0, thickness - depth));
+          solid = plate.subtract(text);
+        } else {
+          const text = temps.add(Manifold.extrude(cs, item.depth + 0.3).translate(0, 0, thickness - 0.3));
+          solid = plate.add(text);
+        }
+        const pb = outline.bounds();
+        size = [pb.max[0] - pb.min[0], pb.max[1] - pb.min[1]];
+      } else {
+        const [z0, z1] = textZRange(item);
+        if (!(z1 - z0 > 0)) fail('EMPTY_RESULT', 'Height or depth must be greater than zero.');
+        const extruded = temps.add(Manifold.extrude(cs, z1 - z0));
+        solid = extruded.translate(0, 0, z0);
+      }
+      return { solid, size, rounding: info.rounding, cutter: null };
     } finally {
       info.cs.delete();
+      temps.dispose();
+    }
+  }
+
+  /**
+   * An attached part in its local frame: the chosen side faces the model
+   * (contact at z = 0), scaled, tilted, sunk into the surface, with its join:
+   *   fuse   – the part itself (the sink makes the union solid)
+   *   fillet – plus a layered concave fillet skirt around its foot
+   *   pegs   – plus pegs underneath; `cutter` holds the matching holes for the model
+   */
+  function partSolidFor(item) {
+    const part = parts.get(item.partId);
+    const temps = scope();
+    try {
+      const rot = ATTACH_ROTATIONS[item.attach] ?? ATTACH_ROTATIONS.bottom;
+      let m = temps.add(part.manifold.rotate(rot));
+      const { min, max } = m.boundingBox();
+      m = temps.add(m.translate(-(min[0] + max[0]) / 2, -(min[1] + max[1]) / 2, -min[2]));
+      const scale = item.scale > 0 ? item.scale : 1;
+      if (scale !== 1) m = temps.add(m.scale(scale));
+      if (item.tilt) m = temps.add(m.rotate([item.tilt, 0, 0]));
+      const sink = Math.max(0, item.sink ?? 0);
+      const bb = m.boundingBox();
+      const height = bb.max[2] - bb.min[2];
+      const eps = Math.min(0.05, height / 10);
+      const footprint = temps.add(m.slice(bb.min[2] + eps));
+      const fb = footprint.bounds();
+      const size = [fb.max[0] - fb.min[0], fb.max[1] - fb.min[1]];
+      let solid;
+      let cutter = null;
+      if (item.join === 'fillet' && item.filletRadius > 0) {
+        const r = item.filletRadius;
+        const layer = Math.max(0.1, Math.min(0.3, r / 6));
+        const d = (z) => r - Math.sqrt(Math.max(0, r * r - (r - z) * (r - z)));
+        const slabs = [];
+        for (let z0 = 0; z0 < r - 1e-9; z0 += layer) {
+          const at = Math.min(z0 + layer / 2, bb.max[2] - eps);
+          const slice = temps.add(m.slice(bb.min[2] + at));
+          if (slice.isEmpty()) continue;
+          const grown = temps.add(slice.offset(d(z0), 'Round', 2, 16));
+          const bottom = z0 === 0 ? -(sink + eps) : z0;
+          slabs.push(temps.add(Manifold.extrude(grown, z0 + layer - bottom).translate(0, 0, bottom)));
+        }
+        const skirt = slabs.length ? temps.add(Manifold.union(slabs)) : null;
+        const sunk = temps.add(m.translate(0, 0, -sink));
+        solid = skirt ? sunk.add(skirt) : sunk.translate(0, 0, 0);
+      } else if (item.join === 'pegs' && item.pegCount > 0) {
+        const radius = Math.max(0.3, item.pegDiameter / 2);
+        const clearance = Math.max(0, item.pegClearance ?? 0.15);
+        const length = Math.max(0.5, item.pegLength);
+        // peg centres: inside the footprint shrunk by the peg radius, spread along its long axis
+        const inner = temps.add(footprint.offset(-(radius + 0.4), 'Miter', 2, 4));
+        const where = inner.isEmpty() ? footprint : inner;
+        const ib = where.bounds();
+        const [cx, cy] = centroidOf(where);
+        const count = Math.max(1, Math.min(6, Math.round(item.pegCount)));
+        const longX = ib.max[0] - ib.min[0] >= ib.max[1] - ib.min[1];
+        const span = (longX ? ib.max[0] - ib.min[0] : ib.max[1] - ib.min[1]) * 0.8;
+        const centres = [];
+        for (let i = 0; i < count; i++) {
+          const f = count === 1 ? 0 : i / (count - 1) - 0.5;
+          centres.push(longX ? [cx + f * span, cy] : [cx, cy + f * span]);
+        }
+        const pegs = centres.map(([x, y]) => temps.add(Manifold.cylinder(length + eps, radius, radius, 32).translate(x, y, -length)));
+        const holes = centres.map(([x, y]) =>
+          temps.add(Manifold.cylinder(length + clearance + 1, radius + clearance, radius + clearance, 32).translate(x, y, -(length + clearance))),
+        );
+        solid = m.add(temps.add(Manifold.union(pegs)));
+        cutter = Manifold.union(holes);
+      } else {
+        solid = m.translate(0, 0, -sink);
+      }
+      return { solid, cutter, size, rounding: null, part: { name: part.info.name, triangles: part.info.triangles } };
+    } finally {
+      temps.dispose();
     }
   }
 
@@ -417,13 +614,27 @@ export function createEngine({ wasm }) {
     if (entry) return { ...entry, flat: flatEntry, placement };
     let solid;
     let stats = null;
-    const s = item.conform && base.kind !== 'none' ? sampler(placement) : null;
-    if (s) {
+    const wantsStats = base.kind !== 'none';
+    const s = wantsStats && (item.conform || isPart(item)) ? sampler(placement) : null;
+    if (s && item.conform && !isPart(item)) {
       const out = conformSolid(flatEntry.solid, s);
       solid = out.solid;
       stats = { ...out.stats, conformed: out.conformed };
     } else {
       solid = flatEntry.solid.translate(0, 0, 0);
+      if (s) {
+        // a rigid part is not warped, but we still want to know how it meets the surface
+        const bb = flatEntry.solid.boundingBox();
+        const foot = flatEntry.solid.slice(bb.min[2] + Math.min(0.05, (bb.max[2] - bb.min[2]) / 10));
+        if (!foot.isEmpty()) {
+          const slab = Manifold.extrude(foot, 0.2);
+          const out = conformSolid(slab, s);
+          stats = { ...out.stats, conformed: false };
+          out.solid.delete();
+          slab.delete();
+        }
+        foot.delete();
+      }
     }
     entry = { solid, stats };
     conformed.set(key, entry);
@@ -435,14 +646,24 @@ export function createEngine({ wasm }) {
     const notes = [];
     const nozzle = printing.nozzle ?? 0.4;
     const layer = printing.layerHeight ?? 0.2;
-    if (item.mode === 'engrave' && base?.kind !== 'none' && !base?.current?.manifold) {
+    const meets = baseMode(item);
+    if (meets === 'engrave' && base?.kind !== 'none' && !base?.current?.manifold) {
       notes.push({
         level: 'warn',
         code: 'ENGRAVE_UNAVAILABLE',
         text: "This model couldn't be made watertight, so text can only be raised on it, not cut in.",
       });
     }
-    if (stats) notes.push(...conformNotes(stats, { mode: item.mode, depth: item.depth, overlap: item.overlap, nozzle }));
+    if (stats) {
+      const depth = isPart(item) ? (flatEntry.solid.boundingBox().max[2] ?? item.depth) : item.plate !== 'none' ? item.plateThickness : item.depth;
+      notes.push(...conformNotes(stats, { mode: meets, depth, overlap: item.overlap, nozzle }));
+    }
+    if (isPart(item)) {
+      if (item.join === 'pegs') {
+        notes.push({ level: 'info', code: 'PEGS', text: 'Pegs: the part is downloaded as its own file and glued into the matching holes.' });
+      }
+      return notes;
+    }
     const { rounding } = flatEntry;
     const { stroke, limits } = strokeFor(effective(item), printing);
     if (stroke?.thin) {
@@ -469,7 +690,7 @@ export function createEngine({ wasm }) {
         text: `Corner rounding was limited to ${rounding.applied.toFixed(2)} mm by the thinnest strokes.`,
       });
     }
-    if (item.depth < 2 * layer) {
+    if (item.depth < 2 * layer && !(item.plate !== 'none' && item.mode === 'engrave')) {
       notes.push({
         level: 'info',
         code: 'SHALLOW',
@@ -502,6 +723,7 @@ export function createEngine({ wasm }) {
         stats: placed.stats,
         notes: notesFor(item, placed, printing),
         matrix: placed.placement.toArray(),
+        part: placed.flat.part ?? null,
       },
       transfer: [positions.buffer, index.buffer],
     };
@@ -513,7 +735,8 @@ export function createEngine({ wasm }) {
   function finalFor(items, baseVersion, printing, progress) {
     const b = baseFor(baseVersion);
     const active = items.filter(hasText);
-    requireFonts(active);
+    requireFonts(active.filter((i) => !isPart(i)));
+    requireParts(active);
     const key = `${baseVersion}|${active.map((i) => `${shapeKey(i, fontKeyOf(i))}|${placeKey(i)}`).sort().join(';')}`;
     if (result?.key === key) return result;
 
@@ -521,6 +744,7 @@ export function createEngine({ wasm }) {
     const skipped = [];
     const emboss = [];
     const engrave = [];
+    const separate = []; // parts joined with pegs: printed on their own
     const temps = scope();
     try {
       active.forEach((item, n) => {
@@ -536,18 +760,25 @@ export function createEngine({ wasm }) {
           });
           return;
         }
-        if (item.mode === 'engrave' && !b.current.manifold) {
+        const meets = baseMode(item);
+        const needsCut = meets === 'engrave' || (isPart(item) && item.join === 'pegs');
+        if (needsCut && !b.current.manifold) {
           skipped.push(item.id);
           notes.push({
             level: 'warn',
             code: 'ENGRAVE_UNAVAILABLE',
             itemId: item.id,
-            text: `${quote(item)} is cut-in text, which needs a watertight model, so it was left out.`,
+            text: `${quote(item)} needs to cut into the model, which needs a watertight model, so it was left out.`,
           });
           return;
         }
         const world = temps.add(placed.solid.transform(toMat4(placed.placement)));
-        (item.mode === 'engrave' ? engrave : emboss).push(world);
+        if (isPart(item) && item.join === 'pegs' && placed.flat.cutter) {
+          engrave.push(temps.add(placed.flat.cutter.transform(toMat4(placed.placement))));
+          separate.push({ id: item.id, name: itemLabel(item, 'part'), solid: world.translate(0, 0, 0) });
+          return;
+        }
+        (meets === 'engrave' ? engrave : emboss).push(world);
       });
 
       let solid = null;
@@ -592,8 +823,11 @@ export function createEngine({ wasm }) {
       }
 
       const kept = solid ? solid.translate(0, 0, 0) : null; // our own handle, outside the scope
-      if (result) result.solid?.delete();
-      result = { key, solid: kept, notes, skipped, passthrough: b.current.passthrough };
+      if (result) {
+        result.solid?.delete();
+        result.separate?.forEach((p) => p.solid.delete());
+      }
+      result = { key, solid: kept, notes, skipped, separate, passthrough: b.current.passthrough };
       return result;
     } finally {
       temps.dispose();
@@ -603,7 +837,14 @@ export function createEngine({ wasm }) {
   function resultDisplay({ items, baseVersion, printing }, progress) {
     const final = finalFor(items, baseVersion, printing, progress);
     progress?.('Preparing the view…');
-    const buffers = displayBuffers(final.solid, final.passthrough);
+    const temps = scope();
+    let shown = final.solid;
+    if (final.separate.length) {
+      shown = temps.add(Manifold.compose([...(final.solid ? [final.solid] : []), ...final.separate.map((p) => p.solid)]));
+    }
+    const lod = shown ? temps.add(lodFor(shown)) : null;
+    const buffers = displayBuffers(lod ?? shown, final.passthrough);
+    temps.dispose();
     return {
       message: {
         display: {
@@ -628,7 +869,14 @@ export function createEngine({ wasm }) {
     if (!soup || !soup.length) fail('EMPTY_RESULT', 'There is nothing to export yet. Type some text or load a model.');
     progress?.('Writing STL…');
     const stl = writeBinarySTL(soup, `STL-Text ${name}`);
-    return { message: { stl, triangles: soup.length / 9, notes: final.notes, skipped: final.skipped }, transfer: [stl] };
+    const extra = final.separate.map((p) => {
+      const partSoup = manifoldToSoup(p.solid);
+      return { name: p.name, stl: writeBinarySTL(partSoup, `STL-Text ${p.name}`), triangles: partSoup.length / 9 };
+    });
+    return {
+      message: { stl, triangles: soup.length / 9, notes: final.notes, skipped: final.skipped, extra },
+      transfer: [stl, ...extra.map((e) => e.stl)],
+    };
   }
 
   /* ------------------------------------------------------------- fonts */
@@ -645,11 +893,55 @@ export function createEngine({ wasm }) {
     return { message: { fontId, label, glyphs: font.glyphs.length }, transfer: [] };
   }
 
+  /* ------------------------------------------------------------- parts */
+
+  function addPart({ partId, bytes, name = 'part' }, progress) {
+    let geometry;
+    try {
+      geometry = parseSTL(bytes);
+    } catch (err) {
+      fail('STL_INVALID', err.message);
+    }
+    const soup = triangleSoup(geometry);
+    geometry.dispose();
+    progress?.('Checking the part…');
+    const repaired = repairToManifold(soup, { onProgress: (stage) => progress?.(`${stage}…`) });
+    if (!repaired.manifold) {
+      fail('PART_INVALID', `"${name}" could not be made into a solid, so it cannot be attached. Repair it in your slicer first.`);
+    }
+    parts.get(partId)?.manifold.delete();
+    const m = repaired.manifold;
+    const { min, max } = m.boundingBox();
+    const info = {
+      name,
+      triangles: m.numTri(),
+      size: [max[0] - min[0], max[1] - min[1], max[2] - min[2]],
+      watertight: true,
+      repaired: !!repaired.report.repaired,
+      summary: describeRepair(repaired.report),
+      dropped: repaired.passthrough.length / 9,
+    };
+    parts.set(partId, { manifold: m, info, key: `${partId}:${bytes.byteLength}` });
+    flat.clear();
+    clearDerived();
+    return { message: { partId, info }, transfer: [] };
+  }
+
   /* ---------------------------------------------------------- dispatch */
 
   const handlers = {
-    ping: () => ({ message: { ready: true, caches: { flat: flat.size, conformed: conformed.size, result: result ? 1 : 0 }, fonts: [...fonts.keys()], baseVersion: base?.version ?? null }, transfer: [] }),
+    ping: () => ({
+      message: {
+        ready: true,
+        caches: { flat: flat.size, conformed: conformed.size, result: result ? 1 : 0 },
+        fonts: [...fonts.keys()],
+        parts: [...parts.keys()],
+        baseVersion: base?.version ?? null,
+      },
+      transfer: [],
+    }),
     'font.add': addFont,
+    'part.add': addPart,
     'base.load': loadBase,
     'base.update': updateBase,
     preview,
@@ -677,6 +969,8 @@ export function createEngine({ wasm }) {
       clearDerived();
       disposeBase();
       fonts.clear();
+      for (const p of parts.values()) p.manifold.delete();
+      parts.clear();
     },
   };
 }

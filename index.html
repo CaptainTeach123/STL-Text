@@ -59,13 +59,67 @@
 
         <!-- ============================================================ texts -->
         <section class="card" aria-labelledby="h-texts">
-          <h2 id="h-texts"><span class="step">2</span> Texts</h2>
-          <ul id="itemList" class="items" role="listbox" aria-label="Text items (arrow keys to choose)" tabindex="0"></ul>
+          <h2 id="h-texts"><span class="step">2</span> Texts &amp; parts</h2>
+          <ul id="itemList" class="items" role="listbox" aria-label="Texts and parts (arrow keys to choose)" tabindex="0"></ul>
           <div class="row">
             <button type="button" id="addTextBtn" class="btn">+ Add text</button>
+            <button type="button" id="openPartBtn" class="btn" title="Attach another STL file to the model">+ Add part (STL)…</button>
+            <input id="partFile" type="file" accept=".stl,model/stl" hidden />
             <button type="button" id="duplicateBtn" class="btn">Duplicate</button>
             <button type="button" id="deleteBtn" class="btn ghost">Delete</button>
           </div>
+        </section>
+
+        <!-- ============================================================ part -->
+        <section class="card" aria-labelledby="h-part" id="partCard" hidden>
+          <h2 id="h-part"><span class="step">3</span> Part</h2>
+          <p class="hint" id="partInfo"></p>
+          <div class="grid2">
+            <label class="field num">
+              <span>Scale <small>%</small></span>
+              <input type="number" data-key="scale" min="1" max="1000" step="1" value="100" />
+              <input type="range" data-key="scale" min="10" max="300" step="1" value="100" aria-label="Scale" />
+            </label>
+            <label class="field">
+              <span>Attach by its</span>
+              <select data-key="attach">
+                <option value="bottom">bottom</option>
+                <option value="top">top</option>
+                <option value="front">front</option>
+                <option value="back">back</option>
+                <option value="left">left side</option>
+                <option value="right">right side</option>
+              </select>
+            </label>
+            <label class="field num">
+              <span>Tilt <small>degrees</small></span>
+              <input type="number" data-key="tilt" min="-90" max="90" step="1" value="0" />
+              <input type="range" data-key="tilt" min="-45" max="45" step="1" value="0" aria-label="Tilt" />
+            </label>
+            <label class="field num" title="How deep the part sits into the surface so the two fuse into one solid">
+              <span>Sink into surface <small>mm</small></span>
+              <input type="number" data-key="sink" min="0" max="50" step="0.1" value="0.4" />
+              <input type="range" data-key="sink" min="0" max="5" step="0.1" value="0.4" aria-label="Sink depth" />
+            </label>
+          </div>
+          <span class="label">Connection</span>
+          <fieldset class="seg wide" aria-label="How the part connects">
+            <label><input type="radio" name="join" data-key="join" value="fuse" checked /><span>Fused</span></label>
+            <label title="A smooth fillet around the foot: the strongest and cleanest joint"><input type="radio" name="join" data-key="join" value="fillet" /><span>Fused + fillet</span></label>
+            <label title="Print the part separately and glue it into matching holes"><input type="radio" name="join" data-key="join" value="pegs" /><span>Pegs &amp; holes</span></label>
+          </fieldset>
+          <label class="field num fillet-only">
+            <span>Fillet radius <small>mm</small></span>
+            <input type="number" data-key="filletRadius" min="0.2" max="20" step="0.1" value="1.5" />
+            <input type="range" data-key="filletRadius" min="0.2" max="6" step="0.1" value="1.5" aria-label="Fillet radius" />
+          </label>
+          <div class="grid2 pegs-only">
+            <label class="field inline"><span>Pegs</span><input type="number" data-key="pegCount" min="1" max="6" step="1" value="2" /></label>
+            <label class="field inline"><span>Diameter</span><input type="number" data-key="pegDiameter" min="1" max="20" step="0.5" value="3" /><span class="unit">mm</span></label>
+            <label class="field inline"><span>Length</span><input type="number" data-key="pegLength" min="1" max="50" step="0.5" value="6" /><span class="unit">mm</span></label>
+            <label class="field inline" title="Extra room in the holes so the pegs fit after printing"><span>Clearance</span><input type="number" data-key="pegClearance" min="0" max="1" step="0.05" value="0.15" /><span class="unit">mm</span></label>
+          </div>
+          <p class="hint pegs-only">The part downloads as its own STL with the pegs; the model gets the holes.</p>
         </section>
 
         <!-- ======================================================= text & font -->
@@ -130,19 +184,40 @@
 
         <!-- ====================================================== raised / cut -->
         <section class="card" aria-labelledby="h-style">
-          <h2 id="h-style"><span class="step">4</span> Raised or cut</h2>
+          <h2 id="h-style"><span class="step">4</span> <span id="styleTitle">Raised or cut</span></h2>
           <fieldset class="seg wide" aria-label="Mode">
-            <label><input type="radio" name="mode" data-key="mode" value="emboss" checked /><span>Raised <small>emboss</small></span></label>
-            <label><input type="radio" name="mode" data-key="mode" value="engrave" /><span>Cut in <small>engrave</small></span></label>
+            <label><input type="radio" name="mode" data-key="mode" value="emboss" checked /><span id="modeAddLabel">Raised <small>emboss</small></span></label>
+            <label><input type="radio" name="mode" data-key="mode" value="engrave" /><span id="modeCutLabel">Cut in <small>engrave</small></span></label>
           </fieldset>
-          <label class="field num">
+          <label class="field num text-only">
             <span id="depthLabel">Height <small>mm</small></span>
             <input type="number" data-key="depth" min="0.1" max="100" step="0.1" value="1.5" />
             <input type="range" data-key="depth" min="0.2" max="10" step="0.1" value="1.5" aria-label="Height or depth" />
           </label>
-          <label class="check" title="Rounds sharp corners by half the nozzle width so they print cleanly"><input type="checkbox" id="roundCorners" /> Round sharp corners (printer-friendly)</label>
+          <label class="field inline text-only" title="A plate behind the text that is raised on the model – a plaque, or a banner with swallow-tailed ends">
+            <span>Backing plate</span>
+            <select data-key="plate">
+              <option value="none">None</option>
+              <option value="plaque">Plaque (rounded)</option>
+              <option value="banner">Banner (ribbon)</option>
+            </select>
+          </label>
+          <div class="grid2 plate-only">
+            <label class="field num">
+              <span>Plate thickness <small>mm</small></span>
+              <input type="number" data-key="plateThickness" min="0.4" max="30" step="0.2" value="2" />
+              <input type="range" data-key="plateThickness" min="0.4" max="8" step="0.2" value="2" aria-label="Plate thickness" />
+            </label>
+            <label class="field num">
+              <span>Margin <small>mm</small></span>
+              <input type="number" data-key="platePadding" min="0" max="50" step="0.5" value="3" />
+              <input type="range" data-key="platePadding" min="0" max="15" step="0.5" value="3" aria-label="Plate margin" />
+            </label>
+          </div>
+          <p class="hint plate-only">Raised text sits on the plate; cut-in text is engraved into it. The plate follows curved surfaces, so a banner wraps around a cane or a mug.</p>
+          <label class="check text-only" title="Rounds sharp corners by half the nozzle width so they print cleanly"><input type="checkbox" id="roundCorners" /> Round sharp corners (printer-friendly)</label>
           <ul class="notes" id="textNotes" aria-live="polite"></ul>
-          <details class="disclosure">
+          <details class="disclosure text-only">
             <summary>Advanced</summary>
             <div class="tools">
               <label class="check" title="Keeps the depth constant on mugs, rings and other curves"><input type="checkbox" data-key="conform" checked /> Follow curved surfaces</label>

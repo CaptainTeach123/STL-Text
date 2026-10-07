@@ -33,6 +33,7 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
     return channels.get(name);
   };
   const fonts = new Map(); // fontId -> ArrayBuffer (kept for rehydration)
+  const parts = new Map(); // partId -> { bytes, name } (kept for rehydration)
   let base = null; // { kind, bytes, name, version, transforms, simplify }
   let fatalError = null;
 
@@ -122,13 +123,16 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
     }
     const code = msg.error?.code;
     // a fresh worker may lack the model AND a font: rehydrate as often as needed (bounded)
-    if ((entry.retries ?? 0) < 3 && (code === 'FONT_MISSING' || code === 'BASE_MISSING')) {
+    if ((entry.retries ?? 0) < 3 && (code === 'FONT_MISSING' || code === 'BASE_MISSING' || code === 'PART_MISSING')) {
       finish(entry);
       entry.retries = (entry.retries ?? 0) + 1;
       try {
         if (code === 'FONT_MISSING') {
           const ids = msg.error.details?.fontIds ?? [msg.error.details?.fontId];
           await Promise.all(ids.map((id) => rehydrateFont(id)));
+        } else if (code === 'PART_MISSING') {
+          const ids = msg.error.details?.partIds ?? [msg.error.details?.partId];
+          await Promise.all(ids.map((id) => rehydratePart(id)));
         } else await rehydrateBase();
         enqueue(entry);
       } catch {
@@ -158,6 +162,12 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
     await request(`font:${fontId}`, 'font.add', { fontId, bytes: copy(bytes) });
   }
 
+  async function rehydratePart(partId) {
+    const part = parts.get(partId);
+    if (!part) throw new EngineError({ code: 'PART_MISSING', message: `Part ${partId} is not loaded`, details: { partId } });
+    await request(`part:${partId}`, 'part.add', { partId, name: part.name, bytes: copy(part.bytes) });
+  }
+
   async function rehydrateBase() {
     if (!base) throw new EngineError({ code: 'BASE_MISSING', message: 'No model is loaded' });
     await request('base', 'base.load', {
@@ -185,6 +195,12 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
       fonts.set(fontId, bytes);
       // one channel per font: adding several fonts at once must not drop any
       return request(`font:${fontId}`, 'font.add', { fontId, bytes: copy(bytes) });
+    },
+
+    /** Register an STL part to attach (bytes are kept on this side for restarts). */
+    addPart(partId, bytes, name) {
+      parts.set(partId, { bytes, name });
+      return request(`part:${partId}`, 'part.add', { partId, name, bytes: copy(bytes) });
     },
 
     /**

@@ -11,24 +11,32 @@ Everything runs in your browser. Your models and fonts are never uploaded anywhe
 - **Open any STL** (binary or ASCII). Broken files are **repaired automatically**: near-duplicate vertices are welded, flipped faces fixed, holes closed, inside-out and overlapping shells sorted out. Whatever cannot be repaired is kept as-is (shown in amber) so nothing from your model is lost.
 - **Any font:** upload a `.ttf` / `.otf` / `.woff` file (or drop one on the page), pick a font installed on your computer (Chrome / Edge), or use one of six built-in fonts.
 - **Lines in different fonts and sizes.** A text is a stack of lines, and every line has its own font and letter height – a big serif title with a small script name under it, laid out and placed as one block. Press Enter for a new line; the width field scales the whole block.
-- **Several texts** on one model, each still editable: pick one in the *Texts* list, change its lines, placement or raised/cut setting at any time. Undo / redo for everything.
+- **Plaques and banners.** Give a text a backing plate – a rounded plaque or a swallow-tailed banner – that is raised on the model with the text raised on it or engraved into it. Plates follow curves too, so a banner wraps around a cane or a mug.
+- **Attach other STL files** as parts: place a second model on the first and choose how it connects – *fused* (sunk into the surface), *fused with a fillet* (a smooth, layered fillet around the foot: the strongest, cleanest joint) or *pegs and holes* (the part is downloaded on its own with pegs, the model gets matching holes with clearance, for printing separately and gluing). Scale it, choose which side touches, tilt it, or use it as a cutter.
+- **Several texts and parts** on one model, each still editable: pick one in the *Texts & parts* list, change its lines, placement or connection at any time. Undo / redo for everything.
 - **Click the model to place** a text; it aligns to the surface you click. Drag the text to move it, nudge with the arrow keys, snap to a side, rotate.
 - **Follows curves.** Text keeps a constant height / depth on mugs, rings, domes and other curved surfaces instead of cutting a flat slab.
 - **Raised or cut in**, with height / depth, letter height or overall width in mm, letter and line spacing, alignment, boldness, mirror (for stamps) and printer-friendly corner rounding.
 - **Printing checks** based on your nozzle and layer height: strokes too thin to print, gaps that will fill in, engraving that would cut through a thin wall, text hanging over an edge or crossing a step, text that doesn't touch the model, raised text shallower than two layers – each with a one-click fix where possible.
 - **Model tools:** convert inches to millimetres, stand a Y-up model upright, rotate, centre on the build plate, simplify huge meshes. The app suggests these when a file looks like it needs them.
-- **Clean solids.** Text is merged with real boolean operations ([Manifold](https://github.com/elalish/manifold)), so the result is one watertight body – not overlapping shells. The heavy work runs in a background thread; the view stays responsive even with large models.
+- **Clean solids.** Text and parts are merged with real boolean operations ([Manifold](https://github.com/elalish/manifold)), so the result is one watertight body – not overlapping shells. The heavy work runs in a background thread; the view stays responsive even with large models, and models above ~400k triangles are shown through a lighter preview while downloads keep the full detail.
 
 ## Using it
 
 1. **Model** – *Open STL…* (or drag a file onto the page). The info line shows its size and whether it needed repair; the app assumes millimetres, like most slicers.
-2. **Texts** – *Add text*, then type. Each text in the list keeps its own lines, placement and raised/cut setting.
+2. **Texts & parts** – *Add text*, then type; or *Add part (STL)…* to attach another model. Each entry in the list keeps its own settings and placement.
 3. **Text & fonts** – one row per line: its wording, font and letter height in mm. *Add line* (or Enter) adds a line below the current one; uploaded fonts apply to the current line. *Text width* scales all lines together.
-4. **Raised or cut** – choose *Raised* or *Cut in* and the height / depth. Warnings about printability appear here.
+4. **Raised or cut** – choose *Raised* or *Cut in* and the height / depth; optionally a *Backing plate* (plaque or banner) with its thickness and margin. Warnings about printability appear here. For a part this card offers *Add* or *Cut out*, and the *Part* card its scale, attach side, tilt, sink depth and connection (fused, fused + fillet, pegs & holes).
 5. **Placement** – click the model where the text should go, or drag it. The green ring shows where a click would land.
 6. **Show final result** (top right of the 3D view) computes the real merged model; **Download STL** saves it.
 
-The final model is always *model + all raised texts − all cut-in texts*, whatever order you added them in, so cut-in text always cuts through raised text.
+The final model is always *model + everything raised or fused − everything cut*, whatever order you added them in, so cut-in text always cuts through raised text. Parts connected with pegs are not merged: they are downloaded as separate files.
+
+### Connecting parts well
+
+- **Fused** is right for one-piece prints: the part sinks a little into the surface (default 0.4 mm) so the two bodies share material.
+- **Fused + fillet** adds a concave fillet around the foot of the part, built from layers so it prints exactly as drawn. It spreads the load over a wider footprint, hides small gaps on curved surfaces and looks like a cast joint. 1–3 mm radius suits most parts.
+- **Pegs & holes** is for parts printed separately (another colour, another orientation): pegs on the part, holes in the model with a clearance (0.15 mm is a good start for a snug fit after printing), glued on assembly.
 
 ### Tips for printing
 
@@ -70,7 +78,7 @@ npm run e2e      # builds the app and drives it in headless Chromium
 
 | File | Role |
 | --- | --- |
-| `src/engine.js` | The geometry engine: a pure request handler (runs in the Web Worker, or in Node for tests). Loads and repairs models, parses fonts, builds text solids, computes the final geometry, exports STL, prepares display buffers with normals and a serialised BVH for picking |
+| `src/engine.js` | The geometry engine: a pure request handler (runs in the Web Worker, or in Node for tests). Loads and repairs models and parts, parses fonts, builds text / plate / part solids and their joins (fillet skirts, pegs and holes), computes the final geometry, exports STL (plus separate part files), prepares display buffers – simplified for very dense models – with normals and a serialised BVH for picking |
 | `src/worker.js` | 20-line Web Worker shim around the engine, owns the Manifold WASM instance |
 | `src/engineClient.js` | Main-thread side: request scheduling (fast typing never queues stale previews), rehydration of fonts and model after a worker restart, error codes |
 | `src/document.js` | Plain-data document: model transforms, text items, selection, undo / redo |

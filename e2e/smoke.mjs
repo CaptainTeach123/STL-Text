@@ -67,6 +67,8 @@ const broken = (() => {
 const brokenFile = writeFixture('broken.stl', broken);
 const cyl = Manifold.cylinder(60, 20, 20, 128, true).rotate([90, 0, 0]); // axis along Y, top at z = 20
 const cylFile = writeFixture('cylinder.stl', soupOf(cyl));
+const bar = Manifold.cube([20, 6, 3], true);
+const barFile = writeFixture('bar.stl', soupOf(bar));
 const inchBox = Manifold.cube([2, 1, 0.5], true);
 const inchFile = writeFixture('inch.stl', soupOf(inchBox));
 const pacifico = path.join(root, 'node_modules/@fontsource/pacifico/files/pacifico-latin-400-normal.woff');
@@ -300,6 +302,68 @@ try {
   check((await page.locator('#lineList .line').count()) === 1 && (await page.evaluate(() => document.activeElement?.className)) === 'line-text', 'removing a line with × keeps the keyboard focus in the editor');
   await setLines(['Hello', 'World']);
 
+  console.log('\nbacking plate: plaque and banner');
+  await setLines(['Hello']);
+  await page.click('input[name="mode"][value="emboss"]', { force: true });
+  await idle();
+  const bareWidth = Number.parseFloat(await page.inputValue('#widthInput'));
+  await page.selectOption('select[data-key="plate"]', 'plaque');
+  await idle();
+  const plaqueWidth = Number.parseFloat(await page.inputValue('#widthInput'));
+  check(Math.abs(plaqueWidth - (bareWidth + 6)) < 0.6, 'plaque is wider than the text by twice the margin', `${bareWidth} -> ${plaqueWidth}`);
+  check(!(await page.locator('.plate-only').first().isHidden()), 'plate controls appear');
+  await page.selectOption('select[data-key="plate"]', 'banner');
+  await idle();
+  const bannerWidth = Number.parseFloat(await page.inputValue('#widthInput'));
+  check(bannerWidth > plaqueWidth, 'banner has tails beyond the plaque width', `${plaqueWidth} -> ${bannerWidth}`);
+  const plated = await download('banner.stl');
+  const textDepth = Number.parseFloat(await page.inputValue('input[type="number"][data-key="depth"]'));
+  check(plated.volume > base.volume && plated.sizeOk && Math.abs(plated.max[2] - (4 + 2 + textDepth)) < 0.05, 'banner with raised text exports as one solid, plate 2 mm + text', `max z ${plated.max[2].toFixed(2)} (depth ${textDepth}) vol ${plated.volume?.toFixed(0)}`);
+  await page.screenshot({ path: path.join(out, '3c-banner.png') });
+  await page.selectOption('select[data-key="plate"]', 'none');
+  await idle();
+
+  console.log('\nattach a part');
+  const beforePart = await download('before-part.stl'); // the plaque with the current text on it
+  const itemsBefore = await page.locator('#itemList li').count();
+  await page.setInputFiles('#partFile', barFile);
+  await page.waitForFunction((n) => document.querySelectorAll('#itemList li').length === n + 1, itemsBefore);
+  await idle();
+  check(!(await page.locator('#partCard').isHidden()) && (await page.locator('#textCard').isHidden()), 'selecting a part shows the Part card instead of the text card');
+  check((await page.locator('#partInfo').innerText()).includes('20.0 × 6.0 × 3.0'), 'part info shows its size', await page.locator('#partInfo').innerText());
+  await page.click('[data-side="top"]');
+  await idle();
+  const fused = await download('part-fused.stl');
+  // the part sits over the raised letters, so the shared volume counts once: between the part minus letters and the part minus its sunk slice
+  const added = fused.volume - beforePart.volume;
+  check(added > 200 && added <= 360 - 20 * 6 * 0.4 + 1 && fused.sizeOk, 'fused part adds its volume (minus what it shares with the model)', `+${added.toFixed(0)} mm³`);
+  await page.check('input[name="join"][value="fillet"]');
+  await idle();
+  check(!(await page.locator('.fillet-only').first().isHidden()), 'fillet radius control appears');
+  const filleted = await download('part-fillet.stl');
+  check(filleted.volume > fused.volume + 20 && filleted.sizeOk, 'fillet adds material around the foot', `${filleted.volume?.toFixed(0)} > ${fused.volume?.toFixed(0)}`);
+  await page.screenshot({ path: path.join(out, '6-part-fillet.png') });
+  await page.check('input[name="join"][value="pegs"]');
+  await idle();
+  const [dlA, dlB] = await Promise.all([
+    page.waitForEvent('download'),
+    page.waitForEvent('download', { predicate: (d) => /part-1/.test(d.suggestedFilename()) }),
+    page.click('#downloadBtn'),
+  ]).then((r) => r.slice(0, 2));
+  const fileA = path.join(out, 'pegs-model.stl');
+  const fileB = path.join(out, 'pegs-part.stl');
+  await dlA.saveAs(fileA);
+  await dlB.saveAs(fileB);
+  await idle();
+  const pegModel = inspectStl(fileA);
+  const pegPart = inspectStl(fileB);
+  check(pegModel.volume < beforePart.volume - 50 && pegModel.sizeOk, 'pegs: the model gets holes', `${pegModel.volume?.toFixed(0)} < ${beforePart.volume?.toFixed(0)}`);
+  check(pegPart.volume > 360 && pegPart.sizeOk, 'pegs: the part downloads separately with its pegs', `${pegPart.volume?.toFixed(0)}`);
+  await page.click('#deleteBtn');
+  await idle();
+  await page.click('#itemList li:first-child');
+  await idle();
+
   console.log('\nshow final result');
   await page.check('#resultToggle');
   await idle();
@@ -309,6 +373,8 @@ try {
   check(!(await page.isChecked('#resultToggle')), 'editing switches the final result view off');
 
   console.log('\nprinting warnings');
+  await page.check('input[name="mode"][value="engrave"]');
+  await idle();
   await setNumber('depth', 6);
   check((await page.locator('#textNotes').innerText()).includes('cut through'), 'deep engraving warns about cutting through the plaque', await page.locator('#textNotes').innerText());
   await page.click('#textNotes .btn');

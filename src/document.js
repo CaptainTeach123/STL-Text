@@ -10,7 +10,25 @@ import { Matrix3, Matrix4, Vector3 } from 'three';
 export const LINE_DEFAULTS = Object.freeze({ text: '', fontId: 'inter', size: 10 });
 
 export const ITEM_DEFAULTS = Object.freeze({
+  kind: 'text', // 'text' | 'part' (an attached STL)
   lines: [LINE_DEFAULTS], // stacked lines; each may use a different font and size
+  // backing plate behind the text: 'none' | 'plaque' (rounded rectangle) | 'banner' (swallow-tailed ribbon)
+  plate: 'none',
+  plateThickness: 2,
+  platePadding: 3,
+  // attached part (kind 'part')
+  partId: null,
+  name: '',
+  scale: 1,
+  attach: 'bottom', // which side of the part touches the model
+  tilt: 0, // degrees, leans the part about its reading axis
+  sink: 0.4, // how deep the part sits into the surface
+  join: 'fuse', // 'fuse' | 'fillet' | 'pegs'
+  filletRadius: 1.5,
+  pegCount: 2,
+  pegDiameter: 3,
+  pegLength: 6,
+  pegClearance: 0.15,
   letterSpacing: 0,
   lineSpacing: 1.7,
   align: 'center',
@@ -28,8 +46,10 @@ export const ITEM_DEFAULTS = Object.freeze({
 });
 
 const SHAPE_KEYS = [
-  'lines', 'letterSpacing', 'lineSpacing', 'align', 'weight',
+  'kind', 'lines', 'letterSpacing', 'lineSpacing', 'align', 'weight',
   'cornerRadius', 'mirror', 'quality', 'mode', 'depth', 'overlap',
+  'plate', 'plateThickness', 'platePadding',
+  'partId', 'scale', 'attach', 'tilt', 'sink', 'join', 'filletRadius', 'pegCount', 'pegDiameter', 'pegLength', 'pegClearance',
 ];
 const PLACE_KEYS = ['position', 'normal', 'spin', 'conform'];
 
@@ -69,27 +89,40 @@ let nextId = 1;
 export function createItem(overrides = {}) {
   const { text, fontId, size, ...rest } = overrides;
   const item = { ...ITEM_DEFAULTS, ...rest, id: overrides.id ?? `t${nextId++}` };
-  item.lines = linesOf({ lines: rest.lines, text, fontId, size });
+  item.lines = item.kind === 'part' ? [] : linesOf({ lines: rest.lines, text, fontId, size });
+  if (item.kind === 'part') item.conform = false; // a rigid part is never warped
   item.position = [...item.position];
   item.normal = [...item.normal];
   return item;
 }
 
-/** True when the item would produce geometry. */
-export const hasText = (item) => (item.lines ?? []).some((l) => String(l.text ?? '').trim().length > 0);
+/** An attached-part item for a loaded part asset. */
+export function createPart(partId, name, overrides = {}) {
+  return createItem({ kind: 'part', partId, name, ...overrides });
+}
+
+export const isPart = (item) => item?.kind === 'part';
+
+/** True when the item would produce geometry (text with letters, or a part). */
+export const hasText = (item) =>
+  isPart(item) ? !!item.partId : (item.lines ?? []).some((l) => String(l.text ?? '').trim().length > 0);
+export const hasContent = hasText;
+
+/** How the item meets the model: a plated text is always raised on it. */
+export const baseMode = (item) => (!isPart(item) && item.plate !== 'none' ? 'emboss' : item.mode);
 
 /** The item's wording as one string (lines joined by newlines). */
 export const itemText = (item) => (item.lines ?? []).map((l) => l.text ?? '').join('\n');
 
-/** First non-blank line, for lists and messages. */
+/** First non-blank line (or the part's name), for lists and messages. */
 export const itemLabel = (item, fallback = 'empty text') =>
-  (item.lines ?? []).map((l) => String(l.text ?? '').trim()).find(Boolean) ?? fallback;
+  isPart(item) ? item.name || 'part' : (item.lines ?? []).map((l) => String(l.text ?? '').trim()).find(Boolean) ?? fallback;
 
 /** Fonts used by an item, in line order, without repeats. */
 export const fontIds = (item) => [...new Set((item.lines ?? []).map((l) => l.fontId))];
 
-/** Largest letter height in the item (mm). */
-export const maxSize = (item) => Math.max(0, ...(item.lines ?? []).map((l) => l.size || 0));
+/** Largest letter height in the item (mm); 10 for parts (used for spacing duplicates). */
+export const maxSize = (item) => (isPart(item) ? 10 : Math.max(0, ...(item.lines ?? []).map((l) => l.size || 0)));
 
 /** Move items with the model: positions by the matrix, normals by its rotation. */
 export function transformItems(items, matrix) {

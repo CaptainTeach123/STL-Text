@@ -1,5 +1,5 @@
 import { Matrix4, Vector3 } from 'three';
-import { Document, ITEM_DEFAULTS, fontIds, frameOf, hasText, itemLabel, maxSize, placeKey, shapeKey, stableKey } from './document.js';
+import { Document, ITEM_DEFAULTS, createPart, fontIds, frameOf, hasText, isPart, itemLabel, maxSize, placeKey, shapeKey, stableKey } from './document.js';
 import { createEngineClient } from './engineClient.js';
 import { Viewer } from './viewer.js';
 import { SIDES, placementMatrix } from './placement.js';
@@ -13,6 +13,8 @@ const SETTINGS_KEY = 'stltext.settings.v2';
 const doc = new Document();
 const viewer = new Viewer($('stage'));
 const fonts = new Map(); // fontId -> { label, group }
+const partAssets = new Map(); // partId -> { name, info }
+let partCount = 0;
 const printing = { nozzle: 0.4, layerHeight: 0.2 };
 const defaults = { fontId: 'inter', size: 10, mode: 'emboss', depth: 1.5, quality: 'normal', roundCorners: false };
 
@@ -158,6 +160,12 @@ function describeModel() {
   }
   if (info.passthroughTriangles && info.watertight) {
     notes.push({ level: 'warn', text: 'The amber part of the model could not be repaired; text can only be raised there.' });
+  }
+  if (info.simplifiedView) {
+    notes.push({
+      level: 'info',
+      text: `Showing a lighter preview (${info.displayTriangles.toLocaleString()} of ${info.triangles.toLocaleString()} triangles) so the view stays smooth. Downloads keep the full detail.`,
+    });
   }
   return { text, notes };
 }
@@ -387,6 +395,28 @@ function addItem(text = '', overrides = {}, { focus = true } = {}) {
   return item;
 }
 
+/** Attach another STL: load it as a part asset and add a part item at the last click. */
+async function addPartFile(file) {
+  const name = file.name.replace(/\.stl$/i, '');
+  const partId = `part-${++partCount}`;
+  showProgress(`Reading ${file.name}…`);
+  try {
+    const { info } = await client.addPart(partId, await file.arrayBuffer(), name);
+    partAssets.set(partId, { name, info });
+    const from = doc.selected;
+    const place = lastClick ?? (from && { position: from.position, normal: from.normal }) ?? topCenter();
+    doc.addItem({ ...createPart(partId, name), id: undefined, ...place });
+    setStatus(
+      `Added ${name} (${info.size.map((v) => fmt(v)).join(' × ')} mm${info.repaired ? ', repaired' : ''}). Click the model to place it; choose how it connects in the Part card.`,
+      'ok',
+    );
+  } catch (err) {
+    setStatus(`Could not add ${file.name}: ${friendly(err)}`, 'error');
+  } finally {
+    showProgress(null);
+  }
+}
+
 /**
  * Put the caret in a line's text box (after the next render).
  * `caret`: 'all' selects the text (new lines), 'end' puts the caret at the
@@ -559,17 +589,23 @@ async function download() {
   try {
     const r = await client.export(doc.items, version(), name, { printing });
     if (!r) return;
-    const blob = new Blob([r.stl], { type: 'model/stl' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `${name.replace(/[^\w.-]+/g, '_')}.stl`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+    const save = (bytes, fileName) => {
+      const blob = new Blob([bytes], { type: 'model/stl' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `${fileName.replace(/[^\w.-]+/g, '_')}.stl`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+      return { name: a.download, kb: (blob.size / 1024).toFixed(0) };
+    };
+    const main = save(r.stl, name);
+    const extras = (r.extra ?? []).map((e, i) => save(e.stl, `${name}-part-${i + 1}-${e.name}`));
     const warnings = r.notes.filter((n) => n.level === 'warn');
     setStatus(
-      `Downloaded ${a.download} (${(blob.size / 1024).toFixed(0)} KB, ${r.triangles.toLocaleString()} triangles).` +
+      `Downloaded ${main.name} (${main.kb} KB, ${r.triangles.toLocaleString()} triangles)` +
+        (extras.length ? ` and ${extras.length} separate part file${extras.length > 1 ? 's' : ''} (${extras.map((e) => e.name).join(', ')}) to print and glue in.` : '.') +
         (warnings.length ? `\n${warnings.map((n) => n.text).join('\n')}` : ''),
       warnings.length ? 'error' : 'ok',
     );
@@ -589,13 +625,31 @@ function fillPanel(item) {
     document.querySelectorAll('[data-key]').forEach((el) => {
       const key = el.dataset.key;
       const value = item ? item[key] : ITEM_DEFAULTS[key];
+      const shown = key === 'scale' ? Math.round((value ?? 1) * 100) : value;
       if (el.type === 'radio') el.checked = el.value === String(value);
       else if (el.type === 'checkbox') el.checked = !!value;
       else if (el.type === 'number' || el.type === 'range') {
         // "0.0" being typed is numerically 0: leave it alone rather than mangle it
-        if (Number.parseFloat(el.value) !== value) el.value = value ?? '';
-      } else if (el.value !== String(value ?? '')) el.value = value ?? '';
+        if (Number.parseFloat(el.value) !== shown) el.value = shown ?? '';
+      } else if (el.value !== String(shown ?? '')) el.value = shown ?? '';
     });
+    const part = isPart(item);
+    $('textCard').hidden = part;
+    $('partCard').hidden = !part;
+    document.querySelectorAll('.text-only').forEach((el) => (el.hidden = part));
+    document.querySelectorAll('.plate-only').forEach((el) => (el.hidden = part || !item || item.plate === 'none'));
+    document.querySelectorAll('.fillet-only').forEach((el) => (el.hidden = !part || item.join !== 'fillet'));
+    document.querySelectorAll('.pegs-only').forEach((el) => (el.hidden = !part || item.join !== 'pegs'));
+    $('styleTitle').textContent = part ? 'Add or cut out' : 'Raised or cut';
+    $('modeAddLabel').innerHTML = part ? 'Add <small>join</small>' : 'Raised <small>emboss</small>';
+    $('modeCutLabel').innerHTML = part ? 'Cut out <small>use as a cutter</small>' : 'Cut in <small>engrave</small>';
+    if (part) {
+      const asset = partAssets.get(item.partId);
+      const info = asset?.info;
+      $('partInfo').textContent = info
+        ? `${asset.name}: ${info.size.map((v) => fmt(v)).join(' × ')} mm · ${info.triangles.toLocaleString()} triangles${info.repaired ? ' · repaired on load' : ''}`
+        : item.name;
+    }
     ['posX', 'posY', 'posZ'].forEach((id, i) => ($(id).value = item ? Math.round(item.position[i] * 100) / 100 : 0));
     $('roundCorners').checked = !!item && item.cornerRadius > 0;
     $('depthLabel').innerHTML = `${item?.mode === 'engrave' ? 'Depth' : 'Height'} <small>mm</small>`;
@@ -802,17 +856,23 @@ function renderItems() {
       li.setAttribute('aria-selected', String(item.id === doc.state.selectedId));
       li.dataset.id = item.id;
       const glyph = document.createElement('span');
-      glyph.className = `glyph ${item.mode}`;
-      glyph.textContent = item.mode === 'engrave' ? 'C' : 'R';
-      glyph.title = item.mode === 'engrave' ? 'Cut in' : 'Raised';
+      const part = isPart(item);
+      glyph.className = `glyph ${part ? 'part' : item.mode}`;
+      glyph.textContent = part ? 'P' : item.mode === 'engrave' ? 'C' : 'R';
+      glyph.title = part ? 'Attached part' : item.mode === 'engrave' ? 'Cut in' : 'Raised';
       const name = document.createElement('span');
       const first = itemLabel(item, '');
       name.className = `name${first ? '' : ' empty'}`;
       name.textContent = first || 'empty text';
       const meta = document.createElement('span');
       meta.className = 'meta';
-      const sizes = [...new Set(item.lines.map((l) => l.size))];
-      meta.textContent = `${item.lines.length > 1 ? `${item.lines.length} lines · ` : ''}${sizes.join(' / ')} mm`;
+      if (part) {
+        const joinLabel = { fuse: 'fused', fillet: 'fillet', pegs: 'pegs' }[item.join] ?? item.join;
+        meta.textContent = `${Math.round(item.scale * 100)}% · ${item.mode === 'engrave' ? 'cut out' : joinLabel}`;
+      } else {
+        const sizes = [...new Set(item.lines.map((l) => l.size))];
+        meta.textContent = `${item.lines.length > 1 ? `${item.lines.length} lines · ` : ''}${sizes.join(' / ')} mm`;
+      }
       li.append(glyph, name, meta);
       li.tabIndex = -1;
       li.onclick = () => doc.select(item.id);
@@ -832,7 +892,7 @@ function renderSelectedInfo() {
     SHALLOW: (n) => n.suggestedDepth && { label: `Use ${n.suggestedDepth} mm`, run: () => doc.updateItem(sel.id, { depth: n.suggestedDepth }) },
     NOT_TOUCHING: () => modelInfo?.hasModel && { label: 'Put on top', run: () => snapToSide('top') },
   });
-  const width = info?.size?.[0];
+  const width = sel && !isPart(sel) ? info?.size?.[0] : null;
   if (document.activeElement !== $('widthInput')) $('widthInput').value = width ? fmt(width) : '';
   $('widthHint').textContent = width ? 'scales all lines' : '';
 }
@@ -849,8 +909,8 @@ function render() {
 
   const hasModel = !!modelInfo?.hasModel;
   if (booted && !engraveAvailable()) {
-    // cut-in text needs a watertight model; whatever path got us here, make such items raised
-    const cut = doc.items.filter((i) => i.mode === 'engrave');
+    // cutting needs a watertight model; whatever path got us here, make such items raised
+    const cut = doc.items.filter((i) => i.mode === 'engrave' && (isPart(i) || i.plate === 'none'));
     if (cut.length) {
       cut.forEach((i) => doc.updateItem(i.id, { mode: 'emboss' }, { coalesce: 'no-engrave' }));
       doc.endCoalescing();
@@ -944,8 +1004,9 @@ function bindControls() {
     el.addEventListener(continuous ? 'input' : 'change', () => {
       if (filling) return;
       if (el.type === 'radio' && !el.checked) return;
-      const value = readValue(el);
+      let value = readValue(el);
       if (typeof value === 'number' && Number.isNaN(value)) return;
+      if (key === 'scale') value = Math.max(0.01, value / 100);
       let sel = doc.selected;
       if (!sel) sel = addItem('', {}, { focus: false });
       // keep paired slider/number inputs in sync
@@ -953,7 +1014,7 @@ function bindControls() {
         if (other !== el && (other.type === 'range' || other.type === 'number')) other.value = value;
       });
       doc.updateItem(sel.id, { [key]: value }, continuous ? { coalesce: `${key}:${sel.id}` } : undefined);
-      if (key in defaults) {
+      if (key in defaults && !isPart(sel)) {
         defaults[key] = value;
         saveSettings();
       }
@@ -1041,6 +1102,12 @@ function bindControls() {
 
   $('openStlBtn').addEventListener('click', () => $('stlFile').click());
   $('openFontBtn').addEventListener('click', () => $('fontFile').click());
+  $('openPartBtn').addEventListener('click', () => $('partFile').click());
+  $('partFile').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (file) addPartFile(file);
+  });
   $('stlFile').addEventListener('change', async (e) => {
     const file = e.target.files[0];
     e.target.value = '';

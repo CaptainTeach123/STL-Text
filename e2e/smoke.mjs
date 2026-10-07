@@ -447,6 +447,48 @@ try {
   await idle();
   check(/50\.8 × 25\.4 × 12\.7 mm/.test(await page.locator('#modelInfo').innerText()), 'undo reverts the model transform');
 
+  console.log('\nenhance detail');
+  {
+    const core = Manifold.cube([24, 24, 6], true);
+    const ball = Manifold.sphere(1.5, 12);
+    const soft = core.minkowskiSum(ball).refineToLength(0.8);
+    const softFile = writeFixture('soft.stl', soupOf(soft));
+    core.delete();
+    ball.delete();
+    soft.delete();
+    await openStl(softFile, 'soft');
+    await page.click('#enhanceModel summary');
+    check(!(await page.locator('[data-enhance="sharpen"]').first().isDisabled()), 'enhance controls are enabled on a watertight model');
+    const softBefore = await download('soft-before.stl');
+    await page.fill('input[type="number"][data-enhance="sharpen"]', '100');
+    await page.dispatchEvent('input[type="number"][data-enhance="sharpen"]', 'change');
+    await idle();
+    const notes = await page.locator('#modelNotes').innerText();
+    check(/Enhanced: [\d,]+ points moved/.test(notes), 'model notes report the enhancement', notes.replace(/\s+/g, ' ').slice(0, 160));
+    const sharpened = await download('soft-sharpened.stl');
+    check(sharpened.triangles === softBefore.triangles && sharpened.sizeOk, 'sharpening keeps the triangle count', `${sharpened.triangles} vs ${softBefore.triangles}`);
+    check(Math.abs(sharpened.volume - softBefore.volume) / softBefore.volume < 0.03, 'sharpening keeps the volume', `${sharpened.volume?.toFixed(0)} vs ${softBefore.volume?.toFixed(0)}`);
+    const softBytes = fs.readFileSync(path.join(out, 'soft-before.stl'));
+    const sharpBytes = fs.readFileSync(path.join(out, 'soft-sharpened.stl'));
+    check(!softBytes.equals(sharpBytes), 'the downloaded model actually changed');
+    await page.check('#enhanceCompare');
+    await idle();
+    check(/Showing the original/.test(await page.locator('#modelNotes').innerText()), '"Show original" shows the model as loaded');
+    await page.uncheck('#enhanceCompare');
+    await idle();
+    check(/Enhanced:/.test(await page.locator('#modelNotes').innerText()), 'unticking brings the enhancement back');
+    await page.click('#undoBtn');
+    await idle();
+    check(!/Enhanced:/.test(await page.locator('#modelNotes').innerText()), 'undo removes the enhancement', await page.locator('#modelNotes').innerText());
+    check(Number(await page.inputValue('input[type="number"][data-enhance="sharpen"]')) === 0, 'the slider follows the undo');
+    await page.click('#redoBtn');
+    await idle();
+    await page.click('#enhanceReset');
+    await idle();
+    check(!/Enhanced:/.test(await page.locator('#modelNotes').innerText()), 'Reset switches the enhancement off');
+    await page.screenshot({ path: path.join(out, '7-enhance.png') });
+  }
+
   console.log('\nno model');
   await page.click('#clearBtn');
   await idle();

@@ -1,6 +1,7 @@
 import { Matrix4, Vector3 } from 'three';
 import { Document, ITEM_DEFAULTS, createPart, fontIds, frameOf, hasText, isPart, itemLabel, maxSize, placeKey, shapeKey, stableKey } from './document.js';
 import { createEngineClient } from './engineClient.js';
+import { ENHANCE_DEFAULTS, isEnhanceActive } from './enhance.js';
 import { Viewer } from './viewer.js';
 import { SIDES, placementMatrix } from './placement.js';
 import { BUNDLED_FONTS, canQueryLocalFonts, fetchBundledFont, listLocalFonts, localFontBytes } from './fontCatalog.js';
@@ -21,6 +22,7 @@ const defaults = { fontId: 'inter', size: 10, mode: 'emboss', depth: 1.5, qualit
 const previewKeys = new Map(); // itemId -> key of the last preview requested
 const previewInfo = new Map(); // itemId -> { size, notes, stats }
 let modelInfo = null; // info of the model as the engine sees it
+let compareOriginal = false; // "Show original": view the model without its enhancement
 let modelReport = null;
 let sentVersion = null; // doc.baseVersion the engine currently has
 let basePending = null; // promise of the base request in flight, if any
@@ -167,6 +169,16 @@ function describeModel() {
       text: `Showing a lighter preview (${info.displayTriangles.toLocaleString()} of ${info.triangles.toLocaleString()} triangles) so the view stays smooth. Downloads keep the full detail.`,
     });
   }
+  if (info.enhanced?.failed) {
+    notes.push({ level: 'warn', text: 'Enhancement skipped: at these settings the result would not be a valid solid. Try smaller amounts.' });
+  } else if (info.enhanced) {
+    notes.push({
+      level: 'ok',
+      text: `Enhanced: ${info.enhanced.verticesMoved.toLocaleString()} points moved, at most ${fmt(info.enhanced.maxDisplacement)} mm. Downloads include the enhancement.`,
+    });
+  } else if (isEnhanceActive(doc.base?.enhance) && compareOriginal) {
+    notes.push({ level: 'info', text: 'Showing the original model; untick "Show original" to see it enhanced.' });
+  }
   return { text, notes };
 }
 
@@ -282,7 +294,7 @@ async function syncBase() {
   const v = version();
   sentVersion = v;
   const pending = doc.base
-    ? client.updateBase({ version: v, transforms: doc.base.transforms, simplify: doc.base.simplify })
+    ? client.updateBase({ version: v, transforms: doc.base.transforms, simplify: doc.base.simplify, enhance: compareOriginal ? null : doc.base.enhance })
     : client.loadBase({ kind: 'none', version: v });
   basePending = pending;
   try {
@@ -363,6 +375,65 @@ function applyFix(kind) {
   }
   if (matrix) doc.transformBase(matrix);
   setStatus('');
+}
+
+/* ----------------------------------------------------------------- enhance */
+
+const ENHANCE_PERCENT = new Set(['sharpen', 'detail', 'smooth']);
+
+/** Fill the Enhance controls from the document (unless the user is typing in one). */
+function fillEnhance() {
+  const settings = doc.base?.enhance ?? ENHANCE_DEFAULTS;
+  const usable = !!doc.base && !!modelInfo?.watertight;
+  filling = true;
+  try {
+    document.querySelectorAll('[data-enhance]').forEach((el) => {
+      const key = el.dataset.enhance;
+      const shown = ENHANCE_PERCENT.has(key) ? Math.round((settings[key] ?? 0) * 100) : settings[key] ?? ENHANCE_DEFAULTS[key];
+      if (el !== document.activeElement && Number.parseFloat(el.value) !== shown) el.value = shown;
+      el.disabled = !usable;
+    });
+  } finally {
+    filling = false;
+  }
+  const active = isEnhanceActive(doc.base?.enhance);
+  if (!active) compareOriginal = false; // nothing to compare against
+  $('enhanceCompare').disabled = !usable || !active;
+  $('enhanceCompare').checked = compareOriginal && active;
+  $('enhanceReset').disabled = !usable || !active;
+  $('enhanceModel').classList.toggle('active', active);
+  $('enhanceHint').textContent = !doc.base
+    ? 'Load a model first.'
+    : !modelInfo?.watertight
+      ? 'Needs a watertight model (this one has gaps that could not be repaired).'
+      : 'For soft, low-definition models: crisper edges, flatter surfaces and bolder relief print better and look sharper.';
+}
+
+function bindEnhance() {
+  document.querySelectorAll('[data-enhance]').forEach((el) => {
+    const key = el.dataset.enhance;
+    el.addEventListener('input', () => {
+      if (filling || !doc.base) return;
+      let value = Number.parseFloat(el.value);
+      if (Number.isNaN(value)) return;
+      if (ENHANCE_PERCENT.has(key)) value = Math.min(1, Math.max(0, value / 100));
+      document.querySelectorAll(`[data-enhance="${key}"]`).forEach((other) => {
+        if (other !== el) other.value = el.value;
+      });
+      compareOriginal = false;
+      doc.enhanceBase({ [key]: value }, { coalesce: `enhance:${key}` });
+    });
+    el.addEventListener('change', () => doc.endCoalescing());
+  });
+  $('enhanceReset').addEventListener('click', () => {
+    compareOriginal = false;
+    doc.enhanceBase(null);
+  });
+  $('enhanceCompare').addEventListener('change', () => {
+    compareOriginal = $('enhanceCompare').checked;
+    sentVersion = null; // same document version, different model: make syncBase re-derive it
+    render();
+  });
 }
 
 /* ------------------------------------------------------------------- items */
@@ -914,6 +985,7 @@ function render() {
 
   renderItems();
   fillPanel(sel);
+  fillEnhance();
   renderSelectedInfo();
 
   const hasModel = !!modelInfo?.hasModel;
@@ -1086,6 +1158,7 @@ function bindControls() {
     }),
   );
   document.querySelectorAll('[data-fix]').forEach((btn) => btn.addEventListener('click', () => applyFix(btn.dataset.fix)));
+  bindEnhance();
   $('scaleBtn').addEventListener('click', () => applyFix('scale'));
   $('simplifyBtn').addEventListener('click', () => applyFix('simplify'));
 

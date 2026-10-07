@@ -741,3 +741,16 @@ body[data-engine='busy'] .stage canvas {
   width: 30px;
   padding: 4px 0;
 }
+
+/* ---------- enhance detail ---------- */
+.disclosure.active > summary {
+  color: var(--accent);
+}
+.disclosure summary small {
+  font-weight: 400;
+  color: var(--muted);
+  margin-left: 0.35rem;
+}
+.disclosure .disclosure {
+  margin-top: 0.25rem;
+}

@@ -1,4 +1,5 @@
 import { Matrix3, Matrix4, Vector3 } from 'three';
+import { ENHANCE_DEFAULTS } from './enhance.js';
 
 /**
  * The document: which model is loaded and how it was transformed, the text
@@ -137,7 +138,7 @@ export function transformItems(items, matrix) {
 
 const clone = (state) => ({
   ...state,
-  base: state.base && { ...state.base, transforms: state.base.transforms.map((t) => [...t]) },
+  base: state.base && { ...state.base, transforms: state.base.transforms.map((t) => [...t]), enhance: state.base.enhance ? { ...state.base.enhance } : null },
   items: state.items.map((i) => ({ ...i, lines: i.lines.map((l) => ({ ...l })), position: [...i.position], normal: [...i.normal] })),
 });
 
@@ -229,7 +230,7 @@ export class Document {
    */
   setBase(kind, name = 'model') {
     this.commit((s) => {
-      s.base = kind === 'none' ? null : { kind, name, transforms: [], simplify: null };
+      s.base = kind === 'none' ? null : { kind, name, transforms: [], simplify: null, enhance: null };
       s.baseVersion += 1;
     });
     // a new model starts a new history: the previous model's bytes are gone
@@ -257,7 +258,22 @@ export class Document {
     });
   }
 
-  /** Back to the model as loaded (undo all transforms / simplify). */
+  /**
+   * Change the model enhancement (sharpen / smooth / detail amounts and
+   * their options); `patch` null switches it off. Slider drags coalesce.
+   */
+  enhanceBase(patch, { coalesce = null } = {}) {
+    if (!this.state.base) return;
+    this.commit(
+      (s) => {
+        s.base.enhance = patch ? { ...ENHANCE_DEFAULTS, ...(s.base.enhance ?? {}), ...patch } : null;
+        s.baseVersion += 1;
+      },
+      { coalesce },
+    );
+  }
+
+  /** Back to the model as loaded (undo all transforms / simplify / enhancement). */
   resetBase() {
     if (!this.state.base) return;
     // the engine composes M = T_n · … · T_1, so undo it with M⁻¹ as a whole
@@ -266,6 +282,7 @@ export class Document {
     this.commit((s) => {
       s.base.transforms = [];
       s.base.simplify = null;
+      s.base.enhance = null;
       s.baseVersion += 1;
       s.items = transformItems(s.items, inverse);
     });

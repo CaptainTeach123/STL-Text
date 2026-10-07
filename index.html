@@ -55,6 +55,44 @@
               </div>
             </div>
           </details>
+          <details id="enhanceModel" class="disclosure">
+            <summary>Enhance detail <small>sharpen edges · flatten bumps · boost relief</small></summary>
+            <div class="tools">
+              <p class="hint tiny" id="enhanceHint">For soft, low-definition models: crisper edges, flatter surfaces and bolder relief print better and look sharper.</p>
+              <label class="field num" title="Makes edges crisp and the surfaces that meet there flat. The edge angle (Advanced) decides what counts as an edge.">
+                <span>Sharpen edges <small>%</small></span>
+                <input type="number" data-enhance="sharpen" min="0" max="100" step="5" value="0" />
+                <input type="range" data-enhance="sharpen" min="0" max="100" step="5" value="0" aria-label="Sharpen edges" />
+              </label>
+              <label class="field num" title="Removes small lumps and ripples from surfaces while keeping edges and relief.">
+                <span>Smooth bumps <small>%</small></span>
+                <input type="number" data-enhance="smooth" min="0" max="100" step="5" value="0" />
+                <input type="range" data-enhance="smooth" min="0" max="100" step="5" value="0" aria-label="Smooth bumps" />
+              </label>
+              <label class="field num" title="Deepens fine relief – leaves, berries, scrollwork – so it stands out and prints with more definition.">
+                <span>Boost relief <small>%</small></span>
+                <input type="number" data-enhance="detail" min="0" max="100" step="5" value="0" />
+                <input type="range" data-enhance="detail" min="0" max="100" step="5" value="0" aria-label="Boost relief" />
+              </label>
+              <details class="disclosure">
+                <summary>Fine-tune</summary>
+                <div class="grid2">
+                  <label class="field num" title="Edges bending more than this are treated as edges to sharpen; gentler bends are treated as curved surface">
+                    <span>Edge angle <small>degrees</small></span>
+                    <input type="number" data-enhance="edgeAngle" min="10" max="80" step="5" value="30" />
+                  </label>
+                  <label class="field num" title="How large the relief to boost or the bumps to smooth are. 0 picks a size from the mesh.">
+                    <span>Relief size <small>mm · 0 = auto</small></span>
+                    <input type="number" data-enhance="featureSize" min="0" max="20" step="0.1" value="0" />
+                  </label>
+                </div>
+              </details>
+              <div class="row spread">
+                <label class="check" title="Compare with the model as loaded"><input type="checkbox" id="enhanceCompare" /> Show original</label>
+                <button type="button" class="btn small ghost" id="enhanceReset">Reset</button>
+              </div>
+            </div>
+          </details>
         </section>
 
         <!-- ============================================================ texts -->

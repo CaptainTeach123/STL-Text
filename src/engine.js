@@ -7,6 +7,7 @@ import { parseSTL, triangleSoup, writeBinarySTL } from './stl.js';
 import { buildBVH, concatSoups, displayBuffers, geometryFromBuffers, manifoldToSoup } from './mesh.js';
 import { placementMatrix, toMat4 } from './placement.js';
 import { baseMode, fontIds, hasText, isPart, itemLabel, placeKey, shapeKey } from './document.js';
+import { enhanceMesh, isEnhanceActive } from './enhance.js';
 
 /**
  * The geometry engine: a pure request handler that owns Manifold objects,
@@ -315,6 +316,56 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     disposeCurrent();
     base.original?.manifold?.delete();
     base = null;
+    enhanceCache.forEach((e) => e.manifold?.delete());
+    enhanceCache.clear();
+  }
+
+  /**
+   * The model with soft edges sharpened, bumps smoothed and relief boosted
+   * (see enhance.js). Cached by settings so comparing against the original
+   * and nudging one slider back and forth do not redo the work.
+   * Returns { manifold (caller owns, or null when the result was unusable), stats }.
+   */
+  const enhanceCache = new Map();
+  function enhancedFor(solid, enhance, key, progress) {
+    let entry = enhanceCache.get(key);
+    if (!entry) {
+      const mesh = solid.getMesh();
+      const stride = mesh.numProp;
+      let positions = mesh.vertProperties;
+      if (stride !== 3) {
+        const count = positions.length / stride;
+        const xyz = new Float32Array(count * 3);
+        for (let i = 0; i < count; i++) {
+          xyz[i * 3] = positions[i * stride];
+          xyz[i * 3 + 1] = positions[i * stride + 1];
+          xyz[i * 3 + 2] = positions[i * stride + 2];
+        }
+        positions = xyz;
+      }
+      const out = enhanceMesh({ positions, index: mesh.triVerts }, enhance, (stage, fraction) =>
+        progress?.(`${stage}…`, { done: Math.round(fraction * 100), total: 100 }),
+      );
+      let result = null;
+      try {
+        const built = new wasm.Mesh({ numProp: 3, vertProperties: out.positions, triVerts: mesh.triVerts });
+        result = wasm.Manifold.ofMesh(built);
+        if (result.status() !== 'NoError' || result.isEmpty() || result.volume() <= 0) {
+          result.delete();
+          result = null;
+        }
+      } catch {
+        result = null;
+      }
+      entry = { manifold: result, stats: out.stats };
+      enhanceCache.set(key, entry);
+      if (enhanceCache.size > 4) {
+        const oldest = enhanceCache.keys().next().value;
+        enhanceCache.get(oldest).manifold?.delete();
+        enhanceCache.delete(oldest);
+      }
+    }
+    return { manifold: entry.manifold ? entry.manifold.translate(0, 0, 0) : null, stats: entry.stats };
   }
 
   const composeTransforms = (transforms) =>
@@ -337,7 +388,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   function deriveCurrent(progress) {
     disposeCurrent();
     clearDerived();
-    const { original, transforms, simplify } = base;
+    const { original, transforms, simplify, enhance } = base;
     const matrix = composeTransforms(transforms);
     let manifold = original.manifold ? original.manifold.transform(toMat4(matrix)) : null;
     if (manifold && simplify > 0) {
@@ -345,6 +396,17 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const simpler = manifold.simplify(simplify);
       manifold.delete();
       manifold = simpler;
+    }
+    let enhanced = null; // { ...stats, failed }
+    if (manifold && isEnhanceActive(enhance)) {
+      progress?.('Enhancing…');
+      const key = `${JSON.stringify(transforms)}|${simplify}|${JSON.stringify(enhance)}`;
+      const out = enhancedFor(manifold, enhance, key, progress);
+      enhanced = { ...out.stats, failed: !out.manifold };
+      if (out.manifold) {
+        manifold.delete();
+        manifold = out.manifold;
+      }
     }
     const passthrough = transformSoup(original.passthrough, matrix);
     progress?.('Preparing the view…');
@@ -388,7 +450,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       repaired: !!original.report?.repaired,
       passthroughTriangles: passthrough.length / 9,
       hasModel: base.kind !== 'none',
-      suggestions: base.kind === 'stl' && transforms.length === 0 && !simplify ? modelSuggestions({ size, triangles }) : [],
+      enhanced,
+      suggestions: base.kind === 'stl' && transforms.length === 0 && !simplify && !enhanced ? modelSuggestions({ size, triangles }) : [],
     };
     const display = {
       positions: buffers.positions.slice(), // the worker keeps its own copy for sampling
@@ -405,7 +468,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     };
   }
 
-  function loadBase({ kind, bytes, name = 'model', version, transforms = [], simplify = null }, progress) {
+  function loadBase({ kind, bytes, name = 'model', version, transforms = [], simplify = null, enhance = null }, progress) {
     disposeBase();
     clearDerived();
     let original;
@@ -439,15 +502,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     } else {
       fail('INTERNAL', `Unknown model kind "${kind}"`);
     }
-    base = { version, kind, name, original, transforms, simplify };
+    base = { version, kind, name, original, transforms, simplify, enhance };
     return deriveCurrent(progress);
   }
 
-  function updateBase({ version, transforms = [], simplify = null }, progress) {
+  function updateBase({ version, transforms = [], simplify = null, enhance = null }, progress) {
     if (!base?.original) fail('BASE_MISSING', 'The model is not loaded in the engine', { version });
     base.version = version;
     base.transforms = transforms;
     base.simplify = simplify;
+    base.enhance = enhance;
     return deriveCurrent(progress);
   }
 

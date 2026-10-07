@@ -34,7 +34,7 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
   };
   const fonts = new Map(); // fontId -> ArrayBuffer (kept for rehydration)
   const parts = new Map(); // partId -> { bytes, name } (kept for rehydration)
-  let base = null; // { kind, bytes, name, version, transforms, simplify }
+  let base = null; // { kind, bytes, name, version, transforms, simplify, enhance }
   let fatalError = null;
 
   const state = () => (live.size ? 'busy' : worker ? 'idle' : 'stopped');
@@ -177,6 +177,7 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
       version: base.version,
       transforms: base.transforms,
       simplify: base.simplify,
+      enhance: base.enhance ?? null,
     });
   }
 
@@ -208,15 +209,15 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
      * Returns the display payload + repair report.
      */
     loadBase({ kind, bytes = null, name = 'model', version }) {
-      base = { kind, bytes, name, version, transforms: [], simplify: null };
-      return request('base', 'base.load', { kind, name, bytes: bytes ? copy(bytes) : null, version, transforms: [], simplify: null });
+      base = { kind, bytes, name, version, transforms: [], simplify: null, enhance: null };
+      return request('base', 'base.load', { kind, name, bytes: bytes ? copy(bytes) : null, version, transforms: [], simplify: null, enhance: null });
     },
 
-    /** Re-derive the model with a new transform list / simplify tolerance. */
-    updateBase({ version, transforms, simplify }) {
+    /** Re-derive the model with a new transform list / simplify tolerance / enhancement. */
+    updateBase({ version, transforms, simplify, enhance = null }) {
       if (!base) return Promise.reject(new EngineError({ code: 'BASE_MISSING', message: 'No model is loaded' }));
-      base = { ...base, version, transforms, simplify };
-      return request('base', 'base.update', { version, transforms, simplify });
+      base = { ...base, version, transforms, simplify, enhance };
+      return request('base', 'base.update', { version, transforms, simplify, enhance });
     },
 
     /**

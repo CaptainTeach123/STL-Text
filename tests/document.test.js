@@ -207,3 +207,34 @@ describe('Document', () => {
     expect(doc.history).toHaveLength(2);
   });
 });
+
+describe('Document enhancement settings', () => {
+  it('enhanceBase merges settings, coalesces drags, and resetBase clears them', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'm');
+    const v0 = doc.state.baseVersion;
+    doc.enhanceBase({ sharpen: 0.4 }, { coalesce: 'enhance:sharpen' });
+    doc.enhanceBase({ sharpen: 0.6 }, { coalesce: 'enhance:sharpen' });
+    doc.endCoalescing();
+    expect(doc.base.enhance).toMatchObject({ sharpen: 0.6, detail: 0, smooth: 0, edgeAngle: 30 });
+    expect(doc.state.baseVersion).toBe(v0 + 2);
+    doc.enhanceBase({ detail: 0.5 });
+    expect(doc.base.enhance).toMatchObject({ sharpen: 0.6, detail: 0.5 });
+    expect(doc.undo()).toBe(true);
+    expect(doc.base.enhance).toMatchObject({ sharpen: 0.6, detail: 0 });
+    expect(doc.undo()).toBe(true); // the whole drag is one step
+    expect(doc.base.enhance).toBeNull();
+    expect(doc.redo()).toBe(true);
+    expect(doc.base.enhance.sharpen).toBe(0.6);
+    doc.resetBase();
+    expect(doc.base.enhance).toBeNull();
+    doc.enhanceBase({ smooth: 1 });
+    doc.enhanceBase(null);
+    expect(doc.base.enhance).toBeNull();
+    // history snapshots are independent copies
+    doc.enhanceBase({ smooth: 1 });
+    const snapshot = doc.base.enhance;
+    doc.enhanceBase({ smooth: 0.2 });
+    expect(snapshot.smooth).toBe(1);
+  });
+});

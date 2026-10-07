@@ -387,13 +387,22 @@ function addItem(text = '', overrides = {}, { focus = true } = {}) {
   return item;
 }
 
-/** Put the caret in a line's text box (after the next render). */
-function focusLine(index) {
+/**
+ * Put the caret in a line's text box (after the next render).
+ * `caret`: 'all' selects the text (new lines), 'end' puts the caret at the
+ * end, a number keeps that column (arrow-key navigation).
+ */
+function focusLine(index, caret = 'all') {
   requestAnimationFrame(() => {
     const input = $('lineList').querySelectorAll('.line-text')[index];
-    if (input) {
-      input.focus();
-      input.select();
+    if (!input) return;
+    input.focus();
+    const len = input.value.length;
+    if (caret === 'all') input.select();
+    else if (caret === 'end') input.setSelectionRange(len, len);
+    else {
+      const col = Math.min(Number(caret) || 0, len);
+      input.setSelectionRange(col, col);
     }
   });
 }
@@ -496,6 +505,7 @@ function refreshPreviews() {
       })
       .catch((err) => {
         if (previewKeys.get(item.id) !== key) return;
+        if (err.code === 'FONT_MISSING' || err.code === 'BASE_MISSING') previewKeys.delete(item.id); // transient: try again next render
         viewer.setOverlayStale(item.id, false);
         previewInfo.set(item.id, { size: null, notes: [{ level: 'warn', code: err.code, text: friendly(err) }], stats: null });
         if (item.id === doc.state.selectedId) renderSelectedInfo();
@@ -614,9 +624,17 @@ function renderLines(item) {
   const list = $('lineList');
   const lines = item?.lines ?? [];
   currentLine = Math.min(currentLine, Math.max(0, lines.length - 1));
-  const signature = `${item?.id ?? '-'}:${lines.length}:${[...fonts.keys()].join(',')}`;
+  const signature = `${item?.id ?? '-'}:${lines.length}`;
   if (signature !== linesSignature) {
     linesSignature = signature;
+    // a rebuild must never swallow the field the user is typing in
+    const focused = document.activeElement?.closest?.('#lineList .line');
+    const restore = focused && {
+      index: Number(focused.dataset.index),
+      field: document.activeElement.className,
+      start: document.activeElement.selectionStart,
+      end: document.activeElement.selectionEnd,
+    };
     list.replaceChildren(
       ...lines.map((line, index) => {
         const li = document.createElement('li');
@@ -626,6 +644,7 @@ function renderLines(item) {
         const text = document.createElement('input');
         text.className = 'line-text';
         text.type = 'text';
+        text.value = line.text; // rows are born with their values (the focused one is never overwritten later)
         text.placeholder = index === 0 ? 'Type your text…' : `Line ${index + 1}`;
         text.spellcheck = false;
         text.setAttribute('aria-label', `Line ${index + 1} text`);
@@ -647,16 +666,36 @@ function renderLines(item) {
             focusLine(at);
           } else if (e.key === 'Backspace' && text.value === '' && sel.lines.length > 1) {
             e.preventDefault();
-            doc.removeLine(sel.id, index);
+            doc.endCoalescing();
             currentLine = Math.max(0, index - 1);
-            focusLine(currentLine);
+            doc.removeLine(sel.id, index);
+            focusLine(currentLine, 'end');
           } else if (e.key === 'ArrowDown' && index < sel.lines.length - 1) {
             e.preventDefault();
-            focusLine(index + 1);
+            focusLine(index + 1, text.selectionStart ?? 0);
           } else if (e.key === 'ArrowUp' && index > 0) {
             e.preventDefault();
-            focusLine(index - 1);
+            focusLine(index - 1, text.selectionStart ?? 0);
           }
+        });
+        text.addEventListener('paste', (e) => {
+          const sel = doc.selected;
+          const pasted = e.clipboardData?.getData('text/plain') ?? '';
+          if (!sel || !/[\r\n]/.test(pasted)) return; // single-line pastes behave normally
+          e.preventDefault();
+          const parts = pasted.replace(/\r\n?/g, '\n').split('\n');
+          const start = text.selectionStart ?? text.value.length;
+          const end = text.selectionEnd ?? start;
+          const head = text.value.slice(0, start) + parts[0];
+          const tail = text.value.slice(end);
+          doc.endCoalescing();
+          doc.updateLine(sel.id, index, { text: head + (parts.length === 1 ? tail : '') });
+          let at = index;
+          parts.slice(1).forEach((part, n) => {
+            at = doc.addLine(sel.id, at, { text: part + (n === parts.length - 2 ? tail : '') });
+          });
+          currentLine = at;
+          focusLine(at, 'end');
         });
 
         const font = document.createElement('select');
@@ -680,6 +719,7 @@ function renderLines(item) {
         size.min = '0.5';
         size.max = '500';
         size.step = '0.5';
+        size.value = line.size;
         size.title = 'Letter height (mm)';
         size.setAttribute('aria-label', `Line ${index + 1} letter height in mm`);
         size.addEventListener('input', () => {
@@ -702,8 +742,9 @@ function renderLines(item) {
         remove.setAttribute('aria-label', `Remove line ${index + 1}`);
         remove.addEventListener('click', () => {
           if (!doc.selected) return;
-          doc.removeLine(doc.selected.id, index);
           currentLine = Math.max(0, index - 1);
+          doc.removeLine(doc.selected.id, index);
+          focusLine(currentLine, 'end'); // the clicked button is gone with its row
         });
         tools.append(size, unit, remove);
 
@@ -712,7 +753,22 @@ function renderLines(item) {
         return li;
       }),
     );
+    if (restore && lines[restore.index]) {
+      const row = list.children[restore.index];
+      const el = row?.querySelector(`.${restore.field.split(' ')[0]}`);
+      if (el) {
+        el.focus();
+        if (el.setSelectionRange && restore.start != null) {
+          try {
+            el.setSelectionRange(restore.start, restore.end);
+          } catch {
+            /* number inputs refuse selection ranges */
+          }
+        }
+      }
+    }
   }
+  const fontList = [...fonts.keys()].join(',');
   list.querySelectorAll('.line').forEach((li, index) => {
     const line = lines[index];
     li.classList.toggle('current', index === currentLine);
@@ -720,6 +776,10 @@ function renderLines(item) {
     const font = li.querySelector('.line-font');
     const size = li.querySelector('.line-size');
     if (document.activeElement !== text && text.value !== line.text) text.value = line.text;
+    if (font.dataset.fonts !== fontList || !font.querySelector(`option[value="${CSS.escape(line.fontId)}"]`)) {
+      font.replaceChildren(...fontOptions(line.fontId)); // a font arrived or went: refresh the options in place
+      font.dataset.fonts = fontList;
+    }
     if (font.value !== line.fontId) font.value = line.fontId;
     if (document.activeElement !== size && Number.parseFloat(size.value) !== line.size) size.value = line.size;
     li.querySelector('.line-remove').disabled = lines.length <= 1;

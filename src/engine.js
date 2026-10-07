@@ -179,8 +179,19 @@ export function createEngine({ wasm }) {
     return entry;
   };
 
+  /** Fail once with ALL the fonts the items need but the engine lacks, so one rehydration round suffices. */
+  const requireFonts = (items) => {
+    const missing = [...new Set(items.flatMap((i) => fontIds(i)).filter((id) => !fonts.has(id)))];
+    if (missing.length) {
+      fail('FONT_MISSING', `Font "${missing[0]}" is not loaded`, { fontId: missing[0], fontIds: missing });
+    }
+  };
+
   /** Cache key fragment covering every font an item uses (re-uploads change it). */
-  const fontKeyOf = (item) => fontIds(item).map((id) => fontFor(id).key).join(',');
+  const fontKeyOf = (item) => {
+    requireFonts([item]);
+    return fontIds(item).map((id) => fontFor(id).key).join(',');
+  };
 
   /** The item's lines with their parsed fonts, ready for the layout. */
   const linesWithFonts = (item) => item.lines.map((l) => ({ font: fontFor(l.fontId).font, text: l.text, size: l.size }));
@@ -502,6 +513,7 @@ export function createEngine({ wasm }) {
   function finalFor(items, baseVersion, printing, progress) {
     const b = baseFor(baseVersion);
     const active = items.filter(hasText);
+    requireFonts(active);
     const key = `${baseVersion}|${active.map((i) => `${shapeKey(i, fontKeyOf(i))}|${placeKey(i)}`).sort().join(';')}`;
     if (result?.key === key) return result;
 

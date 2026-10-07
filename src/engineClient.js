@@ -126,11 +126,13 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
       finish(entry);
       entry.retries = (entry.retries ?? 0) + 1;
       try {
-        if (code === 'FONT_MISSING') await rehydrateFont(msg.error.details?.fontId);
-        else await rehydrateBase();
+        if (code === 'FONT_MISSING') {
+          const ids = msg.error.details?.fontIds ?? [msg.error.details?.fontId];
+          await Promise.all(ids.map((id) => rehydrateFont(id)));
+        } else await rehydrateBase();
         enqueue(entry);
-      } catch (err) {
-        entry.reject(err);
+      } catch {
+        entry.reject(new EngineError(msg.error)); // could not rehydrate: the engine's own error says what is missing
       }
       return;
     }

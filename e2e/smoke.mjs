@@ -274,6 +274,32 @@ try {
   await setLineSize(0, 10);
   await setLineSize(1, 10);
 
+  console.log('\nline editing keeps what you typed');
+  await setLines(['Hello']);
+  await page.focus('#lineList .line-text >> nth=0');
+  await page.keyboard.press('End');
+  await page.keyboard.press('Enter');
+  await idle();
+  await page.keyboard.press('Backspace'); // remove the empty line again
+  await idle();
+  await page.keyboard.type(' world');
+  await idle();
+  check((await page.inputValue('#lineList .line-text >> nth=0')) === 'Hello world', 'Backspace on an empty line puts the caret at the end of the previous line', await page.inputValue('#lineList .line-text >> nth=0'));
+  await page.evaluate(() => {
+    const input = document.querySelector('#lineList .line-text');
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+    const data = new DataTransfer();
+    data.setData('text/plain', 'Happy\nBirthday');
+    input.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+  });
+  await idle();
+  check((await page.locator('#lineList .line').count()) === 2 && (await page.inputValue('#lineList .line-text >> nth=1')) === 'Birthday', 'pasting multi-line text makes lines', `${await page.locator('#lineList .line').count()} lines`);
+  await page.click('#lineList .line-remove >> nth=1');
+  await idle();
+  check((await page.locator('#lineList .line').count()) === 1 && (await page.evaluate(() => document.activeElement?.className)) === 'line-text', 'removing a line with × keeps the keyboard focus in the editor');
+  await setLines(['Hello', 'World']);
+
   console.log('\nshow final result');
   await page.check('#resultToggle');
   await idle();
@@ -393,6 +419,38 @@ try {
   await page.click('[data-fix="center"]'); // a model tool while the load is still running
   await openStl(bigFile, 'big');
   check(/180,000 triangles|180000 triangles/.test((await page.locator('#modelInfo').innerText()).replace(/\u202f/g, ',')), 'model tool during a load does not lose the model');
+
+  console.log('\nfonts arriving while typing');
+  {
+    const slow = await context.newPage();
+    const slowProblems = [];
+    slow.on('pageerror', (e) => slowProblems.push(e.message));
+    let release;
+    const gate = new Promise((r) => (release = r));
+    let served = 0;
+    await slow.route('**/*.woff', async (route) => {
+      served += 1;
+      if (served > 1) await gate; // the first font loads normally, the rest wait until we say so
+      await route.continue();
+    });
+    await slow.goto(url);
+    await slow.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    await slow.waitForFunction(() => document.querySelector('#lineList .line-text')?.value === 'Hello', null, { timeout: 30000 });
+    await slow.click('#lineList .line-text >> nth=0');
+    await slow.keyboard.press('End');
+    await slow.keyboard.type(' ab');
+    release();
+    await slow.waitForFunction(() => document.querySelector('#lineList .line-font').options.length === 6, null, { timeout: 30000 });
+    await slow.waitForTimeout(300);
+    await slow.keyboard.type('c');
+    await slow.keyboard.press('Backspace');
+    await slow.waitForTimeout(300);
+    const value = await slow.inputValue('#lineList .line-text >> nth=0');
+    check(value === 'Hello ab', 'typing continues after fonts arrive and Backspace edits the text, not the item', value);
+    check((await slow.locator('#itemList li').count()) === 1, 'the text item survived', String(await slow.locator('#itemList li').count()));
+    check(slowProblems.length === 0, 'no page errors in the slow-fonts page', slowProblems.join(' | '));
+    await slow.close();
+  }
 
   check(problems.length === 0, 'no console errors or exceptions (page or worker)', problems.join(' | '));
 } finally {

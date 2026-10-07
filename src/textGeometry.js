@@ -222,7 +222,10 @@ export function buildCrossSectionInfo(linesOrFont, textOrOptions, maybeOptions) 
   const lines = legacy
     ? String(textOrOptions).replace(/\r\n?/g, '\n').split('\n').map((t) => ({ font: linesOrFont, text: t, size: options.size ?? 10 }))
     : linesOrFont;
-  const o = { ...DEFAULT_TEXT_OPTIONS, ...options, size: Math.max(0, ...lines.map((l) => l.size || 0)) };
+  const sizes = lines.map((l) => l.size || 0).filter((v) => v > 0);
+  const o = { ...DEFAULT_TEXT_OPTIONS, ...options, size: Math.max(0, ...sizes) };
+  // simplification must respect the smallest letters, not the biggest line
+  const smallest = sizes.length ? Math.min(...sizes) : o.size;
   const polygons = layoutLines(lines, o);
   const info = { cs: null, rounding: null, polygons: polygons.length };
   if (!polygons.length) return info;
@@ -241,7 +244,7 @@ export function buildCrossSectionInfo(linesOrFont, textOrOptions, maybeOptions) 
     step(rounded.cs);
     info.rounding = { requested: o.cornerRadius, applied: rounded.appliedRadius, limited: rounded.limited };
   }
-  step(cs.simplify(Math.max(0.001, o.size * 0.0005)));
+  step(cs.simplify(Math.max(0.001, smallest * 0.0005)));
   if (cs.isEmpty()) {
     cs.delete();
     return info;

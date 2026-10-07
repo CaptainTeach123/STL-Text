@@ -267,6 +267,16 @@ describe('stacked lines with different fonts and sizes', () => {
     expect(layoutLines([{ font, text: 'A', size: 0 }])).toEqual([]);
   });
 
+  it('a small line next to a huge one keeps its detail', () => {
+    const pacifico = loadFont('pacifico', 'pacifico-latin-400-normal.woff');
+    const alone = buildLinesCrossSection([{ font: pacifico, text: 'name', size: 3 }], { quality: 'fine' });
+    const beside = buildLinesCrossSection([{ font, text: 'TITLE', size: 200 }, { font: pacifico, text: 'name', size: 3 }], { quality: 'fine' });
+    const title = buildCrossSection(font, 'TITLE', { size: 200, quality: 'fine' });
+    const smallArea = beside.area() - title.area();
+    expect(Math.abs(smallArea - alone.area()) / alone.area()).toBeLessThan(0.01);
+    [alone, beside, title].forEach((c) => c.delete());
+  });
+
   it('one-font shorthand still matches the old behaviour', () => {
     const viaText = buildCrossSection(font, 'Hello\nWorld', { size: 10 });
     const viaLines = buildLinesCrossSection([{ font, text: 'Hello', size: 10 }, { font, text: 'World', size: 10 }]);

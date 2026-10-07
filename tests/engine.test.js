@@ -203,8 +203,8 @@ describe('preview', () => {
     expect(r.size[1]).toBeLessThan(9 + 5 + 1.7 * 7); // but not two full pitches
     const one = await client.preview(createItem({ lines: [{ text: 'TITLE', fontId: 'inter', size: 9 }], position: [0, 0, 4] }), version);
     expect(r.size[0]).toBeCloseTo(one.size[0], 1); // the title is the widest line
-    const missing = { ...item, lines: [item.lines[0], { ...item.lines[1], fontId: 'nope' }] };
-    await expect(client.preview(missing, version)).rejects.toMatchObject({ code: 'FONT_MISSING', details: { fontId: 'nope' } });
+    const missing = { ...item, lines: [{ ...item.lines[0], fontId: 'nope' }, { ...item.lines[1], fontId: 'nada' }] };
+    await expect(client.preview(missing, version)).rejects.toMatchObject({ code: 'FONT_MISSING', details: { fontId: 'nope', fontIds: ['nope', 'nada'] } });
   });
 
   it('follows a curved surface', async () => {
@@ -351,13 +351,20 @@ describe('client scheduler', () => {
     // replay the client's memory into the new client (what restart() does internally)
     await c2.addFont('inter', fontBytes('inter', 'inter-latin-700-normal.woff'));
     await c2.loadBase({ kind: 'stl', bytes: stlOf(box), name: 'box', version });
+    await c2.addFont('pacifico', fontBytes('pacifico', 'pacifico-latin-400-normal.woff'));
+    await c2.addFont('slab', fontBytes('roboto-slab', 'roboto-slab-latin-700-normal.woff'));
     c2.restart(); // throws the worker away; next request must rehydrate
-    const r = await c2.preview(topItem('Hi', { position: [0, 0, 7.5] }), version); // needs the model AND the font back
+    const threeFonts = createItem({
+      lines: [{ text: 'A', fontId: 'inter', size: 8 }, { text: 'b', fontId: 'pacifico', size: 5 }, { text: 'C', fontId: 'slab', size: 6 }],
+      position: [0, 0, 7.5],
+      normal: [0, 0, 1],
+    });
+    const r = await c2.preview(threeFonts, version); // needs the model AND three fonts back, within the retry bound
     expect(r.geometry.positions.length).toBeGreaterThan(0);
     expect(c2.fatalError).toBeNull();
     expect(engines.length).toBe(2);
     const ping = await c2.call('ping', {});
-    expect(ping.fonts).toEqual(['inter']);
+    expect(ping.fonts.sort()).toEqual(['inter', 'pacifico', 'slab']);
     expect(ping.baseVersion).toBe(version);
     box.delete();
     engines.forEach((e) => e.dispose());

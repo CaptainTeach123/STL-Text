@@ -615,6 +615,10 @@ input[type='range'] {
   grid-column: 1;
   grid-row: 2;
   align-self: center;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .nudge {
   display: inline-flex;

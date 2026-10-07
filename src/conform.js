@@ -235,8 +235,12 @@ export function conformSolid(flatSolid, sampler, options = {}) {
   };
   if (misses === h.length) return result(flatSolid.translate(0, 0, 0), false, { ...stats, minHeight: NaN, maxHeight: NaN });
 
-  // slope, steps and curvature from the cells that really hit the surface
+  // slope, steps and curvature from the cells that really hit the surface.
+  // A step is a sudden slope change next to a gentle surface (a ledge, a
+  // groove); a smooth surface that merely turns away from the text normal
+  // (the side of a cylinder) is "steep", not a step.
   const tanMax = Math.tan((maxSlopeDeg * Math.PI) / 180);
+  const tanGentle = Math.tan(Math.PI / 6);
   let maxSlope = 0;
   let crossesEdge = false;
   let rMin = Infinity;
@@ -245,21 +249,33 @@ export function conformSolid(flatSolid, sampler, options = {}) {
   for (let j = 0; j < ny; j++) {
     for (let i = 0; i < nx; i++) {
       if (!ok(i, j)) continue;
-      const gx = ok(i - 1, j) && ok(i + 1, j) ? (at(i + 1, j) - at(i - 1, j)) / (2 * cell) : NaN;
-      const gy = ok(i, j - 1) && ok(i, j + 1) ? (at(i, j + 1) - at(i, j - 1)) / (2 * cell) : NaN;
-      const slope = Math.hypot(Number.isFinite(gx) ? gx : 0, Number.isFinite(gy) ? gy : 0);
-      if (slope > maxSlope) maxSlope = slope;
-      for (const [d2, g, wide] of [
-        [Number.isFinite(gx) ? at(i + 1, j) - 2 * at(i, j) + at(i - 1, j) : NaN, gx, ok(i - 2, j) && ok(i + 2, j) ? at(i + 2, j) - 2 * at(i, j) + at(i - 2, j) : NaN],
-        [Number.isFinite(gy) ? at(i, j + 1) - 2 * at(i, j) + at(i, j - 1) : NaN, gy, ok(i, j - 2) && ok(i, j + 2) ? at(i, j + 2) - 2 * at(i, j) + at(i, j - 2) : NaN],
-      ]) {
-        if (!Number.isFinite(d2)) continue;
-        // a second difference larger than one cell of the steepest allowed slope is a step, not a curve
-        if (Math.abs(d2) > cell * tanMax) crossesEdge = true;
+      let slopeX = 0;
+      let slopeY = 0;
+      let step = false;
+      for (const [di, dj] of [[1, 0], [0, 1]]) {
+        if (!ok(i - di, j - dj) || !ok(i + di, j + dj)) continue;
+        const left = (at(i, j) - at(i - di, j - dj)) / cell;
+        const right = (at(i + di, j + dj) - at(i, j)) / cell;
+        const change = Math.abs(right - left); // second difference per cell
+        if (change > tanMax && Math.min(Math.abs(left), Math.abs(right)) < tanGentle) {
+          step = true;
+          continue;
+        }
+        const g = (left + right) / 2;
+        if (di) slopeX = g;
+        else slopeY = g;
         // curvature over a two-cell stencil, so the facets of a coarse model don't register as tight bends
-        const hpp = Number.isFinite(wide) ? Math.abs(wide) / (4 * cell * cell) : Math.abs(d2) / (cell * cell);
+        const wide = ok(i - 2 * di, j - 2 * dj) && ok(i + 2 * di, j + 2 * dj)
+          ? (at(i + 2 * di, j + 2 * dj) - 2 * at(i, j) + at(i - 2 * di, j - 2 * dj)) / (4 * cell * cell)
+          : change / cell;
+        const hpp = Math.abs(wide);
         if (hpp > 1e-6) rMin = Math.min(rMin, (1 + g * g) ** 1.5 / hpp);
       }
+      if (step) {
+        crossesEdge = true;
+        continue; // the wall of a step is not "the surface is too curved"
+      }
+      maxSlope = Math.max(maxSlope, Math.hypot(slopeX, slopeY));
     }
   }
   stats.maxSlopeDeg = (Math.atan(maxSlope) * 180) / Math.PI;

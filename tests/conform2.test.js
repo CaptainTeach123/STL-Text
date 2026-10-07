@@ -82,13 +82,20 @@ describe('conformSolid stats', () => {
     expect(conformNotes(fine.stats).map((n) => n.code)).toEqual(['FOLLOWS_CURVE']);
     const wide = run(cyl, top(20), slab(38, 6, -0.4, 2));
     expect(wide.stats.steep).toBe(true);
+    expect(wide.stats.crossesEdge).toBe(false); // a smooth silhouette is not a step
     expect(conformNotes(wide.stats).some((n) => n.code === 'TOO_CURVED')).toBe(true);
+    // wider than the cylinder itself: still "too curved", still no false step
+    const over = run(cyl, top(20), slab(48, 6, -0.4, 2));
+    expect(over.stats.steep).toBe(true);
+    expect(over.stats.crossesEdge).toBe(false);
   });
 
   it('detects a step inside the footprint and still returns a valid solid', () => {
     const stepped = M.cube([40, 40, 10], true).add(M.cube([20, 40, 2], true).translate(10, 0, 6));
     const out = run(stepped, top(5), slab(30, 6, -0.4, 1.5));
     expect(out.stats.crossesEdge).toBe(true);
+    expect(out.stats.steep).toBe(false); // the step's wall is not "too curved"
+    expect(conformNotes(out.stats).some((n) => n.code === 'TOO_CURVED')).toBe(false);
     expect(conformNotes(out.stats).some((n) => n.code === 'CROSSES_EDGE')).toBe(true);
     expect(out.solid.status()).toBe('NoError');
   });

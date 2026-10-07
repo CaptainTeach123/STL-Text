@@ -557,7 +557,7 @@ function renderSelectedInfo() {
   });
   const width = info?.size?.[0];
   if (document.activeElement !== $('widthInput')) $('widthInput').value = width ? fmt(width) : '';
-  $('widthHint').textContent = width ? 'Edit to scale the letters' : '';
+  $('widthHint').textContent = width ? 'scales the letters' : '';
 }
 
 function render() {

@@ -343,11 +343,12 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         }
         positions = xyz;
       }
-      const out = enhanceMesh({ positions, index: mesh.triVerts }, enhance, (stage, fraction) =>
-        progress?.(`${stage}…`, { done: Math.round(fraction * 100), total: 100 }),
-      );
+      let out = { positions: positions, stats: null };
       let result = null;
       try {
+        out = enhanceMesh({ positions, index: mesh.triVerts }, enhance, (stage, fraction) =>
+          progress?.(`${stage}…`, { done: Math.round(fraction * 100), total: 100 }),
+        );
         const built = new wasm.Mesh({ numProp: 3, vertProperties: out.positions, triVerts: mesh.triVerts });
         result = wasm.Manifold.ofMesh(built);
         if (result.status() !== 'NoError' || result.isEmpty() || result.volume() <= 0) {
@@ -357,7 +358,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       } catch {
         result = null;
       }
-      entry = { manifold: result, stats: out.stats };
+      entry = { manifold: result, stats: out.stats ?? { verticesMoved: 0, maxDisplacement: 0, meanDisplacement: 0, flipsPrevented: 0, featureEdges: 0, iterations: 0 } };
       enhanceCache.set(key, entry);
       if (enhanceCache.size > 4) {
         const oldest = enhanceCache.keys().next().value;

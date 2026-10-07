@@ -9,6 +9,9 @@
  *             their neighbours (bilateral: by distance and by how alike the
  *             normals already are, never across an edge sharper than
  *             `edgeAngle`), then vertices are moved to fit the new normals.
+ *             Only groups of faces whose filtered normals agree are fitted as
+ *             planes; a face on its own (a coarse facet of a curved surface)
+ *             is left where it is, so nothing gets lumpy.
  *   sharpen – guided normal filtering: a face next to a markedly flatter
  *             patch adopts that patch's normal, so rounded edges turn into
  *             two flat faces meeting at a crease; isolated curved surfaces
@@ -18,8 +21,11 @@
  *             amplified along the vertex normal. Flat and smooth regions are
  *             masked out ("coring") and creases are pinned.
  *
- * Everything runs on typed arrays with CSR adjacency; no allocation in hot
- * loops; deterministic.
+ * Everything runs on typed arrays with CSR adjacency; the per-face and
+ * per-vertex loops allocate nothing; deterministic. Meant for meshes whose
+ * triangles are small next to the features (what generators produce); on
+ * very coarse meshes the relief boost can still mistake an irregular vertex
+ * for relief, and smoothing/sharpening simply leave coarse facets alone.
  */
 
 export const ENHANCE_DEFAULTS = Object.freeze({ sharpen: 0, detail: 0, smooth: 0, edgeAngle: 30, featureSize: 0, maxMove: 0 });
@@ -336,7 +342,7 @@ function guidance(topo, fd, n, g, S, capFace, edgeStep, cut2) {
       cz += a * c[j3 + 2];
       const ex = n[j3] - n[i3], ey = n[j3 + 1] - n[i3 + 1], ez = n[j3 + 2] - n[i3 + 2];
       const d = ex * ex + ey * ey + ez * ez;
-      if (d > md) md = d;
+      if (d > md && d <= cut2) md = d; // steps across an already-sharp crease are not "roundness" to compare against
     }
     maxd[i] = md;
     // a patch is a plane to snap to only when no crease (a step steeper than the edge angle) runs through it
@@ -525,8 +531,8 @@ function fitToNormals(topo, index, pos0, pos, nTarget, n0, iterations, cap, stat
   const rn = new Float64Array(R * 3);
   const ra = new Float64Array(R);
   const rd = new Float64Array(R);
-  const rdAll = new Float64Array(R);
-  const raAll = new Float64Array(R);
+  const rd0 = new Float64Array(R); // fallback plane: the target normal through the region's ORIGINAL centroid
+  const ra0 = new Float64Array(R);
   for (let f = 0; f < T; f++) {
     const r = label[f];
     const a = fd.area[f];
@@ -542,28 +548,44 @@ function fitToNormals(topo, index, pos0, pos, nTarget, n0, iterations, cap, stat
       rn[r * 3 + 2] /= l;
     }
   }
+  for (let f = 0; f < T; f++) {
+    const r = label[f];
+    const a = fd.area[f];
+    if (a === 0) continue;
+    rd0[r] += a * (rn[r * 3] * fd.c[f * 3] + rn[r * 3 + 1] * fd.c[f * 3 + 1] + rn[r * 3 + 2] * fd.c[f * 3 + 2]);
+    ra0[r] += a;
+  }
+  for (let r = 0; r < R; r++) rd0[r] = ra0[r] > 0 ? rd0[r] / ra0[r] : 0;
+  // only a group of at least three faces is a plane worth fitting; a face on its own (a facet of a coarse curved surface,
+  // whose filtered normal no closed mesh could take) constrains nothing, so coarse curvature is never pulled into lumps
+  const MIN_PLANE = 3;
+  const faces = new Int32Array(R);
+  for (let f = 0; f < T; f++) faces[label[f]]++;
   const disp = new Float64Array(V * 3);
   const scale = new Float64Array(V);
   const cand = new Float64Array(V * 3);
   let prevented = 0;
+  let prevResidual = Infinity;
   for (let it = 0; it < iterations; it++) {
     rd.fill(0);
     ra.fill(0);
-    rdAll.fill(0);
-    raAll.fill(0);
+    let residual = 0; // how far the faces still are from their target normals
     for (let f = 0; f < T; f++) {
       const r = label[f];
       const a = fd.area[f];
       if (a === 0) continue;
-      const off = a * (rn[r * 3] * fd.c[f * 3] + rn[r * 3 + 1] * fd.c[f * 3 + 1] + rn[r * 3 + 2] * fd.c[f * 3 + 2]);
-      rdAll[r] += off;
-      raAll[r] += a;
-      if (fd.n[f * 3] * rn[r * 3] + fd.n[f * 3 + 1] * rn[r * 3 + 1] + fd.n[f * 3 + 2] * rn[r * 3 + 2] >= cosAnchor) {
-        rd[r] += off;
+      const agree = fd.n[f * 3] * rn[r * 3] + fd.n[f * 3 + 1] * rn[r * 3 + 1] + fd.n[f * 3 + 2] * rn[r * 3 + 2];
+      if (faces[r] >= MIN_PLANE) residual += a * (1 - agree);
+      if (agree >= cosAnchor) {
+        rd[r] += a * (rn[r * 3] * fd.c[f * 3] + rn[r * 3 + 1] * fd.c[f * 3 + 1] + rn[r * 3 + 2] * fd.c[f * 3 + 2]);
         ra[r] += a;
       }
     }
-    for (let r = 0; r < R; r++) rd[r] = ra[r] > 0 ? rd[r] / ra[r] : raAll[r] > 0 ? rdAll[r] / raAll[r] : 0;
+    // targets a closed mesh cannot take (e.g. averaged facet normals of a coarse sphere) make the fit stall: stop rather than drift to the cap
+    if (residual >= prevResidual * 0.995) break;
+    prevResidual = residual;
+    // a plane is defined by the faces already lying in it; until one does, by the target normal through its original centroid
+    for (let r = 0; r < R; r++) rd[r] = ra[r] > 0 ? rd[r] / ra[r] : rd0[r];
     for (let v = 0; v < V; v++) {
       const v3 = v * 3;
       const px = pos[v3], py = pos[v3 + 1], pz = pos[v3 + 2];
@@ -571,8 +593,8 @@ function fitToNormals(topo, index, pos0, pos, nTarget, n0, iterations, cap, stat
       for (let p = vfStart[v]; p < vfStart[v + 1]; p++) {
         const f = vfList[p];
         const a = fd.area[f];
-        if (a === 0) continue;
         const r = label[f];
+        if (a === 0 || faces[r] < MIN_PLANE) continue;
         const nx = rn[r * 3], ny = rn[r * 3 + 1], nz = rn[r * 3 + 2];
         const d = rd[r] - (nx * px + ny * py + nz * pz);
         sx += a * nx * d;
@@ -604,9 +626,9 @@ function fitToNormals(topo, index, pos0, pos, nTarget, n0, iterations, cap, stat
     prevented += guardedPlace(index, n0, pos, disp, scale, cand, flipDot);
     pos.set(cand);
     faceData(pos, index, fd);
+    stats.iterations++;
   }
   stats.flipsPrevented += prevented;
-  stats.iterations += iterations;
   stats.regions = R;
 }
 
@@ -712,7 +734,7 @@ function reliefDisplacement(pos, index, topo, { gain, featureSize, edgeAngle, ca
     const rho = ring[v] > 0 ? Math.max(0.5, Math.min(1.5, ringBar[v] / ring[v])) : 1;
     lam[v] = 0.5 * rho * f[v];
   }
-  const total = K + K0 + K2 + Ke;
+  const total = 2 * K + 2 * (K0 + K2) + K2 + Ke;
   let done = 0;
   const tick = (k, n) => {
     if (k === n || k % 8 === 0) progress?.((done + k) / total);
@@ -724,13 +746,37 @@ function reliefDisplacement(pos, index, topo, { gain, featureSize, edgeAngle, ca
   for (let v = 0; v < V; v++) {
     h[v] = f[v] * ((pos[v * 3] - q[v * 3]) * vn[v * 3] + (pos[v * 3 + 1] - q[v * 3 + 1]) * vn[v * 3 + 1] + (pos[v * 3 + 2] - q[v * 3 + 2]) * vn[v * 3 + 2]);
   }
-  // band-pass: cut vertex-scale noise, subtract the local mean (the curvature shrink of the base, so spheres keep their radius)
-  const hs = smoothField(h, topo, lam, K0, 1, tick);
-  done += K0;
+  // band-pass: cut vertex-scale noise and subtract the local mean (the curvature shrink of the base, so spheres keep
+  // their radius). The umbrella also leaves a connectivity pattern on any smooth surface (irregular vertices sit deeper
+  // in the base); it shows up identically when the operator is applied to the already-smooth base, so that is
+  // band-passed the same way and subtracted: a perfectly smooth coarse sphere yields no relief, real relief survives
+  // the first `cut` passes drop vertex-scale noise, which must not be amplified
+  const bandPass = (x, cut) => {
+    const lo = smoothField(x, topo, lam, cut, 1, tick);
+    done += cut;
+    const mean = smoothField(x, topo, lam, K2, 1, tick);
+    done += K2;
+    for (let v = 0; v < V; v++) lo[v] -= mean[v];
+    return lo;
+  };
+  const r = bandPass(h, K0);
+  // the proxy: the base with its shrink added back, i.e. the model without relief but at its own size
   const hm = smoothField(h, topo, lam, K2, 1, tick);
   done += K2;
-  const r = new Float64Array(V);
-  for (let v = 0; v < V; v++) r[v] = hs[v] - hm[v];
+  const proxy = new Float64Array(V * 3);
+  for (let v = 0; v < V; v++) {
+    proxy[v * 3] = q[v * 3] + hm[v] * vn[v * 3];
+    proxy[v * 3 + 1] = q[v * 3 + 1] + hm[v] * vn[v * 3 + 1];
+    proxy[v * 3 + 2] = q[v * 3 + 2] + hm[v] * vn[v * 3 + 2];
+  }
+  const proxyBase = smoothField(proxy, topo, lam, K, 3, tick);
+  done += K;
+  const hq = new Float64Array(V);
+  for (let v = 0; v < V; v++) {
+    hq[v] = f[v] * ((proxy[v * 3] - proxyBase[v * 3]) * vn[v * 3] + (proxy[v * 3 + 1] - proxyBase[v * 3 + 1]) * vn[v * 3 + 1] + (proxy[v * 3 + 2] - proxyBase[v * 3 + 2]) * vn[v * 3 + 2]);
+  }
+  const rq = bandPass(hq, K0);
+  for (let v = 0; v < V; v++) r[v] -= rq[v];
   // coring: flat and smooth regions (tiny band-pass energy, in edge-length units) stay put
   const energy = new Float64Array(V);
   for (let v = 0; v < V; v++) energy[v] = r[v] * r[v];
@@ -739,11 +785,24 @@ function reliefDisplacement(pos, index, topo, { gain, featureSize, edgeAngle, ca
   for (let v = 0; v < V; v++) {
     const A = Math.sqrt(Math.max(0, em[v])) / (hv[v] || 1);
     const mask = f[v] * smoothstep(0.02, 0.08, A);
-    const raw = gain * mask * r[v];
+    const raw = 2 * gain * mask * r[v]; // the operator-pattern subtraction also takes about half of the relief signal
     const c = cap[v];
-    disp[v] = c > 0 && Number.isFinite(raw) ? c * Math.tanh(raw / c) : 0; // soft cap: strictly below the cap, no flat 'mesa' tops
+    disp[v] = c > 0 && Number.isFinite(c) && Number.isFinite(raw) ? c * Math.tanh(raw / c) : 0; // soft cap: strictly below the cap, no flat 'mesa' tops
   }
   return { disp, vn, passes: total };
+}
+
+/** A mesh the filters can work on: whole triangles, indices into the vertex list, finite coordinates. */
+function validateMesh(positions, index, V, T) {
+  if (positions.length % 3 !== 0 || index.length % 3 !== 0) throw new Error('enhanceMesh: positions must hold 3 numbers per vertex and index 3 per triangle');
+  for (let i = 0; i < index.length; i++) {
+    const v = index[i];
+    if (!(v >= 0 && v < V) || v !== Math.floor(v)) throw new Error(`enhanceMesh: triangle ${Math.floor(i / 3)} refers to vertex ${v}, which does not exist`);
+  }
+  for (let i = 0; i < positions.length; i++) {
+    if (!Number.isFinite(positions[i])) throw new Error(`enhanceMesh: vertex ${Math.floor(i / 3)} has a non-finite coordinate`);
+  }
+  void T;
 }
 
 /* -------------------------------------------------------------------- main */
@@ -763,14 +822,15 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
   const smooth = clamp01(+o.smooth || 0);
   const detail = clamp01(+o.detail || 0);
   const edgeAngle = Math.min(150, Math.max(5, +o.edgeAngle || 30));
-  const featureSize = Math.max(0, +o.featureSize || 0);
-  const maxMove = Math.max(0, +o.maxMove || 0);
+  const featureSize = Number.isFinite(+o.featureSize) ? Math.max(0, +o.featureSize) : 0;
+  const maxMove = Number.isFinite(+o.maxMove) ? Math.max(0, +o.maxMove) : 0;
   const index = mesh.index;
   const V = mesh.positions.length / 3;
   const T = index.length / 3;
   const stats = { verticesMoved: 0, maxDisplacement: 0, meanDisplacement: 0, flipsPrevented: 0, featureEdges: 0, iterations: 0 };
   const identity = () => ({ positions: mesh.positions instanceof Float32Array ? mesh.positions.slice() : Float32Array.from(mesh.positions), stats });
   if (!(sharpen > 0 || smooth > 0 || detail > 0) || V === 0 || T === 0) return identity();
+  validateMesh(mesh.positions, index, V, T);
   const report = (stage, fraction) => onProgress?.(stage, Math.min(1, Math.max(0, fraction)));
 
   report('Analysing the surface', 0);
@@ -788,16 +848,38 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
   report('Analysing the surface', 0.08);
 
   let pos = pos0.slice();
-  let n = fd0.n.slice();
+
+  /** Pins for the relief boost: vertices on creases (judged on the current geometry) and on open edges never move. */
+  const pinsFor = (fd) => {
+    const { maxDih } = dihedrals(edges, index, fd.n, edgeAngle, V);
+    const pin = new Float64Array(V);
+    for (let v = 0; v < V; v++) pin[v] = edges.open[v] ? 0 : 1 - smoothstep(0.75 * edgeAngle, edgeAngle, maxDih[v]);
+    return pin;
+  };
+  /** Apply a relief displacement (along the vertex normals) with the flip guard, from the current positions. */
+  const applyRelief = (fdNow, { disp, vn }, flipDot) => {
+    const vec = new Float64Array(V * 3);
+    for (let v = 0; v < V; v++) {
+      vec[v * 3] = disp[v] * vn[v * 3];
+      vec[v * 3 + 1] = disp[v] * vn[v * 3 + 1];
+      vec[v * 3 + 2] = disp[v] * vn[v * 3 + 2];
+    }
+    const scale = new Float64Array(V);
+    const out = new Float64Array(V * 3);
+    stats.flipsPrevented += guardedPlace(index, fdNow.n, pos, vec, scale, out, flipDot);
+    pos = out;
+  };
 
   if (smooth > 0 || sharpen > 0) {
+    const fdS = fd0;
     const tmp = new Float64Array(T * 3);
     const cut = chord(edgeAngle);
     const sigmaR = cut / 2;
     const sigmaS = featureSize > 0 ? featureSize : 1.5 * h;
     const stopCos = Math.cos((0.5 * Math.PI) / 180);
-    let cur = n;
+    let cur = fd0.n.slice();
     let nxt = tmp;
+    let nSmooth = null; // the normals after smoothing only, for a partial sharpen amount
     const turned = () => {
       for (let i = 0; i < T * 3; i += 3) if (cur[i] * nxt[i] + cur[i + 1] * nxt[i + 1] + cur[i + 2] * nxt[i + 2] < stopCos) return true;
       return false;
@@ -815,6 +897,7 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
         report('Smoothing bumps', 0.1 + (0.2 * (k + 1)) / K);
         if (!more) break;
       }
+      if (sharpen > 0 && sharpen < 1) nSmooth = cur.slice();
     }
     if (sharpen > 0) {
       const g = new Float64Array(T * 3);
@@ -835,8 +918,8 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
           if (d > edgeStep[edges.faceA[e]]) edgeStep[edges.faceA[e]] = d;
           if (d > edgeStep[edges.faceB[e]]) edgeStep[edges.faceB[e]] = d;
         }
-        guidance(topo, fd0, cur, g, S, capFace, edgeStep, cut * cut);
-        bilateral(topo, fd0, cur, g, nxt, sigmaS, sigmaR, cut, S.gate, true);
+        guidance(topo, fdS, cur, g, S, capFace, edgeStep, cut * cut);
+        bilateral(topo, fdS, cur, g, nxt, sigmaS, sigmaR, cut, S.gate, true);
         const more = turned();
         [cur, nxt] = [nxt, cur];
         stats.iterations++;
@@ -844,13 +927,17 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
         if (!more) break;
       }
     }
-    n = cur;
     report('Fitting the surface', 0.5);
-    fitToNormals(topo, index, pos0, pos, n, n0, 10, cap, stats);
-    if (sharpen > 0 && sharpen < 1 && smooth === 0) {
-      // a partial amount is a fraction of the full movement, re-checked for flips
+    fitToNormals(topo, index, pos0, pos, cur, n0, 10, cap, stats);
+    if (sharpen > 0 && sharpen < 1) {
+      // a partial amount is a fraction of the way from the smoothed-only result to the fully sharpened one, re-checked for flips
+      let from = pos0;
+      if (nSmooth) {
+        from = pos0.slice();
+        fitToNormals(topo, index, pos0, from, nSmooth, n0, 10, cap, stats);
+      }
       const disp = new Float64Array(V * 3);
-      for (let i = 0; i < V * 3; i++) disp[i] = sharpen * (pos[i] - pos0[i]);
+      for (let i = 0; i < V * 3; i++) disp[i] = from[i] - pos0[i] + sharpen * (pos[i] - from[i]);
       const scale = new Float64Array(V);
       const out = new Float64Array(V * 3);
       stats.flipsPrevented += guardedPlace(index, n0, pos0, disp, scale, out, 0.2);
@@ -860,23 +947,11 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
   }
 
   if (detail > 0) {
-    // creases (sharp edges in the current geometry) are pinned so relief boosting never rings across them
+    // creases (sharp edges in the current, possibly just sharpened geometry) are pinned so relief boosting never rings across them
     const fdNow = faceData(pos, index);
-    const { maxDih } = dihedrals(edges, index, fdNow.n, edgeAngle, V);
-    const pin = new Float64Array(V);
-    for (let v = 0; v < V; v++) pin[v] = edges.open[v] ? 0 : 1 - smoothstep(0.75 * edgeAngle, edgeAngle, maxDih[v]);
-    const { disp, vn, passes } = reliefDisplacement(pos, index, topo, { gain: 2.5 * detail, featureSize, edgeAngle, cap, pin }, (f) => report('Boosting relief', 0.6 + 0.3 * f));
-    stats.iterations += passes;
-    const vec = new Float64Array(V * 3);
-    for (let v = 0; v < V; v++) {
-      vec[v * 3] = disp[v] * vn[v * 3];
-      vec[v * 3 + 1] = disp[v] * vn[v * 3 + 1];
-      vec[v * 3 + 2] = disp[v] * vn[v * 3 + 2];
-    }
-    const scale = new Float64Array(V);
-    const out = new Float64Array(V * 3);
-    stats.flipsPrevented += guardedPlace(index, fdNow.n, pos, vec, scale, out, 0.05);
-    pos = out;
+    const relief = reliefDisplacement(pos, index, topo, { gain: 2.5 * detail, featureSize, edgeAngle, cap, pin: pinsFor(fdNow) }, (f) => report('Boosting relief', 0.6 + 0.3 * f));
+    stats.iterations += relief.passes;
+    applyRelief(fdNow, relief, 0.05);
   }
 
   // shared budget: the total movement of a vertex never exceeds its cap, and the result has no flipped triangle

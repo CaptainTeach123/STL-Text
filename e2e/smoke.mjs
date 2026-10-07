@@ -485,13 +485,15 @@ try {
     await page.click('#enhanceModel summary');
     check(!(await page.locator('[data-enhance="sharpen"]').first().isDisabled()), 'enhance controls are enabled on a watertight model');
     const softBefore = await download('soft-before.stl');
+    const triangleCount = async () => Number((await page.locator('#modelInfo').innerText()).match(/([\d,]+) triangles/)[1].replace(/,/g, ''));
+    const trianglesBefore = await triangleCount();
     await page.fill('input[type="number"][data-enhance="sharpen"]', '100');
     await page.dispatchEvent('input[type="number"][data-enhance="sharpen"]', 'change');
     await idle();
     const notes = await page.locator('#modelNotes').innerText();
     check(/Enhanced: [\d,]+ points moved/.test(notes), 'model notes report the enhancement', notes.replace(/\s+/g, ' ').slice(0, 160));
     const sharpened = await download('soft-sharpened.stl');
-    check(sharpened.triangles === softBefore.triangles && sharpened.sizeOk, 'sharpening keeps the triangle count', `${sharpened.triangles} vs ${softBefore.triangles}`);
+    check((await triangleCount()) === trianglesBefore && sharpened.sizeOk, 'sharpening keeps the model triangle count', `${await triangleCount()} vs ${trianglesBefore}`);
     check(Math.abs(sharpened.volume - softBefore.volume) / softBefore.volume < 0.03, 'sharpening keeps the volume', `${sharpened.volume?.toFixed(0)} vs ${softBefore.volume?.toFixed(0)}`);
     const softBytes = fs.readFileSync(path.join(out, 'soft-before.stl'));
     const sharpBytes = fs.readFileSync(path.join(out, 'soft-sharpened.stl'));

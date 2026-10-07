@@ -85,6 +85,10 @@
                     <span>Relief size <small>mm · 0 = auto</small></span>
                     <input type="number" data-enhance="featureSize" min="0" max="20" step="0.1" value="0" />
                   </label>
+                  <label class="field num" title="How far any point may move. 0 = a third of the local triangle size, which is always safe; allow more to sharpen wider roundings.">
+                    <span>Max move <small>mm · 0 = auto</small></span>
+                    <input type="number" data-enhance="maxMove" min="0" max="5" step="0.05" value="0" />
+                  </label>
                 </div>
               </details>
               <div class="row spread">

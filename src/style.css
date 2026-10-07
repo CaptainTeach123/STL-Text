@@ -691,3 +691,50 @@ input[type='range'] {
 body[data-engine='busy'] .stage canvas {
   cursor: progress;
 }
+
+/* ---------- lines editor ---------- */
+.lines-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.lines {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.lines .line {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.lines .line.current {
+  border-color: var(--accent);
+}
+.lines .line-text {
+  grid-column: 1 / -1;
+  font-size: 15px;
+}
+.lines .line-font {
+  min-width: 0;
+}
+.lines .line-tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.lines .line-size {
+  width: 64px;
+}
+.lines .line-remove {
+  width: 30px;
+  padding: 4px 0;
+}

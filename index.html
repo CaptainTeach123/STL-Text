@@ -70,16 +70,13 @@
 
         <!-- ======================================================= text & font -->
         <section class="card" aria-labelledby="h-text" id="textCard">
-          <h2 id="h-text"><span class="step">3</span> Text &amp; font</h2>
-          <label class="field">
-            <span>Text <small>(Enter for a new line)</small></span>
-            <textarea id="text" data-key="text" rows="2" spellcheck="false" placeholder="Type your text…"></textarea>
-          </label>
-
-          <label class="field">
-            <span>Font</span>
-            <select id="font" data-key="fontId"></select>
-          </label>
+          <h2 id="h-text"><span class="step">3</span> Text &amp; fonts</h2>
+          <div class="lines-head">
+            <span class="label">Lines <small>– each with its own font and size</small></span>
+            <button type="button" id="addLineBtn" class="btn small">+ Add line</button>
+          </div>
+          <ol id="lineList" class="lines" aria-label="Lines of this text"></ol>
+          <p class="hint">Press <b>Enter</b> in a line for a new line below it. Fonts: any <b>.ttf / .otf / .woff</b> file works – upload it or drop it on the page; it is applied to the current line.</p>
           <div class="row">
             <button type="button" id="openFontBtn" class="btn">Upload font…</button>
             <input id="fontFile" type="file" accept=".ttf,.otf,.woff,font/ttf,font/otf,font/woff" hidden />
@@ -89,18 +86,12 @@
             <span>Installed fonts</span>
             <select id="localFonts"></select>
           </label>
-          <p class="hint">Any <b>.ttf / .otf / .woff</b> file works – upload it or drop it on the page.</p>
 
           <div class="grid2">
             <label class="field num">
-              <span>Letter height <small>mm</small></span>
-              <input type="number" data-key="size" min="0.5" max="500" step="0.5" value="10" />
-              <input type="range" data-key="size" min="1" max="60" step="0.5" value="10" aria-label="Letter height" />
-            </label>
-            <label class="field num">
               <span>Text width <small>mm</small></span>
               <input type="number" id="widthInput" min="1" max="2000" step="0.5" value="0" />
-              <span class="hint tiny" id="widthHint" title="Change it to scale the letters">scales the letters</span>
+              <span class="hint tiny" id="widthHint" title="Change it to scale all lines together">scales all lines</span>
             </label>
             <label class="field num">
               <span>Letter spacing <small>mm</small></span>

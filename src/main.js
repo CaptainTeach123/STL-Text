@@ -1,5 +1,5 @@
 import { Matrix4, Vector3 } from 'three';
-import { Document, ITEM_DEFAULTS, frameOf, hasText, placeKey, shapeKey, stableKey } from './document.js';
+import { Document, ITEM_DEFAULTS, fontIds, frameOf, hasText, itemLabel, maxSize, placeKey, shapeKey, stableKey } from './document.js';
 import { createEngineClient } from './engineClient.js';
 import { Viewer } from './viewer.js';
 import { SIDES, placementMatrix } from './placement.js';
@@ -26,6 +26,8 @@ let lastContentKey = '';
 let lastClick = null; // { position, normal } of the last click on the model
 let booted = false;
 let userFontCount = 0;
+let currentLine = 0; // which line of the selected text the line tools act on
+let linesSignature = ''; // what the lines editor was last built for
 let fatalCount = 0; // consecutive engine crashes; stops the automatic restarts
 let halted = false;
 const MAX_FATALS = 3;
@@ -359,9 +361,10 @@ function applyFix(kind) {
 
 const engraveAvailable = () => !!(modelInfo?.hasModel && modelInfo?.watertight);
 
+const lineDefaults = () => ({ text: '', fontId: fonts.has(defaults.fontId) ? defaults.fontId : 'inter', size: defaults.size });
+
 const itemDefaults = () => ({
-  fontId: fonts.has(defaults.fontId) ? defaults.fontId : 'inter',
-  size: defaults.size,
+  lines: [lineDefaults()],
   mode: engraveAvailable() ? defaults.mode : 'emboss',
   depth: defaults.depth,
   quality: defaults.quality,
@@ -371,15 +374,28 @@ const itemDefaults = () => ({
 function addItem(text = '', overrides = {}, { focus = true } = {}) {
   const from = doc.selected;
   const place = lastClick ?? (from && { position: from.position, normal: from.normal }) ?? topCenter();
+  const firstLine = from ? { ...from.lines[0], text } : { ...lineDefaults(), text };
   const item = doc.addItem({
     ...itemDefaults(),
-    ...(from ? { fontId: from.fontId, size: from.size, mode: from.mode, depth: from.depth, quality: from.quality, cornerRadius: from.cornerRadius } : {}),
-    text,
+    ...(from ? { mode: from.mode, depth: from.depth, quality: from.quality, cornerRadius: from.cornerRadius } : {}),
+    lines: [firstLine],
     ...place,
     ...overrides,
   });
-  if (focus) $('text').focus();
+  currentLine = 0;
+  if (focus) focusLine(0);
   return item;
+}
+
+/** Put the caret in a line's text box (after the next render). */
+function focusLine(index) {
+  requestAnimationFrame(() => {
+    const input = $('lineList').querySelectorAll('.line-text')[index];
+    if (input) {
+      input.focus();
+      input.select();
+    }
+  });
 }
 
 function topCenter() {
@@ -451,7 +467,7 @@ const previewKey = (item) => `${shapeKey(item)}|${placeKey(item)}|${version()}|$
 function refreshPreviews() {
   const ids = new Set();
   for (const item of doc.items) {
-    if (!hasText(item) || !fonts.has(item.fontId)) {
+    if (!hasText(item) || !fontIds(item).every((id) => fonts.has(id))) {
       viewer.removeOverlay(item.id);
       previewKeys.delete(item.id);
       previewInfo.delete(item.id);
@@ -529,7 +545,7 @@ async function showResult(on) {
 async function download() {
   const items = doc.items.filter(hasText);
   if (!items.length && !modelInfo?.hasModel) return setStatus('Type some text or open a model first.', 'error');
-  const name = modelInfo?.hasModel ? `${modelInfo.name}-text` : items.map((i) => i.text.trim().split('\n')[0]).join('-').slice(0, 40) || 'text';
+  const name = modelInfo?.hasModel ? `${modelInfo.name}-text` : items.map((i) => itemLabel(i, '')).filter(Boolean).join('-').slice(0, 40) || 'text';
   try {
     const r = await client.export(doc.items, version(), name, { printing });
     if (!r) return;
@@ -565,7 +581,6 @@ function fillPanel(item) {
       const value = item ? item[key] : ITEM_DEFAULTS[key];
       if (el.type === 'radio') el.checked = el.value === String(value);
       else if (el.type === 'checkbox') el.checked = !!value;
-      else if (el.tagName === 'SELECT' && key === 'fontId') el.value = fonts.has(value) ? value : el.value;
       else if (el.type === 'number' || el.type === 'range') {
         // "0.0" being typed is numerically 0: leave it alone rather than mangle it
         if (Number.parseFloat(el.value) !== value) el.value = value ?? '';
@@ -574,9 +589,148 @@ function fillPanel(item) {
     ['posX', 'posY', 'posZ'].forEach((id, i) => ($(id).value = item ? Math.round(item.position[i] * 100) / 100 : 0));
     $('roundCorners').checked = !!item && item.cornerRadius > 0;
     $('depthLabel').innerHTML = `${item?.mode === 'engrave' ? 'Depth' : 'Height'} <small>mm</small>`;
+    renderLines(item);
   } finally {
     filling = false;
   }
+}
+
+/** Font options for a line's dropdown (built-in first, then uploaded). */
+function fontOptions(selectedId) {
+  const groups = { bundled: document.createElement('optgroup'), user: document.createElement('optgroup') };
+  groups.bundled.label = 'Built in';
+  groups.user.label = 'Your fonts';
+  for (const [id, f] of fonts) groups[f.group === 'user' ? 'user' : 'bundled'].append(new Option(f.label, id, false, id === selectedId));
+  if (selectedId && !fonts.has(selectedId)) groups.user.append(new Option('(font not available)', selectedId, false, true));
+  return [groups.bundled, ...(groups.user.children.length ? [groups.user] : [])];
+}
+
+/**
+ * The lines editor. Rows are rebuilt only when the structure changes (item,
+ * line count, fonts); otherwise values are patched in place so typing is
+ * never interrupted.
+ */
+function renderLines(item) {
+  const list = $('lineList');
+  const lines = item?.lines ?? [];
+  currentLine = Math.min(currentLine, Math.max(0, lines.length - 1));
+  const signature = `${item?.id ?? '-'}:${lines.length}:${[...fonts.keys()].join(',')}`;
+  if (signature !== linesSignature) {
+    linesSignature = signature;
+    list.replaceChildren(
+      ...lines.map((line, index) => {
+        const li = document.createElement('li');
+        li.className = 'line';
+        li.dataset.index = index;
+
+        const text = document.createElement('input');
+        text.className = 'line-text';
+        text.type = 'text';
+        text.placeholder = index === 0 ? 'Type your text…' : `Line ${index + 1}`;
+        text.spellcheck = false;
+        text.setAttribute('aria-label', `Line ${index + 1} text`);
+        text.addEventListener('input', () => {
+          if (filling || !doc.selected) return;
+          doc.updateLine(doc.selected.id, index, { text: text.value }, { coalesce: `line-text:${doc.selected.id}:${index}` });
+        });
+        text.addEventListener('change', () => doc.endCoalescing());
+        text.addEventListener('keydown', (e) => {
+          const sel = doc.selected;
+          if (!sel) return;
+          // handled here; never let the page-level shortcuts (Backspace = delete text) see them
+          if (['Enter', 'Backspace', 'ArrowDown', 'ArrowUp'].includes(e.key)) e.stopPropagation();
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            doc.endCoalescing();
+            const at = doc.addLine(sel.id, index);
+            currentLine = at;
+            focusLine(at);
+          } else if (e.key === 'Backspace' && text.value === '' && sel.lines.length > 1) {
+            e.preventDefault();
+            doc.removeLine(sel.id, index);
+            currentLine = Math.max(0, index - 1);
+            focusLine(currentLine);
+          } else if (e.key === 'ArrowDown' && index < sel.lines.length - 1) {
+            e.preventDefault();
+            focusLine(index + 1);
+          } else if (e.key === 'ArrowUp' && index > 0) {
+            e.preventDefault();
+            focusLine(index - 1);
+          }
+        });
+
+        const font = document.createElement('select');
+        font.className = 'line-font';
+        font.setAttribute('aria-label', `Line ${index + 1} font`);
+        font.append(...fontOptions(line.fontId));
+        font.addEventListener('change', () => {
+          if (filling || !doc.selected) return;
+          doc.updateLine(doc.selected.id, index, { fontId: font.value });
+          if (fonts.get(font.value)?.group === 'bundled') {
+            defaults.fontId = font.value;
+            saveSettings();
+          }
+        });
+
+        const tools = document.createElement('div');
+        tools.className = 'line-tools';
+        const size = document.createElement('input');
+        size.className = 'line-size';
+        size.type = 'number';
+        size.min = '0.5';
+        size.max = '500';
+        size.step = '0.5';
+        size.title = 'Letter height (mm)';
+        size.setAttribute('aria-label', `Line ${index + 1} letter height in mm`);
+        size.addEventListener('input', () => {
+          if (filling || !doc.selected) return;
+          const v = Number.parseFloat(size.value);
+          if (!(v > 0)) return;
+          doc.updateLine(doc.selected.id, index, { size: v }, { coalesce: `line-size:${doc.selected.id}:${index}` });
+          defaults.size = v;
+          saveSettings();
+        });
+        size.addEventListener('change', () => doc.endCoalescing());
+        const unit = document.createElement('span');
+        unit.className = 'unit';
+        unit.textContent = 'mm';
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'btn small ghost line-remove';
+        remove.textContent = '×';
+        remove.title = 'Remove this line';
+        remove.setAttribute('aria-label', `Remove line ${index + 1}`);
+        remove.addEventListener('click', () => {
+          if (!doc.selected) return;
+          doc.removeLine(doc.selected.id, index);
+          currentLine = Math.max(0, index - 1);
+        });
+        tools.append(size, unit, remove);
+
+        for (const el of [text, font, size]) el.addEventListener('focus', () => setCurrentLine(index));
+        li.append(text, font, tools);
+        return li;
+      }),
+    );
+  }
+  list.querySelectorAll('.line').forEach((li, index) => {
+    const line = lines[index];
+    li.classList.toggle('current', index === currentLine);
+    const text = li.querySelector('.line-text');
+    const font = li.querySelector('.line-font');
+    const size = li.querySelector('.line-size');
+    if (document.activeElement !== text && text.value !== line.text) text.value = line.text;
+    if (font.value !== line.fontId) font.value = line.fontId;
+    if (document.activeElement !== size && Number.parseFloat(size.value) !== line.size) size.value = line.size;
+    li.querySelector('.line-remove').disabled = lines.length <= 1;
+  });
+  $('addLineBtn').disabled = !item;
+}
+
+function setCurrentLine(index) {
+  if (currentLine === index) return;
+  currentLine = index;
+  $('lineList').querySelectorAll('.line').forEach((li, i) => li.classList.toggle('current', i === index));
 }
 
 function renderItems() {
@@ -592,12 +746,13 @@ function renderItems() {
       glyph.textContent = item.mode === 'engrave' ? 'C' : 'R';
       glyph.title = item.mode === 'engrave' ? 'Cut in' : 'Raised';
       const name = document.createElement('span');
-      const first = item.text.trim().split('\n')[0];
+      const first = itemLabel(item, '');
       name.className = `name${first ? '' : ' empty'}`;
       name.textContent = first || 'empty text';
       const meta = document.createElement('span');
       meta.className = 'meta';
-      meta.textContent = `${item.size} mm`;
+      const sizes = [...new Set(item.lines.map((l) => l.size))];
+      meta.textContent = `${item.lines.length > 1 ? `${item.lines.length} lines · ` : ''}${sizes.join(' / ')} mm`;
       li.append(glyph, name, meta);
       li.tabIndex = -1;
       li.onclick = () => doc.select(item.id);
@@ -610,7 +765,7 @@ function renderSelectedInfo() {
   const sel = doc.selected;
   const info = sel ? previewInfo.get(sel.id) : null;
   const notes = [...(info?.notes ?? [])];
-  if (sel && !fonts.has(sel.fontId)) notes.unshift({ level: 'warn', text: 'This font is not available – choose another one.' });
+  if (sel && !fontIds(sel).every((id) => fonts.has(id))) notes.unshift({ level: 'warn', text: 'A font used by this text is not available – choose another one.' });
   renderNotes($('textNotes'), notes, {
     CUT_THROUGH: (n) => n.suggestedDepth && { label: `Use ${n.suggestedDepth} mm`, run: () => doc.updateItem(sel.id, { depth: n.suggestedDepth }) },
     THIN_STROKES: (n) => n.suggestedWeight != null && { label: 'Make bolder', run: () => doc.updateItem(sel.id, { weight: n.suggestedWeight }) },
@@ -619,7 +774,7 @@ function renderSelectedInfo() {
   });
   const width = info?.size?.[0];
   if (document.activeElement !== $('widthInput')) $('widthInput').value = width ? fmt(width) : '';
-  $('widthHint').textContent = width ? 'scales the letters' : '';
+  $('widthHint').textContent = width ? 'scales all lines' : '';
 }
 
 function render() {
@@ -670,10 +825,7 @@ doc.subscribe(render);
 
 function registerFont(id, label, group) {
   fonts.set(id, { label, group });
-  const option = new Option(label, id);
-  const target = group === 'user' ? $('userFonts') : $('bundledFonts');
-  target.append(option);
-  target.hidden = false;
+  linesSignature = ''; // line dropdowns need the new option
 }
 
 async function addUserFont(bytes, fileName) {
@@ -681,8 +833,9 @@ async function addUserFont(bytes, fileName) {
   const { label } = await client.addFont(id, bytes);
   registerFont(id, label, 'user');
   const sel = doc.selected;
-  if (sel) doc.updateItem(sel.id, { fontId: id });
-  else addItem('', { fontId: id }, { focus: false });
+  if (sel) doc.updateLine(sel.id, currentLine, { fontId: id });
+  else addItem('', { lines: [{ ...lineDefaults(), fontId: id }] }, { focus: false });
+  render();
   return label;
 }
 
@@ -734,17 +887,14 @@ function bindControls() {
       const value = readValue(el);
       if (typeof value === 'number' && Number.isNaN(value)) return;
       let sel = doc.selected;
-      if (!sel) sel = addItem(key === 'text' ? value : '', {}, { focus: false });
+      if (!sel) sel = addItem('', {}, { focus: false });
       // keep paired slider/number inputs in sync
       document.querySelectorAll(`[data-key="${key}"]`).forEach((other) => {
         if (other !== el && (other.type === 'range' || other.type === 'number')) other.value = value;
       });
       doc.updateItem(sel.id, { [key]: value }, continuous ? { coalesce: `${key}:${sel.id}` } : undefined);
-      if (key in defaults && key !== 'fontId') {
+      if (key in defaults) {
         defaults[key] = value;
-        saveSettings();
-      } else if (key === 'fontId' && fonts.get(value)?.group === 'bundled') {
-        defaults.fontId = value;
         saveSettings();
       }
     });
@@ -767,8 +917,9 @@ function bindControls() {
     const target = Number.parseFloat($('widthInput').value);
     const current = previewInfo.get(sel?.id)?.size?.[0];
     if (!sel || !(target > 0) || !(current > 0)) return;
-    const size = Math.min(500, Math.max(0.5, Math.round(((sel.size * target) / current) * 10) / 10));
-    doc.updateItem(sel.id, { size });
+    const factor = target / current;
+    const lines = sel.lines.map((l) => ({ ...l, size: Math.min(500, Math.max(0.5, Math.round(l.size * factor * 10) / 10)) }));
+    doc.updateItem(sel.id, { lines });
   });
 
   $('roundCorners').addEventListener('change', () => {
@@ -802,6 +953,12 @@ function bindControls() {
   $('simplifyBtn').addEventListener('click', () => applyFix('simplify'));
 
   $('addTextBtn').addEventListener('click', () => addItem());
+  $('addLineBtn').addEventListener('click', () => {
+    const sel = doc.selected ?? addItem('', {}, { focus: false });
+    const at = doc.addLine(sel.id, currentLine);
+    currentLine = at;
+    focusLine(at);
+  });
   // keyboard access to the Texts list: arrows move the selection
   $('itemList').addEventListener('keydown', (e) => {
     const items = doc.items;
@@ -841,7 +998,8 @@ function bindControls() {
   }
 
   window.addEventListener('keydown', (e) => {
-    const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName ?? '');
+    // judge by the event's target: a handler may have re-rendered the focused field away already
+    const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target?.tagName ?? '') || e.target?.isContentEditable;
     const mod = e.ctrlKey || e.metaKey;
     if (mod && e.key.toLowerCase() === 'z' && !typing) {
       e.preventDefault();
@@ -898,7 +1056,7 @@ function bindControls() {
 function deleteSelected() {
   const sel = doc.selected;
   if (!sel) return;
-  const label = sel.text.trim().split('\n')[0] || 'empty text';
+  const label = itemLabel(sel);
   doc.deleteItem(sel.id);
   toast(`Deleted “${label}”.`, { label: 'Undo', run: () => doc.undo() });
 }
@@ -908,14 +1066,6 @@ function deleteSelected() {
 async function boot() {
   loadSettings();
   bindControls();
-  const group = (id, label) => {
-    const g = document.createElement('optgroup');
-    g.id = id;
-    g.label = label;
-    return g;
-  };
-  $('font').append(group('bundledFonts', 'Built in'), group('userFonts', 'Your fonts'));
-  $('userFonts').hidden = true;
   showProgress('Starting the geometry engine…');
 
   try {
@@ -930,7 +1080,7 @@ async function boot() {
     const others = Promise.all(rest.map((f) => add(f).catch((err) => console.error(err))));
     await loadModel('sample');
     booted = true;
-    doc.addItem({ ...itemDefaults(), text: 'Hello', ...topCenter() });
+    doc.addItem({ ...itemDefaults(), lines: [{ ...lineDefaults(), text: 'Hello' }], ...topCenter() });
     await others;
     render();
     setStatus('Click the plaque to move the text, or open your own STL.');

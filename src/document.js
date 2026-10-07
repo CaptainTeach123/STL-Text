@@ -6,10 +6,11 @@ import { Matrix3, Matrix4, Vector3 } from 'three';
  * the worker derives everything heavy from it on request.
  */
 
+/** One line of a text item: its own wording, font and letter height (cap height, mm). */
+export const LINE_DEFAULTS = Object.freeze({ text: '', fontId: 'inter', size: 10 });
+
 export const ITEM_DEFAULTS = Object.freeze({
-  text: '',
-  fontId: 'inter',
-  size: 10, // cap height, model units (mm)
+  lines: [LINE_DEFAULTS], // stacked lines; each may use a different font and size
   letterSpacing: 0,
   lineSpacing: 1.7,
   align: 'center',
@@ -27,7 +28,7 @@ export const ITEM_DEFAULTS = Object.freeze({
 });
 
 const SHAPE_KEYS = [
-  'text', 'fontId', 'size', 'letterSpacing', 'lineSpacing', 'align', 'weight',
+  'lines', 'letterSpacing', 'lineSpacing', 'align', 'weight',
   'cornerRadius', 'mirror', 'quality', 'mode', 'depth', 'overlap',
 ];
 const PLACE_KEYS = ['position', 'normal', 'spin', 'conform'];
@@ -46,8 +47,8 @@ export function stableKey(value) {
 
 const pick = (obj, keys) => Object.fromEntries(keys.map((k) => [k, obj[k]]));
 
-/** Everything that changes the text's own shape (font, typography, mode, depth). */
-export function shapeKey(item, fontKey = item.fontId) {
+/** Everything that changes the text's own shape (wording, fonts, typography, mode, depth). */
+export function shapeKey(item, fontKey = fontIds(item).join(',')) {
   return stableKey({ ...pick(item, SHAPE_KEYS), fontKey });
 }
 
@@ -56,16 +57,39 @@ export function placeKey(item) {
   return stableKey(pick(item, PLACE_KEYS));
 }
 
+/** Build the lines of an item from overrides; `text`/`fontId`/`size` are accepted as a one-font shorthand. */
+export function linesOf({ lines, text, fontId, size } = {}) {
+  const base = { ...LINE_DEFAULTS, ...(fontId !== undefined && { fontId }), ...(size !== undefined && { size }) };
+  if (Array.isArray(lines) && lines.length) return lines.map((l) => ({ ...base, ...l }));
+  const rows = String(text ?? '').replace(/\r\n?/g, '\n').split('\n');
+  return rows.map((t) => ({ ...base, text: t }));
+}
+
 let nextId = 1;
 export function createItem(overrides = {}) {
-  const item = { ...ITEM_DEFAULTS, ...overrides, id: overrides.id ?? `t${nextId++}` };
+  const { text, fontId, size, ...rest } = overrides;
+  const item = { ...ITEM_DEFAULTS, ...rest, id: overrides.id ?? `t${nextId++}` };
+  item.lines = linesOf({ lines: rest.lines, text, fontId, size });
   item.position = [...item.position];
   item.normal = [...item.normal];
   return item;
 }
 
 /** True when the item would produce geometry. */
-export const hasText = (item) => String(item.text ?? '').trim().length > 0;
+export const hasText = (item) => (item.lines ?? []).some((l) => String(l.text ?? '').trim().length > 0);
+
+/** The item's wording as one string (lines joined by newlines). */
+export const itemText = (item) => (item.lines ?? []).map((l) => l.text ?? '').join('\n');
+
+/** First non-blank line, for lists and messages. */
+export const itemLabel = (item, fallback = 'empty text') =>
+  (item.lines ?? []).map((l) => String(l.text ?? '').trim()).find(Boolean) ?? fallback;
+
+/** Fonts used by an item, in line order, without repeats. */
+export const fontIds = (item) => [...new Set((item.lines ?? []).map((l) => l.fontId))];
+
+/** Largest letter height in the item (mm). */
+export const maxSize = (item) => Math.max(0, ...(item.lines ?? []).map((l) => l.size || 0));
 
 /** Move items with the model: positions by the matrix, normals by its rotation. */
 export function transformItems(items, matrix) {
@@ -81,7 +105,7 @@ export function transformItems(items, matrix) {
 const clone = (state) => ({
   ...state,
   base: state.base && { ...state.base, transforms: state.base.transforms.map((t) => [...t]) },
-  items: state.items.map((i) => ({ ...i, position: [...i.position], normal: [...i.normal] })),
+  items: state.items.map((i) => ({ ...i, lines: i.lines.map((l) => ({ ...l })), position: [...i.position], normal: [...i.normal] })),
 });
 
 export class Document {
@@ -231,7 +255,7 @@ export class Document {
     if (!src) return null;
     const copy = createItem({ ...src, id: undefined });
     const { x, y, z } = frameOf(src);
-    const shift = y.multiplyScalar(-1.2 * src.size);
+    const shift = y.multiplyScalar(-1.2 * maxSize(src));
     copy.position = new Vector3(...src.position).add(shift).toArray();
     void x;
     void z;
@@ -247,6 +271,36 @@ export class Document {
       const item = s.items.find((i) => i.id === id);
       if (item) Object.assign(item, patch);
     }, options);
+  }
+
+  /** Change one line of an item (text, fontId or size). */
+  updateLine(id, index, patch, options) {
+    this.commit((s) => {
+      const item = s.items.find((i) => i.id === id);
+      if (item?.lines[index]) Object.assign(item.lines[index], patch);
+    }, options);
+  }
+
+  /** Insert a new line after `index` (defaults: copy the font and size of that line). Returns the new index. */
+  addLine(id, index, overrides = {}) {
+    const item = this.state.items.find((i) => i.id === id);
+    if (!item) return -1;
+    const at = Math.min(Math.max(index, -1), item.lines.length - 1);
+    const from = item.lines[at] ?? item.lines[item.lines.length - 1] ?? LINE_DEFAULTS;
+    this.commit((s) => {
+      const target = s.items.find((i) => i.id === id);
+      target.lines.splice(at + 1, 0, { ...from, text: '', ...overrides });
+    });
+    return at + 1;
+  }
+
+  /** Remove a line (an item always keeps at least one). */
+  removeLine(id, index) {
+    const item = this.state.items.find((i) => i.id === id);
+    if (!item || item.lines.length <= 1 || !item.lines[index]) return;
+    this.commit((s) => {
+      s.items.find((i) => i.id === id).lines.splice(index, 1);
+    });
   }
 
   deleteItem(id) {

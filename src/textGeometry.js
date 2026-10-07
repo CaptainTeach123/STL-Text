@@ -17,7 +17,7 @@ export const QUALITY = {
 };
 
 export const DEFAULT_TEXT_OPTIONS = {
-  size: 10,
+  size: 10, // one-font shorthand only; lines carry their own sizes
   letterSpacing: 0, // extra space between letters, in model units
   lineSpacing: 1.7, // line pitch as a multiple of the cap height
   align: 'center', // 'left' | 'center' | 'right'
@@ -115,18 +115,24 @@ function flatten(out, pts, tol) {
  * Lay out `text` and return closed polygons (arrays of [x, y], Y up) in model
  * units. Origin is the left end of the first baseline; the caller centres it.
  */
-export function layoutPolygons(font, text, options = {}) {
+/**
+ * Lay out stacked lines – each `{ font, text, size }` with its own font and
+ * cap height (model units) – and return closed polygons (arrays of [x, y],
+ * Y up). The first baseline is at y = 0 and the first line starts at x = 0
+ * (or is centred / right-aligned around x = 0); the caller centres the block.
+ * The distance between two baselines is lineSpacing × the mean of the two
+ * lines' sizes, so a small line under a big one sits where you'd expect.
+ */
+export function layoutLines(lines, options = {}) {
   const o = { ...DEFAULT_TEXT_OPTIONS, ...options };
   const tol = QUALITY[o.quality] ?? QUALITY.normal;
-  const upem = font.unitsPerEm || 1000;
-  const cap = capHeightUnits(font);
-  const scale = o.size / cap; // font units -> model units
-  const spacingUnits = o.letterSpacing / scale;
-  const pitchUnits = o.lineSpacing * cap;
 
-  const lines = String(text).replace(/\r\n?/g, '\n').split('\n');
-  const laid = lines.map((line) => {
-    const glyphs = glyphsFor(font, line);
+  const laid = lines.map(({ font, text, size }) => {
+    const upem = font.unitsPerEm || 1000;
+    const cap = capHeightUnits(font);
+    const scale = (size || 0) / cap; // font units -> model units
+    const spacingUnits = scale > 0 ? o.letterSpacing / scale : 0;
+    const glyphs = glyphsFor(font, String(text ?? '').replace(/\r?\n/g, ' '));
     const xs = [];
     let pen = 0;
     glyphs.forEach((g, i) => {
@@ -134,19 +140,26 @@ export function layoutPolygons(font, text, options = {}) {
       pen += g.advanceWidth ?? 0;
       if (i < glyphs.length - 1) pen += kerning(font, g, glyphs[i + 1]) + spacingUnits;
     });
-    return { glyphs, xs, width: pen };
+    return { font, upem, scale, glyphs, xs, widthUnits: pen };
+  });
+
+  const baselines = [];
+  let baseline = 0;
+  lines.forEach((line, i) => {
+    baselines.push(baseline);
+    if (i < lines.length - 1) baseline -= o.lineSpacing * ((line.size || 0) + (lines[i + 1].size || 0)) / 2;
   });
 
   const polygons = [];
   laid.forEach((line, li) => {
-    const shift =
-      o.align === 'left' ? 0 : o.align === 'right' ? -line.width : -line.width / 2;
-    const baseline = -li * pitchUnits;
+    if (!(line.scale > 0)) return;
+    const shiftUnits = o.align === 'left' ? 0 : o.align === 'right' ? -line.widthUnits : -line.widthUnits / 2;
+    const y0 = baselines[li];
+    const toModel = (x, y) => [(o.mirror ? -x : x) * line.scale, y0 - y * line.scale];
     line.glyphs.forEach((glyph, gi) => {
-      const path = glyph.getPath(line.xs[gi] + shift, 0, upem, undefined, font);
+      const path = glyph.getPath(line.xs[gi] + shiftUnits, 0, line.upem, undefined, line.font);
       let contour = null;
       let last = null;
-      const toModel = (x, y) => [(o.mirror ? -x : x) * scale, (baseline - y) * scale];
       const close = () => {
         if (contour && contour.length >= 3) polygons.push(contour);
         contour = null;
@@ -183,6 +196,13 @@ export function layoutPolygons(font, text, options = {}) {
   return polygons;
 }
 
+/** One font, one size: `text` split on newlines into equal lines (see layoutLines). */
+export function layoutPolygons(font, text, options = {}) {
+  const o = { ...DEFAULT_TEXT_OPTIONS, ...options };
+  const size = options.size ?? 10;
+  const lines = String(text).replace(/\r\n?/g, '\n').split('\n').map((t) => ({ font, text: t, size }));
+  return layoutLines(lines, o);
+}
 
 /**
  * Build the 2D shape of the text as a Manifold CrossSection centred on the
@@ -194,10 +214,16 @@ export function layoutPolygons(font, text, options = {}) {
  *             left a part unrounded), `applied` is the smallest radius used
  *   polygons  number of glyph contours laid out
  */
-export function buildCrossSectionInfo(font, text, options = {}) {
+export function buildCrossSectionInfo(linesOrFont, textOrOptions, maybeOptions) {
   const { CrossSection } = manifold();
-  const o = { ...DEFAULT_TEXT_OPTIONS, ...options };
-  const polygons = layoutPolygons(font, text, o);
+  // accept lines [{ font, text, size }] or the one-font shorthand (font, text, options)
+  const legacy = !Array.isArray(linesOrFont);
+  const options = legacy ? maybeOptions ?? {} : textOrOptions ?? {};
+  const lines = legacy
+    ? String(textOrOptions).replace(/\r\n?/g, '\n').split('\n').map((t) => ({ font: linesOrFont, text: t, size: options.size ?? 10 }))
+    : linesOrFont;
+  const o = { ...DEFAULT_TEXT_OPTIONS, ...options, size: Math.max(0, ...lines.map((l) => l.size || 0)) };
+  const polygons = layoutLines(lines, o);
   const info = { cs: null, rounding: null, polygons: polygons.length };
   if (!polygons.length) return info;
 
@@ -233,6 +259,11 @@ export function buildCrossSectionInfo(font, text, options = {}) {
  */
 export function buildCrossSection(font, text, options = {}) {
   return buildCrossSectionInfo(font, text, options).cs;
+}
+
+/** Cross-section of stacked lines [{ font, text, size }] (see layoutLines). The caller owns the result. */
+export function buildLinesCrossSection(lines, options = {}) {
+  return buildCrossSectionInfo(lines, options).cs;
 }
 
 /** Total length of all contours of a CrossSection. */

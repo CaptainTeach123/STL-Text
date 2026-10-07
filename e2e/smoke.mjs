@@ -121,10 +121,30 @@ try {
     await page.waitForFunction((n) => document.querySelector('#modelInfo').textContent.startsWith(`${n}:`), name);
     await idle();
   };
-  const setText = async (text) => {
-    await page.fill('#text', text);
+  /** Set the selected text's lines (one font/size per line kept as is; extra lines removed, missing ones added). */
+  const setLines = async (lines) => {
+    const count = () => page.locator('#lineList .line').count();
+    while ((await count()) > lines.length) {
+      await page.click('#lineList .line-remove >> nth=-1');
+      await idle();
+    }
+    while ((await count()) < lines.length) {
+      await page.click('#addLineBtn');
+      await idle();
+    }
+    for (let i = 0; i < lines.length; i++) {
+      await page.fill(`#lineList .line-text >> nth=${i}`, lines[i]);
+    }
+    await page.dispatchEvent(`#lineList .line-text >> nth=${lines.length - 1}`, 'change');
     await idle();
   };
+  const setText = (text) => setLines(text === '' ? [''] : text.split('\n'));
+  const setLineSize = async (index, value) => {
+    await page.fill(`#lineList .line-size >> nth=${index}`, String(value));
+    await page.dispatchEvent(`#lineList .line-size >> nth=${index}`, 'change');
+    await idle();
+  };
+  const lineFont = (index) => page.locator(`#lineList .line-font >> nth=${index}`);
   const setNumber = async (key, value) => {
     await page.fill(`input[type="number"][data-key="${key}"]`, String(value));
     await page.dispatchEvent(`input[type="number"][data-key="${key}"]`, 'change');
@@ -137,7 +157,7 @@ try {
   await page.waitForFunction(() => document.querySelector('#widthInput').value !== '', null, { timeout: 30000 });
   await idle();
   check(/plaque: 70\.0 × 30\.0 × 4\.0 mm/.test(await page.locator('#modelInfo').innerText()), 'sample plaque loaded with correct size');
-  check((await page.locator('#font option').count()) === 6, 'six bundled fonts listed');
+  check((await page.locator('#lineList .line-font >> nth=0 >> option').count()) === 6, 'six bundled fonts listed for the line');
   check((await page.locator('#itemList li').count()) === 1, 'one text item to start with');
   check((await page.locator('#modelNotes li').innerText()).includes('Watertight'), 'model note says watertight');
   await page.screenshot({ path: path.join(out, '1-initial.png') });
@@ -189,7 +209,7 @@ try {
   check((await page.locator('#itemList li[aria-selected="true"] .name').innerText()) === 'Second', 'new item is selected');
   await page.click('#itemList li:first-child');
   await idle();
-  check((await page.inputValue('#text')) === 'Hello\nWorld', 'selecting the first item loads its text into the panel');
+  check((await page.inputValue('#lineList .line-text >> nth=0')) === 'Hello' && (await page.inputValue('#lineList .line-text >> nth=1')) === 'World', 'selecting the first item loads its lines into the panel');
   await page.click('#itemList li:nth-child(2)');
   await page.click('#deleteBtn');
   await idle();
@@ -205,10 +225,12 @@ try {
   check(Math.abs(single.volume - embossed.volume) < 1e-3 * embossed.volume, 'deleted item is not in the export', `${single.volume?.toFixed(1)}`);
 
   console.log('\ncut-in text with an uploaded font');
+  await page.click('#lineList .line-text >> nth=0'); // the upload applies to the current line
   await page.setInputFiles('#fontFile', pacifico);
-  await page.waitForFunction(() => document.querySelector('#font').value.startsWith('user-'));
+  await page.waitForFunction(() => document.querySelector('#lineList .line-font').value.startsWith('user-'));
   await idle();
-  check((await page.locator('#font option:checked').innerText()).includes('Pacifico'), 'uploaded font selected', await page.locator('#font option:checked').innerText());
+  check((await lineFont(0).locator('option:checked').innerText()).includes('Pacifico'), 'uploaded font applied to the current line', await lineFont(0).locator('option:checked').innerText());
+  check((await lineFont(1).locator('option:checked').innerText()).includes('Inter'), 'the other line keeps its font');
   await page.check('input[name="mode"][value="engrave"]');
   await idle();
   await setNumber('depth', 1);
@@ -217,6 +239,40 @@ try {
   const engraved = await download('engraved.stl');
   check(Math.abs(engraved.max[2] - 4) < 0.01, 'engraving does not change the outer height', `max z ${engraved.max[2].toFixed(3)}`);
   check(engraved.volume < base.volume, 'engraving removes volume', `${engraved.volume?.toFixed(0)} < ${base.volume.toFixed(0)}`);
+
+  console.log('\nlines with different fonts and sizes');
+  await setLines(['TITLE', 'name']);
+  await page.selectOption('#lineList .line-font >> nth=0', 'slab');
+  await page.selectOption('#lineList .line-font >> nth=1', 'pacifico');
+  await setLineSize(0, 9);
+  await setLineSize(1, 5);
+  const meta = await page.locator('#itemList li[aria-selected="true"] .meta').innerText();
+  check(/2 lines/.test(meta) && /9 \/ 5 mm/.test(meta), 'item shows its two lines and sizes', meta);
+  const titleWidth = await (async () => {
+    await setLines(['TITLE']);
+    await setLineSize(0, 9);
+    const w = Number.parseFloat(await page.inputValue('#widthInput'));
+    await setLines(['TITLE', 'name']);
+    await page.selectOption('#lineList .line-font >> nth=1', 'pacifico');
+    await setLineSize(1, 5);
+    return w;
+  })();
+  check(Math.abs(Number.parseFloat(await page.inputValue('#widthInput')) - titleWidth) < 0.6, 'block width equals the widest line', `${await page.inputValue('#widthInput')} vs ${titleWidth}`);
+  await page.screenshot({ path: path.join(out, '3b-lines.png') });
+  const twoLines = await download('two-lines.stl');
+  check(twoLines.volume !== null && twoLines.sizeOk && Math.abs(twoLines.volume - base.volume) > 10, 'two-line block exports as one watertight solid', `${twoLines.volume?.toFixed(0)} vs plain ${base.volume.toFixed(0)}`);
+  await page.focus('#lineList .line-text >> nth=1');
+  await page.keyboard.press('Enter');
+  await idle();
+  check((await page.locator('#lineList .line').count()) === 3, 'Enter adds a line below');
+  await page.keyboard.press('Backspace');
+  await idle();
+  check((await page.locator('#lineList .line').count()) === 2, 'Backspace on an empty line removes it');
+  await setLines(['Hello', 'World']);
+  await page.selectOption('#lineList .line-font >> nth=0', 'inter');
+  await page.selectOption('#lineList .line-font >> nth=1', 'inter');
+  await setLineSize(0, 10);
+  await setLineSize(1, 10);
 
   console.log('\nshow final result');
   await page.check('#resultToggle');
@@ -232,9 +288,9 @@ try {
   await page.click('#textNotes .btn');
   await idle();
   check(Number.parseFloat(await page.inputValue('input[type="number"][data-key="depth"]')) < 4, 'one-click fix lowers the depth', await page.inputValue('input[type="number"][data-key="depth"]'));
-  await setNumber('size', 3);
+  await setLineSize(0, 3);
   check((await page.locator('#textNotes').innerText()).includes('thinner'), 'tiny text warns about thin strokes');
-  await setNumber('size', 10);
+  await setLineSize(0, 10);
 
   console.log('\nbad font');
   await page.setInputFiles('#fontFile', fakeWoff2);
@@ -247,8 +303,9 @@ try {
   check(/Repaired/.test(modelNotes), 'model note reports the repair', modelNotes.slice(0, 80));
   check(/40\.0 × 25\.0 × 15\.0 mm/.test(await page.locator('#modelInfo').innerText()), 'repaired size is right');
   check(!(await page.locator('input[name="mode"][value="engrave"]').isDisabled()), 'cut-in text is available on the repaired model');
-  await page.selectOption('#font', 'inter');
   await setText('FIX');
+  await page.selectOption('#lineList .line-font >> nth=0', 'inter');
+  await idle();
   await page.check('input[name="mode"][value="engrave"]');
   await setNumber('depth', 1);
   const fixed = await download('broken-engraved.stl');

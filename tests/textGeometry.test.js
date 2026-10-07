@@ -6,6 +6,8 @@ import {
   fontLabel,
   layoutPolygons,
   buildCrossSectionInfo,
+  buildLinesCrossSection,
+  layoutLines,
   printLimits,
   roundCorners,
   thinStrokeReport,
@@ -222,6 +224,73 @@ describe('text -> solid', () => {
       expect(solid.volume(), pkg).toBeGreaterThan(0);
       solid.delete();
     }
+  });
+});
+
+describe('stacked lines with different fonts and sizes', () => {
+  const bounds = (cs) => {
+    const { min, max } = cs.bounds();
+    return { w: max[0] - min[0], h: max[1] - min[1], min, max };
+  };
+
+  it('lays out each line in its own font and size, centred as one block', () => {
+    const pacifico = loadFont('pacifico', 'pacifico-latin-400-normal.woff');
+    const cs = buildLinesCrossSection([
+      { font, text: 'TITLE', size: 14 },
+      { font: pacifico, text: 'name', size: 6 },
+    ]);
+    expect(cs).not.toBeNull();
+    const big = buildCrossSection(font, 'TITLE', { size: 14 });
+    const small = buildLinesCrossSection([{ font: pacifico, text: 'name', size: 6 }]);
+    const b = bounds(cs);
+    expect(b.w).toBeCloseTo(Math.max(bounds(big).w, bounds(small).w), 1); // block is as wide as its widest line
+    // the two lines are stacked: block taller than either line, shorter than their sum + one full pitch
+    expect(b.h).toBeGreaterThan(bounds(big).h);
+    expect(b.h).toBeLessThan(bounds(big).h + bounds(small).h + 1.7 * 10);
+    [cs, big, small].forEach((c) => c.delete());
+  });
+
+  it('baseline pitch uses the mean of the two sizes', () => {
+    // two "H"s: cap heights 14 and 6; the second baseline is lineSpacing * (14 + 6) / 2 below the first
+    const polys = layoutLines([{ font, text: 'H', size: 14 }, { font, text: 'H', size: 6 }], { lineSpacing: 2 });
+    const tops = polys.map((p) => Math.max(...p.map(([, y]) => y)));
+    const bottoms = polys.map((p) => Math.min(...p.map(([, y]) => y)));
+    expect(Math.max(...tops)).toBeCloseTo(14, 1); // first H from y=0 to 14
+    expect(Math.min(...bottoms)).toBeCloseTo(-20, 1); // second baseline at -2*(14+6)/2 = -20
+  });
+
+  it('an empty line keeps its space, and a zero size line is skipped', () => {
+    const three = layoutLines([{ font, text: 'A', size: 10 }, { font, text: '', size: 10 }, { font, text: 'B', size: 10 }]);
+    const two = layoutLines([{ font, text: 'A', size: 10 }, { font, text: 'B', size: 10 }]);
+    const span = (polys) => Math.max(...polys.flat().map(([, y]) => y)) - Math.min(...polys.flat().map(([, y]) => y));
+    expect(span(three)).toBeCloseTo(span(two) + 17, 0);
+    expect(layoutLines([{ font, text: 'A', size: 0 }])).toEqual([]);
+  });
+
+  it('one-font shorthand still matches the old behaviour', () => {
+    const viaText = buildCrossSection(font, 'Hello\nWorld', { size: 10 });
+    const viaLines = buildLinesCrossSection([{ font, text: 'Hello', size: 10 }, { font, text: 'World', size: 10 }]);
+    expect(viaLines.area()).toBeCloseTo(viaText.area(), 6);
+    const a = bounds(viaText);
+    const b = bounds(viaLines);
+    expect(b.w).toBeCloseTo(a.w, 6);
+    expect(b.h).toBeCloseTo(a.h, 6);
+    viaText.delete();
+    viaLines.delete();
+  });
+
+  it('left and right alignment line up all lines on one edge', () => {
+    const edges = (align) => {
+      const polys = layoutLines([{ font, text: 'WWWW', size: 10 }, { font, text: 'i', size: 5 }], { align });
+      const line2 = polys.filter((p) => p.every(([, y]) => y < 0));
+      const line1 = polys.filter((p) => p.some(([, y]) => y >= 0));
+      const xs = (ps) => ps.flat().map(([x]) => x);
+      return { min1: Math.min(...xs(line1)), max1: Math.max(...xs(line1)), min2: Math.min(...xs(line2)), max2: Math.max(...xs(line2)) };
+    };
+    const l = edges('left');
+    expect(Math.abs(l.min2 - l.min1)).toBeLessThan(1.5);
+    const r = edges('right');
+    expect(Math.abs(r.max2 - r.max1)).toBeLessThan(1.5);
   });
 });
 

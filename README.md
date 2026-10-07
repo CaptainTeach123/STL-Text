@@ -10,7 +10,8 @@ Everything runs in your browser. Your models and fonts are never uploaded anywhe
 
 - **Open any STL** (binary or ASCII). Broken files are **repaired automatically**: near-duplicate vertices are welded, flipped faces fixed, holes closed, inside-out and overlapping shells sorted out. Whatever cannot be repaired is kept as-is (shown in amber) so nothing from your model is lost.
 - **Any font:** upload a `.ttf` / `.otf` / `.woff` file (or drop one on the page), pick a font installed on your computer (Chrome / Edge), or use one of six built-in fonts.
-- **Several texts** on one model, each still editable: pick one in the *Texts* list, change its wording, font, size or placement at any time. Undo / redo for everything.
+- **Lines in different fonts and sizes.** A text is a stack of lines, and every line has its own font and letter height – a big serif title with a small script name under it, laid out and placed as one block. Press Enter for a new line; the width field scales the whole block.
+- **Several texts** on one model, each still editable: pick one in the *Texts* list, change its lines, placement or raised/cut setting at any time. Undo / redo for everything.
 - **Click the model to place** a text; it aligns to the surface you click. Drag the text to move it, nudge with the arrow keys, snap to a side, rotate.
 - **Follows curves.** Text keeps a constant height / depth on mugs, rings, domes and other curved surfaces instead of cutting a flat slab.
 - **Raised or cut in**, with height / depth, letter height or overall width in mm, letter and line spacing, alignment, boldness, mirror (for stamps) and printer-friendly corner rounding.
@@ -21,8 +22,8 @@ Everything runs in your browser. Your models and fonts are never uploaded anywhe
 ## Using it
 
 1. **Model** – *Open STL…* (or drag a file onto the page). The info line shows its size and whether it needed repair; the app assumes millimetres, like most slicers.
-2. **Texts** – *Add text*, then type. Each text in the list keeps its own font, size, placement and raised/cut setting.
-3. **Text & font** – choose or upload a font, set the letter height (or the overall width).
+2. **Texts** – *Add text*, then type. Each text in the list keeps its own lines, placement and raised/cut setting.
+3. **Text & fonts** – one row per line: its wording, font and letter height in mm. *Add line* (or Enter) adds a line below the current one; uploaded fonts apply to the current line. *Text width* scales all lines together.
 4. **Raised or cut** – choose *Raised* or *Cut in* and the height / depth. Warnings about printability appear here.
 5. **Placement** – click the model where the text should go, or drag it. The green ring shows where a click would land.
 6. **Show final result** (top right of the 3D view) computes the real merged model; **Download STL** saves it.
@@ -73,7 +74,7 @@ npm run e2e      # builds the app and drives it in headless Chromium
 | `src/worker.js` | 20-line Web Worker shim around the engine, owns the Manifold WASM instance |
 | `src/engineClient.js` | Main-thread side: request scheduling (fast typing never queues stale previews), rehydration of fonts and model after a worker restart, error codes |
 | `src/document.js` | Plain-data document: model transforms, text items, selection, undo / redo |
-| `src/textGeometry.js` | Font + string → glyph outlines → polygons → Manifold `CrossSection` (non-zero union, boldness offset, clamped corner rounding) → extruded solid; thin-stroke and gap checks |
+| `src/textGeometry.js` | Lines (each with its own font and size) → glyph outlines → polygons → Manifold `CrossSection` (non-zero union, boldness offset, clamped corner rounding) → extruded solid; thin-stroke and gap checks |
 | `src/conform.js` | Samples the model surface along the text's normal and warps the text solid to follow it; wall thickness, slope, step and curvature statistics behind the warnings |
 | `src/repair.js` | Triangle soup → watertight Manifold: degenerate removal, exact and tolerant welding (gated so thin sheets are never welded shut), winding fix, hole filling, shell classification (cavities kept), passthrough of what cannot be repaired |
 | `src/mesh.js` | Conversions between triangle soups, Manifold and three.js buffers; display buffers; BVH building |

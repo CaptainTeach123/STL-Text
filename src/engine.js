@@ -6,7 +6,7 @@ import { labelFor, parseFont } from './fontParse.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from './stl.js';
 import { buildBVH, concatSoups, displayBuffers, geometryFromBuffers, manifoldToSoup } from './mesh.js';
 import { placementMatrix, toMat4 } from './placement.js';
-import { hasText, placeKey, shapeKey } from './document.js';
+import { fontIds, hasText, itemLabel, placeKey, shapeKey } from './document.js';
 
 /**
  * The geometry engine: a pure request handler that owns Manifold objects,
@@ -128,7 +128,7 @@ export function samplePlaque(wasm, { width = 70, depth = 30, height = 4, radius 
   return plaque;
 }
 
-const quote = (text) => `“${String(text).trim().split('\n')[0].slice(0, 24)}”`;
+const quote = (item) => `“${itemLabel(item).slice(0, 24)}”`;
 
 /** Heuristic hints about a freshly loaded model (units, orientation, size). */
 export function modelSuggestions({ size, triangles }) {
@@ -173,11 +173,17 @@ export function createEngine({ wasm }) {
     throw new EngineError(code, message, details);
   };
 
-  const fontFor = (item) => {
-    const entry = fonts.get(item.fontId);
-    if (!entry) fail('FONT_MISSING', `Font "${item.fontId}" is not loaded`, { fontId: item.fontId });
+  const fontFor = (fontId) => {
+    const entry = fonts.get(fontId);
+    if (!entry) fail('FONT_MISSING', `Font "${fontId}" is not loaded`, { fontId });
     return entry;
   };
+
+  /** Cache key fragment covering every font an item uses (re-uploads change it). */
+  const fontKeyOf = (item) => fontIds(item).map((id) => fontFor(id).key).join(',');
+
+  /** The item's lines with their parsed fonts, ready for the layout. */
+  const linesWithFonts = (item) => item.lines.map((l) => ({ font: fontFor(l.fontId).font, text: l.text, size: l.size }));
 
   const baseFor = (version) => {
     if (!base || base.version !== version) {
@@ -346,11 +352,10 @@ export function createEngine({ wasm }) {
 
   /** Flat (un-conformed) text solid in the item's local frame, cached by shape. */
   function flatFor(item) {
-    const fontEntry = fontFor(item);
-    const key = shapeKey(item, fontEntry.key);
+    const key = shapeKey(item, fontKeyOf(item));
     let entry = flat.get(key);
     if (entry) return entry;
-    const info = buildCrossSectionInfo(fontEntry.font, item.text, item);
+    const info = buildCrossSectionInfo(linesWithFonts(item), item);
     if (!info.cs) fail('FONT_NO_OUTLINES', 'The font has no outlines for those characters.');
     try {
       const [z0, z1] = textZRange(item);
@@ -370,11 +375,10 @@ export function createEngine({ wasm }) {
   /** Printability report for an item's outline, per nozzle setting (small cache). */
   const strokeCache = new Map();
   function strokeFor(item, printing) {
-    const fontEntry = fontFor(item);
     const limits = printLimits({ nozzle: printing?.nozzle ?? 0.4, mode: item.mode });
-    const key = `${shapeKey(item, fontEntry.key)}|${limits.minStroke}|${limits.minGap}`;
+    const key = `${shapeKey(item, fontKeyOf(item))}|${limits.minStroke}|${limits.minGap}`;
     if (strokeCache.has(key)) return strokeCache.get(key);
-    const info = buildCrossSectionInfo(fontEntry.font, item.text, item);
+    const info = buildCrossSectionInfo(linesWithFonts(item), item);
     let stroke = null;
     if (info.cs) {
       stroke = thinStrokeReport(info.cs, limits);
@@ -397,7 +401,7 @@ export function createEngine({ wasm }) {
     const item = effective(raw);
     const flatEntry = flatFor(item);
     const placement = placementMatrix(item);
-    const key = `${shapeKey(item, fontFor(item).key)}|${placeKey(item)}|${base.version}`;
+    const key = `${shapeKey(item, fontKeyOf(item))}|${placeKey(item)}|${base.version}`;
     let entry = conformed.get(key);
     if (entry) return { ...entry, flat: flatEntry, placement };
     let solid;
@@ -498,7 +502,7 @@ export function createEngine({ wasm }) {
   function finalFor(items, baseVersion, printing, progress) {
     const b = baseFor(baseVersion);
     const active = items.filter(hasText);
-    const key = `${baseVersion}|${active.map((i) => `${shapeKey(i, fontFor(i).key)}|${placeKey(i)}`).sort().join(';')}`;
+    const key = `${baseVersion}|${active.map((i) => `${shapeKey(i, fontKeyOf(i))}|${placeKey(i)}`).sort().join(';')}`;
     if (result?.key === key) return result;
 
     const notes = [];
@@ -516,7 +520,7 @@ export function createEngine({ wasm }) {
             level: 'warn',
             code: 'NOT_TOUCHING',
             itemId: item.id,
-            text: `${quote(item.text)} isn't touching the model and was left out. Click the model to place it on the surface.`,
+            text: `${quote(item)} isn't touching the model and was left out. Click the model to place it on the surface.`,
           });
           return;
         }
@@ -526,7 +530,7 @@ export function createEngine({ wasm }) {
             level: 'warn',
             code: 'ENGRAVE_UNAVAILABLE',
             itemId: item.id,
-            text: `${quote(item.text)} is cut-in text, which needs a watertight model, so it was left out.`,
+            text: `${quote(item)} is cut-in text, which needs a watertight model, so it was left out.`,
           });
           return;
         }

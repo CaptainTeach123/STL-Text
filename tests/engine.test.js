@@ -172,7 +172,7 @@ describe('preview', () => {
     expect(r.matrix).toHaveLength(16);
     expect(r.stats.conformed).toBe(false); // flat plaque: no refinement
     expect(r.notes.map((n) => n.code)).toEqual([]);
-    expect(await client.preview({ ...item, text: '  ' }, version)).toEqual({ empty: true });
+    expect(await client.preview({ ...item, lines: [{ ...item.lines[0], text: '  ' }] }, version)).toEqual({ empty: true });
   });
 
   it('warns: thin strokes, cut-through, not touching, engrave on an unrepairable model', async () => {
@@ -189,6 +189,22 @@ describe('preview', () => {
     await client.loadBase({ kind: 'stl', bytes: writeBinarySTL(open), name: 'open', version: ++version });
     const r = await client.preview(topItem('Hi', { mode: 'engrave', position: [2, 2, 0] }), version);
     expect(r.notes[0].code).toBe('ENGRAVE_UNAVAILABLE');
+  });
+
+  it('stacks lines in different fonts and sizes; a missing font in any line is reported', async () => {
+    await client.loadBase({ kind: 'sample', version: ++version });
+    const item = createItem({
+      lines: [{ text: 'TITLE', fontId: 'inter', size: 9 }, { text: 'name', fontId: 'pacifico', size: 5 }],
+      position: [0, 0, 4],
+      normal: [0, 0, 1],
+    });
+    const r = await client.preview(item, version);
+    expect(r.size[1]).toBeGreaterThan(9); // taller than the title alone: two stacked lines
+    expect(r.size[1]).toBeLessThan(9 + 5 + 1.7 * 7); // but not two full pitches
+    const one = await client.preview(createItem({ lines: [{ text: 'TITLE', fontId: 'inter', size: 9 }], position: [0, 0, 4] }), version);
+    expect(r.size[0]).toBeCloseTo(one.size[0], 1); // the title is the widest line
+    const missing = { ...item, lines: [item.lines[0], { ...item.lines[1], fontId: 'nope' }] };
+    await expect(client.preview(missing, version)).rejects.toMatchObject({ code: 'FONT_MISSING', details: { fontId: 'nope' } });
   });
 
   it('follows a curved surface', async () => {
@@ -309,7 +325,7 @@ describe('client scheduler', () => {
   it('supersedes queued previews: only the latest waiting one runs', async () => {
     await client.loadBase({ kind: 'sample', version: ++version });
     const item = topItem('A', { position: [0, 0, 4] });
-    const results = await Promise.all(['A', 'AB', 'ABC', 'ABCD'].map((t) => client.preview({ ...item, text: t }, version)));
+    const results = await Promise.all(['A', 'AB', 'ABC', 'ABCD'].map((t) => client.preview({ ...item, lines: [{ ...item.lines[0], text: t }] }, version)));
     // a different item is never superseded by this one
     const other = await client.preview(topItem('Other', { position: [10, 0, 4] }), version);
     expect(other).toBeDefined();

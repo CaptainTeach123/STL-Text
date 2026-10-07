@@ -1,6 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import { Matrix4 } from 'three';
-import { Document, createItem, frameOf, placeKey, shapeKey, stableKey, transformItems } from '../src/document.js';
+import {
+  Document,
+  createItem,
+  fontIds,
+  frameOf,
+  hasText,
+  itemLabel,
+  itemText,
+  linesOf,
+  maxSize,
+  placeKey,
+  shapeKey,
+  stableKey,
+  transformItems,
+} from '../src/document.js';
 
 describe('keys', () => {
   it('stableKey ignores key order and slider jitter', () => {
@@ -12,12 +26,66 @@ describe('keys', () => {
   it('shapeKey changes with typography, placeKey with placement', () => {
     const a = createItem({ text: 'Hi' });
     const moved = { ...a, position: [1, 2, 3] };
-    const bigger = { ...a, size: 12 };
+    const bigger = { ...a, lines: [{ ...a.lines[0], size: 12 }] };
     expect(shapeKey(a)).toBe(shapeKey(moved));
     expect(placeKey(a)).not.toBe(placeKey(moved));
     expect(shapeKey(a)).not.toBe(shapeKey(bigger));
     expect(placeKey(a)).toBe(placeKey(bigger));
     expect(shapeKey(a, 'inter:100')).not.toBe(shapeKey(a, 'inter:200')); // re-uploaded font
+  });
+});
+
+describe('lines', () => {
+  it('createItem accepts the one-font shorthand and splits lines', () => {
+    const item = createItem({ text: 'Big\nsmall', fontId: 'slab', size: 12 });
+    expect(item.lines).toEqual([
+      { text: 'Big', fontId: 'slab', size: 12 },
+      { text: 'small', fontId: 'slab', size: 12 },
+    ]);
+    expect(item.text).toBeUndefined();
+    expect(itemText(item)).toBe('Big\nsmall');
+    expect(itemLabel(item)).toBe('Big');
+    expect(maxSize(item)).toBe(12);
+  });
+
+  it('each line can have its own font and size', () => {
+    const item = createItem({ lines: [{ text: 'Title', fontId: 'slab', size: 14 }, { text: 'name', fontId: 'pacifico', size: 7 }] });
+    expect(fontIds(item)).toEqual(['slab', 'pacifico']);
+    expect(maxSize(item)).toBe(14);
+    expect(hasText(item)).toBe(true);
+    expect(hasText(createItem({ lines: [{ text: ' ' }, { text: '' }] }))).toBe(false);
+    expect(itemLabel(createItem({ lines: [{ text: '' }, { text: 'second' }] }))).toBe('second');
+    expect(linesOf({ lines: [{ text: 'x' }], fontId: 'bebas' })[0]).toEqual({ text: 'x', fontId: 'bebas', size: 10 });
+  });
+
+  it('shapeKey changes when any line changes', () => {
+    const a = createItem({ lines: [{ text: 'A', fontId: 'inter', size: 10 }, { text: 'b', fontId: 'inter', size: 6 }] });
+    const b = { ...a, lines: [a.lines[0], { ...a.lines[1], size: 7 }] };
+    const c = { ...a, lines: [a.lines[0], { ...a.lines[1], fontId: 'pacifico' }] };
+    expect(shapeKey(a)).not.toBe(shapeKey(b));
+    expect(shapeKey(a)).not.toBe(shapeKey(c));
+    expect(placeKey(a)).toBe(placeKey(b));
+  });
+
+  it('Document can add, edit and remove lines with undo', () => {
+    const doc = new Document();
+    const item = doc.addItem({ text: 'Hello', fontId: 'inter', size: 10 });
+    const at = doc.addLine(item.id, 0, { fontId: 'pacifico', size: 6 });
+    expect(at).toBe(1);
+    expect(doc.items[0].lines).toHaveLength(2);
+    expect(doc.items[0].lines[1]).toEqual({ text: '', fontId: 'pacifico', size: 6 });
+    doc.updateLine(item.id, 1, { text: 'world' });
+    expect(itemText(doc.items[0])).toBe('Hello\nworld');
+    doc.removeLine(item.id, 0);
+    expect(doc.items[0].lines).toEqual([{ text: 'world', fontId: 'pacifico', size: 6 }]);
+    doc.removeLine(item.id, 0); // never below one line
+    expect(doc.items[0].lines).toHaveLength(1);
+    doc.undo();
+    expect(doc.items[0].lines).toHaveLength(2);
+    // history snapshots are deep copies of the lines
+    doc.updateLine(item.id, 0, { text: 'Changed' });
+    doc.undo();
+    expect(doc.items[0].lines[0].text).toBe('Hello');
   });
 });
 
@@ -42,32 +110,32 @@ describe('Document', () => {
     const a = doc.addItem({ text: 'A' });
     const b = doc.addItem({ text: 'B' });
     expect(doc.selected.id).toBe(b.id);
-    doc.updateItem(a.id, { size: 12 });
-    expect(doc.items[0].size).toBe(12);
+    doc.updateLine(a.id, 0, { size: 12 });
+    expect(doc.items[0].lines[0].size).toBe(12);
     doc.deleteItem(b.id);
     expect(doc.items).toHaveLength(1);
     expect(doc.selected.id).toBe(a.id);
     expect(doc.undo()).toBe(true); // delete
     expect(doc.items).toHaveLength(2);
     expect(doc.undo()).toBe(true); // size
-    expect(doc.items[0].size).toBe(10);
+    expect(doc.items[0].lines[0].size).toBe(10);
     expect(doc.redo()).toBe(true);
-    expect(doc.items[0].size).toBe(12);
+    expect(doc.items[0].lines[0].size).toBe(12);
     expect(doc.canRedo).toBe(true);
   });
 
   it('coalesces slider drags into one undo step', () => {
     const doc = new Document();
     const a = doc.addItem({ text: 'A' });
-    doc.updateItem(a.id, { size: 11 }, { coalesce: 'size' });
-    doc.updateItem(a.id, { size: 12 }, { coalesce: 'size' });
-    doc.updateItem(a.id, { size: 13 }, { coalesce: 'size' });
+    doc.updateLine(a.id, 0, { size: 11 }, { coalesce: 'size' });
+    doc.updateLine(a.id, 0, { size: 12 }, { coalesce: 'size' });
+    doc.updateLine(a.id, 0, { size: 13 }, { coalesce: 'size' });
     doc.endCoalescing();
-    doc.updateItem(a.id, { size: 14 }, { coalesce: 'size' });
+    doc.updateLine(a.id, 0, { size: 14 }, { coalesce: 'size' });
     expect(doc.undo()).toBe(true);
-    expect(doc.items[0].size).toBe(13);
+    expect(doc.items[0].lines[0].size).toBe(13);
     expect(doc.undo()).toBe(true);
-    expect(doc.items[0].size).toBe(10);
+    expect(doc.items[0].lines[0].size).toBe(10);
   });
 
   it('transforming the base carries the items and bumps the version', () => {

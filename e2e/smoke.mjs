@@ -362,6 +362,20 @@ try {
   // the part sits over the raised letters, so the shared volume counts once: between the part minus letters and the part minus its sunk slice
   const added = fused.volume - beforePart.volume;
   check(added > 200 && added <= 360 - 20 * 6 * 0.4 + 1 && fused.sizeOk, 'fused part adds its volume (minus what it shares with the model)', `+${added.toFixed(0)} mm³`);
+  // a part turned so another side faces the model: "Snap to model" attaches it by that side and lays it flat
+  await page.click('[data-turn="tilt"]');
+  await idle();
+  check(Number(await page.inputValue('input[type="number"][data-key="tilt"]')) === 90, 'the X button tilts the part by 90°');
+  await page.click('#snapBtn');
+  await idle();
+  check(
+    (await page.inputValue('select[data-key="attach"]')) === 'front' && Number(await page.inputValue('input[type="number"][data-key="tilt"]')) === 0,
+    '"Snap to model" attaches the part by the side that faced the model and clears the tilt',
+    `${await page.inputValue('select[data-key="attach"]')} / tilt ${await page.inputValue('input[type="number"][data-key="tilt"]')}`,
+  );
+  check(/fused/.test(await page.locator('#itemList li[aria-selected="true"] .meta').innerText()), 'the snapped part is fused with the model');
+  await page.selectOption('select[data-key="attach"]', 'bottom');
+  await idle();
   await page.check('input[name="join"][value="fillet"]');
   await idle();
   check(!(await page.locator('.fillet-only').first().isHidden()), 'fillet radius control appears');

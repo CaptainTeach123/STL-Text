@@ -5,7 +5,7 @@ import { buildCrossSectionInfo, printLimits, textZRange, thinStrokeReport } from
 import { labelFor, parseFont } from './fontParse.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from './stl.js';
 import { buildBVH, concatSoups, displayBuffers, geometryFromBuffers, manifoldToSoup } from './mesh.js';
-import { placementMatrix, toMat4 } from './placement.js';
+import { ATTACH_ROTATIONS, placementMatrix, toMat4 } from './placement.js';
 import { baseMode, fontIds, hasText, isPart, isSpot, itemLabel, placeKey, shapeKey } from './document.js';
 import { enhanceMesh, extractRegion, isEnhanceActive, regionWeights } from './enhance.js';
 
@@ -164,18 +164,7 @@ export function modelSuggestions({ size, triangles }) {
   return suggestions;
 }
 
-/**
- * Rotation (degrees about X, Y, Z) that turns the chosen side of a part so it
- * faces down (-Z), i.e. becomes the face that touches the model.
- */
-export const ATTACH_ROTATIONS = {
-  bottom: [0, 0, 0],
-  top: [180, 0, 0],
-  front: [90, 0, 0], // -Y side down
-  back: [-90, 0, 0], // +Y side down
-  left: [0, -90, 0], // -X side down
-  right: [0, 90, 0], // +X side down
-};
+export { ATTACH_ROTATIONS };
 
 /** Outline of a backing plate centred on the origin. */
 export function plateShape(wasm, kind, width, height) {

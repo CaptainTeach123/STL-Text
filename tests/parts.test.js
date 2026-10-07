@@ -4,6 +4,7 @@ import path from 'node:path';
 import { createEngine, plateShape } from '../src/engine.js';
 import { createEngineClient, createLocalWorker } from '../src/engineClient.js';
 import { createItem, createPart } from '../src/document.js';
+import { sideFacing, snapPartTo } from '../src/placement.js';
 import { manifold } from '../src/manifold.js';
 import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
@@ -281,6 +282,36 @@ describe('parts really merge with the model', () => {
     // far above the surface it is simply not touching
     const far = onTop({ position: [0, 0, 10] });
     expect((await client.preview(far, version)).notes.map((n) => n.code)).toContain('NOT_TOUCHING');
+  });
+
+  it('"Snap to model" lays a part standing on its edge beside the model flat against it, so it merges', async () => {
+    await loadBox(); // 60 × 30 × 6, its -Y wall at y = -15
+    const plate = wasm.Manifold.cube([20, 6, 1], true); // a thin plate, like a banner
+    await client.addPart('plate', stlOf(plate), 'plate');
+    plate.delete();
+    // standing on its bottom edge (tilt 90) in the air south of the wall, like a banner dropped beside a trophy
+    const standing = createPart('plate', 'plate', { position: [0, -19, 0], normal: [0, 0, 1], tilt: 90 });
+    const before = await client.preview(standing, version);
+    expect(before.notes.map((n) => n.code)).toContain('NOT_TOUCHING');
+    expect(before.bounds.max[2] - before.bounds.min[2]).toBeCloseTo(6, 3); // it stands 6 mm tall
+    // the UI snaps from the part's centre to the nearest surface point: the wall, whose outward normal is -Y
+    expect(sideFacing(standing, [0, 1, 0])).toBe('bottom'); // the big face points at the wall
+    const snapped = { ...standing, ...snapPartTo(standing, { point: [0, -15, 0], normal: [0, -1, 0] }) };
+    expect(snapped).toMatchObject({ attach: 'bottom', tilt: 0, roll: 0, normal: [0, -1, 0] });
+    const after = await client.preview(snapped, version);
+    expect(after.notes.map((n) => n.code)).not.toContain('NOT_TOUCHING');
+    expect(after.notes.map((n) => n.code)).not.toContain('EDGE_CONTACT');
+    expect(after.stats.touches).toBe(true);
+    expect(after.bounds.max[2] - after.bounds.min[2]).toBeCloseTo(1, 3); // flat: 1 mm thick along the wall normal
+    expect(after.bounds.min[2]).toBeCloseTo(-0.4, 3); // sunk into the wall
+    const ex = await client.export([snapped], version, 'x');
+    expect(ex.notes.map((n) => n.code)).not.toContain('NOT_MERGED');
+    const m = solidOfStl(ex.stl);
+    expect(m.decompose().length).toBe(1);
+    const bb = m.boundingBox();
+    expect(bb.min[1]).toBeCloseTo(-15 - 1 + 0.4, 2); // the plate stands proud of the wall by 0.6 mm
+    expect(m.volume() - BASE_VOLUME).toBeCloseTo(20 * 6 * (1 - 0.4), 0);
+    m.delete();
   });
 
   it('a raised text that hovers without overlapping is reported as not merged', async () => {

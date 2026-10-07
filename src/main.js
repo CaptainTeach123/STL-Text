@@ -3,7 +3,7 @@ import { Document, ITEM_DEFAULTS, createPart, createSpot, fontIds, frameOf, hasT
 import { createEngineClient } from './engineClient.js';
 import { ENHANCE_DEFAULTS, isEnhanceActive } from './enhance.js';
 import { Viewer } from './viewer.js';
-import { SIDES, placementMatrix } from './placement.js';
+import { SIDES, placementMatrix, snapPartTo } from './placement.js';
 import { BUNDLED_FONTS, canQueryLocalFonts, fetchBundledFont, listLocalFonts, localFontBytes } from './fontCatalog.js';
 
 const $ = (id) => document.getElementById(id);
@@ -20,7 +20,7 @@ const printing = { nozzle: 0.4, layerHeight: 0.2 };
 const defaults = { fontId: 'inter', size: 10, mode: 'emboss', depth: 1.5, quality: 'normal', roundCorners: false };
 
 const previewKeys = new Map(); // itemId -> key of the last preview requested
-const previewInfo = new Map(); // itemId -> { size, notes, stats }
+const previewInfo = new Map(); // itemId -> { size, notes, stats, bounds, matrix }
 const detached = new Map(); // itemId -> true when the latest preview says the item is not touching the model
 let modelInfo = null; // info of the model as the engine sees it
 let compareOriginal = false; // "Show original": view the model without its enhancement
@@ -557,10 +557,17 @@ function snapHit(side) {
 function snapToModel() {
   const sel = doc.selected;
   if (!sel || !modelInfo?.hasModel) return;
-  const hit = viewer.closestSurfacePoint(sel.position);
+  // a part is measured from its centre, so the side of it that faces the model is what gets laid on the surface –
+  // not just the anchor point, which may already be on the model while the part stands on an edge or hangs in the air
+  const info = isPart(sel) ? previewInfo.get(sel.id) : null;
+  const from =
+    info?.bounds && info.matrix
+      ? new Vector3(...info.bounds.min).add(new Vector3(...info.bounds.max)).multiplyScalar(0.5).applyMatrix4(new Matrix4().fromArray(info.matrix)).toArray()
+      : sel.position;
+  const hit = viewer.closestSurfacePoint(from);
   if (!hit) return;
   lastClick = { position: hit.point, normal: hit.normal };
-  doc.updateItem(sel.id, { position: hit.point, normal: hit.normal });
+  doc.updateItem(sel.id, isPart(sel) ? snapPartTo(sel, hit) : { position: hit.point, normal: hit.normal });
 }
 
 /** Turn the selected part by 90° about one of its axes (tilt: X, roll: Y, spin: Z). */
@@ -651,7 +658,7 @@ function refreshPreviews() {
           previewInfo.delete(item.id);
         } else {
           viewer.setOverlay(item.id, { geometry: r.geometry, matrix: r.matrix, mode: isSpot(item) ? 'spot' : item.mode, selected: item.id === doc.state.selectedId });
-          previewInfo.set(item.id, { size: r.size, notes: r.notes, stats: r.stats });
+          previewInfo.set(item.id, { size: r.size, notes: r.notes, stats: r.stats, bounds: r.bounds, matrix: r.matrix });
           const loose = r.notes.some((n) => n.code === 'NOT_TOUCHING');
           viewer.setOverlayDetached(item.id, loose);
           if (!!detached.get(item.id) !== loose) {

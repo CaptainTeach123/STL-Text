@@ -2,7 +2,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Matrix4 } from 'three';
-import { createEngine } from '../src/engine.js';
+import { createEngine, passthroughRangesOf } from '../src/engine.js';
 import { createEngineClient, createLocalWorker } from '../src/engineClient.js';
 import { createItem } from '../src/document.js';
 import { manifold } from '../src/manifold.js';
@@ -106,6 +106,25 @@ describe('base loading', () => {
     expect(r2.info.passthroughTriangles).toBe(1);
     expect(r2.display.passthroughStart).toBe(r2.info.triangles - 1);
     expect(r2.report.summary).toMatch(/kept as-is/);
+    box.delete();
+  });
+
+  it('marks the unrepaired triangles correctly even after the BVH reorders the index', async () => {
+    const box = wasm.Manifold.cube([40, 25, 15], true);
+    const loose = new Float32Array([-100, 0, 0, -99, 0, 0, -100, 1, 0]); // sorts to the FRONT of a spatial index
+    const soup = soupOf(box);
+    const both = new Float32Array(soup.length + 9);
+    both.set(soup);
+    both.set(loose, soup.length);
+    const r = await client.loadBase({ kind: 'stl', bytes: writeBinarySTL(both), name: 'loose', version: ++version });
+    expect(r.display.passthroughRanges.reduce((n, [, c]) => n + c, 0)).toBe(1);
+    for (const [start, count] of r.display.passthroughRanges) {
+      for (let t = start; t < start + count; t++) {
+        const v = r.display.index[t * 3];
+        expect(r.display.positions[v * 3]).toBeLessThan(-98); // the loose triangle, wherever it ended up
+      }
+    }
+    expect(passthroughRangesOf(new Uint32Array([0, 1, 2, 9, 10, 11, 3, 4, 5, 12, 13, 14, 15, 16, 17]), 9)).toEqual([[1, 1], [3, 2]]);
     box.delete();
   });
 
@@ -229,6 +248,41 @@ describe('result and export', () => {
     box.delete();
   });
 
+  it('keeps a small separate part of the model when text is added', async () => {
+    const plate = wasm.Manifold.cube([100, 50, 10], true);
+    const bead = wasm.Manifold.cube([3, 3, 3], true).translate(60, 0, 0); // 27 mm³ next to a 50 000 mm³ plate
+    const soup = soupOf(plate);
+    const beadSoup = soupOf(bead);
+    const both = new Float32Array(soup.length + beadSoup.length);
+    both.set(soup);
+    both.set(beadSoup, soup.length);
+    await client.loadBase({ kind: 'stl', bytes: writeBinarySTL(both), name: 'beads', version: ++version });
+    const ex = await client.export([topItem('Hi', { position: [0, 0, 5] })], version, 'beads');
+    expect(ex.notes.map((n) => n.code)).not.toContain('FRAGMENTS_REMOVED');
+    expect(volumeOfStl(ex.stl)).toBeGreaterThan(50_000 + 27 + 10); // plate + bead + text
+    plate.delete();
+    bead.delete();
+  });
+
+  it('printing settings change the warnings and reach result/export', async () => {
+    await client.loadBase({ kind: 'sample', version: ++version });
+    const item = topItem('Hello', { position: [0, 0, 4] });
+    const fine = await client.preview(item, version, { printing: { nozzle: 0.4 } });
+    expect(fine.notes.map((n) => n.code)).not.toContain('THIN_STROKES');
+    const coarse = await client.preview(item, version, { printing: { nozzle: 1.5 } });
+    expect(coarse.notes.map((n) => n.code)).toContain('THIN_STROKES');
+    expect(coarse.notes.find((n) => n.code === 'THIN_STROKES').text).toMatch(/3 mm/);
+    const back = await client.preview(item, version, { printing: { nozzle: 0.4 } });
+    expect(back.notes.map((n) => n.code)).not.toContain('THIN_STROKES');
+    // options are forwarded for result and export too
+    const seen = [];
+    const spyEngine = { handle: async (req) => { seen.push(req); return { message: { id: req.id, ok: true, result: {} }, transfer: [] }; } };
+    const spy = createEngineClient({ createWorker: () => createLocalWorker(Promise.resolve(spyEngine)) });
+    await spy.result([], 1, { printing: { nozzle: 0.6 } });
+    await spy.export([], 1, 'x', { printing: { nozzle: 0.6 } });
+    expect(seen.map((r) => r.printing?.nozzle)).toEqual([0.6, 0.6]);
+  });
+
   it('no model: raised text exports on its own, cut-in text is skipped with a note', async () => {
     await client.loadBase({ kind: 'none', version: ++version });
     const item = topItem('Solo', { position: [0, 0, 0] });
@@ -269,20 +323,28 @@ describe('client scheduler', () => {
     const box = wasm.Manifold.cube([40, 25, 15], true);
     await client.loadBase({ kind: 'stl', bytes: stlOf(box), name: 'box', version: ++version });
     await client.updateBase({ version: ++version, transforms: [new Matrix4().makeScale(2, 2, 2).toArray()], simplify: null });
-    const fresh = createEngine({ wasm }); // a brand new worker knows nothing
-    const c2 = createEngineClient({ createWorker: () => createLocalWorker(Promise.resolve(fresh)) });
+    // every spawn gets a brand new engine that knows nothing, like a real worker restart
+    const engines = [];
+    const c2 = createEngineClient({
+      createWorker: () => {
+        const e = createEngine({ wasm });
+        engines.push(e);
+        return createLocalWorker(Promise.resolve(e));
+      },
+    });
     // replay the client's memory into the new client (what restart() does internally)
     await c2.addFont('inter', fontBytes('inter', 'inter-latin-700-normal.woff'));
     await c2.loadBase({ kind: 'stl', bytes: stlOf(box), name: 'box', version });
     c2.restart(); // throws the worker away; next request must rehydrate
-    const r = await c2.preview(topItem('Hi', { position: [0, 0, 7.5] }), version);
+    const r = await c2.preview(topItem('Hi', { position: [0, 0, 7.5] }), version); // needs the model AND the font back
     expect(r.geometry.positions.length).toBeGreaterThan(0);
     expect(c2.fatalError).toBeNull();
+    expect(engines.length).toBe(2);
     const ping = await c2.call('ping', {});
     expect(ping.fonts).toEqual(['inter']);
     expect(ping.baseVersion).toBe(version);
     box.delete();
-    fresh.dispose();
+    engines.forEach((e) => e.dispose());
   });
 
   it('reports progress stages', async () => {

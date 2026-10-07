@@ -70,7 +70,7 @@ export const hasText = (item) => String(item.text ?? '').trim().length > 0;
 /** Move items with the model: positions by the matrix, normals by its rotation. */
 export function transformItems(items, matrix) {
   const m = matrix instanceof Matrix4 ? matrix : new Matrix4().fromArray(matrix);
-  const rot = new Matrix3().setFromMatrix4(m);
+  const rot = new Matrix3().getNormalMatrix(m); // inverse transpose: right for mirrors and uneven scales too
   return items.map((item) => ({
     ...item,
     position: new Vector3(...item.position).applyMatrix4(m).toArray(),
@@ -203,10 +203,9 @@ export class Document {
   /** Back to the model as loaded (undo all transforms / simplify). */
   resetBase() {
     if (!this.state.base) return;
-    const inverse = this.state.base.transforms
-      .slice()
-      .reverse()
-      .reduce((m, t) => m.multiply(new Matrix4().fromArray(t).invert()), new Matrix4());
+    // the engine composes M = T_n · … · T_1, so undo it with M⁻¹ as a whole
+    const forward = this.state.base.transforms.reduce((acc, t) => new Matrix4().fromArray(t).multiply(acc), new Matrix4());
+    const inverse = forward.invert();
     this.commit((s) => {
       s.base.transforms = [];
       s.base.simplify = null;

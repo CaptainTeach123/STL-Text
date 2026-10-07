@@ -21,10 +21,14 @@ const previewInfo = new Map(); // itemId -> { size, notes, stats }
 let modelInfo = null; // info of the model as the engine sees it
 let modelReport = null;
 let sentVersion = null; // doc.baseVersion the engine currently has
+let basePending = null; // promise of the base request in flight, if any
 let lastContentKey = '';
 let lastClick = null; // { position, normal } of the last click on the model
 let booted = false;
 let userFontCount = 0;
+let fatalCount = 0; // consecutive engine crashes; stops the automatic restarts
+let halted = false;
+const MAX_FATALS = 3;
 
 const client = createEngineClient({
   createWorker: () => new Worker(new URL('./worker.js', import.meta.url), { type: 'module' }),
@@ -38,6 +42,21 @@ const client = createEngineClient({
     previewKeys.clear();
     sentVersion = null;
     if (err.code !== 'RESTARTED') {
+      fatalCount += 1;
+      if (fatalCount >= MAX_FATALS) {
+        halted = true;
+        showProgress(null);
+        setStatus('The geometry engine keeps crashing on this model. Simplify it or load a smaller one, then retry.', 'error');
+        toast('The geometry engine crashed repeatedly and was stopped.', {
+          label: 'Retry',
+          run: () => {
+            fatalCount = 0;
+            halted = false;
+            render();
+          },
+        });
+        return;
+      }
       toast('The geometry engine ran out of memory and was restarted. Try Simplify or a smaller model if it happens again.');
     }
     render();
@@ -186,6 +205,7 @@ function renderSuggestions() {
 }
 
 function onBase(result, { frame = false } = {}) {
+  fatalCount = 0;
   modelInfo = result.info;
   modelReport = result.report;
   viewer.setBase(result.display);
@@ -202,6 +222,10 @@ function onBase(result, { frame = false } = {}) {
 
 async function loadModel(kind, { bytes = null, name = 'model' } = {}) {
   showProgress('Reading the file…');
+  // setBase() bumps the version and re-renders synchronously; claim that
+  // version first so syncBase() does not post a pointless update of the
+  // previous model ahead of this load
+  sentVersion = doc.state.baseVersion + 1;
   doc.setBase(kind, name);
   if (kind === 'none') {
     // nothing to cut into or sit on: texts become raised and drop onto the build plate
@@ -212,8 +236,11 @@ async function loadModel(kind, { bytes = null, name = 'model' } = {}) {
     lastClick = null;
   }
   sentVersion = version();
+  const pending = client.loadBase({ kind, bytes, name, version: sentVersion });
+  basePending = pending;
   try {
-    const result = await client.loadBase({ kind, bytes, name, version: sentVersion });
+    const result = await pending;
+    if (!result) return; // superseded by a newer load, which renders itself
     onBase(result, { frame: true });
     if (kind === 'stl') {
       setStatus(
@@ -231,22 +258,32 @@ async function loadModel(kind, { bytes = null, name = 'model' } = {}) {
     setStatus(`Could not open ${name}: ${friendly(err)}`, 'error');
     doc.setBase('none');
     await syncBase();
+  } finally {
+    if (basePending === pending) basePending = null;
   }
 }
 
 /** Make sure the engine has the document's current model state. */
 async function syncBase() {
-  if (sentVersion === version()) return;
+  if (sentVersion === version()) {
+    if (basePending) await basePending; // previews must wait for the model they are for
+    return;
+  }
   const v = version();
   sentVersion = v;
+  const pending = doc.base
+    ? client.updateBase({ version: v, transforms: doc.base.transforms, simplify: doc.base.simplify })
+    : client.loadBase({ kind: 'none', version: v });
+  basePending = pending;
   try {
-    const result = doc.base
-      ? await client.updateBase({ version: v, transforms: doc.base.transforms, simplify: doc.base.simplify })
-      : await client.loadBase({ kind: 'none', version: v });
+    const result = await pending;
     if (result) onBase(result);
+    else if (sentVersion === v) sentVersion = null; // superseded: let the next render re-sync
   } catch (err) {
     sentVersion = null;
     setStatus(friendly(err), 'error');
+  } finally {
+    if (basePending === pending) basePending = null;
   }
 }
 
@@ -320,16 +357,18 @@ function applyFix(kind) {
 
 /* ------------------------------------------------------------------- items */
 
+const engraveAvailable = () => !!(modelInfo?.hasModel && modelInfo?.watertight);
+
 const itemDefaults = () => ({
   fontId: fonts.has(defaults.fontId) ? defaults.fontId : 'inter',
   size: defaults.size,
-  mode: defaults.mode,
+  mode: engraveAvailable() ? defaults.mode : 'emboss',
   depth: defaults.depth,
   quality: defaults.quality,
   cornerRadius: defaults.roundCorners ? Math.round((printing.nozzle / 2) * 100) / 100 : 0,
 });
 
-function addItem(text = '') {
+function addItem(text = '', overrides = {}, { focus = true } = {}) {
   const from = doc.selected;
   const place = lastClick ?? (from && { position: from.position, normal: from.normal }) ?? topCenter();
   const item = doc.addItem({
@@ -337,8 +376,9 @@ function addItem(text = '') {
     ...(from ? { fontId: from.fontId, size: from.size, mode: from.mode, depth: from.depth, quality: from.quality, cornerRadius: from.cornerRadius } : {}),
     text,
     ...place,
+    ...overrides,
   });
-  $('text').focus();
+  if (focus) $('text').focus();
   return item;
 }
 
@@ -381,8 +421,10 @@ function nudge(direction, step) {
   const d = { left: x.clone().negate(), right: x, up: y, down: y.clone().negate() }[direction].multiplyScalar(step);
   const moved = new Vector3(...sel.position).add(d);
   const hit = viewer.raycastFrom(moved.clone().addScaledVector(z, 5).toArray(), z.clone().negate().toArray());
-  const near = hit && new Vector3(...hit.point).distanceTo(moved) < 10;
-  doc.updateItem(sel.id, near ? { position: hit.point, normal: hit.normal } : { position: moved.toArray() }, { coalesce: 'nudge' });
+  // only drop onto a surface that faces the same way and is close by – never through the model onto its far side
+  const usable =
+    hit && new Vector3(...hit.normal).dot(z) > 0.2 && new Vector3(...hit.point).distanceTo(moved) <= Math.max(3 * step, 3);
+  doc.updateItem(sel.id, usable ? { position: hit.point, normal: hit.normal } : { position: moved.toArray() }, { coalesce: 'nudge' });
 }
 
 viewer.onPick = ({ point, normal }) => {
@@ -425,7 +467,8 @@ function refreshPreviews() {
     client
       .preview(item, version(), { printing })
       .then((r) => {
-        if (!r || previewKeys.get(item.id) !== key) return; // superseded
+        fatalCount = 0;
+        if (!r || previewKeys.get(item.id) !== key) return; // superseded or removed
         if (r.empty) {
           viewer.removeOverlay(item.id);
           previewInfo.delete(item.id);
@@ -442,6 +485,12 @@ function refreshPreviews() {
         if (item.id === doc.state.selectedId) renderSelectedInfo();
       });
   }
+  for (const id of [...previewKeys.keys()]) {
+    if (!ids.has(id)) {
+      previewKeys.delete(id); // a late response for a removed item is then ignored
+      previewInfo.delete(id);
+    }
+  }
   viewer.pruneOverlays(ids);
   viewer.setOverlaySelected(doc.state.selectedId);
 }
@@ -449,14 +498,19 @@ function refreshPreviews() {
 /* ------------------------------------------------------------ final result */
 
 let resultBusy = false;
+let resultPending = false;
 async function showResult(on) {
   viewer.showResult(false);
   if (!on) return;
-  if (resultBusy) return;
+  if (resultBusy) {
+    resultPending = true; // run again for the new content once this one lands
+    return;
+  }
   resultBusy = true;
+  const requestedFor = lastContentKey;
   try {
     const r = await client.result(doc.items, version(), { printing });
-    if (!r || !$('resultToggle').checked) return;
+    if (!r || !$('resultToggle').checked || lastContentKey !== requestedFor) return; // stale
     viewer.setResult(r.display);
     viewer.showResult(true);
     if (r.notes.length) setStatus(r.notes.map((n) => n.text).join('\n'), r.notes.some((n) => n.level === 'warn') ? 'error' : '');
@@ -465,6 +519,10 @@ async function showResult(on) {
     setStatus(friendly(err), 'error');
   } finally {
     resultBusy = false;
+    if (resultPending) {
+      resultPending = false;
+      if ($('resultToggle').checked) showResult(true);
+    }
   }
 }
 
@@ -508,7 +566,10 @@ function fillPanel(item) {
       if (el.type === 'radio') el.checked = el.value === String(value);
       else if (el.type === 'checkbox') el.checked = !!value;
       else if (el.tagName === 'SELECT' && key === 'fontId') el.value = fonts.has(value) ? value : el.value;
-      else if (document.activeElement !== el || el.type !== 'textarea') el.value = value ?? '';
+      else if (el.type === 'number' || el.type === 'range') {
+        // "0.0" being typed is numerically 0: leave it alone rather than mangle it
+        if (Number.parseFloat(el.value) !== value) el.value = value ?? '';
+      } else if (el.value !== String(value ?? '')) el.value = value ?? '';
     });
     ['posX', 'posY', 'posZ'].forEach((id, i) => ($(id).value = item ? Math.round(item.position[i] * 100) / 100 : 0));
     $('roundCorners').checked = !!item && item.cornerRadius > 0;
@@ -538,6 +599,7 @@ function renderItems() {
       meta.className = 'meta';
       meta.textContent = `${item.size} mm`;
       li.append(glyph, name, meta);
+      li.tabIndex = -1;
       li.onclick = () => doc.select(item.id);
       return li;
     }),
@@ -571,6 +633,15 @@ function render() {
   renderSelectedInfo();
 
   const hasModel = !!modelInfo?.hasModel;
+  if (booted && !engraveAvailable()) {
+    // cut-in text needs a watertight model; whatever path got us here, make such items raised
+    const cut = doc.items.filter((i) => i.mode === 'engrave');
+    if (cut.length) {
+      cut.forEach((i) => doc.updateItem(i.id, { mode: 'emboss' }, { coalesce: 'no-engrave' }));
+      doc.endCoalescing();
+      return; // the updates re-render
+    }
+  }
   $('undoBtn').disabled = !doc.canUndo;
   $('redoBtn').disabled = !doc.canRedo;
   $('deleteBtn').disabled = !sel;
@@ -588,7 +659,7 @@ function render() {
     $('resultToggle').checked = false;
     viewer.showResult(false);
   }
-  if (booted) {
+  if (booted && !halted) {
     syncBase().then(refreshPreviews);
   }
 }
@@ -611,8 +682,7 @@ async function addUserFont(bytes, fileName) {
   registerFont(id, label, 'user');
   const sel = doc.selected;
   if (sel) doc.updateItem(sel.id, { fontId: id });
-  else addItem();
-  $('font').value = id;
+  else addItem('', { fontId: id }, { focus: false });
   return label;
 }
 
@@ -664,7 +734,7 @@ function bindControls() {
       const value = readValue(el);
       if (typeof value === 'number' && Number.isNaN(value)) return;
       let sel = doc.selected;
-      if (!sel) sel = addItem(key === 'text' ? value : '');
+      if (!sel) sel = addItem(key === 'text' ? value : '', {}, { focus: false });
       // keep paired slider/number inputs in sync
       document.querySelectorAll(`[data-key="${key}"]`).forEach((other) => {
         if (other !== el && (other.type === 'range' || other.type === 'number')) other.value = value;
@@ -732,6 +802,16 @@ function bindControls() {
   $('simplifyBtn').addEventListener('click', () => applyFix('simplify'));
 
   $('addTextBtn').addEventListener('click', () => addItem());
+  // keyboard access to the Texts list: arrows move the selection
+  $('itemList').addEventListener('keydown', (e) => {
+    const items = doc.items;
+    if (!items.length) return;
+    const index = items.findIndex((i) => i.id === doc.state.selectedId);
+    const pick = { ArrowDown: index + 1, ArrowUp: index - 1, Home: 0, End: items.length - 1 }[e.key];
+    if (pick === undefined) return;
+    e.preventDefault();
+    doc.select(items[Math.min(items.length - 1, Math.max(0, pick))].id);
+  });
   $('duplicateBtn').addEventListener('click', () => doc.selected && doc.duplicateItem(doc.selected.id));
   $('deleteBtn').addEventListener('click', deleteSelected);
   $('undoBtn').addEventListener('click', () => doc.undo());
@@ -787,7 +867,9 @@ function bindControls() {
       doc.updateItem(doc.selected.id, { spin: doc.selected.spin + (e.key === ']' ? 5 : -5) }, { coalesce: 'spin-key' });
     }
   });
-  window.addEventListener('keyup', () => doc.endCoalescing());
+  window.addEventListener('keyup', (e) => {
+    if (/^Arrow|^[[\]]$/.test(e.key)) doc.endCoalescing(); // nudge / rotate runs
+  });
 
   // drag & drop an .stl or a font file anywhere on the page
   let depth = 0;

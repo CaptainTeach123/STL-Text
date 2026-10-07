@@ -96,6 +96,27 @@ function scope() {
   };
 }
 
+/**
+ * Runs of triangles ([startTriangle, count]) whose vertices lie beyond the
+ * solid's vertex range, i.e. the unrepaired soup, in whatever order the index
+ * is in (a BVH build reorders it).
+ */
+export function passthroughRangesOf(index, solidVertexCount) {
+  const ranges = [];
+  let start = -1;
+  const triangles = index.length / 3;
+  for (let t = 0; t < triangles; t++) {
+    const pass = index[t * 3] >= solidVertexCount;
+    if (pass && start < 0) start = t;
+    if (!pass && start >= 0) {
+      ranges.push([start, t - start]);
+      start = -1;
+    }
+  }
+  if (start >= 0) ranges.push([start, triangles - start]);
+  return ranges;
+}
+
 /** A small rounded plaque, handy as a starting model. */
 export function samplePlaque(wasm, { width = 70, depth = 30, height = 4, radius = 4 } = {}) {
   const { CrossSection, Manifold } = wasm;
@@ -230,11 +251,19 @@ export function createEngine({ wasm }) {
       buffers.index = built.index; // the reordered copy, for the main thread
       geometry.boundsTree = built.bvh;
     }
+    // which triangles (in the reordered index) belong to the unrepaired soup
+    const passthroughRanges = passthroughRangesOf(buffers.index, buffers.solidVertexCount);
     geometry.computeBoundingBox();
     const bb = geometry.boundingBox;
     const size = buffers.index.length ? [bb.max.x - bb.min.x, bb.max.y - bb.min.y, bb.max.z - bb.min.z] : [0, 0, 0];
     const triangles = buffers.index.length / 3;
-    base.current = { manifold, passthrough, geometry, bounds: buffers.index.length ? { min: bb.min.toArray(), max: bb.max.toArray() } : null };
+    base.current = {
+      manifold,
+      passthrough,
+      geometry,
+      bounds: buffers.index.length ? { min: bb.min.toArray(), max: bb.max.toArray() } : null,
+      shellVolumes: null, // filled lazily: volumes of the model's own shells
+    };
     const info = {
       name: base.name,
       kind: base.kind,
@@ -254,6 +283,7 @@ export function createEngine({ wasm }) {
       normals: buffers.normals,
       index: buffers.index,
       passthroughStart: buffers.passthroughStart,
+      passthroughRanges,
       bvhRoots,
       bvhVersion,
     };
@@ -314,8 +344,8 @@ export function createEngine({ wasm }) {
   /** Without a model there is nothing to sink into: text sits on the plate. */
   const effective = (item) => (base?.kind === 'none' && item.mode !== 'engrave' ? { ...item, overlap: 0 } : item);
 
-  /** Flat (un-conformed) text solid in the item's local frame, cached. */
-  function flatFor(item, printing) {
+  /** Flat (un-conformed) text solid in the item's local frame, cached by shape. */
+  function flatFor(item) {
     const fontEntry = fontFor(item);
     const key = shapeKey(item, fontEntry.key);
     let entry = flat.get(key);
@@ -325,18 +355,35 @@ export function createEngine({ wasm }) {
     try {
       const [z0, z1] = textZRange(item);
       if (!(z1 - z0 > 0)) fail('EMPTY_RESULT', 'Height or depth must be greater than zero.');
-      const limits = printLimits({ nozzle: printing?.nozzle ?? 0.4, mode: item.mode });
-      const stroke = thinStrokeReport(info.cs, limits);
       const { min, max } = info.cs.bounds();
       const extruded = Manifold.extrude(info.cs, z1 - z0);
       const solid = extruded.translate(0, 0, z0);
       extruded.delete();
-      entry = { solid, size: [max[0] - min[0], max[1] - min[1]], stroke, limits, rounding: info.rounding };
+      entry = { solid, size: [max[0] - min[0], max[1] - min[1]], rounding: info.rounding };
       flat.set(key, entry);
       return entry;
     } finally {
       info.cs.delete();
     }
+  }
+
+  /** Printability report for an item's outline, per nozzle setting (small cache). */
+  const strokeCache = new Map();
+  function strokeFor(item, printing) {
+    const fontEntry = fontFor(item);
+    const limits = printLimits({ nozzle: printing?.nozzle ?? 0.4, mode: item.mode });
+    const key = `${shapeKey(item, fontEntry.key)}|${limits.minStroke}|${limits.minGap}`;
+    if (strokeCache.has(key)) return strokeCache.get(key);
+    const info = buildCrossSectionInfo(fontEntry.font, item.text, item);
+    let stroke = null;
+    if (info.cs) {
+      stroke = thinStrokeReport(info.cs, limits);
+      info.cs.delete();
+    }
+    const report = { stroke, limits };
+    strokeCache.set(key, report);
+    if (strokeCache.size > 64) strokeCache.delete(strokeCache.keys().next().value);
+    return report;
   }
 
   function sampler(placement) {
@@ -346,9 +393,9 @@ export function createEngine({ wasm }) {
   }
 
   /** Conformed (or plain) solid for an item on the current base, cached. */
-  function solidFor(raw, printing) {
+  function solidFor(raw) {
     const item = effective(raw);
-    const flatEntry = flatFor(item, printing);
+    const flatEntry = flatFor(item);
     const placement = placementMatrix(item);
     const key = `${shapeKey(item, fontFor(item).key)}|${placeKey(item)}|${base.version}`;
     let entry = conformed.get(key);
@@ -381,7 +428,8 @@ export function createEngine({ wasm }) {
       });
     }
     if (stats) notes.push(...conformNotes(stats, { mode: item.mode, depth: item.depth, overlap: item.overlap, nozzle }));
-    const { stroke, limits, rounding } = flatEntry;
+    const { rounding } = flatEntry;
+    const { stroke, limits } = strokeFor(effective(item), printing);
     if (stroke?.thin) {
       notes.push({
         level: 'warn',
@@ -421,7 +469,7 @@ export function createEngine({ wasm }) {
     const b = baseFor(baseVersion);
     if (!hasText(item)) return { message: { empty: true }, transfer: [] };
     void b;
-    const placed = solidFor(item, printing);
+    const placed = solidFor(item);
     const mesh = placed.solid.getMesh();
     const positions = new Float32Array(mesh.vertProperties.length / mesh.numProp * 3);
     for (let i = 0, n = positions.length / 3; i < n; i++) {
@@ -461,7 +509,7 @@ export function createEngine({ wasm }) {
     try {
       active.forEach((item, n) => {
         progress?.('Building text…', { done: n + 1, total: active.length });
-        const placed = solidFor(item, printing);
+        const placed = solidFor(item);
         if (placed.stats && placed.stats.touches === false && b.kind !== 'none') {
           skipped.push(item.id);
           notes.push({
@@ -503,12 +551,19 @@ export function createEngine({ wasm }) {
       if (solid) {
         if (solid.status() !== 'NoError') fail('INTERNAL', `Geometry operation failed (${solid.status()})`);
         if (solid.isEmpty()) fail('EMPTY_RESULT', 'The result would be empty – the cut-in text removes the whole model.');
-        // drop floating slivers that the booleans can leave behind on curved text
-        if (active.length) {
+        // drop floating slivers that the booleans can leave behind on curved
+        // text – but never a small part the model had to begin with
+        if (emboss.length + engrave.length > 0) {
+          if (!b.current.shellVolumes) {
+            const own = b.current.manifold ? b.current.manifold.decompose() : [];
+            b.current.shellVolumes = own.map((s) => s.volume());
+            own.forEach((s) => s.delete());
+          }
+          const isOwn = (v) => b.current.shellVolumes.some((o) => Math.abs(o - v) <= 1e-6 * Math.max(o, 1e-9));
           const shells = solid.decompose();
           const volumes = shells.map((s) => s.volume());
           const biggest = Math.max(...volumes);
-          const keep = shells.filter((_, i) => volumes[i] >= TINY_SHELL_FRACTION * biggest);
+          const keep = shells.filter((_, i) => volumes[i] >= TINY_SHELL_FRACTION * biggest || isOwn(volumes[i]));
           if (keep.length < shells.length) {
             notes.push({ level: 'info', code: 'FRAGMENTS_REMOVED', text: `Removed ${shells.length - keep.length} tiny loose fragments.` });
             const cleaned = Manifold.compose(keep);
@@ -535,7 +590,14 @@ export function createEngine({ wasm }) {
     const buffers = displayBuffers(final.solid, final.passthrough);
     return {
       message: {
-        display: { positions: buffers.positions, normals: buffers.normals, index: buffers.index, passthroughStart: buffers.passthroughStart, bvhRoots: [] },
+        display: {
+          positions: buffers.positions,
+          normals: buffers.normals,
+          index: buffers.index,
+          passthroughStart: buffers.passthroughStart,
+          passthroughRanges: passthroughRangesOf(buffers.index, buffers.solidVertexCount),
+          bvhRoots: [],
+        },
         notes: final.notes,
         skipped: final.skipped,
         info: { triangles: buffers.index.length / 3 },

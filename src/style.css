@@ -254,6 +254,10 @@ input[type='range'] {
   color: inherit;
   opacity: 0.85;
 }
+.seg input:disabled + span {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 .seg input:focus-visible + span {
   outline: 2px solid var(--accent);
   outline-offset: -2px;

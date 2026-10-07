@@ -327,6 +327,16 @@ try {
   check(/180,000 triangles|180000 triangles/.test((await page.locator('#modelInfo').innerText()).replace(/ /g, ',')), '180k-triangle model loaded', `${Date.now() - t0} ms`);
   check(worstGap < 300, 'main thread stayed responsive while the worker loaded it', `worst frame gap ${worstGap.toFixed(0)} ms`);
 
+  console.log('\nloading while another load is in flight');
+  await page.dblclick('#sampleBtn');
+  await idle();
+  check(/plaque: 70\.0 × 30\.0 × 4\.0 mm/.test(await page.locator('#modelInfo').innerText()), 'double-clicking Sample plaque still loads the plaque', await page.locator('#modelInfo').innerText());
+  check(!(await status()).startsWith('Could not open'), 'no load error from the superseded request', await status());
+  await page.setInputFiles('#stlFile', bigFile);
+  await page.click('[data-fix="center"]'); // a model tool while the load is still running
+  await openStl(bigFile, 'big');
+  check(/180,000 triangles|180000 triangles/.test((await page.locator('#modelInfo').innerText()).replace(/\u202f/g, ',')), 'model tool during a load does not lose the model');
+
   check(problems.length === 0, 'no console errors or exceptions (page or worker)', problems.join(' | '));
 } finally {
   await browser.close();

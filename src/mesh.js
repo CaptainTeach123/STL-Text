@@ -184,7 +184,7 @@ export function displayBuffers(solid, passthrough = null) {
     vo += 3;
     io += 3;
   }
-  return { positions, normals, index, passthroughStart: sIdx.length / 3 };
+  return { positions, normals, index, passthroughStart: sIdx.length / 3, solidVertexCount: sPos.length / 3 };
 }
 
 /** BufferGeometry from display buffers (shares the arrays). */

@@ -131,10 +131,15 @@ export class Viewer {
   /** Mesh from worker display buffers, split into model / passthrough groups. */
   #meshFromDisplay(display) {
     const geometry = geometryFromBuffers(display);
-    const total = display.index.length;
-    const split = display.passthroughStart * 3;
-    geometry.addGroup(0, split, 0);
-    if (split < total) geometry.addGroup(split, total - split, 1);
+    const triangles = display.index.length / 3;
+    const ranges = display.passthroughRanges ?? (display.passthroughStart < triangles ? [[display.passthroughStart, triangles - display.passthroughStart]] : []);
+    let cursor = 0;
+    for (const [start, count] of ranges) {
+      if (start > cursor) geometry.addGroup(cursor * 3, (start - cursor) * 3, 0);
+      geometry.addGroup(start * 3, count * 3, 1);
+      cursor = start + count;
+    }
+    if (cursor < triangles) geometry.addGroup(cursor * 3, (triangles - cursor) * 3, 0);
     if (display.bvhRoots?.length) {
       geometry.boundsTree = MeshBVH.deserialize(
         { version: display.bvhVersion, roots: display.bvhRoots, index: display.index, indirectBuffer: null },

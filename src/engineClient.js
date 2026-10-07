@@ -121,9 +121,10 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
       return;
     }
     const code = msg.error?.code;
-    if (!entry.retried && (code === 'FONT_MISSING' || code === 'BASE_MISSING')) {
+    // a fresh worker may lack the model AND a font: rehydrate as often as needed (bounded)
+    if ((entry.retries ?? 0) < 3 && (code === 'FONT_MISSING' || code === 'BASE_MISSING')) {
       finish(entry);
-      entry.retried = true;
+      entry.retries = (entry.retries ?? 0) + 1;
       try {
         if (code === 'FONT_MISSING') await rehydrateFont(msg.error.details?.fontId);
         else await rehydrateBase();
@@ -141,7 +142,7 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
     if (fatalError && !worker) spawn();
     return new Promise((resolve, reject) => {
       const id = nextId++;
-      enqueue({ channel, request: { id, channel, type, ...payload }, transfer, resolve, reject, retried: false });
+      enqueue({ channel, request: { id, channel, type, ...payload }, transfer, resolve, reject, retries: 0 });
     });
   }
 
@@ -210,13 +211,13 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
     },
 
     /** Display geometry of the final result. */
-    result(items, baseVersion) {
-      return request('result', 'result', { items, baseVersion });
+    result(items, baseVersion, options = {}) {
+      return request('result', 'result', { items, baseVersion, ...options });
     },
 
     /** Binary STL of the final result. */
-    export(items, baseVersion, name) {
-      return request('export', 'export', { items, baseVersion, name });
+    export(items, baseVersion, name, options = {}) {
+      return request('export', 'export', { items, baseVersion, name, ...options });
     },
 
     /** Any other request (tests, diagnostics). */

@@ -943,13 +943,16 @@ const containsBox = (outer, inner) =>
   inner.min.every((v, i) => v >= outer.min[i]) && inner.max.every((v, i) => v <= outer.max[i]);
 
 /** Boolean union of a list of solids; consumes (deletes) the inputs. */
+/** Union of several solids. Consumes the inputs on success; leaves them to the caller on failure. */
 function unionAll(solids) {
   if (solids.length === 1) return solids[0];
   const { Manifold } = manifold();
   const u = Manifold.union(solids);
   const ok = u.status() === 'NoError' && !u.isEmpty();
-  solids.forEach((s) => s.delete());
-  if (ok) return u;
+  if (ok) {
+    solids.forEach((s) => s.delete());
+    return u;
+  }
   u.delete();
   return null;
 }
@@ -1027,6 +1030,14 @@ function assembleShells(parts, report, passthroughs = []) {
       result.delete();
       hole.delete();
       result = carved;
+    } else {
+      // the cavities could not be combined: keep their triangles rather than lose them
+      report.notes.push('Boolean combination of cavities failed');
+      for (const c of cavities) {
+        passthroughs.push(soupOfManifold(c));
+        c.delete();
+      }
+      report.shellsDropped += cavities.length;
     }
   }
   if (!result) {

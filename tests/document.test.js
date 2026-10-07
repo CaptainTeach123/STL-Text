@@ -87,6 +87,29 @@ describe('Document', () => {
     void a;
   });
 
+  it('resetBase undoes non-commuting transforms exactly', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'box');
+    const item = doc.addItem({ text: 'A', position: [10, 5, 15], normal: [0, 0, 1] });
+    const about = (axis, c) =>
+      new Matrix4().makeTranslation(...c).multiply(new Matrix4()[`makeRotation${axis}`](Math.PI / 2)).multiply(new Matrix4().makeTranslation(-c[0], -c[1], -c[2]));
+    doc.transformBase(about('X', [0, 0, 7.5]));
+    doc.transformBase(about('Y', [0, 0, 12.5]));
+    doc.resetBase();
+    const r = (v) => Math.round(v * 1e6) / 1e6;
+    expect(doc.items[0].position.map(r)).toEqual([10, 5, 15]);
+    expect(doc.items[0].normal.map(r)).toEqual([0, 0, 1]);
+    void item;
+  });
+
+  it('transformItems uses the normal matrix for uneven scales', () => {
+    const item = createItem({ position: [0, 0, 0], normal: [Math.SQRT1_2, 0, Math.SQRT1_2] });
+    const [s] = transformItems([item], new Matrix4().makeScale(1, 1, 4));
+    // the plane x + z = c stretched 4x in z becomes x + z/4 = c
+    expect(s.normal[0]).toBeCloseTo(0.9701, 3);
+    expect(s.normal[2]).toBeCloseTo(0.2425, 3);
+  });
+
   it('duplicate offsets one line down in the text frame and selects the copy', () => {
     const doc = new Document();
     const a = doc.addItem({ text: 'A', size: 10, position: [0, 0, 5], normal: [0, 0, 1] });

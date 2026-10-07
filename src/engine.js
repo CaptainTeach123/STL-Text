@@ -866,6 +866,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     if (entry) return { ...entry, flat: flatEntry, placement };
     let solid;
     let stats = null;
+    let settle = 0; // how far a rigid part was lowered to meet the surface (local z, ≤ 0)
     const wantsStats = base.kind !== 'none';
     const s = wantsStats && (item.conform || isPart(item)) ? sampler(placement) : null;
     if (s && item.conform && !isPart(item)) {
@@ -888,9 +889,18 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           slab.delete();
         }
         foot.delete();
+        // a rigid part rests on the surface: when the highest point of the surface under its foot lies below the
+        // contact plane (a curved or sloping surface, a click that landed a little high) the part comes down to it,
+        // so that it really overlaps the model by its sink instead of hovering with an air gap
+        if (isPart(item) && stats?.touches && Number.isFinite(stats.maxHeight) && stats.maxHeight < -1e-6) {
+          settle = stats.maxHeight;
+          solid.delete();
+          solid = flatEntry.solid.translate(0, 0, settle);
+          stats.settled = -settle;
+        }
       }
     }
-    entry = { solid, stats };
+    entry = { solid, stats, settle };
     conformed.set(key, entry);
     return { ...entry, flat: flatEntry, placement };
   }
@@ -945,6 +955,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     }
     if (isPart(item)) {
       notes.push(...(flatEntry.warnings ?? []));
+      if (stats?.settled > 0.05) {
+        notes.push({ level: 'info', code: 'SETTLED', text: `Lowered the part ${stats.settled.toFixed(1)} mm so it rests on the surface here.` });
+      }
+      if (base?.kind !== 'none' && !base?.current?.manifold && item.mode !== 'engrave') {
+        notes.push({
+          level: 'warn',
+          code: 'FUSE_UNAVAILABLE',
+          text: 'This model has gaps that could not be closed, so the part is placed over it but cannot be merged into one solid. Most slicers still print overlapping pieces as one.',
+        });
+      }
       if (item.mode !== 'engrave' && item.join === 'pegs') {
         if (base?.kind !== 'none' && !base?.current?.manifold) {
           notes.push({ level: 'warn', code: 'PEGS_UNAVAILABLE', text: 'Pegs need holes in a watertight model; this model has gaps, so the part is fused instead.' });
@@ -1037,6 +1057,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const emboss = [];
     const engrave = [];
     const separate = []; // parts joined with pegs: printed on their own
+    const raised = []; // raised items and their world solids, to check that each really merged
     const temps = scope();
     try {
       active.forEach((item, n) => {
@@ -1067,7 +1088,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         }
         const world = temps.add(placed.solid.transform(toMat4(placed.placement)));
         if (pegged) {
-          engrave.push(temps.add(placed.flat.cutter.transform(toMat4(placed.placement))));
+          const holes = placed.settle ? temps.add(placed.flat.cutter.translate(0, 0, placed.settle)) : placed.flat.cutter;
+          engrave.push(temps.add(holes.transform(toMat4(placed.placement))));
           // shown in place; exported in its own frame, turned over so the pegs point up
           const flipped = temps.add(placed.solid.rotate([180, 0, 0]));
           const fbb = flipped.boundingBox();
@@ -1075,6 +1097,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           return;
         }
         (meets === 'engrave' ? engrave : emboss).push(world);
+        if (meets !== 'engrave') raised.push({ item, world });
       });
 
       let solid = null;
@@ -1114,6 +1137,19 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
             solid = temps.add(cleaned);
           } else {
             shells.forEach((s) => s.delete());
+          }
+          // more pieces than the model had: something raised did not actually overlap the model and stayed loose
+          if (b.current.manifold && keep.length > b.current.shellVolumes.length) {
+            for (const { item, world } of raised) {
+              const overlap = temps.add(b.current.manifold.intersect(world));
+              if (!overlap.isEmpty()) continue;
+              notes.push({
+                level: 'warn',
+                code: 'NOT_MERGED',
+                itemId: item.id,
+                text: `${quote(item)} isn't merged with the model (they don't overlap), so it would print as a loose piece. Snap it to the model or sink it deeper.`,
+              });
+            }
           }
         }
       }

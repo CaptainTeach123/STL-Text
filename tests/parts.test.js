@@ -258,6 +258,55 @@ describe('attached parts', () => {
   });
 });
 
+describe('parts really merge with the model', () => {
+  it('a part placed a little above the surface comes down to rest on it, so the result is one solid', async () => {
+    await loadBox();
+    const high = onTop({ position: [0, 0, 5] }); // 2 mm above the top of the box (z = 3)
+    const p = await client.preview(high, version);
+    expect(p.notes.map((n) => n.code)).toContain('SETTLED');
+    expect(p.notes.map((n) => n.code)).not.toContain('NOT_TOUCHING');
+    expect(p.bounds.min[2]).toBeCloseTo(-2 - 0.4, 2); // lowered by the gap, then sunk
+    const ex = await client.export([high], version, 'x');
+    expect(ex.notes.map((n) => n.code)).not.toContain('NOT_MERGED');
+    const m = solidOfStl(ex.stl);
+    expect(m.decompose().length).toBe(1);
+    expect(m.boundingBox().max[2]).toBeCloseTo(3 + 3 - 0.4, 2);
+    expect(m.volume() - BASE_VOLUME).toBeCloseTo(360 - 20 * 6 * 0.4, 0);
+    m.delete();
+    // pegs follow the part down: the holes start at the surface, not 2 mm above it
+    const pegged = onTop({ position: [0, 0, 5], join: 'pegs', pegCount: 2, pegDiameter: 3, pegLength: 5, pegClearance: 0.15 });
+    const exp = await client.export([pegged], version, 'x');
+    const holeRadius = 1.65;
+    expect(BASE_VOLUME - volumeOfStl(exp.stl)).toBeCloseTo(2 * Math.PI * holeRadius * holeRadius * 5.15, -1);
+    // far above the surface it is simply not touching
+    const far = onTop({ position: [0, 0, 10] });
+    expect((await client.preview(far, version)).notes.map((n) => n.code)).toContain('NOT_TOUCHING');
+  });
+
+  it('a raised text that hovers without overlapping is reported as not merged', async () => {
+    await loadBox();
+    const hover = createItem({ text: 'Hi', fontId: 'inter', size: 8, position: [0, 0, 4], normal: [0, 0, 1], conform: false, overlap: 0.4 });
+    const ex = await client.export([hover], version, 'x');
+    const note = ex.notes.find((n) => n.code === 'NOT_MERGED');
+    expect(note).toBeTruthy();
+    expect(note.itemId).toBe(hover.id);
+    const m = solidOfStl(ex.stl);
+    expect(m.decompose().length).toBeGreaterThan(1); // the box plus the loose letters
+    m.delete();
+    // the same text on the surface merges and gets no such note
+    const onIt = createItem({ text: 'Hi', fontId: 'inter', size: 8, position: [0, 0, 3], normal: [0, 0, 1], conform: false, overlap: 0.4 });
+    const ex2 = await client.export([onIt], version, 'x');
+    expect(ex2.notes.map((n) => n.code)).not.toContain('NOT_MERGED');
+  });
+
+  it('on a model with gaps a part explains that it cannot be merged', async () => {
+    const open = new Float32Array([0, 0, 0, 30, 0, 0, 0, 30, 0]);
+    await client.loadBase({ kind: 'stl', bytes: writeBinarySTL(open), name: 'open', version: ++version });
+    const p = await client.preview(createPart('bar', 'bar', { position: [8, 8, 0], normal: [0, 0, 1] }), version);
+    expect(p.notes.map((n) => n.code)).toContain('FUSE_UNAVAILABLE');
+  });
+});
+
 describe('text on a plate', () => {
   const text = (extra = {}) => createItem({ text: 'Hi', fontId: 'inter', size: 8, position: [0, 0, 3], normal: [0, 0, 1], ...extra });
 

@@ -3,15 +3,18 @@ import { Matrix4 } from 'three';
 import {
   Document,
   createItem,
+  createSpot,
   fontIds,
   frameOf,
   hasText,
+  isSpot,
   itemLabel,
   itemText,
   linesOf,
   maxSize,
   placeKey,
   shapeKey,
+  spotsKey,
   stableKey,
   transformItems,
 } from '../src/document.js';
@@ -236,5 +239,31 @@ describe('Document enhancement settings', () => {
     const snapshot = doc.base.enhance;
     doc.enhanceBase({ smooth: 0.2 });
     expect(snapshot.smooth).toBe(1);
+  });
+});
+
+describe('clean-up spots', () => {
+  it('are items that count as content, and changing them is a new model version', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'm');
+    const spot = doc.addItem({ ...createSpot(), id: undefined, position: [1, 2, 3], radius: 5 });
+    expect(isSpot(spot)).toBe(true);
+    expect(hasText(spot)).toBe(true);
+    expect(itemLabel(spot)).toBe('clean-up spot');
+    expect(spot.conform).toBe(true);
+    const v0 = doc.state.baseVersion;
+    doc.updateItem(spot.id, { radius: 7 });
+    expect(doc.state.baseVersion).toBe(v0 + 1);
+    const k = spotsKey(doc.items);
+    doc.updateItem(spot.id, { spin: 45 }); // spin does not change what a spot does
+    expect(spotsKey(doc.items)).toBe(k);
+    expect(doc.state.baseVersion).toBe(v0 + 1);
+    const text = doc.addItem({ text: 'Hi' });
+    doc.updateItem(text.id, { depth: 3 });
+    expect(doc.state.baseVersion).toBe(v0 + 1); // texts never re-derive the model
+    doc.deleteItem(spot.id);
+    expect(doc.state.baseVersion).toBe(v0 + 2);
+    expect(doc.undo()).toBe(true);
+    expect(doc.items.some(isSpot)).toBe(true);
   });
 });

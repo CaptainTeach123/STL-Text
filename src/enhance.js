@@ -28,13 +28,67 @@
  * for relief, and smoothing/sharpening simply leave coarse facets alone.
  */
 
-export const ENHANCE_DEFAULTS = Object.freeze({ sharpen: 0, detail: 0, smooth: 0, edgeAngle: 30, featureSize: 0, maxMove: 0 });
+export const ENHANCE_DEFAULTS = Object.freeze({ sharpen: 0, detail: 0, smooth: 0, deepen: 0, evenOut: 0, edgeAngle: 30, featureSize: 0, maxMove: 0 });
 
 /** The cap on vertex movement when none is given: this fraction of the local mean edge length. */
 export const CAP_FACTOR = 0.35;
 
 export function isEnhanceActive(options) {
-  return !!options && ((options.sharpen ?? 0) > 0 || (options.detail ?? 0) > 0 || (options.smooth ?? 0) > 0);
+  return !!options && ((options.sharpen ?? 0) > 0 || (options.detail ?? 0) > 0 || (options.smooth ?? 0) > 0 || (options.deepen ?? 0) > 0 || (options.evenOut ?? 0) > 0);
+}
+
+/**
+ * The part of a mesh within `radius` of `center` (for a local clean-up):
+ * the triangles whose three vertices are all inside, re-indexed compactly.
+ * `vertexMap` maps the sub-mesh's vertices back to the full mesh. Vertices on
+ * the cut boundary become open edges, which the filters never move, so the
+ * region blends into the rest of the model.
+ */
+export function extractRegion(positions, index, center, radius) {
+  const V = positions.length / 3;
+  const r2 = radius * radius;
+  const map = new Int32Array(V).fill(-1);
+  const inside = new Uint8Array(V);
+  for (let v = 0; v < V; v++) {
+    const dx = positions[v * 3] - center[0], dy = positions[v * 3 + 1] - center[1], dz = positions[v * 3 + 2] - center[2];
+    if (dx * dx + dy * dy + dz * dz <= r2) inside[v] = 1;
+  }
+  const faces = [];
+  for (let t = 0; t < index.length; t += 3) {
+    if (inside[index[t]] && inside[index[t + 1]] && inside[index[t + 2]]) faces.push(t);
+  }
+  const used = [];
+  const subIndex = new Uint32Array(faces.length * 3);
+  let n = 0;
+  for (let i = 0; i < faces.length; i++) {
+    for (let k = 0; k < 3; k++) {
+      const v = index[faces[i] + k];
+      if (map[v] < 0) {
+        map[v] = used.length;
+        used.push(v);
+      }
+      subIndex[n++] = map[v];
+    }
+  }
+  const subPositions = new Float32Array(used.length * 3);
+  for (let i = 0; i < used.length; i++) {
+    subPositions[i * 3] = positions[used[i] * 3];
+    subPositions[i * 3 + 1] = positions[used[i] * 3 + 1];
+    subPositions[i * 3 + 2] = positions[used[i] * 3 + 2];
+  }
+  return { positions: subPositions, index: subIndex, vertexMap: Int32Array.from(used) };
+}
+
+/** Per-vertex weights 1 inside (1 − feather)·radius of `center`, fading smoothly to 0 at the radius. */
+export function regionWeights(positions, center, radius, feather = 0.5) {
+  const V = positions.length / 3;
+  const w = new Float64Array(V);
+  const inner = radius * (1 - Math.min(1, Math.max(0, feather)));
+  for (let v = 0; v < V; v++) {
+    const d = Math.hypot(positions[v * 3] - center[0], positions[v * 3 + 1] - center[1], positions[v * 3 + 2] - center[2]);
+    w[v] = 1 - smoothstep(inner, Math.max(inner + 1e-9, radius), d);
+  }
+  return w;
 }
 
 const chord = (deg) => 2 * Math.sin((deg * Math.PI) / 360); // |n1 - n2| for unit normals `deg` apart
@@ -681,7 +735,7 @@ function smoothField(x, topo, lam, K, stride, progress) {
  * positions); returns the signed displacement per vertex (mm, along `vn`)
  * before the flip guard, plus the vertex normals.
  */
-function reliefDisplacement(pos, index, topo, { gain, featureSize, edgeAngle, cap, pin }, progress) {
+function reliefDisplacement(pos, index, topo, { gain = 0, deepen = 0, evenOut = 0, featureSize, edgeAngle, cap, pin, weights = null }, progress) {
   const { V, hv, hMean, diag, adjStart, adj } = topo;
   // vertex normals (area weighted) from the current positions
   const fd = faceData(pos, index);
@@ -781,15 +835,44 @@ function reliefDisplacement(pos, index, topo, { gain, featureSize, edgeAngle, ca
   const energy = new Float64Array(V);
   for (let v = 0; v < V; v++) energy[v] = r[v] * r[v];
   const em = smoothField(energy, topo, lam, Ke, 1, tick);
+  // evening out: relief that is weaker than typical for the region gets more gain, stronger relief a little less.
+  // "Typical" is the energy-weighted mean amplitude, so the many faint fringe vertices do not drag it down
+  let typical = 0;
+  if (evenOut > 0) {
+    let sum = 0;
+    let wsum = 0;
+    for (let v = 0; v < V; v++) {
+      const A = Math.sqrt(Math.max(0, em[v])) / (hv[v] || 1);
+      const w = (weights ? weights[v] : 1) * f[v];
+      if (A > 0.02 && w > 0) {
+        sum += w * A * A;
+        wsum += w * A;
+      }
+    }
+    typical = wsum > 0 ? sum / wsum : 0;
+  }
   const disp = new Float64Array(V);
   for (let v = 0; v < V; v++) {
     const A = Math.sqrt(Math.max(0, em[v])) / (hv[v] || 1);
     const mask = f[v] * smoothstep(0.02, 0.08, A);
-    const raw = 2 * gain * mask * r[v]; // the operator-pattern subtraction also takes about half of the relief signal
+    const even = typical > 0 && A > 0 ? evenOut * Math.max(-0.5, Math.min(3, typical / A - 1)) : 0;
+    // boost (the operator-pattern subtraction takes about half of the relief signal, hence 2×), even out, and
+    // deepen: valleys (negative relief) are pushed further down, which separates details that have run together
+    const raw = 2 * mask * ((gain + even) * r[v] + 3 * deepen * Math.min(0, r[v]));
     const c = cap[v];
     disp[v] = c > 0 && Number.isFinite(c) && Number.isFinite(raw) ? c * Math.tanh(raw / c) : 0; // soft cap: strictly below the cap, no flat 'mesa' tops
   }
-  return { disp, vn, passes: total };
+  // a few numbers about what the step saw (for diagnostics and tests)
+  let maxR = 0, maxRq = 0, maxH = 0, pinned = 0, masked = 0;
+  for (let v = 0; v < V; v++) {
+    if (Math.abs(r[v]) > maxR) maxR = Math.abs(r[v]);
+    if (Math.abs(rq[v]) > maxRq) maxRq = Math.abs(rq[v]);
+    if (Math.abs(h[v]) > maxH) maxH = Math.abs(h[v]);
+    if (f[v] < 0.5) pinned++;
+    const A = Math.sqrt(Math.max(0, em[v])) / (hv[v] || 1);
+    if (f[v] * smoothstep(0.02, 0.08, A) > 0.5) masked++;
+  }
+  return { disp, vn, passes: total, debug: { K, F, maxH, maxR, maxRq, pinned, unmasked: masked, typical } };
 }
 
 /** A mesh the filters can work on: whole triangles, indices into the vertex list, finite coordinates. */
@@ -821,6 +904,10 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
   const sharpen = clamp01(+o.sharpen || 0);
   const smooth = clamp01(+o.smooth || 0);
   const detail = clamp01(+o.detail || 0);
+  const deepen = clamp01(+o.deepen || 0);
+  const evenOut = clamp01(+o.evenOut || 0);
+  const capFactor = Number.isFinite(+o.capFactor) && +o.capFactor > 0 ? +o.capFactor : CAP_FACTOR;
+  const weights = o.weights ?? null; // per-vertex 0..1: how much of the change each vertex takes (local clean-ups)
   const edgeAngle = Math.min(150, Math.max(5, +o.edgeAngle || 30));
   const featureSize = Number.isFinite(+o.featureSize) ? Math.max(0, +o.featureSize) : 0;
   const maxMove = Number.isFinite(+o.maxMove) ? Math.max(0, +o.maxMove) : 0;
@@ -829,8 +916,9 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
   const T = index.length / 3;
   const stats = { verticesMoved: 0, maxDisplacement: 0, meanDisplacement: 0, flipsPrevented: 0, featureEdges: 0, iterations: 0 };
   const identity = () => ({ positions: mesh.positions instanceof Float32Array ? mesh.positions.slice() : Float32Array.from(mesh.positions), stats });
-  if (!(sharpen > 0 || smooth > 0 || detail > 0) || V === 0 || T === 0) return identity();
+  if (!(sharpen > 0 || smooth > 0 || detail > 0 || deepen > 0 || evenOut > 0) || V === 0 || T === 0) return identity();
   validateMesh(mesh.positions, index, V, T);
+  if (weights && weights.length !== V) throw new Error('enhanceMesh: weights must hold one number per vertex');
   const report = (stage, fraction) => onProgress?.(stage, Math.min(1, Math.max(0, fraction)));
 
   report('Analysing the surface', 0);
@@ -842,7 +930,7 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
   const h = topo.hMean;
   // the budget every vertex may move, shared by all operations
   const cap = new Float64Array(V);
-  for (let v = 0; v < V; v++) cap[v] = maxMove > 0 ? maxMove : CAP_FACTOR * (topo.hv[v] || h);
+  for (let v = 0; v < V; v++) cap[v] = maxMove > 0 ? maxMove : capFactor * (topo.hv[v] || h);
   // vertices on boundary or non-manifold edges never move
   for (let v = 0; v < V; v++) if (edges.open[v]) cap[v] = 0;
   report('Analysing the surface', 0.08);
@@ -946,11 +1034,16 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
     report('Fitting the surface', 0.6);
   }
 
-  if (detail > 0) {
+  if (detail > 0 || deepen > 0 || evenOut > 0) {
     // creases (sharp edges in the current, possibly just sharpened geometry) are pinned so relief boosting never rings across them
     const fdNow = faceData(pos, index);
-    const relief = reliefDisplacement(pos, index, topo, { gain: 2.5 * detail, featureSize, edgeAngle, cap, pin: pinsFor(fdNow) }, (f) => report('Boosting relief', 0.6 + 0.3 * f));
+    const relief = reliefDisplacement(
+      pos, index, topo,
+      { gain: 2.5 * detail, deepen, evenOut, featureSize, edgeAngle, cap, pin: pinsFor(fdNow), weights },
+      (f) => report('Boosting relief', 0.6 + 0.3 * f),
+    );
     stats.iterations += relief.passes;
+    stats.relief = relief.debug;
     applyRelief(fdNow, relief, 0.05);
   }
 
@@ -959,7 +1052,8 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
   const total = new Float64Array(V * 3);
   for (let v = 0; v < V; v++) {
     const v3 = v * 3;
-    let dx = pos[v3] - pos0[v3], dy = pos[v3 + 1] - pos0[v3 + 1], dz = pos[v3 + 2] - pos0[v3 + 2];
+    const w = weights ? Math.min(1, Math.max(0, weights[v])) : 1;
+    let dx = w * (pos[v3] - pos0[v3]), dy = w * (pos[v3 + 1] - pos0[v3 + 1]), dz = w * (pos[v3 + 2] - pos0[v3 + 2]);
     const l = Math.sqrt(dx * dx + dy * dy + dz * dz);
     const c = cap[v];
     if (l > c) {

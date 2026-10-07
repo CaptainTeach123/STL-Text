@@ -34,7 +34,7 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
   };
   const fonts = new Map(); // fontId -> ArrayBuffer (kept for rehydration)
   const parts = new Map(); // partId -> { bytes, name } (kept for rehydration)
-  let base = null; // { kind, bytes, name, version, transforms, simplify, enhance }
+  let base = null; // { kind, bytes, name, version, transforms, simplify, enhance, spots }
   let fatalError = null;
 
   const state = () => (live.size ? 'busy' : worker ? 'idle' : 'stopped');
@@ -178,6 +178,7 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
       transforms: base.transforms,
       simplify: base.simplify,
       enhance: base.enhance ?? null,
+      spots: base.spots ?? [],
     });
   }
 
@@ -208,16 +209,16 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
      * Load a model: kind 'stl' (with bytes), 'sample' or 'none'.
      * Returns the display payload + repair report.
      */
-    loadBase({ kind, bytes = null, name = 'model', version }) {
-      base = { kind, bytes, name, version, transforms: [], simplify: null, enhance: null };
-      return request('base', 'base.load', { kind, name, bytes: bytes ? copy(bytes) : null, version, transforms: [], simplify: null, enhance: null });
+    loadBase({ kind, bytes = null, name = 'model', version, spots = [] }) {
+      base = { kind, bytes, name, version, transforms: [], simplify: null, enhance: null, spots };
+      return request('base', 'base.load', { kind, name, bytes: bytes ? copy(bytes) : null, version, transforms: [], simplify: null, enhance: null, spots });
     },
 
-    /** Re-derive the model with a new transform list / simplify tolerance / enhancement. */
-    updateBase({ version, transforms, simplify, enhance = null }) {
+    /** Re-derive the model with a new transform list / simplify tolerance / enhancement / clean-up spots. */
+    updateBase({ version, transforms, simplify, enhance = null, spots = [] }) {
       if (!base) return Promise.reject(new EngineError({ code: 'BASE_MISSING', message: 'No model is loaded' }));
-      base = { ...base, version, transforms, simplify, enhance };
-      return request('base', 'base.update', { version, transforms, simplify, enhance });
+      base = { ...base, version, transforms, simplify, enhance, spots };
+      return request('base', 'base.update', { version, transforms, simplify, enhance, spots });
     },
 
     /**

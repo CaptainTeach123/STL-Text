@@ -24,6 +24,11 @@ export const ITEM_DEFAULTS = Object.freeze({
   attach: 'bottom', // which side of the part touches the model
   tilt: 0, // degrees, leans the part about its reading axis
   roll: 0, // lean sideways (degrees about the part's front–back axis); spin about the surface normal lives in the placement
+  // clean-up spots (kind 'spot'): a round area of the model that gets a stronger, local enhancement
+  radius: 8, // mm
+  feather: 0.5, // 0..1: how much of the radius is a soft edge
+  sharpen: 0, smooth: 0, detail: 0.5, deepen: 0.6, evenOut: 0.4, // amounts 0..1
+  featureSize: 0, maxMove: 0, // mm, 0 = automatic
   sink: 0.4, // how deep the part sits into the surface
   join: 'fuse', // 'fuse' | 'fillet' | 'pegs'
   filletRadius: 1.5,
@@ -52,6 +57,7 @@ const SHAPE_KEYS = [
   'cornerRadius', 'mirror', 'quality', 'mode', 'depth', 'overlap',
   'plate', 'plateThickness', 'platePadding',
   'partId', 'scale', 'attach', 'tilt', 'roll', 'sink', 'join', 'filletRadius', 'pegCount', 'pegDiameter', 'pegLength', 'pegClearance',
+  'radius', 'feather', 'sharpen', 'smooth', 'detail', 'deepen', 'evenOut', 'featureSize', 'maxMove',
 ];
 const PLACE_KEYS = ['position', 'normal', 'spin', 'conform'];
 
@@ -91,8 +97,9 @@ let nextId = 1;
 export function createItem(overrides = {}) {
   const { text, fontId, size, ...rest } = overrides;
   const item = { ...ITEM_DEFAULTS, ...rest, id: overrides.id ?? `t${nextId++}` };
-  item.lines = item.kind === 'part' ? [] : linesOf({ lines: rest.lines, text, fontId, size });
+  item.lines = item.kind === 'part' || item.kind === 'spot' ? [] : linesOf({ lines: rest.lines, text, fontId, size });
   if (item.kind === 'part') item.conform = false; // a rigid part is never warped
+  if (item.kind === 'spot') item.conform = true; // the spot's ring hugs the surface
   item.position = [...item.position];
   item.normal = [...item.normal];
   return item;
@@ -105,9 +112,26 @@ export function createPart(partId, name, overrides = {}) {
 
 export const isPart = (item) => item?.kind === 'part';
 
-/** True when the item would produce geometry (text with letters, or a part). */
+/** A clean-up spot: a round area of the model that gets its own, stronger enhancement. */
+export function createSpot(overrides = {}) {
+  return createItem({ kind: 'spot', name: '', ...overrides });
+}
+
+export const isSpot = (item) => item?.kind === 'spot';
+
+/** The spots as the engine needs them (everything that changes what they do to the model). */
+export const spotsOf = (items) =>
+  items
+    .filter(isSpot)
+    .map((s) => ({
+      id: s.id, position: s.position, radius: s.radius, feather: s.feather,
+      sharpen: s.sharpen, smooth: s.smooth, detail: s.detail, deepen: s.deepen, evenOut: s.evenOut, featureSize: s.featureSize, maxMove: s.maxMove,
+    }));
+export const spotsKey = (items) => stableKey(spotsOf(items));
+
+/** True when the item would produce geometry (text with letters, a part) or affect the model (a spot). */
 export const hasText = (item) =>
-  isPart(item) ? !!item.partId : (item.lines ?? []).some((l) => String(l.text ?? '').trim().length > 0);
+  isSpot(item) ? true : isPart(item) ? !!item.partId : (item.lines ?? []).some((l) => String(l.text ?? '').trim().length > 0);
 export const hasContent = hasText;
 
 /** How the item meets the model: a plated text is always raised on it. */
@@ -118,13 +142,17 @@ export const itemText = (item) => (item.lines ?? []).map((l) => l.text ?? '').jo
 
 /** First non-blank line (or the part's name), for lists and messages. */
 export const itemLabel = (item, fallback = 'empty text') =>
-  isPart(item) ? item.name || 'part' : (item.lines ?? []).map((l) => String(l.text ?? '').trim()).find(Boolean) ?? fallback;
+  isSpot(item)
+    ? item.name || 'clean-up spot'
+    : isPart(item)
+      ? item.name || 'part'
+      : (item.lines ?? []).map((l) => String(l.text ?? '').trim()).find(Boolean) ?? fallback;
 
 /** Fonts used by an item, in line order, without repeats. */
 export const fontIds = (item) => [...new Set((item.lines ?? []).map((l) => l.fontId))];
 
 /** Largest letter height in the item (mm); 10 for parts (used for spacing duplicates). */
-export const maxSize = (item) => (isPart(item) ? 10 : Math.max(0, ...(item.lines ?? []).map((l) => l.size || 0)));
+export const maxSize = (item) => (isSpot(item) ? item.radius * 2 : isPart(item) ? 10 : Math.max(0, ...(item.lines ?? []).map((l) => l.size || 0)));
 
 /** Move items with the model: positions by the matrix, normals by its rotation. */
 export function transformItems(items, matrix) {
@@ -194,6 +222,8 @@ export class Document {
     this.coalesceKey = coalesce;
     const next = clone(this.state);
     mutate(next);
+    // clean-up spots change the model itself, so anything about them is a new model version
+    if (spotsKey(next.items) !== spotsKey(this.state.items)) next.baseVersion += 1;
     this.state = next;
     this.#notify();
   }

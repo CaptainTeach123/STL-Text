@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { createEngine } from '../src/engine.js';
 import { createEngineClient, createLocalWorker } from '../src/engineClient.js';
-import { createItem } from '../src/document.js';
+import { createItem, createSpot } from '../src/document.js';
 import { manifold } from '../src/manifold.js';
 import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
@@ -112,5 +112,57 @@ describe('model enhancement in the engine', () => {
     const r = await client.updateBase({ version: ++version, transforms: [], simplify: null, enhance: { sharpen: 0, detail: 0, smooth: 0, edgeAngle: 30, featureSize: 0, maxMove: 0 } });
     expect(r.info.enhanced).toBeNull();
     soft.delete();
+  });
+});
+
+describe('clean-up spots in the engine', () => {
+  const clump = () => {
+    const { Manifold } = wasm;
+    const plate = Manifold.cube([30, 30, 4], true).refineToLength(0.4);
+    const mesh = plate.getMesh();
+    plate.delete();
+    const stride = mesh.numProp;
+    const p = Float32Array.from({ length: (mesh.vertProperties.length / stride) * 3 }, (_, i) => mesh.vertProperties[Math.floor(i / 3) * stride + (i % 3)]);
+    for (let v = 0; v < p.length; v += 3) {
+      if (Math.abs(p[v + 2] - 2) > 1e-6) continue;
+      for (const [bx, by] of [[-1.8, 0], [1.8, 0]]) p[v + 2] += 0.8 * Math.exp(-((p[v] - bx) ** 2 + (p[v + 1] - by) ** 2) / (2 * 1.2 * 1.2));
+    }
+    const built = new wasm.Mesh({ numProp: 3, vertProperties: p, triVerts: mesh.triVerts });
+    return wasm.Manifold.ofMesh(built);
+  };
+
+  it('a spot cleans up only its area, reports what it moved, and the result is exported', async () => {
+    const solid = clump();
+    await load(solid);
+    const plain = await client.export([], version, 'x');
+    const spot = createSpot({ position: [0, 0, 2.5], normal: [0, 0, 1], radius: 6 });
+    const r = await client.updateBase({ version: ++version, transforms: [], simplify: null, enhance: null, spots: [spot] });
+    expect(r.info.spots).toHaveLength(1);
+    expect(r.info.spots[0]).toMatchObject({ id: spot.id, failed: false, empty: false });
+    expect(r.info.spots[0].verticesMoved).toBeGreaterThan(50);
+    expect(r.info.spots[0].maxDisplacement).toBeGreaterThan(0.05);
+    expect(r.info.triangles).toBe(solid.numTri());
+    const ex = await client.export([spot], version, 'x');
+    const a = solidOfStl(plain.stl);
+    const b = solidOfStl(ex.stl);
+    expect(b.status()).toBe('NoError');
+    expect(Math.abs(b.volume() - a.volume()) / a.volume()).toBeLessThan(0.01);
+    // the far corner of the plate is untouched: same bounding box, and the spot itself adds no geometry to the export
+    expect(b.boundingBox().min.map((v) => Math.round(v * 1000))).toEqual(a.boundingBox().min.map((v) => Math.round(v * 1000)));
+    expect(ex.extra).toHaveLength(0);
+    a.delete();
+    b.delete();
+    // the spot's own preview is a ring hugging the surface with a note about what it did
+    const preview = await client.preview(spot, version);
+    expect(preview.geometry.index.length).toBeGreaterThan(0);
+    expect(preview.notes.map((n) => n.code)).toEqual(['SPOT']);
+    expect(preview.notes[0].text).toMatch(/Moved [\d,]+ points/);
+    // a spot off the model does nothing and says so
+    const away = createSpot({ position: [60, 60, 2], normal: [0, 0, 1], radius: 4 });
+    const r2 = await client.updateBase({ version: ++version, transforms: [], simplify: null, enhance: null, spots: [away] });
+    expect(r2.info.spots[0].empty).toBe(true);
+    const p2 = await client.preview(away, version);
+    expect(p2.notes.map((n) => n.code)).toContain('NOT_TOUCHING');
+    solid.delete();
   });
 });

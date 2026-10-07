@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { CAP_FACTOR, ENHANCE_DEFAULTS, enhanceMesh, isEnhanceActive } from '../src/enhance.js';
+import { CAP_FACTOR, ENHANCE_DEFAULTS, enhanceMesh, extractRegion, isEnhanceActive, regionWeights } from '../src/enhance.js';
 import { manifold } from '../src/manifold.js';
 import { setup } from './helpers.js';
 
@@ -533,5 +533,97 @@ describe('enhanceMesh: contract', () => {
     expect(calls[0].fraction).toBe(0);
     expect(calls[calls.length - 1].fraction).toBe(1);
     expect(new Set(calls.map((c) => c.stage)).size).toBeGreaterThan(3);
+  });
+});
+
+/** A plate with two bumps that have run together (a shallow saddle between them) and a weaker bump further away. */
+function clumpPlate() {
+  const plate = build((M) => M.cube([30, 30, 4], true).refineToLength(0.4));
+  const bumps = [[-1.8, 0, 0.8, 1.2], [1.8, 0, 0.8, 1.2], [8, 6, 0.25, 1.2]]; // x, y, height, sigma
+  const p = Float32Array.from(plate.positions);
+  for (let v = 0; v < p.length; v += 3) {
+    if (Math.abs(p[v + 2] - 2) > 1e-6) continue;
+    let dz = 0;
+    for (const [bx, by, height, sigma] of bumps) dz += height * Math.exp(-((p[v] - bx) ** 2 + (p[v + 1] - by) ** 2) / (2 * sigma * sigma));
+    p[v + 2] += dz;
+  }
+  const heightAt = (pos, x, y) => {
+    let best = Infinity;
+    let z = 0;
+    for (let v = 0; v < pos.length; v += 3) {
+      if (Math.abs(plate.positions[v + 2] - 2) > 1e-6) continue;
+      const d = Math.hypot(plate.positions[v] - x, plate.positions[v + 1] - y);
+      if (d < best) {
+        best = d;
+        z = pos[v + 2];
+      }
+    }
+    return z - 2;
+  };
+  const separation = (pos) => (heightAt(pos, -1.8, 0) + heightAt(pos, 1.8, 0)) / 2 - heightAt(pos, 0, 0);
+  return { mesh: { positions: p, index: plate.index }, flat: plate.positions, heightAt, separation };
+}
+
+describe('enhanceMesh: clean-up operations', () => {
+  it('separating details deepens the saddle between merged bumps and leaves flat ground untouched', () => {
+    const { mesh, heightAt, separation } = clumpPlate();
+    const before = separation(mesh.positions);
+    const out = enhanceMesh(mesh, { deepen: 1, featureSize: 3, capFactor: 1 });
+    expect(flips(mesh.positions, out.positions, mesh.index)).toBe(0);
+    expect(separation(out.positions)).toBeGreaterThan(before * 1.15);
+    expect(heightAt(out.positions, -1.8, 0)).toBeCloseTo(heightAt(mesh.positions, -1.8, 0), 2); // deepening only lowers valleys
+    expect(Math.abs(heightAt(out.positions, -10, -10))).toBeLessThan(1e-6);
+    const m = manifoldOf(out.positions, mesh.index);
+    expect(m.status()).toBe('NoError');
+    m.delete();
+  });
+
+  it('evening out lifts a weak bump relative to strong ones; the spot defaults separate and strengthen details', () => {
+    const { mesh, heightAt, separation } = clumpPlate();
+    const weak0 = heightAt(mesh.positions, 8, 6);
+    const strong0 = heightAt(mesh.positions, -1.8, 0);
+    const even = enhanceMesh(mesh, { evenOut: 1, featureSize: 3, capFactor: 1 });
+    expect(heightAt(even.positions, 8, 6) / heightAt(even.positions, -1.8, 0)).toBeGreaterThan((weak0 / strong0) * 1.1);
+    const spot = enhanceMesh(mesh, { deepen: 0.6, evenOut: 0.4, detail: 0.5, featureSize: 3, capFactor: 1 });
+    expect(flips(mesh.positions, spot.positions, mesh.index)).toBe(0);
+    expect(separation(spot.positions)).toBeGreaterThan(separation(mesh.positions) * 1.35);
+    expect(heightAt(spot.positions, 8, 6)).toBeGreaterThan(weak0 * 1.25);
+    expect(spot.stats.maxDisplacement).toBeLessThanOrEqual(1.0 * 0.45 + 1e-6); // capFactor 1 × local edge (≈0.4 mm)
+  });
+
+  it('a region with soft-edged weights changes only inside its radius', () => {
+    const { mesh } = clumpPlate();
+    const centre = [0, 0, 2.5];
+    const region = extractRegion(mesh.positions, mesh.index, centre, 9);
+    expect(region.index.length % 3).toBe(0);
+    expect(region.vertexMap.length).toBe(region.positions.length / 3);
+    for (let i = 0; i < region.vertexMap.length; i++) {
+      const v = region.vertexMap[i];
+      expect(Math.hypot(mesh.positions[v * 3] - centre[0], mesh.positions[v * 3 + 1] - centre[1], mesh.positions[v * 3 + 2] - centre[2])).toBeLessThanOrEqual(9);
+    }
+    const w = regionWeights(region.positions, centre, 6, 0.5);
+    let inner = 0;
+    for (let i = 0; i < w.length; i++) {
+      const d = Math.hypot(region.positions[i * 3] - centre[0], region.positions[i * 3 + 1] - centre[1], region.positions[i * 3 + 2] - centre[2]);
+      if (d <= 3) {
+        expect(w[i]).toBe(1);
+        inner++;
+      }
+      if (d >= 6) expect(w[i]).toBe(0);
+    }
+    expect(inner).toBeGreaterThan(50);
+    const out = enhanceMesh(region, { deepen: 0.6, evenOut: 0.4, detail: 0.5, capFactor: 1, weights: w });
+    const full = Float32Array.from(mesh.positions);
+    for (let i = 0; i < region.vertexMap.length; i++) for (let k = 0; k < 3; k++) full[region.vertexMap[i] * 3 + k] = out.positions[i * 3 + k];
+    let outside = 0;
+    for (let v = 0; v < full.length / 3; v++) {
+      const d = Math.hypot(mesh.positions[v * 3] - centre[0], mesh.positions[v * 3 + 1] - centre[1], mesh.positions[v * 3 + 2] - centre[2]);
+      const moved = full[v * 3] !== mesh.positions[v * 3] || full[v * 3 + 1] !== mesh.positions[v * 3 + 1] || full[v * 3 + 2] !== mesh.positions[v * 3 + 2];
+      if (d > 6 && moved) outside++;
+    }
+    expect(outside).toBe(0);
+    expect(out.stats.verticesMoved).toBeGreaterThan(50);
+    expect(flips(mesh.positions, full, mesh.index)).toBe(0);
+    expect(() => enhanceMesh(region, { detail: 1, weights: new Float64Array(3) })).toThrow(/weights/);
   });
 });

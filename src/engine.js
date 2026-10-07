@@ -6,8 +6,8 @@ import { labelFor, parseFont } from './fontParse.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from './stl.js';
 import { buildBVH, concatSoups, displayBuffers, geometryFromBuffers, manifoldToSoup } from './mesh.js';
 import { placementMatrix, toMat4 } from './placement.js';
-import { baseMode, fontIds, hasText, isPart, itemLabel, placeKey, shapeKey } from './document.js';
-import { enhanceMesh, isEnhanceActive } from './enhance.js';
+import { baseMode, fontIds, hasText, isPart, isSpot, itemLabel, placeKey, shapeKey } from './document.js';
+import { enhanceMesh, extractRegion, isEnhanceActive, regionWeights } from './enhance.js';
 
 /**
  * The geometry engine: a pure request handler that owns Manifold objects,
@@ -318,6 +318,73 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     base = null;
     enhanceCache.forEach((e) => e.manifold?.delete());
     enhanceCache.clear();
+    spotCache.forEach((e) => e.manifold?.delete());
+    spotCache.clear();
+  }
+
+  /**
+   * The model with its clean-up spots applied: each spot enhances only the
+   * part of the mesh within its radius (cut out, enhanced with a soft-edged
+   * weight and a larger movement allowance, written back). Cached by
+   * settings. Returns { manifold (caller owns, or null), stats per spot }.
+   */
+  const spotCache = new Map();
+  function spottedFor(solid, spots, edgeAngle, key, progress) {
+    let entry = spotCache.get(key);
+    if (!entry) {
+      const mesh = solid.getMesh();
+      const stride = mesh.numProp;
+      const count = mesh.vertProperties.length / stride;
+      const positions = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        positions[i * 3] = mesh.vertProperties[i * stride];
+        positions[i * 3 + 1] = mesh.vertProperties[i * stride + 1];
+        positions[i * 3 + 2] = mesh.vertProperties[i * stride + 2];
+      }
+      const index = mesh.triVerts;
+      const stats = [];
+      let result = null;
+      try {
+        spots.forEach((spot, n) => {
+          progress?.('Cleaning up spots…', { done: n + 1, total: spots.length });
+          const radius = Math.max(0.1, spot.radius ?? 8);
+          const region = extractRegion(positions, index, spot.position, radius * 1.5);
+          if (!isEnhanceActive(spot) || region.index.length < 12) {
+            stats.push({ id: spot.id, verticesMoved: 0, maxDisplacement: 0, empty: region.index.length < 12 });
+            return;
+          }
+          const weights = regionWeights(region.positions, spot.position, radius, spot.feather ?? 0.5);
+          // details inside a spot are sized to the spot: by default their size is taken as a third of its radius
+          const out = enhanceMesh(region, {
+            sharpen: spot.sharpen, smooth: spot.smooth, detail: spot.detail, deepen: spot.deepen, evenOut: spot.evenOut,
+            featureSize: spot.featureSize > 0 ? spot.featureSize : radius / 3, maxMove: spot.maxMove, edgeAngle, capFactor: 1, weights,
+          });
+          for (let i = 0; i < region.vertexMap.length; i++) {
+            const v = region.vertexMap[i];
+            positions[v * 3] = out.positions[i * 3];
+            positions[v * 3 + 1] = out.positions[i * 3 + 1];
+            positions[v * 3 + 2] = out.positions[i * 3 + 2];
+          }
+          stats.push({ id: spot.id, verticesMoved: out.stats.verticesMoved, maxDisplacement: out.stats.maxDisplacement, empty: false });
+        });
+        const built = new wasm.Mesh({ numProp: 3, vertProperties: positions, triVerts: index });
+        result = wasm.Manifold.ofMesh(built);
+        if (result.status() !== 'NoError' || result.isEmpty() || result.volume() <= 0) {
+          result.delete();
+          result = null;
+        }
+      } catch {
+        result = null;
+      }
+      entry = { manifold: result, stats: stats.map((s) => ({ ...s, failed: !result })) };
+      spotCache.set(key, entry);
+      if (spotCache.size > 4) {
+        const oldest = spotCache.keys().next().value;
+        spotCache.get(oldest).manifold?.delete();
+        spotCache.delete(oldest);
+      }
+    }
+    return { manifold: entry.manifold ? entry.manifold.translate(0, 0, 0) : null, stats: entry.stats };
   }
 
   /**
@@ -389,7 +456,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   function deriveCurrent(progress) {
     disposeCurrent();
     clearDerived();
-    const { original, transforms, simplify, enhance } = base;
+    const { original, transforms, simplify, enhance, spots } = base;
     const matrix = composeTransforms(transforms);
     let manifold = original.manifold ? original.manifold.transform(toMat4(matrix)) : null;
     if (manifold && simplify > 0) {
@@ -404,6 +471,17 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const key = `${JSON.stringify(transforms)}|${simplify}|${JSON.stringify(enhance)}`;
       const out = enhancedFor(manifold, enhance, key, progress);
       enhanced = { ...out.stats, failed: !out.manifold };
+      if (out.manifold) {
+        manifold.delete();
+        manifold = out.manifold;
+      }
+    }
+    let spotStats = null;
+    if (manifold && spots?.length) {
+      progress?.('Cleaning up spots…');
+      const key = `${JSON.stringify(transforms)}|${simplify}|${JSON.stringify(enhance)}|${JSON.stringify(spots)}`;
+      const out = spottedFor(manifold, spots, enhance?.edgeAngle ?? 30, key, progress);
+      spotStats = out.stats;
       if (out.manifold) {
         manifold.delete();
         manifold = out.manifold;
@@ -436,6 +514,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       geometry,
       bounds: buffers.index.length ? { min: bb.min.toArray(), max: bb.max.toArray() } : null,
       shellVolumes: null, // filled lazily: volumes of the model's own shells
+      spotStats,
     };
     const info = {
       name: base.name,
@@ -452,6 +531,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       passthroughTriangles: passthrough.length / 9,
       hasModel: base.kind !== 'none',
       enhanced,
+      spots: spotStats,
       suggestions: base.kind === 'stl' && transforms.length === 0 && !simplify && !enhanced ? modelSuggestions({ size, triangles }) : [],
     };
     const display = {
@@ -469,7 +549,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     };
   }
 
-  function loadBase({ kind, bytes, name = 'model', version, transforms = [], simplify = null, enhance = null }, progress) {
+  function loadBase({ kind, bytes, name = 'model', version, transforms = [], simplify = null, enhance = null, spots = [] }, progress) {
     disposeBase();
     clearDerived();
     let original;
@@ -503,16 +583,17 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     } else {
       fail('INTERNAL', `Unknown model kind "${kind}"`);
     }
-    base = { version, kind, name, original, transforms, simplify, enhance };
+    base = { version, kind, name, original, transforms, simplify, enhance, spots };
     return deriveCurrent(progress);
   }
 
-  function updateBase({ version, transforms = [], simplify = null, enhance = null }, progress) {
+  function updateBase({ version, transforms = [], simplify = null, enhance = null, spots = [] }, progress) {
     if (!base?.original) fail('BASE_MISSING', 'The model is not loaded in the engine', { version });
     base.version = version;
     base.transforms = transforms;
     base.simplify = simplify;
     base.enhance = enhance;
+    base.spots = spots;
     return deriveCurrent(progress);
   }
 
@@ -545,9 +626,24 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const key = shapeKey(item, fontKeyOf(item));
     let entry = flat.get(key);
     if (entry) return entry;
-    entry = isPart(item) ? partSolidFor(item) : textSolidFor(item);
+    entry = isSpot(item) ? spotSolidFor(item) : isPart(item) ? partSolidFor(item) : textSolidFor(item);
     flat.set(key, entry);
     return entry;
+  }
+
+  /** A clean-up spot's marker: a thin ring of its radius, shown hugging the surface. */
+  function spotSolidFor(item) {
+    const r = Math.max(0.5, item.radius ?? 8);
+    const temps = scope();
+    try {
+      const outer = temps.add(wasm.CrossSection.circle(r, 96));
+      const inner = temps.add(wasm.CrossSection.circle(r * 0.9, 96));
+      const ring = temps.add(outer.subtract(inner));
+      const raw = temps.add(Manifold.extrude(ring, 0.3));
+      return { solid: raw.translate(0, 0, -0.1), cutter: null, size: [2 * r, 2 * r], rounding: null, spot: true };
+    } finally {
+      temps.dispose();
+    }
   }
 
   function textSolidFor(item) {
@@ -789,6 +885,29 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const notes = [];
     const nozzle = printing.nozzle ?? 0.4;
     const layer = printing.layerHeight ?? 0.2;
+    if (isSpot(item)) {
+      if (stats && stats.touches === false && base?.kind !== 'none') {
+        notes.push({ level: 'warn', code: 'NOT_TOUCHING', text: "The spot isn't on the model. Click the model to place it." });
+        return notes;
+      }
+      if (base?.kind === 'none') {
+        notes.push({ level: 'info', code: 'SPOT', text: 'Load a model for the spot to work on.' });
+        return notes;
+      }
+      if (!isEnhanceActive(item)) {
+        notes.push({ level: 'info', code: 'SPOT', text: 'All amounts are 0, so this spot changes nothing yet.' });
+        return notes;
+      }
+      const st = base?.current?.spotStats?.find((s) => s.id === item.id);
+      if (!st || st.empty) {
+        notes.push({ level: 'warn', code: 'SPOT_EMPTY', text: 'No model surface inside this spot – move it onto the model or make it larger.' });
+      } else if (st.failed) {
+        notes.push({ level: 'warn', code: 'SPOT_FAILED', text: 'This clean-up would break the model; try smaller amounts or a smaller max move.' });
+      } else {
+        notes.push({ level: 'ok', code: 'SPOT', text: `Moved ${st.verticesMoved.toLocaleString()} points inside the spot, up to ${st.maxDisplacement.toFixed(2)} mm.` });
+      }
+      return notes;
+    }
     const meets = baseMode(item);
     if (meets === 'engrave' && base?.kind !== 'none' && !base?.current?.manifold) {
       notes.push({
@@ -884,7 +1003,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   /** union(base, raised) − union(cut); cached for the same inputs. */
   function finalFor(items, baseVersion, printing, progress) {
     const b = baseFor(baseVersion);
-    const active = items.filter(hasText);
+    const active = items.filter((i) => hasText(i) && !isSpot(i)); // spots change the model itself, not what is added to it
     requireFonts(active.filter((i) => !isPart(i)));
     requireParts(active);
     const key = `${baseVersion}|${active.map((i) => `${shapeKey(i, fontKeyOf(i))}|${placeKey(i)}`).sort().join(';')}`;

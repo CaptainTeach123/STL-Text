@@ -475,7 +475,7 @@ try {
   console.log('\nenhance detail');
   {
     const core = Manifold.cube([24, 24, 6], true);
-    const ball = Manifold.sphere(1.5, 12);
+    const ball = Manifold.sphere(1.5, 36); // a finely rounded edge: soft, like a generated model
     const soft = core.minkowskiSum(ball).refineToLength(0.8);
     const softFile = writeFixture('soft.stl', soupOf(soft));
     core.delete();
@@ -514,6 +514,62 @@ try {
     await idle();
     check(!/Enhanced:/.test(await page.locator('#modelNotes').innerText()), 'Reset switches the enhancement off');
     await page.screenshot({ path: path.join(out, '7-enhance.png') });
+
+    console.log('\nclean-up spot');
+    // a plate with two bumps that have run together and a weaker one further away: what a clumped wreath looks like
+    const clumpSolid = (() => {
+      const plate = Manifold.cube([30, 30, 4], true).refineToLength(0.4);
+      const m = plate.getMesh();
+      plate.delete();
+      const stride = m.numProp;
+      const p = new Float32Array((m.vertProperties.length / stride) * 3);
+      for (let i = 0; i < p.length / 3; i++) for (let k = 0; k < 3; k++) p[i * 3 + k] = m.vertProperties[i * stride + k];
+      for (let v = 0; v < p.length; v += 3) {
+        if (Math.abs(p[v + 2] - 2) > 1e-6) continue;
+        for (const [bx, by, h] of [[-1.8, 0, 0.8], [1.8, 0, 0.8], [8, 6, 0.25]]) p[v + 2] += h * Math.exp(-((p[v] - bx) ** 2 + (p[v + 1] - by) ** 2) / (2 * 1.2 * 1.2));
+      }
+      const { Mesh } = manifold();
+      return Manifold.ofMesh(new Mesh({ numProp: 3, vertProperties: p, triVerts: m.triVerts }));
+    })();
+    const clumpFile = writeFixture('clump.stl', soupOf(clumpSolid));
+    clumpSolid.delete();
+    await openStl(clumpFile, 'clump');
+    const clumpBefore = await download('clump-before.stl');
+    const clumpTriangles = await triangleCount();
+    const itemsBefore = await page.locator('#itemList li').count();
+    await page.click('[data-side="top"]');
+    await idle();
+    await page.click('#addSpotBtn');
+    await page.waitForFunction((n) => document.querySelectorAll('#itemList li').length === n + 1, itemsBefore);
+    await idle();
+    check(!(await page.locator('#spotCard').isHidden()) && (await page.locator('#textCard').isHidden()) && (await page.locator('#styleCard').isHidden()), 'selecting a spot shows the Clean-up spot card only');
+    check(/mm$/.test(await page.locator('#itemList li[aria-selected="true"] .meta').innerText()), 'the spot is listed with its radius');
+    await page.fill('input[type="number"][data-key="radius"]', '6');
+    await page.dispatchEvent('input[type="number"][data-key="radius"]', 'change');
+    await idle();
+    const spotNotes = await page.locator('#spotNotes').innerText();
+    check(/Moved [1-9][\d,]* points inside the spot/.test(spotNotes), 'the spot reports what it moved on the clumped bumps', spotNotes.replace(/\s+/g, ' ').slice(0, 120));
+    check(/1 clean-up spot applied/.test(await page.locator('#modelNotes').innerText()), 'the model notes count the spot');
+    const spotted = await download('clump-spot.stl');
+    check((await triangleCount()) === clumpTriangles && Math.abs(spotted.volume - clumpBefore.volume) / clumpBefore.volume < 0.01, 'the download includes the clean-up: same model triangles, volume kept', `${await triangleCount()} vs ${clumpTriangles} / ${spotted.volume?.toFixed(0)} vs ${clumpBefore.volume?.toFixed(0)}`);
+    check(!fs.readFileSync(path.join(out, 'clump-spot.stl')).equals(fs.readFileSync(path.join(out, 'clump-before.stl'))), 'the downloaded model actually changed');
+    // on the flat part of the plate the spot honestly does nothing
+    await page.evaluate(() => (document.querySelector('#posX').closest('details').open = true));
+    await page.fill('#posX', '-10');
+    await page.dispatchEvent('#posX', 'change');
+    await page.fill('#posY', '-10');
+    await page.dispatchEvent('#posY', 'change');
+    await idle();
+    check(/Moved 0 points/.test(await page.locator('#spotNotes').innerText()), 'a spot on a flat area reports no change', await page.locator('#spotNotes').innerText());
+    await page.click('#undoBtn');
+    await page.click('#undoBtn');
+    await idle();
+    check(/Moved [1-9]/.test(await page.locator('#spotNotes').innerText()), 'undo moves the spot back onto the bumps');
+    await page.click('#deleteBtn');
+    await idle();
+    check(!/clean-up spot/.test(await page.locator('#modelNotes').innerText()), 'deleting the spot removes it from the model');
+    await page.click('#itemList li:first-child');
+    await idle();
   }
 
   console.log('\nno model');

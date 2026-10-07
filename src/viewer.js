@@ -34,6 +34,7 @@ const COLORS = {
   emboss: 0xff8a2b,
   engrave: 0xff3b6b,
   detached: 0xb8bcc8, // an item that is not touching the model
+  spot: 0x22d3a6, // a clean-up spot's ring
   marker: 0x22d3a6,
 };
 
@@ -203,18 +204,18 @@ export class Viewer {
   /* ---------------------------------------------------------- overlays */
 
   #overlayMaterial(mode) {
-    return mode === 'engrave'
-      ? new MeshStandardMaterial({ color: COLORS.engrave, roughness: 0.6, flatShading: true, transparent: true, opacity: 0.6, depthTest: false })
-      : new MeshStandardMaterial({ color: COLORS.emboss, roughness: 0.45, flatShading: true, transparent: true, opacity: 1 });
+    if (mode === 'engrave') return new MeshStandardMaterial({ color: COLORS.engrave, roughness: 0.6, flatShading: true, transparent: true, opacity: 0.6, depthTest: false });
+    if (mode === 'spot') return new MeshStandardMaterial({ color: COLORS.spot, roughness: 0.5, flatShading: true, transparent: true, opacity: 0.7 });
+    return new MeshStandardMaterial({ color: COLORS.emboss, roughness: 0.45, flatShading: true, transparent: true, opacity: 1 });
   }
 
   #styleOverlay(o) {
-    const base = o.mode === 'engrave' ? 0.6 : 1;
+    const base = o.mode === 'engrave' ? 0.6 : o.mode === 'spot' ? 0.7 : 1;
     const fade = o.selected ? 1 : 0.55;
     const stale = o.stale ? 0.7 : 1;
     const loose = o.detached ? 0.55 : 1;
     o.mesh.material.opacity = base * fade * stale * loose;
-    o.mesh.material.color.set(o.detached ? COLORS.detached : o.mode === 'engrave' ? COLORS.engrave : COLORS.emboss);
+    o.mesh.material.color.set(o.detached ? COLORS.detached : o.mode === 'engrave' ? COLORS.engrave : o.mode === 'spot' ? COLORS.spot : COLORS.emboss);
     o.mesh.material.wireframe = !!o.detached;
     o.mesh.material.transparent = true;
     o.mesh.renderOrder = o.mode === 'engrave' ? 5 : 0;

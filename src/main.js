@@ -1,5 +1,5 @@
 import { Matrix4, Vector3 } from 'three';
-import { Document, ITEM_DEFAULTS, createPart, fontIds, frameOf, hasText, isPart, itemLabel, maxSize, placeKey, shapeKey, stableKey } from './document.js';
+import { Document, ITEM_DEFAULTS, createPart, createSpot, fontIds, frameOf, hasText, isPart, isSpot, itemLabel, maxSize, placeKey, shapeKey, spotsOf, stableKey } from './document.js';
 import { createEngineClient } from './engineClient.js';
 import { ENHANCE_DEFAULTS, isEnhanceActive } from './enhance.js';
 import { Viewer } from './viewer.js';
@@ -180,6 +180,16 @@ function describeModel() {
   } else if (isEnhanceActive(doc.base?.enhance) && compareOriginal) {
     notes.push({ level: 'info', text: 'Showing the original model; untick "Show original" to see it enhanced.' });
   }
+  if (info.spots?.length) {
+    const applied = info.spots.filter((s) => !s.empty && !s.failed);
+    const moved = applied.reduce((n, s) => n + s.verticesMoved, 0);
+    notes.push({
+      level: applied.length ? 'ok' : 'warn',
+      text: applied.length
+        ? `${applied.length} clean-up ${applied.length === 1 ? 'spot' : 'spots'} applied: ${moved.toLocaleString()} points moved. Downloads include them.`
+        : 'The clean-up spots are not on the model surface yet.',
+    });
+  }
   return { text, notes };
 }
 
@@ -259,7 +269,7 @@ async function loadModel(kind, { bytes = null, name = 'model' } = {}) {
     lastClick = null;
   }
   sentVersion = version();
-  const pending = client.loadBase({ kind, bytes, name, version: sentVersion });
+  const pending = client.loadBase({ kind, bytes, name, version: sentVersion, spots: spotsOf(doc.items) });
   basePending = pending;
   try {
     const result = await pending;
@@ -295,7 +305,7 @@ async function syncBase() {
   const v = version();
   sentVersion = v;
   const pending = doc.base
-    ? client.updateBase({ version: v, transforms: doc.base.transforms, simplify: doc.base.simplify, enhance: compareOriginal ? null : doc.base.enhance })
+    ? client.updateBase({ version: v, transforms: doc.base.transforms, simplify: doc.base.simplify, enhance: compareOriginal ? null : doc.base.enhance, spots: spotsOf(doc.items) })
     : client.loadBase({ kind: 'none', version: v });
   basePending = pending;
   try {
@@ -453,7 +463,7 @@ const itemDefaults = () => ({
 
 function addItem(text = '', overrides = {}, { focus = true } = {}) {
   const selected = doc.selected;
-  const from = selected && !isPart(selected) ? selected : null; // a selected part lends only its place
+  const from = selected && !isPart(selected) && !isSpot(selected) ? selected : null; // a selected part or spot lends only its place
   const place = lastClick ?? (selected && { position: selected.position, normal: selected.normal }) ?? topCenter();
   const firstLine = from ? { ...from.lines[0], text } : { ...lineDefaults(), text };
   const item = doc.addItem({
@@ -488,6 +498,17 @@ async function addPartFile(file) {
   } finally {
     showProgress(null);
   }
+}
+
+/** Add a clean-up spot at the last click (or where the selected item is, or on top). */
+function addSpot() {
+  if (!modelInfo?.hasModel) return;
+  const selected = doc.selected;
+  const place = lastClick ?? (selected && { position: selected.position, normal: selected.normal }) ?? topCenter();
+  const longest = Math.max(...(modelInfo.size ?? [40]));
+  const radius = Math.round(Math.min(30, Math.max(3, longest * 0.08)) * 2) / 2;
+  doc.addItem({ ...createSpot(), id: undefined, radius, ...place });
+  setStatus('Added a clean-up spot. Drag it onto a clumped area and adjust its radius and strengths in the Clean-up spot card.', 'ok');
 }
 
 /**
@@ -583,8 +604,15 @@ viewer.onPick = ({ point, normal }) => {
 viewer.onSelectItem = (id) => doc.select(id);
 
 viewer.onDrag = ({ itemId, point, normal, done }) => {
-  if (!done && point) doc.updateItem(itemId, { position: point, normal }, { coalesce: 'drag' });
+  const item = doc.items.find((i) => i.id === itemId);
+  if (!item) return;
+  if (!done && point) {
+    // a spot changes the model itself (a costly recompute), so it only lands when dropped; its ring follows the pointer meanwhile
+    if (isSpot(item)) viewer.setOverlayMatrix(itemId, placementMatrix({ ...item, position: point, normal }));
+    else doc.updateItem(itemId, { position: point, normal }, { coalesce: 'drag' });
+  }
   if (done) {
+    if (isSpot(item) && point) doc.updateItem(itemId, { position: point, normal });
     doc.endCoalescing();
     if (point) lastClick = { position: point, normal };
   }
@@ -619,7 +647,7 @@ function refreshPreviews() {
           viewer.removeOverlay(item.id);
           previewInfo.delete(item.id);
         } else {
-          viewer.setOverlay(item.id, { geometry: r.geometry, matrix: r.matrix, mode: item.mode, selected: item.id === doc.state.selectedId });
+          viewer.setOverlay(item.id, { geometry: r.geometry, matrix: r.matrix, mode: isSpot(item) ? 'spot' : item.mode, selected: item.id === doc.state.selectedId });
           previewInfo.set(item.id, { size: r.size, notes: r.notes, stats: r.stats });
           const loose = r.notes.some((n) => n.code === 'NOT_TOUCHING');
           viewer.setOverlayDetached(item.id, loose);
@@ -727,6 +755,9 @@ function renderPartHint(item) {
   $('partInfo').classList.toggle('warn', !!loose);
 }
 
+/** Item fields shown as percentages in the controls (stored as fractions, scale as a factor). */
+const PERCENT_KEYS = new Set(['scale', 'sharpen', 'smooth', 'detail', 'deepen', 'evenOut', 'feather']);
+
 let filling = false;
 function fillPanel(item) {
   filling = true;
@@ -736,7 +767,7 @@ function fillPanel(item) {
     document.querySelectorAll('[data-key]').forEach((el) => {
       const key = el.dataset.key;
       const value = item ? item[key] : ITEM_DEFAULTS[key];
-      const shown = key === 'scale' ? Math.round((value ?? 1) * 100) : value;
+      const shown = PERCENT_KEYS.has(key) ? Math.round((value ?? (key === 'scale' ? 1 : 0)) * 100) : value;
       if (el.type === 'radio') el.checked = el.value === String(value);
       else if (el.type === 'checkbox') el.checked = !!value;
       else if (el.type === 'number' || el.type === 'range') {
@@ -745,8 +776,11 @@ function fillPanel(item) {
       } else if (el.value !== String(shown ?? '')) el.value = shown ?? '';
     });
     const part = isPart(item);
-    $('textCard').hidden = part;
+    const spot = isSpot(item);
+    $('textCard').hidden = part || spot;
     $('partCard').hidden = !part;
+    $('spotCard').hidden = !spot;
+    $('styleCard').hidden = spot;
     document.querySelectorAll('.text-only').forEach((el) => (el.hidden = part));
     document.querySelectorAll('.plate-only').forEach((el) => (el.hidden = part || !item || item.plate === 'none'));
     const cutter = part && item.mode === 'engrave';
@@ -974,7 +1008,12 @@ function renderItems() {
       name.textContent = first || 'empty text';
       const meta = document.createElement('span');
       meta.className = 'meta';
-      if (part) {
+      if (isSpot(item)) {
+        glyph.className = 'glyph spot';
+        glyph.textContent = 'S';
+        glyph.title = 'Clean-up spot';
+        meta.textContent = `${fmt(item.radius)} mm`;
+      } else if (part) {
         const joinLabel = { fuse: 'fused', fillet: 'fillet', pegs: 'pegs' }[item.join] ?? item.join;
         const loose = detached.get(item.id) && modelInfo?.hasModel;
         meta.textContent = `${Math.round(item.scale * 100)}% · ${loose ? 'not touching' : item.mode === 'engrave' ? 'cut out' : joinLabel}`;
@@ -997,7 +1036,9 @@ function renderSelectedInfo() {
   const info = sel ? previewInfo.get(sel.id) : null;
   const notes = [...(info?.notes ?? [])];
   if (sel && !fontIds(sel).every((id) => fonts.has(id))) notes.unshift({ level: 'warn', text: 'A font used by this text is not available – choose another one.' });
-  renderNotes($('textNotes'), notes, {
+  const spot = isSpot(sel);
+  renderNotes($('spotNotes'), spot ? notes : [], { NOT_TOUCHING: () => modelInfo?.hasModel && { label: 'Snap to model', run: snapToModel }, SPOT_EMPTY: () => modelInfo?.hasModel && { label: 'Snap to model', run: snapToModel } });
+  renderNotes($('textNotes'), spot ? [] : notes, {
     CUT_THROUGH: (n) =>
       n.suggestedDepth && {
         label: `Use ${n.suggestedDepth} mm`,
@@ -1040,6 +1081,8 @@ function render() {
   pegsRadio.parentElement.title = engraveAvailable()
     ? 'Print the part separately and glue it into matching holes'
     : 'Pegs need a watertight model to make holes in';
+  $('addSpotBtn').disabled = !modelInfo?.watertight;
+  $('addSpotBtn').title = modelInfo?.watertight ? 'Clean up a clumped area of the model' : 'Clean-up spots need a watertight model';
   $('undoBtn').disabled = !doc.canUndo;
   $('redoBtn').disabled = !doc.canRedo;
   $('deleteBtn').disabled = !sel;
@@ -1130,7 +1173,7 @@ function bindControls() {
       if (el.type === 'radio' && !el.checked) return;
       let value = readValue(el);
       if (typeof value === 'number' && Number.isNaN(value)) return;
-      if (key === 'scale') value = Math.max(0.01, value / 100);
+      if (PERCENT_KEYS.has(key)) value = key === 'scale' ? Math.max(0.01, value / 100) : Math.min(1, Math.max(0, value / 100));
       let sel = doc.selected;
       if (!sel) sel = addItem('', {}, { focus: false });
       // keep paired slider/number inputs in sync
@@ -1188,6 +1231,7 @@ function bindControls() {
 
   document.querySelectorAll('[data-side]').forEach((btn) => btn.addEventListener('click', () => snapToSide(btn.dataset.side, { look: true })));
   $('snapBtn').addEventListener('click', snapToModel);
+  $('addSpotBtn').addEventListener('click', addSpot);
   document.querySelectorAll('[data-turn]').forEach((btn) => btn.addEventListener('click', () => turnPart(btn.dataset.turn)));
   document.querySelectorAll('[data-nudge]').forEach((btn) =>
     btn.addEventListener('click', () => {

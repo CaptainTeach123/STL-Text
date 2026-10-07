@@ -99,6 +99,63 @@
           </details>
         </section>
 
+        <!-- ============================================================ spot -->
+        <section class="card" aria-labelledby="h-spot" id="spotCard" hidden>
+          <h2 id="h-spot"><span class="step">3</span> Clean-up spot</h2>
+          <p class="hint">A round area that gets a stronger, local clean-up: details that have run together are separated, uneven ones evened out, and relief boosted. Drag the ring onto a clumped area.</p>
+          <div class="grid2">
+            <label class="field num" title="How large an area the spot covers">
+              <span>Radius <small>mm</small></span>
+              <input type="number" data-key="radius" min="0.5" max="200" step="0.5" value="8" />
+              <input type="range" data-key="radius" min="1" max="40" step="0.5" value="8" aria-label="Radius" />
+            </label>
+            <label class="field num" title="How much of the radius fades out gently so the clean-up blends into the rest of the model">
+              <span>Soft edge <small>%</small></span>
+              <input type="number" data-key="feather" min="0" max="100" step="5" value="50" />
+              <input type="range" data-key="feather" min="0" max="100" step="5" value="50" aria-label="Soft edge" />
+            </label>
+          </div>
+          <label class="field num" title="Deepens the valleys between details so merged berries, leaves and scrolls read as separate shapes">
+            <span>Separate details <small>%</small></span>
+            <input type="number" data-key="deepen" min="0" max="100" step="5" value="60" />
+            <input type="range" data-key="deepen" min="0" max="100" step="5" value="60" aria-label="Separate details" />
+          </label>
+          <label class="field num" title="Gives weak details more depth and very strong ones a little less, so the area reads evenly">
+            <span>Even out depth <small>%</small></span>
+            <input type="number" data-key="evenOut" min="0" max="100" step="5" value="40" />
+            <input type="range" data-key="evenOut" min="0" max="100" step="5" value="40" aria-label="Even out depth" />
+          </label>
+          <label class="field num" title="Deepens fine relief so it stands out">
+            <span>Boost relief <small>%</small></span>
+            <input type="number" data-key="detail" min="0" max="100" step="5" value="50" />
+            <input type="range" data-key="detail" min="0" max="100" step="5" value="50" aria-label="Boost relief" />
+          </label>
+          <div class="grid2">
+            <label class="field num" title="Makes edges inside the spot crisp">
+              <span>Sharpen edges <small>%</small></span>
+              <input type="number" data-key="sharpen" min="0" max="100" step="5" value="0" />
+            </label>
+            <label class="field num" title="Removes small lumps and ripples inside the spot">
+              <span>Smooth bumps <small>%</small></span>
+              <input type="number" data-key="smooth" min="0" max="100" step="5" value="0" />
+            </label>
+          </div>
+          <details class="disclosure">
+            <summary>Fine-tune</summary>
+            <div class="grid2">
+              <label class="field num" title="How large the details to work on are. 0 picks a size from the mesh.">
+                <span>Relief size <small>mm · 0 = auto</small></span>
+                <input type="number" data-key="featureSize" min="0" max="50" step="0.1" value="0" />
+              </label>
+              <label class="field num" title="How far any point inside the spot may move. 0 = about one triangle size; allow more to separate deeply merged details.">
+                <span>Max move <small>mm · 0 = auto</small></span>
+                <input type="number" data-key="maxMove" min="0" max="10" step="0.05" value="0" />
+              </label>
+            </div>
+          </details>
+          <ul class="notes" id="spotNotes" aria-live="polite"></ul>
+        </section>
+
         <!-- ============================================================ texts -->
         <section class="card" aria-labelledby="h-texts">
           <h2 id="h-texts"><span class="step">2</span> Texts &amp; parts</h2>
@@ -106,6 +163,7 @@
           <div class="row">
             <button type="button" id="addTextBtn" class="btn">+ Add text</button>
             <button type="button" id="openPartBtn" class="btn" title="Attach another STL file to the model">+ Add part (STL)…</button>
+            <button type="button" id="addSpotBtn" class="btn" title="Clean up a clumped area of the model">+ Clean-up spot</button>
             <input id="partFile" type="file" accept=".stl,model/stl" hidden />
             <button type="button" id="duplicateBtn" class="btn">Duplicate</button>
             <button type="button" id="deleteBtn" class="btn ghost">Delete</button>
@@ -237,7 +295,7 @@
         </section>
 
         <!-- ====================================================== raised / cut -->
-        <section class="card" aria-labelledby="h-style">
+        <section class="card" aria-labelledby="h-style" id="styleCard">
           <h2 id="h-style"><span class="step">4</span> <span id="styleTitle">Raised or cut</span></h2>
           <fieldset class="seg wide" aria-label="Mode">
             <label><input type="radio" name="mode" data-key="mode" value="emboss" checked /><span id="modeAddLabel">Raised <small>emboss</small></span></label>

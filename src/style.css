@@ -505,6 +505,9 @@ input[type='range'] {
 .items li .glyph.part {
   background: #3b82f6;
 }
+.items li .glyph.spot {
+  background: #0f9d84;
+}
 .items li .name {
   flex: 1;
   min-width: 0;

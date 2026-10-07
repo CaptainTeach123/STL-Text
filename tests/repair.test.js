@@ -148,7 +148,7 @@ describe('repairToManifold', () => {
     expect(r.report.repaired).toBe(true);
     expect(r.report.weldTolerance).toBeGreaterThan(0);
     expect(r.report.holesFilled).toBe(0);
-    expect(r.text).toMatch(/^Repaired: welded \d+ vertices \(tolerance [\d.e-]+ mm\)\.$/);
+    expect(r.text).toMatch(/^Repaired: welded \d+ vertices \(gaps up to [\d.e-]+ mm\)\.$/);
   });
 
   it('welds and fills holes in the same mesh', () => {
@@ -242,7 +242,7 @@ describe('repairToManifold', () => {
     expect(report.shellsDropped).toBe(1);
     expect(report.shells).toBe(0);
     expect(report.outputTriangles).toBe(0);
-    expect(describeRepair(report)).toMatch(/^Could not repair: .*dropped 1 shell that could not be repaired\.$/);
+    expect(describeRepair(report)).toMatch(/^Could not repair: .*one piece \(1 faces\) couldn't be repaired — it is kept as-is in your download\.$/);
   });
 
   it('fills a big hole where a whole face is missing', () => {

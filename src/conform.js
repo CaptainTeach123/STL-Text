@@ -24,6 +24,7 @@ const bvhCache = new WeakMap();
 function bvhFor(geometry) {
   const position = geometry?.attributes?.position;
   if (!position || position.count < 3) return null;
+  if (geometry.boundsTree) return geometry.boundsTree; // built by the engine for picking
   let bvh = bvhCache.get(geometry);
   if (!bvh) {
     const copy = new BufferGeometry();
@@ -77,21 +78,32 @@ export function createSurfaceSampler(geometry, placement, options = {}) {
     below = Math.min(below, reach);
   }
 
-  return {
-    heightAt(x, y) {
-      if (!bvh) return NaN;
-      ray.origin.set(x, y, above).applyMatrix4(placement);
-      const hits = bvh.raycast(ray, DoubleSide, 0, above + below);
-      let best = NaN;
-      let bestAbs = Infinity;
-      for (const hit of hits) {
-        const z = local.copy(hit.point).applyMatrix4(inverse).z;
-        if (Math.abs(z) < bestAbs) {
-          bestAbs = Math.abs(z);
-          best = z;
-        }
+  const sample = (x, y) => {
+    if (!bvh) return { z: NaN, wall: Infinity };
+    ray.origin.set(x, y, above).applyMatrix4(placement);
+    const hits = bvh.raycast(ray, DoubleSide, 0, above + below);
+    let best = NaN;
+    let bestAbs = Infinity;
+    const zs = [];
+    for (const hit of hits) {
+      const z = local.copy(hit.point).applyMatrix4(inverse).z;
+      zs.push(z);
+      if (Math.abs(z) < bestAbs) {
+        bestAbs = Math.abs(z);
+        best = z;
       }
-      return best;
+    }
+    // the next surface crossing behind the chosen one = the wall thickness there
+    let wall = Infinity;
+    for (const z of zs) if (z < best - 1e-6) wall = Math.min(wall, best - z);
+    return { z: best, wall };
+  };
+
+  return {
+    /** Local-Z height of the surface at (x, y) and the wall thickness behind it. */
+    sample,
+    heightAt(x, y) {
+      return sample(x, y).z;
     },
     dispose() {
       if (bvh && bvhCache.get(geometry) === bvh) bvhCache.delete(geometry);
@@ -162,10 +174,18 @@ export function conformSolid(flatSolid, sampler, options = {}) {
   const width = max[0] - min[0];
   const height = max[1] - min[1];
   const flatTolerance = options.flatTolerance ?? 0.02;
+  const maxSlopeDeg = options.maxSlopeDeg ?? 60;
+  const reach = options.reach ?? 5;
+  const wallLimit = options.wallLimit ?? Infinity;
+  const emptyStats = {
+    samples: 0, misses: 0, missFraction: 0, touches: false, minHeight: NaN, maxHeight: NaN, meanHeight: NaN,
+    minWall: Infinity, thinCells: 0, maxSlopeDeg: 0, steep: false, crossesEdge: false, rMin: Infinity,
+    cell: NaN, maxEdge: NaN, grid: [0, 0],
+  };
   const result = (solid, conformed, stats) => ({
     solid,
     conformed,
-    stats: { samples: 0, misses: 0, minHeight: NaN, maxHeight: NaN, cell: NaN, grid: [0, 0], ...stats, triangles: solid.numTri() },
+    stats: { ...emptyStats, ...stats, conformed, triangles: solid.numTri() },
   });
   if (!(width > 0 && height > 0)) return result(flatSolid.translate(0, 0, 0), false, {});
 
@@ -180,30 +200,86 @@ export function conformSolid(flatSolid, sampler, options = {}) {
   const y0 = min[1] - margin;
 
   const h = new Float64Array(nx * ny);
+  const valid = new Uint8Array(nx * ny);
   let misses = 0;
   let sum = 0;
   let lo = Infinity;
   let hi = -Infinity;
+  let minWall = Infinity;
+  let thinCells = 0;
+  let touches = false;
+  const probe = sampler.sample ?? ((x, y) => ({ z: sampler.heightAt(x, y), wall: Infinity }));
   for (let j = 0; j < ny; j++) {
     for (let i = 0; i < nx; i++) {
-      const z = sampler.heightAt(x0 + i * cell, y0 + j * cell);
-      h[j * nx + i] = z;
+      const { z, wall } = probe(x0 + i * cell, y0 + j * cell);
+      const k = j * nx + i;
       if (Number.isFinite(z)) {
+        h[k] = z;
+        valid[k] = 1;
         sum += z;
         if (z < lo) lo = z;
         if (z > hi) hi = z;
+        if (Math.abs(z) <= reach) touches = true;
+        if (wall < minWall) minWall = wall;
+        if (wall < wallLimit) thinCells++;
       } else {
-        h[j * nx + i] = NaN;
+        h[k] = NaN;
         misses++;
       }
     }
   }
-  const stats = { samples: h.length, misses, minHeight: lo, maxHeight: hi, cell, grid: [nx, ny] };
+  const stats = {
+    samples: h.length, misses, missFraction: misses / h.length, touches,
+    minHeight: lo, maxHeight: hi, meanHeight: misses === h.length ? NaN : sum / (h.length - misses),
+    minWall, thinCells, cell, grid: [nx, ny],
+  };
   if (misses === h.length) return result(flatSolid.translate(0, 0, 0), false, { ...stats, minHeight: NaN, maxHeight: NaN });
+
+  // slope, steps and curvature from the cells that really hit the surface
+  const tanMax = Math.tan((maxSlopeDeg * Math.PI) / 180);
+  let maxSlope = 0;
+  let crossesEdge = false;
+  let rMin = Infinity;
+  const at = (i, j) => h[j * nx + i];
+  const ok = (i, j) => i >= 0 && j >= 0 && i < nx && j < ny && valid[j * nx + i];
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      if (!ok(i, j)) continue;
+      const gx = ok(i - 1, j) && ok(i + 1, j) ? (at(i + 1, j) - at(i - 1, j)) / (2 * cell) : NaN;
+      const gy = ok(i, j - 1) && ok(i, j + 1) ? (at(i, j + 1) - at(i, j - 1)) / (2 * cell) : NaN;
+      const slope = Math.hypot(Number.isFinite(gx) ? gx : 0, Number.isFinite(gy) ? gy : 0);
+      if (slope > maxSlope) maxSlope = slope;
+      for (const [d2, g, wide] of [
+        [Number.isFinite(gx) ? at(i + 1, j) - 2 * at(i, j) + at(i - 1, j) : NaN, gx, ok(i - 2, j) && ok(i + 2, j) ? at(i + 2, j) - 2 * at(i, j) + at(i - 2, j) : NaN],
+        [Number.isFinite(gy) ? at(i, j + 1) - 2 * at(i, j) + at(i, j - 1) : NaN, gy, ok(i, j - 2) && ok(i, j + 2) ? at(i, j + 2) - 2 * at(i, j) + at(i, j - 2) : NaN],
+      ]) {
+        if (!Number.isFinite(d2)) continue;
+        // a second difference larger than one cell of the steepest allowed slope is a step, not a curve
+        if (Math.abs(d2) > cell * tanMax) crossesEdge = true;
+        // curvature over a two-cell stencil, so the facets of a coarse model don't register as tight bends
+        const hpp = Number.isFinite(wide) ? Math.abs(wide) / (4 * cell * cell) : Math.abs(d2) / (cell * cell);
+        if (hpp > 1e-6) rMin = Math.min(rMin, (1 + g * g) ** 1.5 / hpp);
+      }
+    }
+  }
+  stats.maxSlopeDeg = (Math.atan(maxSlope) * 180) / Math.PI;
+  stats.steep = stats.maxSlopeDeg > maxSlopeDeg;
+  stats.crossesEdge = crossesEdge;
+  stats.rMin = rMin;
+
   if (hi - lo <= flatTolerance) {
-    return result(flatSolid.translate(0, 0, sum / (h.length - misses)), false, stats);
+    return result(flatSolid.translate(0, 0, stats.meanHeight), false, stats);
   }
   if (misses) fillMisses(h, nx, ny);
+
+  // refine just finely enough that the warped facets stay within the chord error
+  const chordError = options.chordError ?? 0.02;
+  let maxEdge = options.maxEdge;
+  if (!(maxEdge > 0)) {
+    maxEdge = Number.isFinite(rMin) ? Math.sqrt(8 * rMin * chordError) : 2;
+    maxEdge = Math.min(Math.max(maxEdge, 0.25), 2, Math.min(width, height) / 3);
+  }
+  stats.maxEdge = maxEdge;
 
   // bilinear interpolation of the grid, clamped to its edges
   const heightAt = (x, y) => {
@@ -219,10 +295,48 @@ export function conformSolid(flatSolid, sampler, options = {}) {
     return bottom * (1 - fy) + top * fy;
   };
 
-  const refined = flatSolid.refineToLength(options.maxEdge ?? cell);
+  const refined = flatSolid.refineToLength(maxEdge);
   const solid = refined.warpBatch((verts, count) => {
     for (let i = 0; i < count; i++) verts[i * 3 + 2] += heightAt(verts[i * 3], verts[i * 3 + 1]);
   });
   refined.delete();
   return result(solid, true, stats);
+}
+
+/**
+ * Plain-language notes about a conformed placement, for the UI.
+ * Each note is { level: 'warn' | 'info', code, text, ...extras }.
+ */
+export function conformNotes(stats, { mode = 'emboss', depth = 1, overlap = 0.4, nozzle = 0.4 } = {}) {
+  const notes = [];
+  if (!stats) return notes;
+  if (!stats.touches) {
+    notes.push({ level: 'warn', code: 'NOT_TOUCHING', text: "This text isn't touching the model. Click the model to place it on the surface." });
+  }
+  if (stats.missFraction > 0.02) {
+    notes.push({ level: 'warn', code: 'OVERHANG', text: 'Part of the text hangs over the edge of the surface.' });
+  }
+  if (stats.steep) {
+    notes.push({
+      level: 'warn',
+      code: 'TOO_CURVED',
+      text: 'The text is wider than this curve can hold; letters near the ends stretch. Try shorter text, smaller letters or two lines.',
+    });
+  }
+  if (stats.crossesEdge) {
+    notes.push({ level: 'warn', code: 'CROSSES_EDGE', text: 'The text crosses an edge or step in the model here.' });
+  }
+  if (mode === 'engrave' && Number.isFinite(stats.minWall) && stats.minWall < depth + nozzle) {
+    notes.push({
+      level: 'warn',
+      code: 'CUT_THROUGH',
+      text: `${depth} mm deep would cut through — the wall here is ${stats.minWall.toFixed(1)} mm.`,
+      suggestedDepth: Math.max(0.1, Math.floor((stats.minWall - nozzle) * 10) / 10),
+    });
+  }
+  if (stats.conformed && stats.maxSlopeDeg > 10) {
+    notes.push({ level: 'info', code: 'FOLLOWS_CURVE', text: 'Text follows the curve here.' });
+  }
+  void overlap;
+  return notes;
 }

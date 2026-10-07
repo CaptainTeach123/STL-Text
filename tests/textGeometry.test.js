@@ -5,6 +5,8 @@ import {
   capHeightUnits,
   fontLabel,
   layoutPolygons,
+  buildCrossSectionInfo,
+  printLimits,
   roundCorners,
   thinStrokeReport,
 } from '../src/textGeometry.js';
@@ -96,36 +98,84 @@ describe('text -> solid', () => {
     expect(area(-0.3)).toBeLessThan(area(0));
   });
 
-  it('rounds corners: fewer sharp vertices, nearly the same area, holes kept', () => {
+  it('rounds corners: more arc vertices, nearly the same area, counters kept', () => {
     const sharp = buildCrossSection(font, 'HE', { size: 10 });
     const rounded = buildCrossSection(font, 'HE', { size: 10, cornerRadius: 0.4 });
     expect(Math.abs(rounded.area() - sharp.area()) / sharp.area()).toBeLessThan(0.03);
-    // every 90° corner becomes an arc, so the vertex count goes up
     expect(rounded.numVert()).toBeGreaterThan(sharp.numVert());
-    // the closing step must not fill the counter of an "O"
     const o = buildCrossSection(font, 'O', { size: 10 });
-    const oRounded = roundCorners(o, 0.4);
-    expect(oRounded.numContour()).toBe(2);
-    [sharp, rounded, o, oRounded].forEach((c) => c.delete());
+    const plain = roundCorners(o, 0.4);
+    expect(plain.cs.numContour()).toBe(2);
+    const both = roundCorners(o, 0.4, { concaveRadius: 0.4 });
+    expect(both.cs.numContour()).toBe(2);
+    [sharp, rounded, o, plain.cs, both.cs].forEach((c) => c.delete());
   });
 
-  it('flags strokes that are too thin to print', () => {
+  it('never erases thin letters when rounding (radius is clamped per part)', () => {
+    const parts = (cs) => {
+      const p = cs.decompose();
+      const n = p.length;
+      p.forEach((c) => c.delete());
+      return n;
+    };
+    const tiny = buildCrossSection(font, 'Hello', { size: 3 });
+    const tinyRounded = roundCorners(tiny, 0.3);
+    expect(parts(tinyRounded.cs)).toBe(parts(tiny)); // H e l l o
+    expect(tinyRounded.limited).toBe(true);
+    expect(tinyRounded.cs.isEmpty()).toBe(false);
+
     const big = buildCrossSection(font, 'Hello', { size: 10 });
-    const ok = thinStrokeReport(big, 0.8);
+    const bigRounded = roundCorners(big, 1);
+    expect(parts(bigRounded.cs)).toBe(parts(big));
+    expect(Math.abs(bigRounded.cs.area() - big.area()) / big.area()).toBeLessThan(0.1);
+
+    const pacifico = loadFont('pacifico', 'pacifico-latin-400-normal.woff');
+    const script = buildCrossSection(pacifico, 'Hello', { size: 12 });
+    const scriptRounded = roundCorners(script, 1);
+    expect(scriptRounded.cs.area()).toBeGreaterThan(0.8 * script.area());
+    const small = buildCrossSection(pacifico, 'Hello', { size: 6 });
+    const smallRounded = roundCorners(small, 0.4);
+    expect(smallRounded.cs.isEmpty()).toBe(false);
+    expect(smallRounded.limited).toBe(true);
+
+    const info = buildCrossSectionInfo(font, 'Hello', { size: 3, cornerRadius: 0.3 });
+    expect(info.rounding.limited).toBe(true);
+    expect(info.rounding.requested).toBe(0.3);
+    expect(buildCrossSectionInfo(font, 'Hi', { size: 10 }).rounding).toBeNull();
+    [tiny, tinyRounded.cs, big, bigRounded.cs, script, scriptRounded.cs, small, smallRounded.cs, info.cs].forEach((c) => c.delete());
+  });
+
+  it('flags strokes that are too thin to print, per part', () => {
+    const big = buildCrossSection(font, 'Hello', { size: 10 });
+    const ok = thinStrokeReport(big, { minStroke: 0.8, minGap: 0.4 });
     expect(ok.thin).toBe(false);
     expect(ok.lostParts).toBe(0);
-    expect(ok.meanStroke).toBeGreaterThan(1.2); // Inter Bold at 10 mm is ~1.7 mm thick
+    expect(ok.minStroke).toBeGreaterThan(1.2);
+    expect(ok.narrowGaps).toBe(false);
+    expect(ok.parts).toHaveLength(5);
+    ok.parts.forEach((p) => expect(p.bounds.max[0]).toBeGreaterThan(p.bounds.min[0]));
+
+    // Inter Bold X at 4 mm has ~0.67 mm strokes: nothing vanishes, but almost no area survives
+    const x = buildCrossSection(font, 'X', { size: 4 });
+    expect(thinStrokeReport(x, { minStroke: 0.8 }).thin).toBe(true);
 
     const tiny = buildCrossSection(font, 'Hello', { size: 3 });
-    const bad = thinStrokeReport(tiny, 0.8);
+    const bad = thinStrokeReport(tiny, { minStroke: 0.8 });
     expect(bad.thin).toBe(true);
-    expect(bad.lostParts).toBeGreaterThan(0);
-    expect(bad.meanStroke).toBeLessThan(0.8);
+    expect(bad.lostParts).toBeGreaterThanOrEqual(1);
 
-    // thinning the outline with a negative weight is caught too
     const thinned = buildCrossSection(font, 'Hello', { size: 10, weight: -0.5 });
-    expect(thinStrokeReport(thinned, 0.8).thin).toBe(true);
-    [big, tiny, thinned].forEach((c) => c.delete());
+    expect(thinStrokeReport(thinned, { minStroke: 0.8 }).thin).toBe(true);
+
+    const tight = buildCrossSection(font, 'Hello', { size: 10, letterSpacing: -1.2 });
+    expect(thinStrokeReport(tight, { minStroke: 0.8, minGap: 1.5 }).narrowGaps).toBe(true);
+    [big, x, tiny, thinned, tight].forEach((c) => c.delete());
+  });
+
+  it('printLimits scale with the nozzle and mode', () => {
+    expect(printLimits({ nozzle: 0.4, mode: 'emboss' })).toEqual({ minStroke: 0.8, minGap: 0.4 });
+    expect(printLimits({ nozzle: 0.4, mode: 'engrave' })).toEqual({ minStroke: 0.48, minGap: 0.8 });
+    expect(printLimits({ nozzle: 0.6 }).minStroke).toBeCloseTo(1.2, 6);
   });
 
   it('mirrors horizontally without changing the footprint', () => {

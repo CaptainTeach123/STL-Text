@@ -34,7 +34,7 @@ const NO_PROGRESS = () => {};
  *   The caller owns the manifold and must `.delete()` it.
  */
 export function repairToManifold(soup, options = {}) {
-  const { maxWeldFraction = 1e-3, maxHoleEdges = 2000, onProgress = NO_PROGRESS } = options;
+  const { maxWeldFraction = 1e-3, maxWeldAbsolute = 0.05, maxHoleEdges = 2000, onProgress = NO_PROGRESS } = options;
   const report = {
     watertight: false,
     repaired: false,
@@ -47,13 +47,25 @@ export function repairToManifold(soup, options = {}) {
     shellsInverted: 0,
     shells: 0,
     shellsDropped: 0,
+    passthroughTriangles: 0,
     notes: [],
   };
+  const passthroughs = []; // soups of triangles that could not join a closed shell
   const finish = (solid) => {
+    const passthrough = concatSoups(passthroughs);
+    report.passthroughTriangles = passthrough.length / 9;
+    if (report.shellsDropped) {
+      const faces = report.passthroughTriangles.toLocaleString('en-US');
+      report.notes.push(
+        report.shellsDropped === 1
+          ? `One piece (${faces} faces) couldn't be repaired — it is kept as-is in your download`
+          : `${report.shellsDropped} pieces (${faces} faces) couldn't be repaired — they are kept as-is in your download`,
+      );
+    }
     report.watertight = solid !== null;
     report.outputTriangles = solid ? solid.numTri() : 0;
     report.repaired = report.notes.length > 0;
-    return { manifold: solid, report };
+    return { manifold: solid, passthrough, report };
   };
 
   // 1. Drop NaN, zero-area and duplicate triangles; weld exactly coincident corners.
@@ -66,6 +78,21 @@ export function repairToManifold(soup, options = {}) {
     report.notes.push('No usable triangles');
     return finish(null);
   }
+  const bbox = boundsOf(vp);
+  const referenceVolume = Math.abs(signedVolume(vp, tri));
+  const rejected = [];
+  // A tolerant weld must not change the shape: refuse rungs that empty the
+  // mesh, move its volume by more than 1 % or shrink its bounding box.
+  const acceptable = (m, tolerance) => {
+    if (m.isEmpty()) return false;
+    const volume = Math.abs(m.volume());
+    if (referenceVolume > 0 && Math.abs(volume - referenceVolume) > 0.01 * referenceVolume) return false;
+    const { min, max } = m.boundingBox();
+    for (let a = 0; a < 3; a++) {
+      if (min[a] - bbox.min[a] > tolerance + 1e-9 || bbox.max[a] - max[a] > tolerance + 1e-9) return false;
+    }
+    return true;
+  };
 
   // 2. Weld with Manifold's own merge(): exactly first, then with ever larger
   //    tolerances (only when open-edge vertices are close enough for that to matter).
@@ -76,6 +103,7 @@ export function repairToManifold(soup, options = {}) {
   let weldedVertices = 0;
   let collapsed = 0;
   const attempt = (tolerance) => {
+    const before = { tri, edges, weldedVertices, collapsed, weldTolerance: report.weldTolerance };
     const mesh = mergedMesh(vp, tri, tolerance);
     const merged = mesh.mergeFromVert?.length ?? 0;
     if (merged) { // carry the welds over to our own index buffer
@@ -88,11 +116,18 @@ export function repairToManifold(soup, options = {}) {
       report.weldTolerance = tolerance;
     }
     if (merged || tolerance === 0) solid = tryOfMesh(mesh); // otherwise the outcome is unchanged
+    if (solid && tolerance > 0 && !acceptable(solid, tolerance)) {
+      solid.delete();
+      solid = null;
+      ({ tri, edges, weldedVertices, collapsed } = before);
+      report.weldTolerance = before.weldTolerance;
+      rejected.push(tolerance);
+    }
   };
   attempt(0);
   if (!solid) {
     edges = buildEdges(tri, V);
-    const ladder = weldLadder(clean.diag, maxWeldFraction);
+    const ladder = weldLadder(clean.diag, maxWeldFraction, maxWeldAbsolute);
     if (ladder.length && hasCloseBoundaryVertices(vp, tri, edges, ladder[ladder.length - 1])) {
       for (const tolerance of ladder) {
         attempt(tolerance);
@@ -102,7 +137,7 @@ export function repairToManifold(soup, options = {}) {
   }
   if (weldedVertices) {
     report.notes.push(`Welded ${plural(weldedVertices, 'vertex', 'vertices')}${
-      report.weldTolerance ? ` (tolerance ${formatLength(report.weldTolerance)} mm)` : ''}`);
+      report.weldTolerance ? ` (gaps up to ${formatLength(report.weldTolerance)} mm)` : ''}`);
   }
   if (collapsed) {
     report.degenerateRemoved += collapsed;
@@ -116,17 +151,89 @@ export function repairToManifold(soup, options = {}) {
   } else {
     // 3. Explicit topology repair on the index buffer.
     onProgress('Repairing topology');
-    ({ vp, tri } = repairTopology(vp, tri, edges, maxHoleEdges, report, onProgress));
+    let fillStart;
+    ({ vp, tri, fillStart } = repairTopology(vp, tri, edges, maxHoleEdges, report, onProgress));
     onProgress('Building solid');
-    parts = buildShells(vp, tri, report.weldTolerance, report);
+    ({ parts } = buildShells(vp, tri, report.weldTolerance, report, passthroughs, fillStart));
   }
 
   onProgress('Combining shells');
-  const result = assembleShells(parts, report);
-  if (report.shellsDropped) {
-    report.notes.push(`Dropped ${plural(report.shellsDropped, 'shell')} that could not be repaired`);
+  let result = assembleShells(parts, report, passthroughs);
+  if (result && report.weldTolerance > 0) {
+    // don't let a coarse weld tolerance propagate into every later boolean
+    const tightened = result.setTolerance(Math.max(1e-6 * clean.diag, 1e-5));
+    result.delete();
+    result = tightened;
   }
   return finish(result);
+}
+
+/** Axis-aligned bounds of a vertex array. */
+function boundsOf(vp) {
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < vp.length; i += 3) {
+    for (let a = 0; a < 3; a++) {
+      const v = vp[i + a];
+      if (v < min[a]) min[a] = v;
+      if (v > max[a]) max[a] = v;
+    }
+  }
+  return { min, max };
+}
+
+/** Signed volume of an indexed triangle mesh (sum of origin tetrahedra). */
+function signedVolume(vp, tri) {
+  let six = 0;
+  for (let t = 0; t < tri.length; t += 3) {
+    const a = tri[t] * 3, b = tri[t + 1] * 3, c = tri[t + 2] * 3;
+    const ax = vp[a], ay = vp[a + 1], az = vp[a + 2];
+    const bx = vp[b], by = vp[b + 1], bz = vp[b + 2];
+    const cx = vp[c], cy = vp[c + 1], cz = vp[c + 2];
+    six += ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz) + az * (bx * cy - by * cx);
+  }
+  return six / 6;
+}
+
+/** Triangle soup (9 floats per triangle) of an indexed mesh. */
+function soupOf(vp, tri) {
+  const out = new Float32Array(tri.length * 3);
+  for (let i = 0; i < tri.length; i++) {
+    const v = tri[i] * 3;
+    out[i * 3] = vp[v];
+    out[i * 3 + 1] = vp[v + 1];
+    out[i * 3 + 2] = vp[v + 2];
+  }
+  return out;
+}
+
+/** Triangle soup of a Manifold's surface. */
+function soupOfManifold(m) {
+  const mesh = m.getMesh();
+  const stride = mesh.numProp;
+  const tri = mesh.triVerts;
+  const out = new Float32Array(tri.length * 3);
+  for (let i = 0; i < tri.length; i++) {
+    const v = tri[i] * stride;
+    out[i * 3] = mesh.vertProperties[v];
+    out[i * 3 + 1] = mesh.vertProperties[v + 1];
+    out[i * 3 + 2] = mesh.vertProperties[v + 2];
+  }
+  return out;
+}
+
+/** Concatenate triangle soups (an empty Float32Array when there are none). */
+function concatSoups(soups) {
+  const parts = soups.filter((s) => s && s.length);
+  if (!parts.length) return new Float32Array(0);
+  if (parts.length === 1) return parts[0];
+  const out = new Float32Array(parts.reduce((n, p) => n + p.length, 0));
+  let offset = 0;
+  for (const p of parts) {
+    out.set(p, offset);
+    offset += p.length;
+  }
+  return out;
 }
 
 /**
@@ -274,9 +381,12 @@ function dropDegenerate(tri) {
 // Step 2: welding with Manifold
 
 /** Positive weld tolerances to try, in increasing order. */
-function weldLadder(diag, maxWeldFraction) {
+function weldLadder(diag, maxWeldFraction, maxAbsolute = Infinity) {
   if (!(maxWeldFraction > 0)) return [];
-  return [...WELD_LADDER.filter((f) => f < maxWeldFraction), maxWeldFraction].map((f) => f * diag);
+  const rungs = [...WELD_LADDER.filter((f) => f < maxWeldFraction), maxWeldFraction]
+    .map((f) => Math.min(f * diag, maxAbsolute))
+    .filter((t) => t > 0);
+  return [...new Set(rungs)].sort((a, b) => a - b);
 }
 
 /**
@@ -742,25 +852,36 @@ function repairTopology(vp, tri, edges, maxHoleEdges, report, onProgress) {
   }
 
   onProgress('Filling holes');
+  const fillStart = tri.length; // fill triangles are appended after the originals
   const holes = fillHoles(vp, tri, edges, maxHoleEdges);
   if (holes.filled) {
     report.holesFilled = holes.filled;
     report.notes.push(`Filled ${plural(holes.filled, 'hole')}`);
   }
   if (holes.skipped) report.notes.push(`Skipped ${plural(holes.skipped, 'hole')} with more than ${maxHoleEdges} edges`);
-  return { vp: holes.vp, tri: holes.tri };
+  return { vp: holes.vp, tri: holes.tri, fillStart };
 }
 
 /** Step 3e: one Manifold per connected shell; shells that fail are dropped. */
-function buildShells(vp, tri, tolerance, report) {
+function buildShells(vp, tri, tolerance, report, passthroughs = [], fillStart = tri.length) {
   const V = vp.length / 3;
   const { count, compOf } = components(tri, buildEdges(tri, V));
   const parts = [];
+  // A shell that cannot be closed, or closes to nothing, passes through with
+  // the triangles the file actually contained (never with our fill patches).
+  const solidOrPass = (shellVp, shellTri, originals) => {
+    const m = tryOfMesh(mergedMesh(shellVp, shellTri, tolerance));
+    if (m && Math.abs(m.volume()) > 0) {
+      parts.push(m);
+      return;
+    }
+    m?.delete();
+    report.shellsDropped++;
+    passthroughs.push(originals);
+  };
   if (count <= 1) {
-    const m = tryOfMesh(mergedMesh(vp, tri, tolerance));
-    if (m) parts.push(m);
-    else report.shellsDropped++;
-    return parts;
+    solidOrPass(vp, tri, soupOf(vp, tri.subarray(0, fillStart)));
+    return { parts };
   }
   // Bucket triangles by component, then compact each shell's vertices.
   const T = tri.length / 3;
@@ -789,11 +910,14 @@ function buildShells(vp, tri, tolerance, report) {
       shellVp[i * 3 + 2] = vp[verts[i] * 3 + 2];
       map[verts[i]] = -1;
     }
-    const m = tryOfMesh(mergedMesh(shellVp, shellTri, tolerance));
-    if (m) parts.push(m);
-    else report.shellsDropped++;
+    // original (non-fill) triangles of this component, in input coordinates
+    const originalIds = [];
+    for (let i = s; i < e; i++) if (compTris[i] * 3 < fillStart) originalIds.push(compTris[i]);
+    const originals = new Uint32Array(originalIds.length * 3);
+    originalIds.forEach((t, n) => originals.set(tri.subarray(t * 3, t * 3 + 3), n * 3));
+    solidOrPass(shellVp, shellTri, soupOf(vp, originals));
   }
-  return parts;
+  return { parts };
 }
 
 // ---------------------------------------------------------------------------
@@ -836,15 +960,22 @@ function unionAll(solids) {
  * shells are turned right-side-out, and overlapping shells are unioned.
  * Consumes the parts; returns the single result or null.
  */
-function assembleShells(parts, report) {
+function assembleShells(parts, report, passthroughs = []) {
   const { Manifold } = manifold();
   let vols = parts.map((p) => p.volume());
   let inverted = 0;
   if (vols.reduce((s, v) => s + v, 0) < 0) { // the whole model is inside-out
-    const flipped = parts.map(flipSolid);
+    const flipped = parts.map((p) => {
+      const backup = soupOfManifold(p);
+      const f = flipSolid(p);
+      if (!f) {
+        report.shellsDropped++;
+        passthroughs.push(backup);
+      }
+      return f;
+    });
     inverted += parts.length;
     parts = flipped.filter(Boolean);
-    report.shellsDropped += flipped.length - parts.length;
     vols = parts.map((p) => p.volume());
   }
   const positives = [];
@@ -854,10 +985,20 @@ function assembleShells(parts, report) {
   const outerBoxes = positives.map((p) => p.boundingBox());
   for (let i = 0; i < parts.length; i++) {
     if (vols[i] > 0) { expected += vols[i]; continue; }
-    if (vols[i] === 0) { parts[i].delete(); report.shellsDropped++; continue; }
+    if (vols[i] === 0) {
+      passthroughs.push(soupOfManifold(parts[i]));
+      parts[i].delete();
+      report.shellsDropped++;
+      continue;
+    }
     const box = parts[i].boundingBox();
+    const backup = soupOfManifold(parts[i]);
     const flipped = flipSolid(parts[i]);
-    if (!flipped) { report.shellsDropped++; continue; }
+    if (!flipped) {
+      report.shellsDropped++;
+      passthroughs.push(backup);
+      continue;
+    }
     if (outerBoxes.some((outer) => containsBox(outer, box))) {
       cavities.push(flipped);
       expected += vols[i];
@@ -890,6 +1031,11 @@ function assembleShells(parts, report) {
   }
   if (!result) {
     report.notes.push('Boolean combination of shells failed');
+    for (const p of [...positives, ...cavities]) {
+      passthroughs.push(soupOfManifold(p));
+      p.delete();
+    }
+    report.shellsDropped += positives.length + cavities.length;
     return null;
   }
   if (report.shells > 1 && Math.abs(result.volume() - expected) > 1e-6 * Math.abs(expected)) {

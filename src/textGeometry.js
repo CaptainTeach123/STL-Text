@@ -22,7 +22,8 @@ export const DEFAULT_TEXT_OPTIONS = {
   lineSpacing: 1.7, // line pitch as a multiple of the cap height
   align: 'center', // 'left' | 'center' | 'right'
   weight: 0, // outline offset in model units (+ bolder, - thinner)
-  cornerRadius: 0, // round sharp corners by this radius (model units)
+  cornerRadius: 0, // round convex (outer) corners by this radius (model units)
+  concaveRadius: 0, // round concave (inner) corners too, by this radius (0 = leave them sharp)
   mirror: false,
   quality: 'normal',
 };
@@ -182,16 +183,23 @@ export function layoutPolygons(font, text, options = {}) {
   return polygons;
 }
 
+
 /**
  * Build the 2D shape of the text as a Manifold CrossSection centred on the
- * origin. Returns null when the text has no visible outline.
- * The caller owns (and must `.delete()`) the result.
+ * origin, and report what happened on the way:
+ *   cs        the shape (the caller owns it and must `.delete()` it), or null
+ *             when the text has no visible outline
+ *   rounding  { requested, applied, limited } when `cornerRadius > 0`, else
+ *             null; `limited` means thin strokes forced a smaller radius (or
+ *             left a part unrounded), `applied` is the smallest radius used
+ *   polygons  number of glyph contours laid out
  */
-export function buildCrossSection(font, text, options = {}) {
+export function buildCrossSectionInfo(font, text, options = {}) {
   const { CrossSection } = manifold();
   const o = { ...DEFAULT_TEXT_OPTIONS, ...options };
   const polygons = layoutPolygons(font, text, o);
-  if (!polygons.length) return null;
+  const info = { cs: null, rounding: null, polygons: polygons.length };
+  if (!polygons.length) return info;
 
   let cs = CrossSection.ofPolygons(polygons, 'NonZero');
   const step = (next) => {
@@ -199,70 +207,275 @@ export function buildCrossSection(font, text, options = {}) {
     cs = next;
   };
   if (o.weight) step(cs.offset(o.weight, 'Miter', 3, 16));
-  if (o.cornerRadius > 0) step(roundCorners(cs, o.cornerRadius));
+  if (o.cornerRadius > 0) {
+    const rounded = roundCorners(cs, o.cornerRadius, {
+      concaveRadius: o.concaveRadius ?? 0,
+      quality: QUALITY[o.quality] ?? QUALITY.normal,
+    });
+    step(rounded.cs);
+    info.rounding = { requested: o.cornerRadius, applied: rounded.appliedRadius, limited: rounded.limited };
+  }
   step(cs.simplify(Math.max(0.001, o.size * 0.0005)));
   if (cs.isEmpty()) {
     cs.delete();
-    return null;
+    return info;
   }
   const { min, max } = cs.bounds();
   step(cs.translate(-(min[0] + max[0]) / 2, -(min[1] + max[1]) / 2));
-  return cs;
+  info.cs = cs;
+  return info;
 }
 
 /**
- * Round both convex and concave corners of a shape by `radius` (a morphological
- * opening followed by a closing). Returns a new CrossSection; the input is left
- * for the caller to delete.
+ * Build the 2D shape of the text as a Manifold CrossSection centred on the
+ * origin. Returns null when the text has no visible outline.
+ * The caller owns (and must `.delete()`) the result.
  */
-export function roundCorners(cs, radius) {
-  const segments = 12;
-  const inner = cs.offset(-radius, 'Round', 2, segments);
-  const opened = inner.offset(radius, 'Round', 2, segments);
-  inner.delete();
-  const outer = opened.offset(radius, 'Round', 2, segments);
-  opened.delete();
-  const closed = outer.offset(-radius, 'Round', 2, segments);
-  outer.delete();
-  return closed;
+export function buildCrossSection(font, text, options = {}) {
+  return buildCrossSectionInfo(font, text, options).cs;
 }
 
-/**
- * Printability check for strokes thinner than `minWidth` (model units).
- * Shrinking the outline by minWidth/2 makes every stroke at or below the limit
- * vanish, which changes the topology: a piece disappears, a letter splits in
- * two, or a counter (hole) opens up. Any of those means "too thin to print".
- * Returns { thin, lostParts, meanStroke } where meanStroke is an estimate of the
- * typical stroke width (2·area / perimeter) for the hint text.
- */
-export function thinStrokeReport(cs, minWidth) {
-  const area = cs.area();
-  if (!(area > 0)) return { thin: false, lostParts: 0, meanStroke: 0 };
-  const polygons = cs.toPolygons();
+/** Total length of all contours of a CrossSection. */
+function perimeterOf(cs) {
   let perimeter = 0;
-  for (const poly of polygons) {
+  for (const poly of cs.toPolygons()) {
     for (let i = 0; i < poly.length; i++) {
       const [ax, ay] = poly[i];
       const [bx, by] = poly[(i + 1) % poly.length];
       perimeter += Math.hypot(bx - ax, by - ay);
     }
   }
-  const topology = (shape) => {
-    const parts = shape.decompose();
-    const components = parts.length;
-    parts.forEach((p) => p.delete());
-    return { components, holes: shape.numContour() - components };
-  };
-  const before = topology(cs);
-  const shrunk = cs.offset(-minWidth / 2, 'Miter', 3, 8);
-  const after = topology(shrunk);
-  shrunk.delete();
-  return {
-    thin: after.components !== before.components || after.holes < before.holes,
-    lostParts: Math.max(0, before.components - after.components),
-    meanStroke: perimeter > 0 ? (2 * area) / perimeter : 0,
-  };
+  return perimeter;
 }
+
+/**
+ * 2·area / perimeter: exact for a long uniform stroke, a slight under-estimate
+ * of the typical stroke width for anything with corners or counters.
+ */
+function strokeEstimate(cs, area = cs.area()) {
+  const perimeter = perimeterOf(cs);
+  return perimeter > 0 ? (2 * area) / perimeter : 0;
+}
+
+/** Connected components and holes (counters) of a shape. */
+function topology(cs) {
+  if (cs.isEmpty()) return { components: 0, holes: 0 };
+  const parts = cs.decompose();
+  const components = parts.length;
+  parts.forEach((p) => p.delete());
+  return { components, holes: cs.numContour() - components };
+}
+
+/**
+ * Segments per full circle so that an arc of `radius` stays within `tolerance`
+ * of the true circle (r·(1 − cos(π/n)) ≤ tolerance), clamped to [6, 64].
+ */
+function arcSegments(radius, tolerance) {
+  if (!(radius > 0)) return 6;
+  if (!(tolerance > 0)) return 64;
+  const c = Math.max(-1, Math.min(1, 1 - tolerance / radius));
+  const n = Math.ceil(Math.PI / Math.acos(c)); // acos(1) = 0 -> Infinity -> 64
+  return Math.min(64, Math.max(6, Number.isFinite(n) ? n : 64));
+}
+
+/**
+ * Diameter of the widest disc that fits inside `cs`, found by bisection on
+ * `cs.offset(-w/2).isEmpty()`. `hi` must be a width at which the shape has
+ * already vanished.
+ */
+function inscribedDiameter(cs, hi, iterations = 8) {
+  let lo = 0;
+  for (let i = 0; i < iterations; i++) {
+    const mid = (lo + hi) / 2;
+    const shrunk = cs.offset(-mid / 2, 'Miter', 2, 4);
+    const empty = shrunk.isEmpty();
+    shrunk.delete();
+    if (empty) hi = mid;
+    else lo = mid;
+  }
+  return lo;
+}
+
+/** Morphological opening (shrink, then grow back): rounds convex corners, erases anything thinner than 2r. */
+function opening(cs, r, segments) {
+  const inner = cs.offset(-r, 'Round', 2, segments);
+  const out = inner.offset(r, 'Round', 2, segments);
+  inner.delete();
+  return out;
+}
+
+/** Morphological closing (grow, then shrink back): rounds concave corners, fills anything narrower than 2r. */
+function closing(cs, r, segments) {
+  const outer = cs.offset(r, 'Round', 2, segments);
+  const out = outer.offset(-r, 'Round', 2, segments);
+  outer.delete();
+  return out;
+}
+
+// A corner radius above ~half the stroke width erases the stroke; stay clear of it.
+const RADIUS_PER_STROKE = 0.45;
+// A rounded part that kept less than this share of its area has lost features, not corners.
+const MIN_AREA_KEPT = 0.5;
+
+/**
+ * Round one connected part with `radius` (convex) and `concaveRadius`
+ * (concave). The result must keep the part's topology (one piece, same holes)
+ * and at least half its area; otherwise the radius is halved, twice. Returns
+ * `{ cs, radius }` or null when every attempt damaged the part.
+ */
+function roundPart(part, radius, concaveRadius, quality) {
+  const area = part.area();
+  const before = topology(part);
+  let r = radius;
+  for (let attempt = 0; attempt < 3 && r > 1e-6; attempt++) {
+    let out = opening(part, r, arcSegments(r, quality));
+    if (out.isEmpty()) {
+      // 2A/P over-estimated the stroke: measure the real inscribed width instead
+      out.delete();
+      r = RADIUS_PER_STROKE * inscribedDiameter(part, 2 * r);
+      if (!(r > 1e-6)) break;
+      out = opening(part, r, arcSegments(r, quality));
+    }
+    const r2 = Math.min(concaveRadius, r);
+    if (r2 > 0 && !out.isEmpty()) {
+      const closed = closing(out, r2, arcSegments(r2, quality));
+      out.delete();
+      out = closed;
+    }
+    const after = topology(out);
+    const intact =
+      !out.isEmpty() &&
+      out.area() >= MIN_AREA_KEPT * area &&
+      after.components === before.components &&
+      after.holes === before.holes;
+    if (intact) return { cs: out, radius: r };
+    out.delete();
+    r /= 2;
+  }
+  return null;
+}
+
+/**
+ * Round the sharp corners of a shape. Convex corners are rounded by `radius`
+ * (a morphological opening); concave corners only when `concaveRadius > 0`
+ * (a closing by min(concaveRadius, radius), applied after the opening).
+ *
+ * Each connected part is rounded on its own with a radius clamped to 0.45× its
+ * estimated stroke width, so thin letters are never erased; a part that would
+ * still vanish, fragment, lose a counter or more than half its area is kept
+ * unrounded. `quality` is the chord tolerance that sets the arc segment count.
+ *
+ * Returns { cs, appliedRadius, limited, restoredParts }:
+ *   cs             the rounded shape (new; the input is left for the caller)
+ *   appliedRadius  smallest radius actually applied to a part (0 if none was)
+ *   limited        true when any part got less than the requested radius
+ *   restoredParts  parts that were kept unrounded
+ */
+export function roundCorners(cs, radius, { concaveRadius = 0, quality = 0.02 } = {}) {
+  const { CrossSection } = manifold();
+  if (!(radius > 0) || cs.isEmpty()) {
+    return { cs: cs.translate(0, 0), appliedRadius: 0, limited: false, restoredParts: 0 };
+  }
+  const parts = cs.decompose();
+  const pieces = [];
+  const created = [];
+  let applied = Infinity;
+  let limited = false;
+  let restoredParts = 0;
+  for (const part of parts) {
+    const stroke = strokeEstimate(part);
+    const r = stroke > 0 ? Math.min(radius, RADIUS_PER_STROKE * stroke) : radius;
+    const rounded = roundPart(part, r, concaveRadius, quality);
+    if (rounded) {
+      pieces.push(rounded.cs);
+      created.push(rounded.cs);
+      applied = Math.min(applied, rounded.radius);
+      if (rounded.radius < radius) limited = true;
+    } else {
+      pieces.push(part);
+      restoredParts++;
+      limited = true;
+    }
+  }
+  const out = CrossSection.union(pieces);
+  parts.forEach((p) => p.delete());
+  created.forEach((p) => p.delete());
+  return { cs: out, appliedRadius: Number.isFinite(applied) ? applied : 0, limited, restoredParts };
+}
+
+// A part keeping less than this share of its area after shrinking is a thin stroke, even if some of it survives.
+const WEAK_RETENTION = 0.25;
+
+/**
+ * Printability check of a text outline (run it on the final cross-section,
+ * after weight and rounding).
+ *
+ * Every connected part is shrunk by `minStroke / 2`, which erases every stroke
+ * at or below `minStroke`: a part that vanishes is "lost", one keeping less
+ * than 25 % of its area is "weak", and either makes `thin` true. Growing the
+ * whole shape by `minGap / 2` merges letters closer than `minGap` and closes
+ * counters narrower than it; either sets `narrowGaps`.
+ *
+ * Returns { thin, lostParts, weakParts, meanStroke, minStroke, narrowGaps, parts }
+ * where meanStroke / minStroke are 2·area / perimeter estimates of the whole
+ * shape and of its thinnest part, and `parts` lists every part as
+ * { bounds: { min: [x, y], max: [x, y] }, retained, stroke } for highlighting.
+ */
+export function thinStrokeReport(cs, { minStroke = 0.8, minGap = 0.4 } = {}) {
+  const report = {
+    thin: false,
+    lostParts: 0,
+    weakParts: 0,
+    meanStroke: 0,
+    minStroke: 0,
+    narrowGaps: false,
+    parts: [],
+  };
+  const area = cs.area();
+  if (!(area > 0)) return report;
+  report.meanStroke = strokeEstimate(cs, area);
+
+  const parts = cs.decompose();
+  let thinnest = Infinity;
+  for (const part of parts) {
+    const partArea = part.area();
+    const stroke = strokeEstimate(part, partArea);
+    thinnest = Math.min(thinnest, stroke);
+    const shrunk = part.offset(-minStroke / 2, 'Miter', 3, 8);
+    const lost = shrunk.isEmpty();
+    const retained = lost || !(partArea > 0) ? 0 : shrunk.area() / partArea;
+    shrunk.delete();
+    if (lost) report.lostParts++;
+    else if (retained < WEAK_RETENTION) report.weakParts++;
+    const { min, max } = part.bounds();
+    report.parts.push({ bounds: { min: [min[0], min[1]], max: [max[0], max[1]] }, retained, stroke });
+  }
+  report.minStroke = Number.isFinite(thinnest) ? thinnest : 0;
+  report.thin = report.lostParts + report.weakParts > 0;
+
+  if (minGap > 0) {
+    const holes = cs.numContour() - parts.length;
+    const grown = cs.offset(minGap / 2, 'Miter', 3, 8);
+    const after = topology(grown);
+    grown.delete();
+    report.narrowGaps = after.components < parts.length || after.holes < holes;
+  }
+  parts.forEach((p) => p.delete());
+  return report;
+}
+
+/**
+ * Printable limits for a nozzle diameter (model units): the thinnest stroke
+ * and the narrowest gap between strokes. Raised text needs two extrusion
+ * widths per stroke and one between letters; engraved pockets can be a little
+ * narrower than that, but the wall left between two pockets must be printable.
+ */
+export function printLimits({ nozzle = 0.4, mode = 'emboss' } = {}) {
+  return mode === 'engrave'
+    ? { minStroke: 1.2 * nozzle, minGap: 2 * nozzle }
+    : { minStroke: 2 * nozzle, minGap: nozzle };
+}
+
 
 /** z-range of the text solid relative to the surface it sits on. */
 export function textZRange({ mode = 'emboss', depth = 1, overlap = 0.4 }) {

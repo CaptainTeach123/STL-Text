@@ -29,9 +29,9 @@ export function triangleSoup(geometry) {
   return out;
 }
 
-/** Serialise a geometry (indexed or not) to a binary STL ArrayBuffer. */
+/** Serialise a geometry (indexed or not) or a Float32Array triangle soup to a binary STL ArrayBuffer. */
 export function writeBinarySTL(geometry, header = 'STL-Text') {
-  const soup = triangleSoup(geometry);
+  const soup = geometry instanceof Float32Array ? geometry : triangleSoup(geometry);
   const triangles = Math.floor(soup.length / 9);
   const buffer = new ArrayBuffer(84 + triangles * 50);
   const view = new DataView(buffer);

@@ -22,6 +22,7 @@ export const DEFAULT_TEXT_OPTIONS = {
   lineSpacing: 1.7, // line pitch as a multiple of the cap height
   align: 'center', // 'left' | 'center' | 'right'
   weight: 0, // outline offset in model units (+ bolder, - thinner)
+  cornerRadius: 0, // round sharp corners by this radius (model units)
   mirror: false,
   quality: 'normal',
 };
@@ -198,6 +199,7 @@ export function buildCrossSection(font, text, options = {}) {
     cs = next;
   };
   if (o.weight) step(cs.offset(o.weight, 'Miter', 3, 16));
+  if (o.cornerRadius > 0) step(roundCorners(cs, o.cornerRadius));
   step(cs.simplify(Math.max(0.001, o.size * 0.0005)));
   if (cs.isEmpty()) {
     cs.delete();
@@ -206,6 +208,60 @@ export function buildCrossSection(font, text, options = {}) {
   const { min, max } = cs.bounds();
   step(cs.translate(-(min[0] + max[0]) / 2, -(min[1] + max[1]) / 2));
   return cs;
+}
+
+/**
+ * Round both convex and concave corners of a shape by `radius` (a morphological
+ * opening followed by a closing). Returns a new CrossSection; the input is left
+ * for the caller to delete.
+ */
+export function roundCorners(cs, radius) {
+  const segments = 12;
+  const inner = cs.offset(-radius, 'Round', 2, segments);
+  const opened = inner.offset(radius, 'Round', 2, segments);
+  inner.delete();
+  const outer = opened.offset(radius, 'Round', 2, segments);
+  opened.delete();
+  const closed = outer.offset(-radius, 'Round', 2, segments);
+  outer.delete();
+  return closed;
+}
+
+/**
+ * Printability check for strokes thinner than `minWidth` (model units).
+ * Shrinking the outline by minWidth/2 makes every stroke at or below the limit
+ * vanish, which changes the topology: a piece disappears, a letter splits in
+ * two, or a counter (hole) opens up. Any of those means "too thin to print".
+ * Returns { thin, lostParts, meanStroke } where meanStroke is an estimate of the
+ * typical stroke width (2·area / perimeter) for the hint text.
+ */
+export function thinStrokeReport(cs, minWidth) {
+  const area = cs.area();
+  if (!(area > 0)) return { thin: false, lostParts: 0, meanStroke: 0 };
+  const polygons = cs.toPolygons();
+  let perimeter = 0;
+  for (const poly of polygons) {
+    for (let i = 0; i < poly.length; i++) {
+      const [ax, ay] = poly[i];
+      const [bx, by] = poly[(i + 1) % poly.length];
+      perimeter += Math.hypot(bx - ax, by - ay);
+    }
+  }
+  const topology = (shape) => {
+    const parts = shape.decompose();
+    const components = parts.length;
+    parts.forEach((p) => p.delete());
+    return { components, holes: shape.numContour() - components };
+  };
+  const before = topology(cs);
+  const shrunk = cs.offset(-minWidth / 2, 'Miter', 3, 8);
+  const after = topology(shrunk);
+  shrunk.delete();
+  return {
+    thin: after.components !== before.components || after.holes < before.holes,
+    lostParts: Math.max(0, before.components - after.components),
+    meanStroke: perimeter > 0 ? (2 * area) / perimeter : 0,
+  };
 }
 
 /** z-range of the text solid relative to the surface it sits on. */

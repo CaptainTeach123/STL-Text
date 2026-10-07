@@ -1,5 +1,13 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { buildCrossSection, buildTextSolid, capHeightUnits, fontLabel, layoutPolygons } from '../src/textGeometry.js';
+import {
+  buildCrossSection,
+  buildTextSolid,
+  capHeightUnits,
+  fontLabel,
+  layoutPolygons,
+  roundCorners,
+  thinStrokeReport,
+} from '../src/textGeometry.js';
 import { bounds, inter, loadFont, setup } from './helpers.js';
 
 let font;
@@ -86,6 +94,38 @@ describe('text -> solid', () => {
     };
     expect(area(0.3)).toBeGreaterThan(area(0));
     expect(area(-0.3)).toBeLessThan(area(0));
+  });
+
+  it('rounds corners: fewer sharp vertices, nearly the same area, holes kept', () => {
+    const sharp = buildCrossSection(font, 'HE', { size: 10 });
+    const rounded = buildCrossSection(font, 'HE', { size: 10, cornerRadius: 0.4 });
+    expect(Math.abs(rounded.area() - sharp.area()) / sharp.area()).toBeLessThan(0.03);
+    // every 90° corner becomes an arc, so the vertex count goes up
+    expect(rounded.numVert()).toBeGreaterThan(sharp.numVert());
+    // the closing step must not fill the counter of an "O"
+    const o = buildCrossSection(font, 'O', { size: 10 });
+    const oRounded = roundCorners(o, 0.4);
+    expect(oRounded.numContour()).toBe(2);
+    [sharp, rounded, o, oRounded].forEach((c) => c.delete());
+  });
+
+  it('flags strokes that are too thin to print', () => {
+    const big = buildCrossSection(font, 'Hello', { size: 10 });
+    const ok = thinStrokeReport(big, 0.8);
+    expect(ok.thin).toBe(false);
+    expect(ok.lostParts).toBe(0);
+    expect(ok.meanStroke).toBeGreaterThan(1.2); // Inter Bold at 10 mm is ~1.7 mm thick
+
+    const tiny = buildCrossSection(font, 'Hello', { size: 3 });
+    const bad = thinStrokeReport(tiny, 0.8);
+    expect(bad.thin).toBe(true);
+    expect(bad.lostParts).toBeGreaterThan(0);
+    expect(bad.meanStroke).toBeLessThan(0.8);
+
+    // thinning the outline with a negative weight is caught too
+    const thinned = buildCrossSection(font, 'Hello', { size: 10, weight: -0.5 });
+    expect(thinStrokeReport(thinned, 0.8).thin).toBe(true);
+    [big, tiny, thinned].forEach((c) => c.delete());
   });
 
   it('mirrors horizontally without changing the footprint', () => {

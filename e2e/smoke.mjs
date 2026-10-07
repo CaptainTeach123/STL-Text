@@ -359,6 +359,16 @@ try {
   const pegPart = inspectStl(fileB);
   check(pegModel.volume < beforePart.volume - 50 && pegModel.sizeOk, 'pegs: the model gets holes', `${pegModel.volume?.toFixed(0)} < ${beforePart.volume?.toFixed(0)}`);
   check(pegPart.volume > 360 && pegPart.sizeOk, 'pegs: the part downloads separately with its pegs', `${pegPart.volume?.toFixed(0)}`);
+  check(Math.abs(pegPart.min[2]) < 0.01 && pegPart.max[2] > 3 + 5 && pegPart.max[2] < 3 + 7, 'pegs: the part file lies flat with the pegs pointing up', `z ${pegPart.min[2].toFixed(2)}…${pegPart.max[2].toFixed(2)}`);
+  check((await page.locator('#textNotes').innerText()).includes('Pegs'), 'pegs: the notes explain the separate download');
+  await page.check('input[name="mode"][value="engrave"]');
+  await idle();
+  check(await page.locator('fieldset.join-only').isHidden(), 'a part used as a cutter has no connection options');
+  check((await page.locator('#sinkLabel').innerText()).startsWith('Cut depth'), 'the sink field becomes the cut depth for a cutter');
+  const cutterPart = await download('part-cutter.stl');
+  check(cutterPart.volume < beforePart.volume - 20 && cutterPart.sizeOk, 'a cutter part removes material', `${cutterPart.volume?.toFixed(0)} < ${beforePart.volume?.toFixed(0)}`);
+  await page.check('input[name="mode"][value="emboss"]');
+  await idle();
   await page.click('#deleteBtn');
   await idle();
   await page.click('#itemList li:first-child');
@@ -445,6 +455,14 @@ try {
   const depth = Number.parseFloat(await page.inputValue('input[type="number"][data-key="depth"]'));
   check(alone.triangles > 50 && Math.abs(alone.min[2]) < 1e-3 && Math.abs(alone.max[2] - depth) < 1e-3, 'text-only export sits on the build plate', `z ${alone.min[2]}..${alone.max[2]} (depth ${depth})`);
   check(!(await page.locator('input[name="mode"][value="engrave"]').isChecked()), 'cut-in text became raised when the model was removed');
+  await page.setInputFiles('#partFile', barFile);
+  await page.waitForFunction(() => document.querySelector('#itemList li .glyph.part'));
+  await idle();
+  check(await page.locator('input[name="join"][value="pegs"]').isDisabled(), 'pegs cannot be chosen without a model to make holes in');
+  const partAlone = await download('part-alone.stl');
+  check(Math.abs(partAlone.min[2]) < 1e-3 && partAlone.volume > 300, 'a part without a model sits on the build plate', `z from ${partAlone.min[2]}`);
+  await page.click('#deleteBtn');
+  await idle();
 
   console.log('\nresponsiveness while loading a large model');
   const bigFile = writeFixture('big.stl', soupOf(Manifold.sphere(30, 600)));

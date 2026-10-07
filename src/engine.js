@@ -282,7 +282,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     conformed.clear();
     if (result) {
       result.solid?.delete();
-      result.separate?.forEach((p) => p.solid.delete());
+      result.separate?.forEach((p) => {
+        p.world.delete();
+        p.local.delete();
+      });
     }
     result = null;
   }
@@ -450,8 +453,23 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
 
   /* -------------------------------------------------------------- text */
 
-  /** Without a model there is nothing to sink into: text sits on the plate. */
-  const effective = (item) => (base?.kind === 'none' && item.mode !== 'engrave' ? { ...item, overlap: 0 } : item);
+  /**
+   * What is actually built: without a model there is nothing to sink into, so
+   * everything sits on the build plate; pegs need holes, so without a
+   * watertight model a pegged part is fused instead (notesFor says so).
+   */
+  const effective = (item) => {
+    const noModel = base?.kind === 'none';
+    const cuttable = !noModel && !!base?.current?.manifold;
+    if (isPart(item)) {
+      let out = item;
+      if (noModel && out.sink) out = { ...out, sink: 0 };
+      if (out.join === 'pegs' && out.mode !== 'engrave' && !cuttable) out = { ...out, join: 'fuse' };
+      return out;
+    }
+    if (noModel && (item.mode !== 'engrave' || item.plate !== 'none')) return { ...item, overlap: 0 };
+    return item;
+  };
 
   /**
    * Flat (un-conformed) solid of an item in its local frame, cached by shape:
@@ -481,13 +499,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         const pad = Math.max(0, item.platePadding ?? 3);
         const thickness = Math.max(0.2, item.plateThickness ?? 2);
         const outline = temps.add(plateShape(wasm, item.plate, size[0] + 2 * pad, size[1] + 2 * pad));
-        const plate = temps.add(Manifold.extrude(outline, thickness + item.overlap).translate(0, 0, -item.overlap));
+        const plateRaw = temps.add(Manifold.extrude(outline, thickness + item.overlap));
+        const plate = temps.add(plateRaw.translate(0, 0, -item.overlap));
         if (item.mode === 'engrave') {
           const depth = Math.max(0.1, item.depth);
-          const text = temps.add(Manifold.extrude(cs, depth + 0.4).translate(0, 0, thickness - depth));
+          const textRaw = temps.add(Manifold.extrude(cs, depth + 0.4));
+          const text = temps.add(textRaw.translate(0, 0, thickness - depth));
           solid = plate.subtract(text);
         } else {
-          const text = temps.add(Manifold.extrude(cs, item.depth + 0.3).translate(0, 0, thickness - 0.3));
+          const textRaw = temps.add(Manifold.extrude(cs, item.depth + 0.3));
+          const text = temps.add(textRaw.translate(0, 0, thickness - 0.3));
           solid = plate.add(text);
         }
         const pb = outline.bounds();
@@ -507,74 +528,128 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
 
   /**
    * An attached part in its local frame: the chosen side faces the model
-   * (contact at z = 0), scaled, tilted, sunk into the surface, with its join:
+   * (contact plane z = 0), scaled, tilted (re-seated so its lowest point is
+   * on the plane), sunk into the surface, with its join:
    *   fuse   – the part itself (the sink makes the union solid)
    *   fillet – plus a layered concave fillet skirt around its foot
-   *   pegs   – plus pegs underneath; `cutter` holds the matching holes for the model
+   *   pegs   – plus pegs underneath; `cutter` holds the matching holes
+   * A part used as a cutter ignores the join. `cut` describes what enters
+   * the model (for the cut-through warning), `warnings` what to tell the user.
    */
   function partSolidFor(item) {
     const part = parts.get(item.partId);
     const temps = scope();
+    const warnings = [];
     try {
       const rot = ATTACH_ROTATIONS[item.attach] ?? ATTACH_ROTATIONS.bottom;
       let m = temps.add(part.manifold.rotate(rot));
-      const { min, max } = m.boundingBox();
-      m = temps.add(m.translate(-(min[0] + max[0]) / 2, -(min[1] + max[1]) / 2, -min[2]));
+      const seat = (solid) => {
+        const { min, max } = solid.boundingBox();
+        return temps.add(solid.translate(-(min[0] + max[0]) / 2, -(min[1] + max[1]) / 2, -min[2]));
+      };
+      m = seat(m);
       const scale = item.scale > 0 ? item.scale : 1;
-      if (scale !== 1) m = temps.add(m.scale(scale));
+      if (scale !== 1) m = seat(temps.add(m.scale(scale)));
+      // tilt pivots about the clicked point: one side goes into the surface, the other lifts off it
       if (item.tilt) m = temps.add(m.rotate([item.tilt, 0, 0]));
       const sink = Math.max(0, item.sink ?? 0);
       const bb = m.boundingBox();
-      const height = bb.max[2] - bb.min[2];
-      const eps = Math.min(0.05, height / 10);
-      const footprint = temps.add(m.slice(bb.min[2] + eps));
-      const fb = footprint.bounds();
+      const buried = Math.max(0, -bb.min[2]);
+      const top = bb.max[2]; // height above the contact plane
+      const eps = Math.min(0.05, top / 10);
+      const footprint = temps.add(m.slice(eps)); // section at the contact plane
+      const fb = footprint.isEmpty() ? m.boundingBox() : footprint.bounds();
       const size = [fb.max[0] - fb.min[0], fb.max[1] - fb.min[1]];
+      const cutter_ = item.mode === 'engrave';
+      const join = cutter_ ? 'fuse' : item.join; // a cutter has no connection to make
+      const liftGap = buried - sink;
+      if (liftGap > 0.05) {
+        warnings.push({
+          level: 'warn',
+          code: 'TILT_GAP',
+          text: `Tilting lifts one edge ${liftGap.toFixed(1)} mm off the surface. Use "Fused + fillet", more sink, or less tilt.`,
+        });
+      }
       let solid;
       let cutter = null;
-      if (item.join === 'fillet' && item.filletRadius > 0) {
+      let cut = { mode: cutter_ ? 'engrave' : 'emboss', depth: sink + buried };
+      if (join === 'fillet' && item.filletRadius > 0) {
         const r = item.filletRadius;
+        const sunk = temps.add(m.translate(0, 0, -sink));
+        const crest = top - sink; // the part's top once sunk: the skirt never rises above it
         const layer = Math.max(0.1, Math.min(0.3, r / 6));
         const d = (z) => r - Math.sqrt(Math.max(0, r * r - (r - z) * (r - z)));
         const slabs = [];
-        for (let z0 = 0; z0 < r - 1e-9; z0 += layer) {
-          const at = Math.min(z0 + layer / 2, bb.max[2] - eps);
-          const slice = temps.add(m.slice(bb.min[2] + at));
+        for (let z0 = 0; z0 < Math.min(r, crest) - 1e-9; z0 += layer) {
+          const zTop = Math.min(z0 + layer, crest);
+          const slice = temps.add(sunk.slice(Math.min(z0 + layer / 2, crest - eps)));
           if (slice.isEmpty()) continue;
           const grown = temps.add(slice.offset(d(z0), 'Round', 2, 16));
           const bottom = z0 === 0 ? -(sink + eps) : z0;
-          slabs.push(temps.add(Manifold.extrude(grown, z0 + layer - bottom).translate(0, 0, bottom)));
+          const slab = temps.add(Manifold.extrude(grown, zTop - bottom));
+          slabs.push(temps.add(slab.translate(0, 0, bottom)));
         }
         const skirt = slabs.length ? temps.add(Manifold.union(slabs)) : null;
-        const sunk = temps.add(m.translate(0, 0, -sink));
         solid = skirt ? sunk.add(skirt) : sunk.translate(0, 0, 0);
-      } else if (item.join === 'pegs' && item.pegCount > 0) {
+      } else if (join === 'pegs' && item.pegCount > 0) {
         const radius = Math.max(0.3, item.pegDiameter / 2);
         const clearance = Math.max(0, item.pegClearance ?? 0.15);
         const length = Math.max(0.5, item.pegLength);
-        // peg centres: inside the footprint shrunk by the peg radius, spread along its long axis
-        const inner = temps.add(footprint.offset(-(radius + 0.4), 'Miter', 2, 4));
-        const where = inner.isEmpty() ? footprint : inner;
-        const ib = where.bounds();
-        const [cx, cy] = centroidOf(where);
         const count = Math.max(1, Math.min(6, Math.round(item.pegCount)));
-        const longX = ib.max[0] - ib.min[0] >= ib.max[1] - ib.min[1];
-        const span = (longX ? ib.max[0] - ib.min[0] : ib.max[1] - ib.min[1]) * 0.8;
-        const centres = [];
-        for (let i = 0; i < count; i++) {
-          const f = count === 1 ? 0 : i / (count - 1) - 0.5;
-          centres.push(longX ? [cx + f * span, cy] : [cx, cy + f * span]);
+        // candidate centres: one per separate foot (where a peg of this size fits), extra ones along the largest foot
+        const inner = temps.add(footprint.offset(-(radius + 0.4), 'Miter', 2, 4));
+        const feet = inner.isEmpty() ? [] : inner.decompose().map((c) => temps.add(c));
+        feet.sort((a, b) => b.area() - a.area());
+        const candidates = [];
+        for (const foot of feet.slice(0, count)) candidates.push(centroidOf(foot));
+        if (feet.length && candidates.length < count) {
+          const big = feet[0];
+          const ib = big.bounds();
+          const [cx, cy] = centroidOf(big);
+          const longX = ib.max[0] - ib.min[0] >= ib.max[1] - ib.min[1];
+          const span = (longX ? ib.max[0] - ib.min[0] : ib.max[1] - ib.min[1]) * 0.8;
+          const extra = count - candidates.length + 1;
+          candidates.length = Math.max(0, candidates.length - 1); // the big foot's centroid is replaced by a spread row
+          for (let i = 0; i < extra; i++) {
+            const f = extra === 1 ? 0 : i / (extra - 1) - 0.5;
+            candidates.push(longX ? [cx + f * span, cy] : [cx, cy + f * span]);
+          }
         }
-        const pegs = centres.map(([x, y]) => temps.add(Manifold.cylinder(length + eps, radius, radius, 32).translate(x, y, -length)));
-        const holes = centres.map(([x, y]) =>
-          temps.add(Manifold.cylinder(length + clearance + 1, radius + clearance, radius + clearance, 32).translate(x, y, -(length + clearance))),
-        );
-        solid = m.add(temps.add(Manifold.union(pegs)));
-        cutter = Manifold.union(holes);
+        // keep only pegs whose whole disc sits under the part
+        const discArea = Math.PI * radius * radius;
+        const centres = candidates.filter(([x, y]) => {
+          const disc = temps.add(wasm.CrossSection.circle(radius, 32).translate(x, y));
+          const under = temps.add(disc.intersect(footprint));
+          return under.area() >= 0.95 * discArea;
+        });
+        if (centres.length < count) {
+          warnings.push({
+            level: 'warn',
+            code: 'PEGS_DROPPED',
+            text: centres.length
+              ? `Only ${centres.length} of ${count} pegs fit under this part; the rest were left out.`
+              : 'No peg of this size fits under the part – use a smaller diameter or the fused connection.',
+          });
+        }
+        if (centres.length) {
+          const pegs = centres.map(([x, y]) => {
+            const c = temps.add(Manifold.cylinder(length + eps, radius, radius, 32));
+            return temps.add(c.translate(x, y, -length));
+          });
+          const holes = centres.map(([x, y]) => {
+            const c = temps.add(Manifold.cylinder(length + clearance + 1, radius + clearance, radius + clearance, 32));
+            return temps.add(c.translate(x, y, -(length + clearance)));
+          });
+          solid = m.add(temps.add(Manifold.union(pegs)));
+          cutter = Manifold.union(holes);
+          cut = { mode: 'engrave', depth: length + clearance + buried };
+        } else {
+          solid = m.translate(0, 0, -sink);
+        }
       } else {
         solid = m.translate(0, 0, -sink);
       }
-      return { solid, cutter, size, rounding: null, part: { name: part.info.name, triangles: part.info.triangles } };
+      return { solid, cutter, size, rounding: null, cut, warnings, part: { name: part.info.name, triangles: part.info.triangles }, pegged: !!cutter };
     } finally {
       temps.dispose();
     }
@@ -625,7 +700,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       if (s) {
         // a rigid part is not warped, but we still want to know how it meets the surface
         const bb = flatEntry.solid.boundingBox();
-        const foot = flatEntry.solid.slice(bb.min[2] + Math.min(0.05, (bb.max[2] - bb.min[2]) / 10));
+        const atPlane = flatEntry.solid.slice(Math.min(0.05, bb.max[2] / 10)); // the contact plane is z = 0
+        const foot = atPlane.isEmpty() ? flatEntry.solid.slice(bb.min[2] + Math.min(0.05, (bb.max[2] - bb.min[2]) / 10)) : atPlane;
+        if (foot !== atPlane) atPlane.delete();
         if (!foot.isEmpty()) {
           const slab = Manifold.extrude(foot, 0.2);
           const out = conformSolid(slab, s);
@@ -655,12 +732,19 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       });
     }
     if (stats) {
-      const depth = isPart(item) ? (flatEntry.solid.boundingBox().max[2] ?? item.depth) : item.plate !== 'none' ? item.plateThickness : item.depth;
-      notes.push(...conformNotes(stats, { mode: meets, depth, overlap: item.overlap, nozzle }));
+      const cut = isPart(item) ? flatEntry.cut : { mode: meets, depth: item.plate !== 'none' ? item.plateThickness : item.depth };
+      notes.push(...conformNotes(stats, { mode: cut.mode, depth: cut.depth, overlap: item.overlap, nozzle }));
     }
     if (isPart(item)) {
-      if (item.join === 'pegs') {
-        notes.push({ level: 'info', code: 'PEGS', text: 'Pegs: the part is downloaded as its own file and glued into the matching holes.' });
+      notes.push(...(flatEntry.warnings ?? []));
+      if (item.mode !== 'engrave' && item.join === 'pegs') {
+        if (base?.kind !== 'none' && !base?.current?.manifold) {
+          notes.push({ level: 'warn', code: 'PEGS_UNAVAILABLE', text: 'Pegs need holes in a watertight model; this model has gaps, so the part is fused instead.' });
+        } else if (base?.kind === 'none') {
+          notes.push({ level: 'warn', code: 'PEGS_UNAVAILABLE', text: 'Pegs need a model to make holes in. Load a model, or use the fused connection.' });
+        } else {
+          notes.push({ level: 'info', code: 'PEGS', text: 'Pegs: the part is downloaded as its own file and glued into the matching holes.' });
+        }
       }
       return notes;
     }
@@ -761,7 +845,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           return;
         }
         const meets = baseMode(item);
-        const needsCut = meets === 'engrave' || (isPart(item) && item.join === 'pegs');
+        const pegged = isPart(item) && meets === 'emboss' && placed.flat.pegged; // effective() already ruled pegs out when they can't be cut
+        const needsCut = meets === 'engrave';
         if (needsCut && !b.current.manifold) {
           skipped.push(item.id);
           notes.push({
@@ -773,9 +858,12 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           return;
         }
         const world = temps.add(placed.solid.transform(toMat4(placed.placement)));
-        if (isPart(item) && item.join === 'pegs' && placed.flat.cutter) {
+        if (pegged) {
           engrave.push(temps.add(placed.flat.cutter.transform(toMat4(placed.placement))));
-          separate.push({ id: item.id, name: itemLabel(item, 'part'), solid: world.translate(0, 0, 0) });
+          // shown in place; exported in its own frame, turned over so the pegs point up
+          const flipped = temps.add(placed.solid.rotate([180, 0, 0]));
+          const fbb = flipped.boundingBox();
+          separate.push({ id: item.id, name: itemLabel(item, 'part'), world, local: temps.add(flipped.translate(0, 0, -fbb.min[2])) });
           return;
         }
         (meets === 'engrave' ? engrave : emboss).push(world);
@@ -823,11 +911,15 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       }
 
       const kept = solid ? solid.translate(0, 0, 0) : null; // our own handle, outside the scope
+      const owned = separate.map((p) => ({ id: p.id, name: p.name, world: p.world.translate(0, 0, 0), local: p.local.translate(0, 0, 0) }));
       if (result) {
         result.solid?.delete();
-        result.separate?.forEach((p) => p.solid.delete());
+        result.separate?.forEach((p) => {
+          p.world.delete();
+          p.local.delete();
+        });
       }
-      result = { key, solid: kept, notes, skipped, separate, passthrough: b.current.passthrough };
+      result = { key, solid: kept, notes, skipped, separate: owned, passthrough: b.current.passthrough };
       return result;
     } finally {
       temps.dispose();
@@ -840,7 +932,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const temps = scope();
     let shown = final.solid;
     if (final.separate.length) {
-      shown = temps.add(Manifold.compose([...(final.solid ? [final.solid] : []), ...final.separate.map((p) => p.solid)]));
+      shown = temps.add(Manifold.compose([...(final.solid ? [final.solid] : []), ...final.separate.map((p) => p.world)]));
     }
     const lod = shown ? temps.add(lodFor(shown)) : null;
     const buffers = displayBuffers(lod ?? shown, final.passthrough);
@@ -870,7 +962,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     progress?.('Writing STL…');
     const stl = writeBinarySTL(soup, `STL-Text ${name}`);
     const extra = final.separate.map((p) => {
-      const partSoup = manifoldToSoup(p.solid);
+      const partSoup = manifoldToSoup(p.local); // lying on its top face, pegs up, ready to print
       return { name: p.name, stl: writeBinarySTL(partSoup, `STL-Text ${p.name}`), triangles: partSoup.length / 9 };
     });
     return {

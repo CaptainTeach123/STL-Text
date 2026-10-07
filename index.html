@@ -96,14 +96,14 @@
               <input type="number" data-key="tilt" min="-90" max="90" step="1" value="0" />
               <input type="range" data-key="tilt" min="-45" max="45" step="1" value="0" aria-label="Tilt" />
             </label>
-            <label class="field num" title="How deep the part sits into the surface so the two fuse into one solid">
-              <span>Sink into surface <small>mm</small></span>
+            <label class="field num" title="How deep the part sits into the surface so the two fuse into one solid (for a cutter: how deep it cuts)">
+              <span id="sinkLabel">Sink into surface <small>mm</small></span>
               <input type="number" data-key="sink" min="0" max="50" step="0.1" value="0.4" />
               <input type="range" data-key="sink" min="0" max="5" step="0.1" value="0.4" aria-label="Sink depth" />
             </label>
           </div>
-          <span class="label">Connection</span>
-          <fieldset class="seg wide" aria-label="How the part connects">
+          <span class="label join-only">Connection</span>
+          <fieldset class="seg wide join-only" aria-label="How the part connects">
             <label><input type="radio" name="join" data-key="join" value="fuse" checked /><span>Fused</span></label>
             <label title="A smooth fillet around the foot: the strongest and cleanest joint"><input type="radio" name="join" data-key="join" value="fillet" /><span>Fused + fillet</span></label>
             <label title="Print the part separately and glue it into matching holes"><input type="radio" name="join" data-key="join" value="pegs" /><span>Pegs &amp; holes</span></label>

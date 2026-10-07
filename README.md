@@ -36,7 +36,9 @@ The final model is always *model + everything raised or fused − everything cut
 
 - **Fused** is right for one-piece prints: the part sinks a little into the surface (default 0.4 mm) so the two bodies share material.
 - **Fused + fillet** adds a concave fillet around the foot of the part, built from layers so it prints exactly as drawn. It spreads the load over a wider footprint, hides small gaps on curved surfaces and looks like a cast joint. 1–3 mm radius suits most parts.
-- **Pegs & holes** is for parts printed separately (another colour, another orientation): pegs on the part, holes in the model with a clearance (0.15 mm is a good start for a snug fit after printing), glued on assembly.
+- **Pegs & holes** is for parts printed separately (another colour, another orientation): pegs on the part, holes in the model with a clearance (0.15 mm is a good start for a snug fit after printing), glued on assembly. Pegs are only placed where a whole peg fits under the part (one under each foot of a bridge-shaped part), and the part file is saved lying on its face with the pegs pointing up, ready to print. Pegs need a watertight model to make holes in; on a model with gaps the part is fused instead.
+- **Tilt** pivots the part about the point you clicked: one edge goes into the surface, the other lifts off it. The app warns when the lifted edge leaves a gap, which a bigger sink or the fillet closes.
+- **Cut out** (a part used as a cutter) removes the part's shape from the model; its *Cut depth* is how far it sinks in. A cutter has no connection options.
 
 ### Tips for printing
 

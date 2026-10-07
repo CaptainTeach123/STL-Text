@@ -88,11 +88,121 @@ describe('attached parts', () => {
     expect(ex.extra[0].name).toBe('bar');
     const part = solidOfStl(ex.extra[0].stl);
     expect(part.volume()).toBeCloseTo(360 + 2 * Math.PI * 1.5 * 1.5 * 5, -1); // bar + two pegs
-    expect(part.boundingBox().min[2]).toBeCloseTo(3 - 5, 2); // pegs hang 5 mm below the contact plane (z = 3)
+    expect(part.decompose().length).toBe(1);
+    // the downloaded part lies on its face with the pegs pointing up, ready to print
+    const pb = part.boundingBox();
+    expect(pb.min[2]).toBeCloseTo(0, 3);
+    expect(pb.max[2]).toBeCloseTo(3 + 5, 2);
+    const body = part.slice(1);
+    const pegTops = part.slice(7);
+    expect(body.area()).toBeCloseTo(20 * 6, 0);
+    expect(pegTops.area()).toBeCloseTo(2 * Math.PI * 1.5 * 1.5, 0);
+    body.delete();
+    pegTops.delete();
     part.delete();
     const r = await client.result([item], version);
     expect(r.notes.map((n) => n.code)).toEqual([]);
     expect(r.display.index.length).toBeGreaterThan(0);
+    expect((await client.preview(item, version)).notes.map((n) => n.code)).toEqual(['PEGS']);
+  });
+
+  it('pegs only go where they fit: one under each foot of a bridge, none under a part too small for them', async () => {
+    await loadBox();
+    // a bridge: two 4×6 feet 20 mm apart joined by a bar on top
+    const foot = wasm.Manifold.cube([4, 6, 4], true);
+    const bar = wasm.Manifold.cube([24, 6, 2], true).translate(0, 0, 3);
+    const bridge = wasm.Manifold.union([foot.translate(-10, 0, 0), foot.translate(10, 0, 0), bar]);
+    await client.addPart('bridge', stlOf(bridge), 'bridge');
+    const item = createPart('bridge', 'bridge', { position: [0, 0, 3], normal: [0, 0, 1], join: 'pegs', pegCount: 2, pegDiameter: 2, pegLength: 4 });
+    const ex = await client.export([item], version, 'x');
+    const part = solidOfStl(ex.extra[0].stl);
+    expect(part.decompose().length).toBe(1); // no loose pegs floating in the gap
+    expect(part.volume()).toBeCloseTo(bridge.volume() + 2 * Math.PI * 1 * 1 * 4, -1);
+    const pegTops = part.slice(part.boundingBox().max[2] - 1);
+    expect(pegTops.decompose().length).toBe(2);
+    const xs = pegTops.decompose().map((p) => (p.bounds().min[0] + p.bounds().max[0]) / 2).sort((a, b) => a - b);
+    expect(xs[0]).toBeCloseTo(-10, 0); // one peg centred under each foot
+    expect(xs[1]).toBeCloseTo(10, 0);
+    pegTops.delete();
+    part.delete();
+    const r = await client.preview(item, version);
+    expect(r.notes.map((n) => n.code)).toEqual(['PEGS']);
+    // a peg wider than the part cannot fit: nothing is cut and the user is told
+    const wide = createPart('bar', 'bar', { position: [0, 0, 3], normal: [0, 0, 1], join: 'pegs', pegCount: 2, pegDiameter: 8, pegLength: 4 });
+    const r2 = await client.preview(wide, version);
+    expect(r2.notes.map((n) => n.code)).toContain('PEGS_DROPPED');
+    const ex2 = await client.export([wide], version, 'x');
+    expect(ex2.extra).toHaveLength(0);
+    expect(volumeOfStl(ex2.stl)).toBeGreaterThan(BASE_VOLUME); // fused instead, no holes
+    bridge.delete();
+    bar.delete();
+    foot.delete();
+  });
+
+  it('pegs need holes: without a watertight model the part is fused and the user is told', async () => {
+    const open = new Float32Array([0, 0, 0, 30, 0, 0, 0, 30, 0]);
+    await client.loadBase({ kind: 'stl', bytes: writeBinarySTL(open), name: 'open', version: ++version });
+    const item = createPart('bar', 'bar', { position: [8, 8, 0], normal: [0, 0, 1], join: 'pegs', pegCount: 2, pegDiameter: 3, pegLength: 5 });
+    const r = await client.preview(item, version);
+    expect(r.notes.map((n) => n.code)).toContain('PEGS_UNAVAILABLE');
+    expect(r.notes.map((n) => n.code)).not.toContain('PEGS');
+    const ex = await client.export([item], version, 'x');
+    expect(ex.extra).toHaveLength(0);
+    // and without any model the part itself is downloaded, sitting on the build plate
+    await client.loadBase({ kind: 'none', version: ++version });
+    const alone = await client.export([createPart('bar', 'bar', { join: 'pegs', sink: 1 })], version, 'x');
+    expect(alone.extra).toHaveLength(0);
+    const m = solidOfStl(alone.stl);
+    expect(m.boundingBox().min[2]).toBeCloseTo(0, 3);
+    expect(m.volume()).toBeCloseTo(360, 0);
+    m.delete();
+  });
+
+  it('a fillet never grows taller than a thin part, and a tilted part pivots about the clicked point', async () => {
+    await loadBox();
+    const thin = wasm.Manifold.cube([20, 10, 1], true);
+    await client.addPart('thin', stlOf(thin), 'thin');
+    const plate = createPart('thin', 'thin', { position: [0, 0, 3], normal: [0, 0, 1], join: 'fillet', filletRadius: 1.5, sink: 0.4 });
+    const p = await client.preview(plate, version);
+    expect(p.bounds.max[2]).toBeCloseTo(1 - 0.4, 2); // the skirt stops at the part's top
+    const ex = await client.export([plate], version, 'x');
+    const m = solidOfStl(ex.stl);
+    expect(m.decompose().length).toBe(1);
+    expect(m.boundingBox().max[2]).toBeCloseTo(3 + 1 - 0.4, 2);
+    m.delete();
+    // tilt: one side of the bar goes into the model and the other lifts off it
+    const tilted = await client.preview(onTop({ tilt: 30, sink: 0.4 }), version);
+    const lift = (6 / 2) * Math.sin(Math.PI / 6); // half the 6 mm width times sin 30°
+    expect(tilted.bounds.min[2]).toBeCloseTo(-lift - 0.4, 1);
+    expect(tilted.notes.map((n) => n.code)).toContain('TILT_GAP');
+    const seated = await client.preview(onTop({ tilt: 30, sink: lift + 0.1 }), version);
+    expect(seated.notes.map((n) => n.code)).not.toContain('TILT_GAP');
+    // the tilted fillet still hugs the part where it meets the surface
+    const tf = await client.export([onTop({ tilt: 30, join: 'fillet', filletRadius: 1.5, sink: lift })], version, 'x');
+    const tm = solidOfStl(tf.stl);
+    expect(tm.decompose().length).toBe(1);
+    tm.delete();
+    thin.delete();
+  });
+
+  it('a part used as a cutter ignores its connection and cuts as deep as its sink', async () => {
+    await loadBox();
+    const plain = await client.export([onTop({ mode: 'engrave', sink: 1, join: 'fuse' })], version, 'x');
+    const pegged = await client.export([onTop({ mode: 'engrave', sink: 1, join: 'pegs' })], version, 'x');
+    const filleted = await client.export([onTop({ mode: 'engrave', sink: 1, join: 'fillet', filletRadius: 2 })], version, 'x');
+    expect(pegged.extra).toHaveLength(0);
+    expect(volumeOfStl(pegged.stl)).toBeCloseTo(volumeOfStl(plain.stl), 1);
+    expect(volumeOfStl(filleted.stl)).toBeCloseTo(volumeOfStl(plain.stl), 1);
+    // cutting deeper than the wall is reported against the real cut depth (the sink)
+    const through = await client.preview(onTop({ mode: 'engrave', sink: 7 }), version);
+    const note = through.notes.find((n) => n.code === 'CUT_THROUGH');
+    expect(note).toBeTruthy();
+    expect(note.text).toMatch(/^7 mm/);
+    const shallow = await client.preview(onTop({ mode: 'engrave', sink: 1 }), version);
+    expect(shallow.notes.map((n) => n.code)).not.toContain('CUT_THROUGH');
+    // pegs longer than the wall are reported too
+    const longPegs = await client.preview(onTop({ join: 'pegs', pegLength: 7 }), version);
+    expect(longPegs.notes.map((n) => n.code)).toContain('CUT_THROUGH');
   });
 
   it('attach side, scale and tilt change the part orientation', async () => {

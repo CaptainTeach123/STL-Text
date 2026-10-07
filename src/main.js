@@ -380,8 +380,9 @@ const itemDefaults = () => ({
 });
 
 function addItem(text = '', overrides = {}, { focus = true } = {}) {
-  const from = doc.selected;
-  const place = lastClick ?? (from && { position: from.position, normal: from.normal }) ?? topCenter();
+  const selected = doc.selected;
+  const from = selected && !isPart(selected) ? selected : null; // a selected part lends only its place
+  const place = lastClick ?? (selected && { position: selected.position, normal: selected.normal }) ?? topCenter();
   const firstLine = from ? { ...from.lines[0], text } : { ...lineDefaults(), text };
   const item = doc.addItem({
     ...itemDefaults(),
@@ -638,8 +639,11 @@ function fillPanel(item) {
     $('partCard').hidden = !part;
     document.querySelectorAll('.text-only').forEach((el) => (el.hidden = part));
     document.querySelectorAll('.plate-only').forEach((el) => (el.hidden = part || !item || item.plate === 'none'));
-    document.querySelectorAll('.fillet-only').forEach((el) => (el.hidden = !part || item.join !== 'fillet'));
-    document.querySelectorAll('.pegs-only').forEach((el) => (el.hidden = !part || item.join !== 'pegs'));
+    const cutter = part && item.mode === 'engrave';
+    document.querySelectorAll('.join-only').forEach((el) => (el.hidden = !part || cutter));
+    document.querySelectorAll('.fillet-only').forEach((el) => (el.hidden = !part || cutter || item.join !== 'fillet'));
+    document.querySelectorAll('.pegs-only').forEach((el) => (el.hidden = !part || cutter || item.join !== 'pegs'));
+    $('sinkLabel').innerHTML = cutter ? 'Cut depth <small>mm</small>' : 'Sink into surface <small>mm</small>';
     $('styleTitle').textContent = part ? 'Add or cut out' : 'Raised or cut';
     $('modeAddLabel').innerHTML = part ? 'Add <small>join</small>' : 'Raised <small>emboss</small>';
     $('modeCutLabel').innerHTML = part ? 'Cut out <small>use as a cutter</small>' : 'Cut in <small>engrave</small>';
@@ -869,6 +873,7 @@ function renderItems() {
       if (part) {
         const joinLabel = { fuse: 'fused', fillet: 'fillet', pegs: 'pegs' }[item.join] ?? item.join;
         meta.textContent = `${Math.round(item.scale * 100)}% · ${item.mode === 'engrave' ? 'cut out' : joinLabel}`;
+        glyph.title = item.mode === 'engrave' ? 'Part used as a cutter' : `Attached part (${joinLabel})`;
       } else {
         const sizes = [...new Set(item.lines.map((l) => l.size))];
         meta.textContent = `${item.lines.length > 1 ? `${item.lines.length} lines · ` : ''}${sizes.join(' / ')} mm`;
@@ -887,7 +892,11 @@ function renderSelectedInfo() {
   const notes = [...(info?.notes ?? [])];
   if (sel && !fontIds(sel).every((id) => fonts.has(id))) notes.unshift({ level: 'warn', text: 'A font used by this text is not available – choose another one.' });
   renderNotes($('textNotes'), notes, {
-    CUT_THROUGH: (n) => n.suggestedDepth && { label: `Use ${n.suggestedDepth} mm`, run: () => doc.updateItem(sel.id, { depth: n.suggestedDepth }) },
+    CUT_THROUGH: (n) =>
+      n.suggestedDepth && {
+        label: `Use ${n.suggestedDepth} mm`,
+        run: () => doc.updateItem(sel.id, isPart(sel) ? (sel.join === 'pegs' && sel.mode !== 'engrave' ? { pegLength: n.suggestedDepth } : { sink: n.suggestedDepth }) : { depth: n.suggestedDepth }),
+      },
     THIN_STROKES: (n) => n.suggestedWeight != null && { label: 'Make bolder', run: () => doc.updateItem(sel.id, { weight: n.suggestedWeight }) },
     SHALLOW: (n) => n.suggestedDepth && { label: `Use ${n.suggestedDepth} mm`, run: () => doc.updateItem(sel.id, { depth: n.suggestedDepth }) },
     NOT_TOUCHING: () => modelInfo?.hasModel && { label: 'Put on top', run: () => snapToSide('top') },
@@ -909,14 +918,21 @@ function render() {
 
   const hasModel = !!modelInfo?.hasModel;
   if (booted && !engraveAvailable()) {
-    // cutting needs a watertight model; whatever path got us here, make such items raised
+    // cutting (and pegs, which need holes) needs a watertight model; whatever path got us here, fix such items
     const cut = doc.items.filter((i) => i.mode === 'engrave' && (isPart(i) || i.plate === 'none'));
-    if (cut.length) {
+    const pegged = doc.items.filter((i) => isPart(i) && i.join === 'pegs');
+    if (cut.length || pegged.length) {
       cut.forEach((i) => doc.updateItem(i.id, { mode: 'emboss' }, { coalesce: 'no-engrave' }));
+      pegged.forEach((i) => doc.updateItem(i.id, { join: 'fuse' }, { coalesce: 'no-engrave' }));
       doc.endCoalescing();
       return; // the updates re-render
     }
   }
+  const pegsRadio = document.querySelector('input[name="join"][value="pegs"]');
+  pegsRadio.disabled = !engraveAvailable();
+  pegsRadio.parentElement.title = engraveAvailable()
+    ? 'Print the part separately and glue it into matching holes'
+    : 'Pegs need a watertight model to make holes in';
   $('undoBtn').disabled = !doc.canUndo;
   $('redoBtn').disabled = !doc.canRedo;
   $('deleteBtn').disabled = !sel;

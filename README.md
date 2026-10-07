@@ -38,11 +38,12 @@ Everything runs in your browser. Your models and fonts are never uploaded anywhe
 
 ## Publishing on GitHub Pages
 
-The workflow in [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) tests, builds and deploys the site on every push to `main`.
+The workflow in [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) runs the tests, builds the app with Vite and deploys `dist/` to GitHub Pages on every push to `main` or the development branch (the branch names are listed in the `if:` conditions of that file).
 
-1. Merge this code into `main`.
-2. In the repository go to **Settings → Pages** and set **Source** to **GitHub Actions**.
-3. Push (or re-run the workflow). The app appears at `https://<your-user>.github.io/<repo>/`.
+1. In the repository go to **Settings → Pages** and set **Source** to **GitHub Actions**.
+2. Push (or re-run the workflow from the Actions tab). The app appears at `https://<your-user>.github.io/<repo>/`.
+
+Don't use the "Jekyll" starter workflow GitHub suggests: this app has to be *built* (the browser cannot load `src/` and `node_modules/` directly), so a Jekyll deployment would publish a blank page.
 
 ## Development
 

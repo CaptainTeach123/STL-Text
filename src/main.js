@@ -21,6 +21,7 @@ const defaults = { fontId: 'inter', size: 10, mode: 'emboss', depth: 1.5, qualit
 
 const previewKeys = new Map(); // itemId -> key of the last preview requested
 const previewInfo = new Map(); // itemId -> { size, notes, stats }
+const detached = new Map(); // itemId -> true when the latest preview says the item is not touching the model
 let modelInfo = null; // info of the model as the engine sees it
 let compareOriginal = false; // "Show original": view the model without its enhancement
 let modelReport = null;
@@ -531,6 +532,24 @@ function snapHit(side) {
   return { position: hit ? hit.point : face, normal: n };
 }
 
+/** Move the selected item onto the nearest point of the model's surface. */
+function snapToModel() {
+  const sel = doc.selected;
+  if (!sel || !modelInfo?.hasModel) return;
+  const hit = viewer.closestSurfacePoint(sel.position);
+  if (!hit) return;
+  lastClick = { position: hit.point, normal: hit.normal };
+  doc.updateItem(sel.id, { position: hit.point, normal: hit.normal });
+}
+
+/** Turn the selected part by 90° about one of its axes (tilt: X, roll: Y, spin: Z). */
+function turnPart(key) {
+  const sel = doc.selected;
+  if (!sel) return;
+  const wrap = (deg) => ((((deg + 180) % 360) + 360) % 360) - 180;
+  doc.updateItem(sel.id, { [key]: wrap((sel[key] ?? 0) + 90) });
+}
+
 function snapToSide(side, { look = false } = {}) {
   const hit = snapHit(side);
   if (!hit) return;
@@ -602,6 +621,13 @@ function refreshPreviews() {
         } else {
           viewer.setOverlay(item.id, { geometry: r.geometry, matrix: r.matrix, mode: item.mode, selected: item.id === doc.state.selectedId });
           previewInfo.set(item.id, { size: r.size, notes: r.notes, stats: r.stats });
+          const loose = r.notes.some((n) => n.code === 'NOT_TOUCHING');
+          viewer.setOverlayDetached(item.id, loose);
+          if (!!detached.get(item.id) !== loose) {
+            detached.set(item.id, loose);
+            renderItems(); // the list shows "not touching" instead of the join
+            if (item.id === doc.state.selectedId && isPart(item)) renderPartHint(item);
+          }
         }
         if (item.id === doc.state.selectedId) renderSelectedInfo();
       })
@@ -617,6 +643,7 @@ function refreshPreviews() {
     if (!ids.has(id)) {
       previewKeys.delete(id); // a late response for a removed item is then ignored
       previewInfo.delete(id);
+      detached.delete(id);
     }
   }
   viewer.pruneOverlays(ids);
@@ -688,6 +715,18 @@ async function download() {
 
 /* ----------------------------------------------------------------- render */
 
+/** The Part card's summary line: what the part is, and whether it is touching the model. */
+function renderPartHint(item) {
+  const asset = partAssets.get(item.partId);
+  const info = asset?.info;
+  const about = info
+    ? `${asset.name}: ${info.size.map((v) => fmt(v)).join(' × ')} mm · ${info.triangles.toLocaleString()} triangles${info.repaired ? ' · repaired on load' : ''}`
+    : item.name;
+  const loose = detached.get(item.id) && modelInfo?.hasModel;
+  $('partInfo').textContent = loose ? `${about}. Not touching the model: click the model to place it, or use "Snap to model".` : about;
+  $('partInfo').classList.toggle('warn', !!loose);
+}
+
 let filling = false;
 function fillPanel(item) {
   filling = true;
@@ -718,13 +757,7 @@ function fillPanel(item) {
     $('styleTitle').textContent = part ? 'Add or cut out' : 'Raised or cut';
     $('modeAddLabel').innerHTML = part ? 'Add <small>join</small>' : 'Raised <small>emboss</small>';
     $('modeCutLabel').innerHTML = part ? 'Cut out <small>use as a cutter</small>' : 'Cut in <small>engrave</small>';
-    if (part) {
-      const asset = partAssets.get(item.partId);
-      const info = asset?.info;
-      $('partInfo').textContent = info
-        ? `${asset.name}: ${info.size.map((v) => fmt(v)).join(' × ')} mm · ${info.triangles.toLocaleString()} triangles${info.repaired ? ' · repaired on load' : ''}`
-        : item.name;
-    }
+    if (part) renderPartHint(item);
     ['posX', 'posY', 'posZ'].forEach((id, i) => ($(id).value = item ? Math.round(item.position[i] * 100) / 100 : 0));
     $('roundCorners').checked = !!item && item.cornerRadius > 0;
     $('depthLabel').innerHTML = `${item?.mode === 'engrave' ? 'Depth' : 'Height'} <small>mm</small>`;
@@ -943,8 +976,10 @@ function renderItems() {
       meta.className = 'meta';
       if (part) {
         const joinLabel = { fuse: 'fused', fillet: 'fillet', pegs: 'pegs' }[item.join] ?? item.join;
-        meta.textContent = `${Math.round(item.scale * 100)}% · ${item.mode === 'engrave' ? 'cut out' : joinLabel}`;
-        glyph.title = item.mode === 'engrave' ? 'Part used as a cutter' : `Attached part (${joinLabel})`;
+        const loose = detached.get(item.id) && modelInfo?.hasModel;
+        meta.textContent = `${Math.round(item.scale * 100)}% · ${loose ? 'not touching' : item.mode === 'engrave' ? 'cut out' : joinLabel}`;
+        meta.classList.toggle('warn', !!loose);
+        glyph.title = loose ? 'Not touching the model – it will be left out' : item.mode === 'engrave' ? 'Part used as a cutter' : `Attached part (${joinLabel})`;
       } else {
         const sizes = [...new Set(item.lines.map((l) => l.size))];
         meta.textContent = `${item.lines.length > 1 ? `${item.lines.length} lines · ` : ''}${sizes.join(' / ')} mm`;
@@ -970,7 +1005,7 @@ function renderSelectedInfo() {
       },
     THIN_STROKES: (n) => n.suggestedWeight != null && { label: 'Make bolder', run: () => doc.updateItem(sel.id, { weight: n.suggestedWeight }) },
     SHALLOW: (n) => n.suggestedDepth && { label: `Use ${n.suggestedDepth} mm`, run: () => doc.updateItem(sel.id, { depth: n.suggestedDepth }) },
-    NOT_TOUCHING: () => modelInfo?.hasModel && { label: 'Put on top', run: () => snapToSide('top') },
+    NOT_TOUCHING: () => modelInfo?.hasModel && { label: 'Snap to model', run: snapToModel },
   });
   const width = sel && !isPart(sel) ? info?.size?.[0] : null;
   if (document.activeElement !== $('widthInput')) $('widthInput').value = width ? fmt(width) : '';
@@ -1011,7 +1046,8 @@ function render() {
   $('duplicateBtn').disabled = !sel;
   $('clearBtn').disabled = !doc.base;
   document.querySelectorAll('[data-fix], #scaleBtn, #simplifyBtn').forEach((b) => (b.disabled = !doc.base));
-  document.querySelectorAll('[data-side], [data-nudge]').forEach((b) => (b.disabled = !sel || !hasModel));
+  document.querySelectorAll('[data-side], [data-nudge], #snapBtn').forEach((b) => (b.disabled = !sel || !hasModel));
+  document.querySelectorAll('[data-turn]').forEach((b) => (b.disabled = !sel));
   document.querySelector('input[name="mode"][value="engrave"]').disabled = !hasModel || !modelInfo?.watertight;
   $('placeHint').innerHTML = hasModel
     ? '<b>Click the model</b> to put the text there, or drag the text. Drag empty space to orbit, right-drag to pan, scroll to zoom.'
@@ -1151,6 +1187,8 @@ function bindControls() {
   }
 
   document.querySelectorAll('[data-side]').forEach((btn) => btn.addEventListener('click', () => snapToSide(btn.dataset.side, { look: true })));
+  $('snapBtn').addEventListener('click', snapToModel);
+  document.querySelectorAll('[data-turn]').forEach((btn) => btn.addEventListener('click', () => turnPart(btn.dataset.turn)));
   document.querySelectorAll('[data-nudge]').forEach((btn) =>
     btn.addEventListener('click', () => {
       nudge(btn.dataset.nudge, Number.parseFloat($('nudgeStep').value));

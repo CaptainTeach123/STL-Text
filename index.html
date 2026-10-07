@@ -129,16 +129,28 @@
                 <option value="right">right side</option>
               </select>
             </label>
-            <label class="field num">
-              <span>Tilt <small>degrees</small></span>
-              <input type="number" data-key="tilt" min="-90" max="90" step="1" value="0" />
-              <input type="range" data-key="tilt" min="-45" max="45" step="1" value="0" aria-label="Tilt" />
-            </label>
             <label class="field num" title="How deep the part sits into the surface so the two fuse into one solid (for a cutter: how deep it cuts)">
               <span id="sinkLabel">Sink into surface <small>mm</small></span>
               <input type="number" data-key="sink" min="0" max="50" step="0.1" value="0.4" />
               <input type="range" data-key="sink" min="0" max="5" step="0.1" value="0.4" aria-label="Sink depth" />
             </label>
+            <label class="field num" title="Lean the part forward or back (about its left–right axis). Whatever is lowest then rests on the surface.">
+              <span>Tilt <small>degrees</small></span>
+              <input type="number" data-key="tilt" min="-180" max="180" step="1" value="0" />
+              <input type="range" data-key="tilt" min="-180" max="180" step="1" value="0" aria-label="Tilt" />
+            </label>
+            <label class="field num" title="Lean the part sideways (about its front–back axis). Whatever is lowest then rests on the surface.">
+              <span>Roll <small>degrees</small></span>
+              <input type="number" data-key="roll" min="-180" max="180" step="1" value="0" />
+              <input type="range" data-key="roll" min="-180" max="180" step="1" value="0" aria-label="Roll" />
+            </label>
+          </div>
+          <div class="row">
+            <span class="label">Turn 90° about</span>
+            <button type="button" class="btn small" data-turn="tilt" title="Tilt by 90°">X</button>
+            <button type="button" class="btn small" data-turn="roll" title="Roll by 90°">Y</button>
+            <button type="button" class="btn small" data-turn="spin" title="Spin by 90° about the surface (also under Placement › Rotate)">Z</button>
+            <span class="hint tiny">Spin about the surface is under Placement.</span>
           </div>
           <span class="label join-only">Connection</span>
           <fieldset class="seg wide join-only" aria-label="How the part connects">
@@ -284,6 +296,7 @@
             <button type="button" class="btn small" data-side="left">Left</button>
             <button type="button" class="btn small" data-side="right">Right</button>
             <button type="button" class="btn small" data-side="bottom">Bottom</button>
+            <button type="button" class="btn small" id="snapBtn" title="Move onto the nearest point of the model's surface">Snap to model</button>
           </div>
           <div class="row spread">
             <div class="nudge" role="group" aria-label="Nudge (arrow keys)">

@@ -158,7 +158,7 @@ describe('attached parts', () => {
     m.delete();
   });
 
-  it('a fillet never grows taller than a thin part, and a tilted part pivots about the clicked point', async () => {
+  it('a fillet never grows taller than a thin part, and a turned part rests on whatever is lowest', async () => {
     await loadBox();
     const thin = wasm.Manifold.cube([20, 10, 1], true);
     await client.addPart('thin', stlOf(thin), 'thin');
@@ -170,15 +170,22 @@ describe('attached parts', () => {
     expect(m.decompose().length).toBe(1);
     expect(m.boundingBox().max[2]).toBeCloseTo(3 + 1 - 0.4, 2);
     m.delete();
-    // tilt: one side of the bar goes into the model and the other lifts off it
+    // tilt: the bar leans, its low edge resting on the surface (sunk by the sink), and the user is warned that only an edge touches
     const tilted = await client.preview(onTop({ tilt: 30, sink: 0.4 }), version);
-    const lift = (6 / 2) * Math.sin(Math.PI / 6); // half the 6 mm width times sin 30°
-    expect(tilted.bounds.min[2]).toBeCloseTo(-lift - 0.4, 1);
-    expect(tilted.notes.map((n) => n.code)).toContain('TILT_GAP');
-    const seated = await client.preview(onTop({ tilt: 30, sink: lift + 0.1 }), version);
-    expect(seated.notes.map((n) => n.code)).not.toContain('TILT_GAP');
+    expect(tilted.bounds.min[2]).toBeCloseTo(-0.4, 2);
+    expect(tilted.bounds.max[2]).toBeCloseTo(3 * Math.cos(Math.PI / 6) + 6 * Math.sin(Math.PI / 6) - 0.4, 1);
+    expect(tilted.notes.map((n) => n.code)).toContain('EDGE_CONTACT');
+    // roll by 90°: the bar stands on its end, a whole face down, centred on the clicked point
+    const rolled = await client.preview(onTop({ roll: 90, sink: 0.4 }), version);
+    expect(rolled.bounds.max[2]).toBeCloseTo(20 - 0.4, 2);
+    expect(rolled.size.map((v) => Math.round(v))).toEqual([3, 6]);
+    expect(Math.abs(rolled.bounds.min[0] + rolled.bounds.max[0])).toBeLessThan(0.01);
+    expect(rolled.notes.map((n) => n.code)).not.toContain('EDGE_CONTACT');
+    // tilt and roll together are one rotation; a part never pokes below its contact plane except by the sink
+    const both = await client.preview(onTop({ tilt: 45, roll: 30, sink: 0 }), version);
+    expect(both.bounds.min[2]).toBeCloseTo(0, 2);
     // the tilted fillet still hugs the part where it meets the surface
-    const tf = await client.export([onTop({ tilt: 30, join: 'fillet', filletRadius: 1.5, sink: lift })], version, 'x');
+    const tf = await client.export([onTop({ tilt: 30, join: 'fillet', filletRadius: 1.5, sink: 0.4 })], version, 'x');
     const tm = solidOfStl(tf.stl);
     expect(tm.decompose().length).toBe(1);
     tm.delete();

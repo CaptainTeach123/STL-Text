@@ -754,3 +754,10 @@ body[data-engine='busy'] .stage canvas {
 .disclosure .disclosure {
   margin-top: 0.25rem;
 }
+
+/* ---------- items that are not touching the model ---------- */
+.items li .meta.warn,
+.hint.warn {
+  color: var(--warn, #c77700);
+  font-weight: 600;
+}

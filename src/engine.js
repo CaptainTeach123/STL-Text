@@ -592,8 +592,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
 
   /**
    * An attached part in its local frame: the chosen side faces the model
-   * (contact plane z = 0), scaled, tilted (re-seated so its lowest point is
-   * on the plane), sunk into the surface, with its join:
+   * (contact plane z = 0), scaled, turned (tilt about X, roll about Y; spin
+   * about Z happens in the placement) and re-seated so its lowest point is
+   * on the plane under the clicked point, sunk into the surface, with its join:
    *   fuse   – the part itself (the sink makes the union solid)
    *   fillet – plus a layered concave fillet skirt around its foot
    *   pegs   – plus pegs underneath; `cutter` holds the matching holes
@@ -614,29 +615,29 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       m = seat(m);
       const scale = item.scale > 0 ? item.scale : 1;
       if (scale !== 1) m = seat(temps.add(m.scale(scale)));
-      // tilt pivots about the clicked point: one side goes into the surface, the other lifts off it
-      if (item.tilt) m = temps.add(m.rotate([item.tilt, 0, 0]));
+      const turned = !!(item.tilt || item.roll);
+      if (turned) m = seat(temps.add(m.rotate([item.tilt || 0, item.roll || 0, 0]))); // whatever is lowest now rests on the surface
       const sink = Math.max(0, item.sink ?? 0);
       const bb = m.boundingBox();
-      const buried = Math.max(0, -bb.min[2]);
       const top = bb.max[2]; // height above the contact plane
       const eps = Math.min(0.05, top / 10);
       const footprint = temps.add(m.slice(eps)); // section at the contact plane
-      const fb = footprint.isEmpty() ? m.boundingBox() : footprint.bounds();
+      const fb = footprint.isEmpty() ? bb : footprint.bounds();
       const size = [fb.max[0] - fb.min[0], fb.max[1] - fb.min[1]];
       const cutter_ = item.mode === 'engrave';
       const join = cutter_ ? 'fuse' : item.join; // a cutter has no connection to make
-      const liftGap = buried - sink;
-      if (liftGap > 0.05) {
+      const extent = (bb.max[0] - bb.min[0]) * (bb.max[1] - bb.min[1]);
+      const contact = footprint.isEmpty() ? 0 : footprint.area();
+      if (turned && contact < 0.2 * extent) {
         warnings.push({
           level: 'warn',
-          code: 'TILT_GAP',
-          text: `Tilting lifts one edge ${liftGap.toFixed(1)} mm off the surface. Use "Fused + fillet", more sink, or less tilt.`,
+          code: 'EDGE_CONTACT',
+          text: 'After turning, only an edge of the part meets the surface. Sink it deeper or use "Fused + fillet" so it fuses firmly.',
         });
       }
       let solid;
       let cutter = null;
-      let cut = { mode: cutter_ ? 'engrave' : 'emboss', depth: sink + buried };
+      let cut = { mode: cutter_ ? 'engrave' : 'emboss', depth: sink };
       if (join === 'fillet' && item.filletRadius > 0) {
         const r = item.filletRadius;
         const sunk = temps.add(m.translate(0, 0, -sink));
@@ -706,7 +707,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           });
           solid = m.add(temps.add(Manifold.union(pegs)));
           cutter = Manifold.union(holes);
-          cut = { mode: 'engrave', depth: length + clearance + buried };
+          cut = { mode: 'engrave', depth: length + clearance };
         } else {
           solid = m.translate(0, 0, -sink);
         }

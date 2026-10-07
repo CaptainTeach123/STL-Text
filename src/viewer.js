@@ -9,6 +9,7 @@ import {
   Group,
   HemisphereLight,
   Matrix4,
+  Triangle,
   Mesh,
   MeshBasicMaterial,
   MeshStandardMaterial,
@@ -32,6 +33,7 @@ const COLORS = {
   passthrough: 0xe0a93a,
   emboss: 0xff8a2b,
   engrave: 0xff3b6b,
+  detached: 0xb8bcc8, // an item that is not touching the model
   marker: 0x22d3a6,
 };
 
@@ -210,7 +212,10 @@ export class Viewer {
     const base = o.mode === 'engrave' ? 0.6 : 1;
     const fade = o.selected ? 1 : 0.55;
     const stale = o.stale ? 0.7 : 1;
-    o.mesh.material.opacity = base * fade * stale;
+    const loose = o.detached ? 0.55 : 1;
+    o.mesh.material.opacity = base * fade * stale * loose;
+    o.mesh.material.color.set(o.detached ? COLORS.detached : o.mode === 'engrave' ? COLORS.engrave : COLORS.emboss);
+    o.mesh.material.wireframe = !!o.detached;
     o.mesh.material.transparent = true;
     o.mesh.renderOrder = o.mode === 'engrave' ? 5 : 0;
     o.mesh.visible = !this.resultShown;
@@ -236,7 +241,7 @@ export class Viewer {
       mesh.matrixAutoUpdate = false;
       mesh.userData.itemId = itemId;
       this.scene.add(mesh);
-      o = { mesh, mode, selected, stale: false };
+      o = { mesh, mode, selected, stale: false, detached: false };
       this.overlays.set(itemId, o);
     }
     o.mode = mode;
@@ -279,6 +284,15 @@ export class Viewer {
     this.requestRender();
   }
 
+  /** Show an item as not touching the model (grey wireframe) or back to normal. */
+  setOverlayDetached(itemId, detached) {
+    const o = this.overlays.get(itemId);
+    if (!o || o.detached === !!detached) return;
+    o.detached = !!detached;
+    this.#styleOverlay(o);
+    this.requestRender();
+  }
+
   /** Move an overlay without new geometry (placement-only change). */
   setOverlayMatrix(itemId, matrix) {
     const o = this.overlays.get(itemId);
@@ -299,6 +313,23 @@ export class Viewer {
       this.marker.visible = false;
       this.requestRender();
     }
+  }
+
+  /** The point of the model's surface nearest to `position`, with its normal, or null. */
+  closestSurfacePoint(position) {
+    const geometry = this.baseMesh?.geometry;
+    if (!geometry?.boundsTree) return null;
+    const found = geometry.boundsTree.closestPointToPoint(new Vector3(...position), {});
+    if (!found) return null;
+    const index = geometry.index;
+    const pos = geometry.attributes.position;
+    const tri = new Triangle();
+    tri.a.fromBufferAttribute(pos, index.getX(found.faceIndex * 3));
+    tri.b.fromBufferAttribute(pos, index.getX(found.faceIndex * 3 + 1));
+    tri.c.fromBufferAttribute(pos, index.getX(found.faceIndex * 3 + 2));
+    const normal = tri.getNormal(new Vector3());
+    if (!normal.lengthSq()) return null;
+    return { point: found.point.toArray(), normal: normal.toArray() };
   }
 
   /** First model surface hit by a ray from `origin` along `direction`, or null. */

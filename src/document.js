@@ -23,6 +23,7 @@ export const ITEM_DEFAULTS = Object.freeze({
   scale: 1,
   attach: 'bottom', // which side of the part touches the model
   tilt: 0, // degrees, leans the part about its reading axis
+  roll: 0, // lean sideways (degrees about the part's front–back axis); spin about the surface normal lives in the placement
   sink: 0.4, // how deep the part sits into the surface
   join: 'fuse', // 'fuse' | 'fillet' | 'pegs'
   filletRadius: 1.5,
@@ -50,7 +51,7 @@ const SHAPE_KEYS = [
   'kind', 'lines', 'letterSpacing', 'lineSpacing', 'align', 'weight',
   'cornerRadius', 'mirror', 'quality', 'mode', 'depth', 'overlap',
   'plate', 'plateThickness', 'platePadding',
-  'partId', 'scale', 'attach', 'tilt', 'sink', 'join', 'filletRadius', 'pegCount', 'pegDiameter', 'pegLength', 'pegClearance',
+  'partId', 'scale', 'attach', 'tilt', 'roll', 'sink', 'join', 'filletRadius', 'pegCount', 'pegDiameter', 'pegLength', 'pegClearance',
 ];
 const PLACE_KEYS = ['position', 'normal', 'spin', 'conform'];
 

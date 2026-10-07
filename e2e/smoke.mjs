@@ -333,7 +333,32 @@ try {
   check((await page.locator('#partInfo').innerText()).includes('20.0 × 6.0 × 3.0'), 'part info shows its size', await page.locator('#partInfo').innerText());
   await page.click('[data-side="top"]');
   await idle();
+  // dragged off the model: the list and the Part card say so, and "Snap to model" brings it back
+  await page.evaluate(() => (document.querySelector('#posX').closest('details').open = true));
+  await page.fill('#posX', '140');
+  await page.dispatchEvent('#posX', 'change');
+  await idle();
+  check(/not touching/.test(await page.locator('#itemList li[aria-selected="true"] .meta').innerText()), 'a part off the model is listed as "not touching", not as fused');
+  check(/Not touching the model/.test(await page.locator('#partInfo').innerText()), 'the Part card explains that the part is not touching');
+  const floating = await download('part-floating.stl');
+  check(Math.abs(floating.volume - beforePart.volume) < 1, 'a part that is not touching is left out of the download', `${floating.volume?.toFixed(0)} vs ${beforePart.volume?.toFixed(0)}`);
+  await page.click('#snapBtn');
+  await idle();
+  check(/fused/.test(await page.locator('#itemList li[aria-selected="true"] .meta').innerText()), '"Snap to model" puts the part back on the model', await page.locator('#itemList li[aria-selected="true"] .meta').innerText());
+  await page.click('[data-side="top"]');
+  await idle();
+  // free rotation: roll the bar by 90° so it stands on its end
+  await page.click('[data-turn="roll"]');
+  await idle();
+  check(Number(await page.inputValue('input[type="number"][data-key="roll"]')) === 90, 'the Y button rolls the part by 90°');
+  const standing = await download('part-standing.stl');
+  await page.click('[data-turn="roll"]');
+  await page.click('[data-turn="roll"]');
+  await page.click('[data-turn="roll"]');
+  await idle();
+  check(Number(await page.inputValue('input[type="number"][data-key="roll"]')) === 0, 'four turns bring the roll back to 0');
   const fused = await download('part-fused.stl');
+  check(standing.max[2] - fused.max[2] > 15, 'a rolled bar stands 20 mm tall instead of 3', `${standing.max[2].toFixed(1)} vs ${fused.max[2].toFixed(1)}`);
   // the part sits over the raised letters, so the shared volume counts once: between the part minus letters and the part minus its sunk slice
   const added = fused.volume - beforePart.volume;
   check(added > 200 && added <= 360 - 20 * 6 * 0.4 + 1 && fused.sizeOk, 'fused part adds its volume (minus what it shares with the model)', `+${added.toFixed(0)} mm³`);

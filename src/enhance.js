@@ -288,8 +288,9 @@ export function pairEdges(index, V) {
 }
 
 /** Dihedral angle (degrees) across every paired edge; returns the count above `edgeAngle` and the sharpest edge at each vertex. */
-function dihedrals(edges, index, n, edgeAngle, V) {
+function dihedrals(edges, index, n, edgeAngle, V, pos = null) {
   const maxDih = new Float64Array(V);
+  const maxConvex = pos ? new Float64Array(V) : maxDih; // ridges only (a valley between details is not a ridge)
   const cosA = Math.cos((edgeAngle * Math.PI) / 180);
   let featureEdges = 0;
   for (let e = 0; e < edges.count; e++) {
@@ -297,15 +298,190 @@ function dihedrals(edges, index, n, edgeAngle, V) {
     const d = n[a * 3] * n[b * 3] + n[a * 3 + 1] * n[b * 3 + 1] + n[a * 3 + 2] * n[b * 3 + 2];
     if (d < cosA) featureEdges++;
     const ang = (Math.acos(d > 1 ? 1 : d < -1 ? -1 : d) * 180) / Math.PI;
+    let convex = true;
+    if (pos) {
+      // convex when face b bends away below face a's plane: its centroid lies on the inner side of a
+      const a0 = index[a * 3] * 3, a1 = index[a * 3 + 1] * 3, a2 = index[a * 3 + 2] * 3;
+      const b0 = index[b * 3] * 3, b1 = index[b * 3 + 1] * 3, b2 = index[b * 3 + 2] * 3;
+      const dx = (pos[b0] + pos[b1] + pos[b2] - pos[a0] - pos[a1] - pos[a2]) / 3;
+      const dy = (pos[b0 + 1] + pos[b1 + 1] + pos[b2 + 1] - pos[a0 + 1] - pos[a1 + 1] - pos[a2 + 1]) / 3;
+      const dz = (pos[b0 + 2] + pos[b1 + 2] + pos[b2 + 2] - pos[a0 + 2] - pos[a1 + 2] - pos[a2 + 2]) / 3;
+      convex = dx * n[a * 3] + dy * n[a * 3 + 1] + dz * n[a * 3 + 2] < 0;
+    }
     // the shared edge: the two vertices both faces have in common
     for (let k = 0; k < 3; k++) {
       const v = index[a * 3 + k];
       if (v === index[b * 3] || v === index[b * 3 + 1] || v === index[b * 3 + 2]) {
         if (ang > maxDih[v]) maxDih[v] = ang;
+        if (pos && convex && ang > maxConvex[v]) maxConvex[v] = ang;
       }
     }
   }
-  return { maxDih, featureEdges };
+  return { maxDih, maxConvex, featureEdges };
+}
+
+/* --------------------------------------------------------------- crossings */
+
+/** Does the segment p→q pass through the inside of triangle (a, b, c)? Indices are into `P` (×3). */
+function segmentCrossesTriangle(P, p, q, a, b, c) {
+  const dx = P[q] - P[p], dy = P[q + 1] - P[p + 1], dz = P[q + 2] - P[p + 2];
+  const e1x = P[b] - P[a], e1y = P[b + 1] - P[a + 1], e1z = P[b + 2] - P[a + 2];
+  const e2x = P[c] - P[a], e2y = P[c + 1] - P[a + 1], e2z = P[c + 2] - P[a + 2];
+  const hx = dy * e2z - dz * e2y, hy = dz * e2x - dx * e2z, hz = dx * e2y - dy * e2x;
+  const det = e1x * hx + e1y * hy + e1z * hz;
+  if (Math.abs(det) < 1e-18) return false;
+  const inv = 1 / det;
+  const sx = P[p] - P[a], sy = P[p + 1] - P[a + 1], sz = P[p + 2] - P[a + 2];
+  const u = (sx * hx + sy * hy + sz * hz) * inv;
+  if (u <= 1e-6 || u >= 1 - 1e-6) return false;
+  const qx = sy * e1z - sz * e1y, qy = sz * e1x - sx * e1z, qz = sx * e1y - sy * e1x;
+  const v = (dx * qx + dy * qy + dz * qz) * inv;
+  if (v <= 1e-6 || u + v >= 1 - 1e-6) return false;
+  const t = (e2x * qx + e2y * qy + e2z * qz) * inv;
+  return t > 1e-6 && t < 1 - 1e-6;
+}
+
+/** Do two triangles that share no vertex pass through each other? */
+function trianglesCross(P, index, s, t) {
+  const a = index[s * 3] * 3, b = index[s * 3 + 1] * 3, c = index[s * 3 + 2] * 3;
+  const d = index[t * 3] * 3, e = index[t * 3 + 1] * 3, f = index[t * 3 + 2] * 3;
+  return (
+    segmentCrossesTriangle(P, a, b, d, e, f) || segmentCrossesTriangle(P, b, c, d, e, f) || segmentCrossesTriangle(P, c, a, d, e, f) ||
+    segmentCrossesTriangle(P, d, e, a, b, c) || segmentCrossesTriangle(P, e, f, a, b, c) || segmentCrossesTriangle(P, f, d, a, b, c)
+  );
+}
+
+/**
+ * Pairs of non-adjacent triangles (among `candidates`) that cross each other
+ * in `P`, found through a uniform grid of `cell` size. Returns a flat array
+ * of triangle id pairs; stops after `limit` pairs.
+ */
+function crossingPairs(P, index, candidates, cell, limit) {
+  const n = candidates.length;
+  const lo = new Float64Array(n * 3);
+  const hi = new Float64Array(n * 3);
+  const cells = new Map();
+  const inv = 1 / cell;
+  for (let i = 0; i < n; i++) {
+    const t = candidates[i];
+    for (let k = 0; k < 3; k++) {
+      lo[i * 3 + k] = Infinity;
+      hi[i * 3 + k] = -Infinity;
+    }
+    for (let c = 0; c < 3; c++) {
+      const v = index[t * 3 + c] * 3;
+      for (let k = 0; k < 3; k++) {
+        const x = P[v + k];
+        if (x < lo[i * 3 + k]) lo[i * 3 + k] = x;
+        if (x > hi[i * 3 + k]) hi[i * 3 + k] = x;
+      }
+    }
+    const x0 = Math.floor(lo[i * 3] * inv), x1 = Math.min(x0 + 7, Math.floor(hi[i * 3] * inv));
+    const y0 = Math.floor(lo[i * 3 + 1] * inv), y1 = Math.min(y0 + 7, Math.floor(hi[i * 3 + 1] * inv));
+    const z0 = Math.floor(lo[i * 3 + 2] * inv), z1 = Math.min(z0 + 7, Math.floor(hi[i * 3 + 2] * inv));
+    for (let x = x0; x <= x1; x++) {
+      for (let y = y0; y <= y1; y++) {
+        for (let z = z0; z <= z1; z++) {
+          const key = `${x},${y},${z}`;
+          let list = cells.get(key);
+          if (!list) {
+            list = [];
+            cells.set(key, list);
+          }
+          list.push(i);
+        }
+      }
+    }
+  }
+  const pairs = [];
+  const stamp = new Int32Array(n);
+  const adjacent = (s, t) => {
+    for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) if (index[s * 3 + a] === index[t * 3 + b]) return true;
+    return false;
+  };
+  for (const list of cells.values()) {
+    for (let p = 0; p < list.length; p++) {
+      const i = list[p];
+      for (let q = p + 1; q < list.length; q++) {
+        const j = list[q];
+        const a = i < j ? i : j, b = i < j ? j : i;
+        if (stamp[b] === a + 1 + n * 0) continue; // already tested this pair from another shared cell (per `a`)
+        if (lo[a * 3] > hi[b * 3] || lo[b * 3] > hi[a * 3] || lo[a * 3 + 1] > hi[b * 3 + 1] || lo[b * 3 + 1] > hi[a * 3 + 1] || lo[a * 3 + 2] > hi[b * 3 + 2] || lo[b * 3 + 2] > hi[a * 3 + 2]) continue;
+        const s = candidates[a], t = candidates[b];
+        if (adjacent(s, t)) continue;
+        if (trianglesCross(P, index, s, t)) {
+          pairs.push(s, t);
+          if (pairs.length >= limit * 2) return pairs;
+        }
+      }
+    }
+    // stamps are only an optimisation across cells for the same pair; a pair that crosses is pushed at most once per cell
+  }
+  // dedupe pairs that were found in several cells
+  if (pairs.length > 2) {
+    const seen = new Set();
+    const out = [];
+    for (let i = 0; i < pairs.length; i += 2) {
+      const k = `${pairs[i]},${pairs[i + 1]}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(pairs[i], pairs[i + 1]);
+    }
+    return out;
+  }
+  return pairs;
+}
+
+/** How many pairs of non-adjacent triangles of a mesh pass through each other (for tests and diagnostics). */
+export function countCrossings(positions, index) {
+  const T = index.length / 3;
+  const topo = buildTopology(positions, index);
+  const all = new Int32Array(T);
+  for (let t = 0; t < T; t++) all[t] = t;
+  return crossingPairs(positions, index, all, 3 * (topo.hMean || 1), 1_000_000).length / 2;
+}
+
+/**
+ * Triangles must not pass through each other. Among the triangles touching
+ * a moved vertex, pairs that cross in the result but did not in the input
+ * get the movement of their vertices halved (then frozen) until no such
+ * crossing is left. Writes `out` = pos0 + scale·total. Returns the number
+ * of crossing pairs caught.
+ */
+function resolveCrossings(index, pos0, out, scale, total, hMean) {
+  const V = scale.length;
+  const T = index.length / 3;
+  const moved = new Uint8Array(V);
+  for (let v = 0; v < V; v++) if (scale[v] > 0 && (total[v * 3] !== 0 || total[v * 3 + 1] !== 0 || total[v * 3 + 2] !== 0)) moved[v] = 1;
+  const list = [];
+  for (let t = 0; t < T; t++) if (moved[index[t * 3]] || moved[index[t * 3 + 1]] || moved[index[t * 3 + 2]]) list.push(t);
+  if (!list.length) return 0;
+  const candidates = Int32Array.from(list);
+  let prevented = 0;
+  for (let round = 0; round < 7; round++) {
+    const pairs = crossingPairs(out, index, candidates, 3 * (hMean || 1), 50_000);
+    if (!pairs.length) break;
+    const f = round < 5 ? 0.5 : 0;
+    let fixed = 0;
+    for (let i = 0; i < pairs.length; i += 2) {
+      const s = pairs[i], t = pairs[i + 1];
+      if (trianglesCross(pos0, index, s, t)) continue; // the model came like this
+      prevented++;
+      for (const tri of [s, t]) {
+        for (let k = 0; k < 3; k++) {
+          const v = index[tri * 3 + k];
+          if (!moved[v] || scale[v] === 0) continue;
+          scale[v] *= f;
+          out[v * 3] = pos0[v * 3] + scale[v] * total[v * 3];
+          out[v * 3 + 1] = pos0[v * 3 + 1] + scale[v] * total[v * 3 + 1];
+          out[v * 3 + 2] = pos0[v * 3 + 2] + scale[v] * total[v * 3 + 2];
+          fixed++;
+        }
+      }
+    }
+    if (!fixed) break;
+  }
+  return prevented;
 }
 
 /* ---------------------------------------------------------- normal filters */
@@ -831,6 +1007,32 @@ function reliefDisplacement(pos, index, topo, { gain = 0, deepen = 0, evenOut = 
   }
   const rq = bandPass(hq, K0);
   for (let v = 0; v < V; v++) r[v] -= rq[v];
+  // deepening never carves below the lowest original surface nearby (the floor: a min-filter of the height over the
+  // kernel) and never touches a summit (a vertex at the top of its neighbourhood: a max-filter over the kernel)
+  let floor = null;
+  let ceiling = null;
+  if (deepen > 0) {
+    floor = Float64Array.from(h);
+    ceiling = Float64Array.from(h);
+    let tmpLo = new Float64Array(V);
+    let tmpHi = new Float64Array(V);
+    const { adjStart, adj } = topo;
+    for (let k = 0; k < K; k++) {
+      for (let v = 0; v < V; v++) {
+        let lo = floor[v];
+        let hi = ceiling[v];
+        for (let i = adjStart[v]; i < adjStart[v + 1]; i++) {
+          const o = adj[i];
+          if (floor[o] < lo) lo = floor[o];
+          if (ceiling[o] > hi) hi = ceiling[o];
+        }
+        tmpLo[v] = lo;
+        tmpHi[v] = hi;
+      }
+      [floor, tmpLo] = [tmpLo, floor];
+      [ceiling, tmpHi] = [tmpHi, ceiling];
+    }
+  }
   // coring: flat and smooth regions (tiny band-pass energy, in edge-length units) stay put
   const energy = new Float64Array(V);
   for (let v = 0; v < V; v++) energy[v] = r[v] * r[v];
@@ -856,9 +1058,13 @@ function reliefDisplacement(pos, index, topo, { gain = 0, deepen = 0, evenOut = 
     const A = Math.sqrt(Math.max(0, em[v])) / (hv[v] || 1);
     const mask = f[v] * smoothstep(0.02, 0.08, A);
     const even = typical > 0 && A > 0 ? evenOut * Math.max(-0.5, Math.min(3, typical / A - 1)) : 0;
-    // boost (the operator-pattern subtraction takes about half of the relief signal, hence 2×), even out, and
-    // deepen: valleys (negative relief) are pushed further down, which separates details that have run together
-    const raw = 2 * mask * ((gain + even) * r[v] + 3 * deepen * Math.min(0, r[v]));
+    // boost (the operator-pattern subtraction takes about half of the relief signal, hence 2×) and even out
+    let raw = 2 * mask * (gain + even) * r[v];
+    // deepen: valleys (negative relief) that sit clearly below the top of their neighbourhood are pushed further
+    // down, which separates details that have run together – but never below the surrounding floor
+    if (deepen > 0 && r[v] < 0 && h[v] < ceiling[v] - 0.1 * (ceiling[v] - floor[v])) {
+      raw += Math.max(2 * mask * 3 * deepen * r[v], Math.min(0, floor[v] - h[v]));
+    }
     const c = cap[v];
     disp[v] = c > 0 && Number.isFinite(c) && Number.isFinite(raw) ? c * Math.tanh(raw / c) : 0; // soft cap: strictly below the cap, no flat 'mesa' tops
   }
@@ -872,7 +1078,7 @@ function reliefDisplacement(pos, index, topo, { gain = 0, deepen = 0, evenOut = 
     const A = Math.sqrt(Math.max(0, em[v])) / (hv[v] || 1);
     if (f[v] * smoothstep(0.02, 0.08, A) > 0.5) masked++;
   }
-  return { disp, vn, passes: total, debug: { K, F, maxH, maxR, maxRq, pinned, unmasked: masked, typical } };
+  return { disp, vn, passes: total, debug: { K, F, maxH, maxR, maxRq, pinned, unmasked: masked, typical, fields: { h, r, f, em, floor, ceiling, disp } } };
 }
 
 /** A mesh the filters can work on: whole triangles, indices into the vertex list, finite coordinates. */
@@ -937,11 +1143,15 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
 
   let pos = pos0.slice();
 
-  /** Pins for the relief boost: vertices on creases (judged on the current geometry) and on open edges never move. */
-  const pinsFor = (fd) => {
-    const { maxDih } = dihedrals(edges, index, fd.n, edgeAngle, V);
+  /**
+   * Pins for the relief steps: vertices on creases (judged on the current geometry) and on open edges never move.
+   * `ridgesOnly` pins convex creases only, so the valley between two merged details stays free to be deepened.
+   */
+  const pinsFor = (fd, current, ridgesOnly = false) => {
+    const { maxDih, maxConvex } = dihedrals(edges, index, fd.n, edgeAngle, V, current);
+    const use = ridgesOnly ? maxConvex : maxDih;
     const pin = new Float64Array(V);
-    for (let v = 0; v < V; v++) pin[v] = edges.open[v] ? 0 : 1 - smoothstep(0.75 * edgeAngle, edgeAngle, maxDih[v]);
+    for (let v = 0; v < V; v++) pin[v] = edges.open[v] ? 0 : 1 - smoothstep(0.75 * edgeAngle, edgeAngle, use[v]);
     return pin;
   };
   /** Apply a relief displacement (along the vertex normals) with the flip guard, from the current positions. */
@@ -1034,13 +1244,25 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
     report('Fitting the surface', 0.6);
   }
 
-  if (detail > 0 || deepen > 0 || evenOut > 0) {
+  if (deepen > 0) {
+    // separating details: ridges stay pinned, the valleys between details are free to go down
+    const fdNow = faceData(pos, index);
+    const relief = reliefDisplacement(
+      pos, index, topo,
+      { deepen, featureSize, edgeAngle, cap, pin: pinsFor(fdNow, pos, true), weights },
+      (f) => report('Separating details', 0.6 + 0.15 * f),
+    );
+    stats.iterations += relief.passes;
+    stats.deepenRelief = relief.debug;
+    applyRelief(fdNow, relief, 0.05);
+  }
+  if (detail > 0 || evenOut > 0) {
     // creases (sharp edges in the current, possibly just sharpened geometry) are pinned so relief boosting never rings across them
     const fdNow = faceData(pos, index);
     const relief = reliefDisplacement(
       pos, index, topo,
-      { gain: 2.5 * detail, deepen, evenOut, featureSize, edgeAngle, cap, pin: pinsFor(fdNow), weights },
-      (f) => report('Boosting relief', 0.6 + 0.3 * f),
+      { gain: 2.5 * detail, evenOut, featureSize, edgeAngle, cap, pin: pinsFor(fdNow, pos), weights },
+      (f) => report('Boosting relief', 0.75 + 0.15 * f),
     );
     stats.iterations += relief.passes;
     stats.relief = relief.debug;
@@ -1069,6 +1291,18 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
   const scale = new Float64Array(V);
   const final = new Float64Array(V * 3);
   stats.flipsPrevented += guardedPlace(index, n0, pos0, total, scale, final, 0.05);
+  // and no triangle may have been pushed through another (checked for local clean-ups and models up to 100k triangles)
+  stats.crossingsPrevented = 0;
+  if (weights || T <= 100_000) {
+    stats.crossingsPrevented = resolveCrossings(index, pos0, final, scale, total, h);
+    if (stats.crossingsPrevented) {
+      // the scaled-back movement is re-checked for flips
+      const scaled = new Float64Array(V * 3);
+      for (let v = 0; v < V; v++) for (let k = 0; k < 3; k++) scaled[v * 3 + k] = scale[v] * total[v * 3 + k];
+      const scale2 = new Float64Array(V);
+      stats.flipsPrevented += guardedPlace(index, n0, pos0, scaled, scale2, final, 0.05);
+    }
+  }
 
   // statistics
   let moved = 0;

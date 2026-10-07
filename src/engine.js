@@ -349,8 +349,15 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           progress?.('Cleaning up spots…', { done: n + 1, total: spots.length });
           const radius = Math.max(0.1, spot.radius ?? 8);
           const region = extractRegion(positions, index, spot.position, radius * 1.5);
-          if (!isEnhanceActive(spot) || region.index.length < 12) {
-            stats.push({ id: spot.id, verticesMoved: 0, maxDisplacement: 0, empty: region.index.length < 12 });
+          // a spot that floats away from the surface (further than the ring's reach) does nothing, like a floating text
+          let nearest = Infinity;
+          for (let i = 0; i < region.positions.length; i += 3) {
+            const d = Math.hypot(region.positions[i] - spot.position[0], region.positions[i + 1] - spot.position[1], region.positions[i + 2] - spot.position[2]);
+            if (d < nearest) nearest = d;
+          }
+          const detached = nearest > Math.min(5, radius);
+          if (!isEnhanceActive(spot) || region.index.length < 12 || detached) {
+            stats.push({ id: spot.id, verticesMoved: 0, maxDisplacement: 0, empty: region.index.length < 12 || detached, detached });
             return;
           }
           const weights = regionWeights(region.positions, spot.position, radius, spot.feather ?? 0.5);
@@ -425,7 +432,15 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       } catch {
         result = null;
       }
-      entry = { manifold: result, stats: out.stats ?? { verticesMoved: 0, maxDisplacement: 0, meanDisplacement: 0, flipsPrevented: 0, featureEdges: 0, iterations: 0 } };
+      // only plain numbers travel to the main thread (the module also returns diagnostic fields)
+      const s = out.stats ?? {};
+      entry = {
+        manifold: result,
+        stats: {
+          verticesMoved: s.verticesMoved ?? 0, maxDisplacement: s.maxDisplacement ?? 0, meanDisplacement: s.meanDisplacement ?? 0,
+          flipsPrevented: s.flipsPrevented ?? 0, crossingsPrevented: s.crossingsPrevented ?? 0, featureEdges: s.featureEdges ?? 0, iterations: s.iterations ?? 0,
+        },
+      };
       enhanceCache.set(key, entry);
       if (enhanceCache.size > 4) {
         const oldest = enhanceCache.keys().next().value;
@@ -898,7 +913,15 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         notes.push({ level: 'info', code: 'SPOT', text: 'All amounts are 0, so this spot changes nothing yet.' });
         return notes;
       }
+      if (!base?.current?.manifold) {
+        notes.push({ level: 'warn', code: 'SPOT_UNAVAILABLE', text: "This model couldn't be made watertight, so clean-up spots can't change it." });
+        return notes;
+      }
       const st = base?.current?.spotStats?.find((s) => s.id === item.id);
+      if (st?.detached) {
+        notes.push({ level: 'warn', code: 'NOT_TOUCHING', text: "The spot isn't on the model. Click the model to place it." });
+        return notes;
+      }
       if (!st || st.empty) {
         notes.push({ level: 'warn', code: 'SPOT_EMPTY', text: 'No model surface inside this spot – move it onto the model or make it larger.' });
       } else if (st.failed) {

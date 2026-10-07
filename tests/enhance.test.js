@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { CAP_FACTOR, ENHANCE_DEFAULTS, enhanceMesh, extractRegion, isEnhanceActive, regionWeights } from '../src/enhance.js';
+import { CAP_FACTOR, ENHANCE_DEFAULTS, countCrossings, enhanceMesh, extractRegion, isEnhanceActive, regionWeights } from '../src/enhance.js';
 import { manifold } from '../src/manifold.js';
 import { setup } from './helpers.js';
 
@@ -573,6 +573,14 @@ describe('enhanceMesh: clean-up operations', () => {
     expect(separation(out.positions)).toBeGreaterThan(before * 1.15);
     expect(heightAt(out.positions, -1.8, 0)).toBeCloseTo(heightAt(mesh.positions, -1.8, 0), 2); // deepening only lowers valleys
     expect(Math.abs(heightAt(out.positions, -10, -10))).toBeLessThan(1e-6);
+    // and never carves a moat into the flat ground right next to the clump
+    let lowestGround = 0;
+    for (let v = 0; v < mesh.positions.length; v += 3) {
+      if (Math.abs(mesh.positions[v + 2] - 2) > 0.05) continue; // ground vertices of the top face
+      const near = Math.hypot(mesh.positions[v], mesh.positions[v + 1]) < 7;
+      if (near && out.positions[v + 2] - 2 < lowestGround) lowestGround = out.positions[v + 2] - 2;
+    }
+    expect(lowestGround).toBeGreaterThan(-0.06);
     const m = manifoldOf(out.positions, mesh.index);
     expect(m.status()).toBe('NoError');
     m.delete();
@@ -625,5 +633,61 @@ describe('enhanceMesh: clean-up operations', () => {
     expect(out.stats.verticesMoved).toBeGreaterThan(50);
     expect(flips(mesh.positions, full, mesh.index)).toBe(0);
     expect(() => enhanceMesh(region, { detail: 1, weights: new Float64Array(3) })).toThrow(/weights/);
+  });
+});
+
+/** Spheres of radius 1.5 standing on a plate, unioned (sharp merge creases, sliver triangles from the boolean). */
+function berries(centres, edge = 0.35) {
+  return build((M) => {
+    const plate = M.cube([30, 30, 4], true);
+    const balls = centres.map(([x, y]) => M.sphere(1.5, 48).translate(x, y, 2 + 1.2));
+    const u = M.union([plate, ...balls]);
+    const r = u.refineToLength(edge);
+    plate.delete();
+    balls.forEach((b) => b.delete());
+    u.delete();
+    return r;
+  });
+}
+
+describe('enhanceMesh: clean-up on berries', () => {
+  const topNear = (positions, x, y) => {
+    let top = -Infinity;
+    for (let v = 0; v < positions.length; v += 3) if (Math.hypot(positions[v] - x, positions[v + 1] - y) < 0.6 && positions[v + 2] > top) top = positions[v + 2];
+    return top;
+  };
+  /** The highest point of the merge crease between two berries whose centres lie on the x axis: the crease is the plane x = midpoint. */
+  const passBetween = (positions, ref, a, b) => {
+    let top = -Infinity;
+    const mx = (a[0] + b[0]) / 2;
+    for (let v = 0; v < positions.length; v += 3) if (Math.abs(ref[v] - mx) < 0.08 && Math.abs(ref[v + 1]) < 0.3 && positions[v + 2] > top) top = positions[v + 2];
+    return top;
+  };
+
+  it('separating details lowers the pass between merged berries but not their tops', () => {
+    const mesh = berries([[-1.2, 0], [1.2, 0]]);
+    const out = enhanceMesh(mesh, { deepen: 1, featureSize: 2, capFactor: 1 });
+    expect(flips(mesh.positions, out.positions, mesh.index)).toBe(0);
+    for (const [x, y] of [[-1.2, 0], [1.2, 0]]) expect(Math.abs(topNear(out.positions, x, y) - topNear(mesh.positions, x, y))).toBeLessThan(0.02);
+    const before = passBetween(mesh.positions, mesh.positions, [-1.2, 0], [1.2, 0]);
+    const after = passBetween(out.positions, mesh.positions, [-1.2, 0], [1.2, 0]);
+    expect(before - after).toBeGreaterThan(0.03);
+    const m = manifoldOf(out.positions, mesh.index);
+    expect(m.status()).toBe('NoError');
+    m.delete();
+  });
+
+  it('a ring of merged berries full of sliver triangles comes out without triangles pushed through each other', () => {
+    const centres = Array.from({ length: 6 }, (_, i) => [2.6 * Math.cos((i * Math.PI) / 3), 2.6 * Math.sin((i * Math.PI) / 3)]);
+    const mesh = berries(centres);
+    expect(countCrossings(mesh.positions, mesh.index)).toBe(0);
+    const centre = [0, 0, 3];
+    const region = extractRegion(mesh.positions, mesh.index, centre, 9);
+    const w = regionWeights(region.positions, centre, 6, 0.5);
+    const out = enhanceMesh(region, { deepen: 0.6, evenOut: 0.4, detail: 0.5, featureSize: 2, capFactor: 1, weights: w });
+    expect(flips(region.positions, out.positions, region.index)).toBe(0);
+    expect(countCrossings(out.positions, region.index)).toBe(0);
+    expect(out.stats.verticesMoved).toBeGreaterThan(100);
+    expect(out.stats.crossingsPrevented).toBeGreaterThanOrEqual(0);
   });
 });

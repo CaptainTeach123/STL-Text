@@ -612,7 +612,10 @@ viewer.onDrag = ({ itemId, point, normal, done }) => {
     else doc.updateItem(itemId, { position: point, normal }, { coalesce: 'drag' });
   }
   if (done) {
-    if (isSpot(item) && point) doc.updateItem(itemId, { position: point, normal });
+    if (isSpot(item)) {
+      if (point) doc.updateItem(itemId, { position: point, normal });
+      else viewer.setOverlayMatrix(itemId, placementMatrix(item)); // dropped off the model: the ring goes back where the spot is
+    }
     doc.endCoalescing();
     if (point) lastClick = { position: point, normal };
   }
@@ -710,7 +713,7 @@ async function showResult(on) {
 }
 
 async function download() {
-  const items = doc.items.filter(hasText);
+  const items = doc.items.filter((i) => hasText(i) && !isSpot(i)); // spots change the model, they are not exported geometry
   if (!items.length && !modelInfo?.hasModel) return setStatus('Type some text or open a model first.', 'error');
   const name = modelInfo?.hasModel ? `${modelInfo.name}-text` : items.map((i) => itemLabel(i, '')).filter(Boolean).join('-').slice(0, 40) || 'text';
   try {
@@ -1095,7 +1098,7 @@ function render() {
   $('placeHint').innerHTML = hasModel
     ? '<b>Click the model</b> to put the text there, or drag the text. Drag empty space to orbit, right-drag to pan, scroll to zoom.'
     : 'No model loaded, so there is nothing to place on – the text is exported on its own. Open an STL or use the sample plaque.';
-  $('downloadBtn').disabled = !hasModel && !doc.items.some(hasText);
+  $('downloadBtn').disabled = !hasModel && !doc.items.some((i) => hasText(i) && !isSpot(i));
 
   if (contentChanged && $('resultToggle').checked && booted) {
     $('resultToggle').checked = false;

@@ -135,7 +135,7 @@ describe('clean-up spots in the engine', () => {
     const solid = clump();
     await load(solid);
     const plain = await client.export([], version, 'x');
-    const spot = createSpot({ position: [0, 0, 2.5], normal: [0, 0, 1], radius: 6 });
+    const spot = createSpot({ position: [0, 0, 2.5], normal: [0, 0, 1], radius: 9 });
     const r = await client.updateBase({ version: ++version, transforms: [], simplify: null, enhance: null, spots: [spot] });
     expect(r.info.spots).toHaveLength(1);
     expect(r.info.spots[0]).toMatchObject({ id: spot.id, failed: false, empty: false });
@@ -163,6 +163,23 @@ describe('clean-up spots in the engine', () => {
     expect(r2.info.spots[0].empty).toBe(true);
     const p2 = await client.preview(away, version);
     expect(p2.notes.map((n) => n.code)).toContain('NOT_TOUCHING');
+    // a spot hovering above the surface (its ring is not touching) is not applied either, however large
+    const hover = createSpot({ position: [0, 0, 16], normal: [0, 0, 1], radius: 30 });
+    const r3 = await client.updateBase({ version: ++version, transforms: [], simplify: null, enhance: null, spots: [hover] });
+    expect(r3.info.spots[0]).toMatchObject({ empty: true, detached: true, verticesMoved: 0 });
+    const ex3 = await client.export([hover], version, 'x');
+    expect(Buffer.from(ex3.stl).equals(Buffer.from(plain.stl))).toBe(true);
+    expect((await client.preview(hover, version)).notes.map((n) => n.code)).toContain('NOT_TOUCHING');
     solid.delete();
+  });
+
+  it('on a model with gaps a spot says it cannot work, instead of claiming an empty area', async () => {
+    const open = new Float32Array([0, 0, 0, 30, 0, 0, 0, 30, 0]);
+    await client.loadBase({ kind: 'stl', bytes: writeBinarySTL(open), name: 'open', version: ++version });
+    const spot = createSpot({ position: [8, 8, 0], normal: [0, 0, 1], radius: 6 });
+    const r = await client.updateBase({ version: ++version, transforms: [], simplify: null, enhance: null, spots: [spot] });
+    expect(r.info.spots).toBeNull();
+    const p = await client.preview(spot, version);
+    expect(p.notes.map((n) => n.code)).toEqual(['SPOT_UNAVAILABLE']);
   });
 });

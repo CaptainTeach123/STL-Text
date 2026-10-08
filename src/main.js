@@ -293,7 +293,10 @@ async function loadModel(kind, { bytes = null, name = 'model' } = {}) {
     doc.setBase('none');
     await syncBase();
   } finally {
-    if (basePending === pending) basePending = null;
+    if (basePending === pending) {
+      basePending = null;
+      setDeriving(false); // a load that overtook a slow derivation also ends its "applying…" state
+    }
   }
 }
 
@@ -767,9 +770,9 @@ async function download() {
   if (!items.length && !modelInfo?.hasModel) return setStatus('Type some text or open a model first.', 'error');
   const name = modelInfo?.hasModel ? `${modelInfo.name}-text` : items.map((i) => itemLabel(i, '')).filter(Boolean).join('-').slice(0, 40) || 'text';
   try {
-    await syncBase();
+    if (!(await syncBase())) return setStatus('The model is still being updated – try the download again in a moment.', '');
     const r = await client.export(doc.items, version(), name, { printing });
-    if (!r) return;
+    if (!r) return setStatus('The model changed while the download was being prepared – try again.', '');
     const save = (bytes, fileName) => {
       const blob = new Blob([bytes], { type: 'model/stl' });
       const a = document.createElement('a');

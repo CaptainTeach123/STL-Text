@@ -142,7 +142,16 @@ export const coversOf = (items) =>
   items
     .filter((i) => (isSpot(i) ? !!i.remove : i.cover && hasText(i) && i.mode !== 'engrave' && (isPart(i) || i.plate !== 'none')))
     .map((i) => ({ ...i }));
-export const coversKey = (items) => stableKey(coversOf(items).map((i) => ({ shape: shapeKey(i, ''), place: placeKey(i), sink: i.sink, fit: i.fit !== false })));
+export const coversKey = (items) =>
+  stableKey(
+    coversOf(items).map((i) =>
+      // a removing spot cuts by where it is and how large it is; its clean-up amounts play no part
+      isSpot(i) ? { spot: true, position: i.position, normal: i.normal, radius: i.radius } : { shape: shapeKey(i, ''), place: placeKey(i), sink: i.sink, fit: i.fit !== false },
+    ),
+  );
+
+/** What identifies the model and where it lies: a new model or a transform moves everything found on its surface. */
+export const modelPlacementKey = (base) => stableKey(base ? { kind: base.kind, name: base.name, loaded: base.loaded, transforms: base.transforms } : null);
 
 /** True when the item would produce geometry (text with letters, a part) or affect the model (a spot). */
 export const hasText = (item) =>
@@ -276,7 +285,7 @@ export class Document {
    */
   setBase(kind, name = 'model') {
     this.commit((s) => {
-      s.base = kind === 'none' ? null : { kind, name, transforms: [], simplify: null, enhance: null };
+      s.base = kind === 'none' ? null : { kind, name, loaded: s.baseVersion + 1, transforms: [], simplify: null, enhance: null };
       s.baseVersion += 1;
     });
     // a new model starts a new history: the previous model's bytes are gone
@@ -346,6 +355,17 @@ export class Document {
       s.selectedId = item.id;
     });
     return item;
+  }
+
+  /** Add several items as one undoable step; the last one is selected. */
+  addItems(list) {
+    const items = list.map((overrides) => createItem(overrides));
+    if (!items.length) return items;
+    this.commit((s) => {
+      s.items.push(...items);
+      s.selectedId = items[items.length - 1].id;
+    });
+    return items;
   }
 
   /** Copy the selected item, offset one line down in its own frame. */

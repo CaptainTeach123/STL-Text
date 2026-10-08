@@ -1,5 +1,5 @@
 import { Matrix4, Vector3 } from 'three';
-import { Document, ITEM_DEFAULTS, coversOf, createPart, createSpot, fontIds, frameOf, hasText, isPart, isSpot, itemLabel, maxSize, placeKey, shapeKey, spotsOf, stableKey } from './document.js';
+import { Document, ITEM_DEFAULTS, coversOf, createPart, createSpot, fontIds, frameOf, hasText, isPart, isSpot, itemLabel, maxSize, placeKey, shapeKey, spotsOf, stableKey, modelPlacementKey } from './document.js';
 import { createEngineClient } from './engineClient.js';
 import { ENHANCE_DEFAULTS, isEnhanceActive } from './enhance.js';
 import { Viewer } from './viewer.js';
@@ -553,8 +553,16 @@ async function addPartFile(file) {
 
 /* --------------------------------------------------------------- details */
 
-let foundDetails = null; // the last "Find details" answer: { details, featureSize }
-let detailCount = 0;
+let foundDetails = null; // the last "Find details" answer: { details, featureSize, placement } – placement: the model it was found on
+const DETAIL_ACTIONS = ['replaceRoundBtn', 'cleanOthersBtn', 'removeAllBtn'];
+
+/** The found details are for the model as it lay: a new model or a transformed one puts them out of place. */
+function dropStaleDetails() {
+  if (!foundDetails || foundDetails.placement === modelPlacementKey(doc.base)) return;
+  foundDetails = null;
+  if (!$('detailsCard').hidden) $('detailsSummary').textContent = 'The model changed – click Find again to look for details on it as it is now.';
+  DETAIL_ACTIONS.forEach((id) => ($(id).disabled = true));
+}
 
 /** Look for the details standing on the model and show what was found with the actions for them. */
 async function findDetails() {
@@ -562,12 +570,16 @@ async function findDetails() {
   const card = $('detailsCard');
   card.hidden = false;
   $('detailsSummary').textContent = 'Looking for details…';
-  ['replaceRoundBtn', 'cleanOthersBtn', 'removeAllBtn'].forEach((id) => ($(id).disabled = true));
+  DETAIL_ACTIONS.forEach((id) => ($(id).disabled = true));
+  foundDetails = null;
   try {
-    if (!(await syncBase())) return;
-    const r = await client.findDetails(version(), { featureSize: Number.parseFloat($('detailScale').value) || 0 });
-    if (!r) return;
-    foundDetails = r;
+    const r = (await syncBase()) ? await client.findDetails(version(), { featureSize: Number.parseFloat($('detailScale').value) || 0 }) : null;
+    if (!r) {
+      // the model changed while looking: the answer would be for the old one
+      $('detailsSummary').textContent = 'The model changed while looking – click Find again.';
+      return;
+    }
+    foundDetails = { ...r, placement: modelPlacementKey(doc.base) };
     const round = r.details.filter((d) => d.kind === 'round').length;
     const other = r.details.length - round;
     $('detailsSummary').textContent = r.details.length
@@ -585,6 +597,7 @@ async function findDetails() {
 async function replaceRoundDetails() {
   const round = foundDetails?.details.filter((d) => d.kind === 'round') ?? [];
   if (!round.length) return;
+  const items = [];
   for (const d of round) {
     const radius = Math.round(d.radius * 20) / 20;
     const partId = `sphere-${radius}`;
@@ -595,8 +608,10 @@ async function replaceRoundDetails() {
     const sink = Math.round(radius * 0.35 * 10) / 10;
     // the sphere's centre goes where the fitted one is: the anchor sits that far below it along the base normal
     const position = d.center.map((c, k) => c - d.normal[k] * (radius - sink));
-    doc.addItem({ ...createPart(partId, 'berry', { attach: 'bottom', sink, fit: false, cover: true, join: 'fuse' }), id: undefined, position, normal: d.normal });
+    items.push({ ...createPart(partId, 'berry', { attach: 'bottom', sink, fit: false, cover: true, join: 'fuse' }), id: undefined, position, normal: d.normal });
   }
+  if (!foundDetails) return; // the model changed meanwhile
+  doc.addItems(items); // one undo step for the lot
   setStatus(`Replaced ${round.length} round ${round.length === 1 ? 'detail' : 'details'} with clean spheres that consume the originals. Each is a part you can adjust or delete.`, 'ok');
 }
 
@@ -604,10 +619,12 @@ async function replaceRoundDetails() {
 function cleanOtherDetails() {
   const others = foundDetails?.details.filter((d) => d.kind !== 'round') ?? [];
   if (!others.length) return;
-  for (const d of others) {
-    const radius = Math.round(Math.max(1.5, d.size * 0.65) * 2) / 2;
-    doc.addItem({ ...createSpot(), id: undefined, radius, featureSize: Math.round((d.size / 3) * 10) / 10, deepen: 0.6, evenOut: 0.4, detail: 0.5, sharpen: 0.3, position: d.center, normal: d.normal });
-  }
+  doc.addItems(
+    others.map((d) => {
+      const radius = Math.round(Math.max(1.5, d.size * 0.65) * 2) / 2;
+      return { ...createSpot(), id: undefined, radius, featureSize: Math.round((d.size / 3) * 10) / 10, deepen: 0.6, evenOut: 0.4, detail: 0.5, sharpen: 0.3, position: d.center, normal: d.normal };
+    }),
+  );
   setStatus(`Added ${others.length} clean-up ${others.length === 1 ? 'spot' : 'spots'} sized to the details found.`, 'ok');
 }
 
@@ -615,11 +632,13 @@ function cleanOtherDetails() {
 function removeFoundDetails() {
   const all = foundDetails?.details ?? [];
   if (!all.length) return;
-  for (const d of all) {
-    const radius = Math.round(Math.max(1.5, (d.kind === 'round' ? d.radius * 2 : d.size) * 0.65) * 2) / 2;
-    const position = d.kind === 'round' ? d.center.map((c, k) => c + d.normal[k] * d.radius * 0.5) : d.center;
-    doc.addItem({ ...createSpot(), id: undefined, radius, remove: true, position, normal: d.normal });
-  }
+  doc.addItems(
+    all.map((d) => {
+      const radius = Math.round(Math.max(1.5, (d.kind === 'round' ? d.radius * 2 : d.size) * 0.65) * 2) / 2;
+      const position = d.kind === 'round' ? d.center.map((c, k) => c + d.normal[k] * d.radius * 0.5) : d.center;
+      return { ...createSpot(), id: undefined, radius, remove: true, position, normal: d.normal };
+    }),
+  );
   setStatus(`Removing ${all.length} ${all.length === 1 ? 'detail' : 'details'}: each is a spot you can resize or delete.`, 'ok');
 }
 
@@ -925,7 +944,9 @@ function fillPanel(item) {
     $('textCard').hidden = part || spot;
     $('partCard').hidden = !part;
     $('spotCard').hidden = !spot;
-    $('spotCard').classList.toggle('removing', !!(spot && item?.remove));
+    const removing = !!(spot && item?.remove);
+    $('spotCard').classList.toggle('removing', removing);
+    document.querySelectorAll('#spotCard .cleanup input').forEach((el) => (el.disabled = removing));
     $('styleCard').hidden = spot;
     document.querySelectorAll('.text-only').forEach((el) => (el.hidden = part));
     document.querySelectorAll('.plate-only').forEach((el) => (el.hidden = part || !item || item.plate === 'none'));
@@ -1210,6 +1231,7 @@ function render() {
   fillEnhance();
   renderSelectedInfo();
 
+  dropStaleDetails();
   const hasModel = !!modelInfo?.hasModel;
   if (booted && !engraveAvailable()) {
     // cutting (and pegs, which need holes) needs a watertight model; whatever path got us here, fix such items

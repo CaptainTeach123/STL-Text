@@ -8,8 +8,8 @@ import { concatSoups, displayBuffers, manifoldToSoup } from './mesh.js';
 import { ViewCache, passthroughRangesOf } from './view.js';
 import { ATTACH_ROTATIONS, placementMatrix, toMat4 } from './placement.js';
 import { baseMode, fontIds, hasText, isPart, isSpot, itemLabel, placeKey, shapeKey } from './document.js';
-import { enhanceMesh, extractRegion, isEnhanceActive, regionWeights, smoothField } from './enhance.js';
-import { baseSurface, findDetails } from './details.js';
+import { enhanceMesh, extractRegion, isEnhanceActive, regionWeights } from './enhance.js';
+import { baseSurface, findDetails, refitSpheres } from './details.js';
 
 /**
  * The geometry engine: a pure request handler that owns Manifold objects,
@@ -194,6 +194,24 @@ function centroidOf(cs) {
   return [cx / (3 * a), cy / (3 * a)];
 }
 
+/** Solve A·x = b (dense, small) by Gaussian elimination with partial pivoting; null when singular. */
+function solveLinear(A, b) {
+  const n = b.length;
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let c = 0; c < n; c++) {
+    let p = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    if (Math.abs(M[p][c]) < 1e-12) return null;
+    [M[c], M[p]] = [M[p], M[c]];
+    for (let r = 0; r < n; r++) {
+      if (r === c) continue;
+      const f = M[r][c] / M[c][c];
+      for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  return M.map((row, i) => row[n] / row[i]);
+}
+
 export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance = LOD_TOLERANCE }) {
   const { Manifold } = wasm;
   const fonts = new Map(); // fontId -> { font, label, key }
@@ -278,7 +296,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     while (map.size > max) {
       const key = map.keys().next().value;
       const e = map.get(key);
-      (e.dispose ? e : e.stage).dispose();
+      (e.dispose ? e : e.stage)?.dispose();
       map.delete(key);
     }
   }
@@ -623,11 +641,13 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   function coverSolidsFor(items, temps) {
     const covers = [];
     const notes = [];
+    const removed = []; // ids of the removing spots that really cut something
     for (const item of items) {
       if (isSpot(item)) {
         if (!item.remove) continue;
         const remover = removerSolidFor(item);
         if (!remover) continue;
+        removed.push(item.id);
         covers.push(temps.add(temps.add(remover).transform(toMat4(placementMatrix(item)))));
         notes.push({ level: 'info', code: 'REMOVED', itemId: item.id, text: `${quote(item)} removes the detail under it, down to the surface it stands on.` });
         continue;
@@ -645,7 +665,52 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       covers.push(temps.add(temps.add(cover).transform(toMat4(placed.placement))));
       notes.push({ level: 'info', code: 'COVERED', itemId: item.id, text: `${quote(item)} covers what is under it: the model's details there were cut away so nothing pokes through.` });
     }
-    return { covers, notes };
+    return { covers, notes, removed };
+  }
+
+  /**
+   * A quadric height field z(x, y) through the given vertices of `local` (xyz triples), fitted by least squares with
+   * the outliers dropped once, or a plane when there are too few points for the curvature; null when there are too
+   * few points for even that. `scale` keeps the fit well conditioned.
+   */
+  function fitHeightQuadric(local, points, scale) {
+    const fit = (verts, terms) => {
+      const n = terms === 6 ? 6 : 3;
+      const A = Array.from({ length: n }, () => new Float64Array(n));
+      const b = new Float64Array(n);
+      const row = new Float64Array(n);
+      for (const v of verts) {
+        const x = local[v * 3] / scale, y = local[v * 3 + 1] / scale, z = local[v * 3 + 2];
+        row[0] = 1;
+        row[1] = x;
+        row[2] = y;
+        if (n === 6) {
+          row[3] = x * x;
+          row[4] = x * y;
+          row[5] = y * y;
+        }
+        for (let i = 0; i < n; i++) {
+          b[i] += row[i] * z;
+          for (let j = 0; j < n; j++) A[i][j] += row[i] * row[j];
+        }
+      }
+      const c = solveLinear(A, b);
+      if (!c) return null;
+      return (x, y) => {
+        const u = x / scale, w = y / scale;
+        return c[0] + c[1] * u + c[2] * w + (n === 6 ? c[3] * u * u + c[4] * u * w + c[5] * w * w : 0);
+      };
+    };
+    const terms = points.length >= 24 ? 6 : points.length >= 8 ? 3 : 0;
+    if (!terms) return null;
+    const first = fit(points, terms);
+    if (!first) return null;
+    // the outliers (a neighbouring detail's foot, a stray vertex) dropped: more than three deviations from the fit
+    const dev = points.map((v) => Math.abs(local[v * 3 + 2] - first(local[v * 3], local[v * 3 + 1])));
+    const sorted = Float64Array.from(dev).sort();
+    const cut = Math.max(0.02, 3 * 1.4826 * sorted[sorted.length >> 1]);
+    const kept = points.filter((v, i) => dev[i] <= cut);
+    return (kept.length >= (terms === 6 ? 24 : 8) && kept.length < points.length ? fit(kept, terms) : null) ?? first;
   }
 
   /**
@@ -662,27 +727,103 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const mesh = stage.view ?? stage.mesh;
     const region = extractRegion(mesh.positions, mesh.index, spot.position, radius * 3);
     if (region.index.length < 12) return null;
-    // the detail's vertices: those standing clearly above the region's smoothed base, within the spot. The base the cut
-    // goes down to is the surface spanned across them with everything else held in place (a membrane fill), so it
-    // follows the surrounding surface exactly and bridges the detail smoothly
-    const { height, topo } = baseSurface(region, { featureSize: 3 * radius, pinBorder: true });
+    // the detail's vertices: those standing clearly above the region's smoothed base, within the spot. The surface the cut
+    // goes down to is found in two steps: the detail is first spanned over with a membrane (its vertices relaxed with
+    // everything else held in place), then that filled surface is smoothed again. Smoothing the original surface alone
+    // would not do: it spreads the detail's bulk over its surroundings and so lies above the true surface under it.
+    const { height, normals, topo } = baseSurface(region, { featureSize: 3 * radius, pinBorder: true });
+    const { adjStart, adj } = topo;
     const V = region.positions.length / 3;
     let maxH = 0;
     for (let v = 0; v < V; v++) if (height[v] > maxH) maxH = height[v];
-    const threshold = Math.max(0.05, 0.2 * maxH);
-    const lam = new Float64Array(V);
+    // the clearly raised vertices seed the detail; it grows over everything a little raised, and on down the detail's
+    // skirt while the height keeps falling, to where the surrounding surface begins, so no stub of its foot is left
+    const d2Of = (v) => (region.positions[v * 3] - spot.position[0]) ** 2 + (region.positions[v * 3 + 1] - spot.position[1]) ** 2 + (region.positions[v * 3 + 2] - spot.position[2]) ** 2;
+    const seedAbove = Math.max(0.05, 0.2 * maxH);
+    const footAbove = Math.max(0.02, 0.04 * maxH);
+    const descent = 0.005 * maxH;
     const reach2 = (1.2 * radius) ** 2;
-    let freed = 0;
+    const foot2 = (1.5 * radius) ** 2;
+    const free = new Uint8Array(V);
+    const freeList = [];
     for (let v = 0; v < V; v++) {
-      const d2 = (region.positions[v * 3] - spot.position[0]) ** 2 + (region.positions[v * 3 + 1] - spot.position[1]) ** 2 + (region.positions[v * 3 + 2] - spot.position[2]) ** 2;
-      if (height[v] > threshold && d2 <= reach2) {
-        lam[v] = 0.5;
-        freed++;
+      if (height[v] > seedAbove && d2Of(v) <= reach2) {
+        free[v] = 1;
+        freeList.push(v);
       }
     }
-    if (!freed) return null;
-    const basePositions = smoothField(Float64Array.from(region.positions), topo, lam, 400, 3);
+    for (let i = 0; i < freeList.length; i++) {
+      const v = freeList[i];
+      for (let k = adjStart[v]; k < adjStart[v + 1]; k++) {
+        const o = adj[k];
+        if (free[o] || d2Of(o) > foot2) continue;
+        if (height[o] <= footAbove && height[o] >= height[v] - descent) continue;
+        free[o] = 1;
+        freeList.push(o);
+      }
+    }
+    if (!freeList.length) return null;
+    // the surface the cut goes down to, as a height field in the spot's frame (z along its normal): a quadric fitted
+    // through the unraised surface around the detail carries the curvature of what it stands on (a membrane simply
+    // spanned across the detail's foot would sag below a curved surface), and a membrane over the residuals – the
+    // freed vertices relaxed to the mean of their neighbours (successive over-relaxation, in place) until they
+    // settle, the surroundings holding them – follows the irregularities of the real surface
     const placement = placementMatrix(spot);
+    const inverse = placement.clone().invert();
+    const local = new Float64Array(V * 3);
+    const lv = new Vector3();
+    for (let v = 0; v < V; v++) {
+      lv.set(region.positions[v * 3], region.positions[v * 3 + 1], region.positions[v * 3 + 2]).applyMatrix4(inverse);
+      local[v * 3] = lv.x;
+      local[v * 3 + 1] = lv.y;
+      local[v * 3 + 2] = lv.z;
+    }
+    // the surroundings: the surface connected to the detail, out to a third again of the detail's reach (a quadric
+    // follows a curved surface closely only over a modest span), not raised, facing the spot's way
+    let freeReach2 = 0;
+    for (const v of freeList) freeReach2 = Math.max(freeReach2, local[v * 3] ** 2 + local[v * 3 + 1] ** 2);
+    const band2 = Math.max((1.2 * radius) ** 2, 1.35 ** 2 * freeReach2);
+    const inBand = (v) => local[v * 3] ** 2 + local[v * 3 + 1] ** 2 <= band2;
+    const seen = new Uint8Array(V);
+    const around = [];
+    const grow = (v) => {
+      for (let k = adjStart[v]; k < adjStart[v + 1]; k++) {
+        const o = adj[k];
+        if (free[o] || seen[o] || !inBand(o)) continue;
+        seen[o] = 1;
+        around.push(o);
+      }
+    };
+    for (const v of freeList) grow(v);
+    for (let i = 0; i < around.length; i++) grow(around[i]);
+    const facing = (v) => normals[v * 3] * spot.normal[0] + normals[v * 3 + 1] * spot.normal[1] + normals[v * 3 + 2] * spot.normal[2] > 0.2;
+    let points = around.filter((v) => height[v] <= footAbove && facing(v));
+    const quadric = fitHeightQuadric(local, points, radius) ?? fitHeightQuadric(local, around.filter(facing), radius);
+    if (!quadric) return null;
+    const rho = new Float64Array(V);
+    for (let v = 0; v < V; v++) if (!free[v]) rho[v] = local[v * 3 + 2] - quadric(local[v * 3], local[v * 3 + 1]);
+    const tolerance = 1e-4 * radius;
+    const omega = 1.7;
+    for (let pass = 0; pass < 20_000; pass++) {
+      let moved = 0;
+      for (const v of freeList) {
+        const s = adjStart[v], e = adjStart[v + 1];
+        if (e === s) continue;
+        let m = 0;
+        for (let k = s; k < e; k++) m += rho[adj[k]];
+        const d = omega * (m / (e - s) - rho[v]);
+        rho[v] += d;
+        if (Math.abs(d) > moved) moved = Math.abs(d);
+      }
+      if (moved < tolerance) break;
+    }
+    const basePositions = Float64Array.from(region.positions);
+    for (const v of freeList) {
+      lv.set(local[v * 3], local[v * 3 + 1], quadric(local[v * 3], local[v * 3 + 1]) + rho[v]).applyMatrix4(placement);
+      basePositions[v * 3] = lv.x;
+      basePositions[v * 3 + 1] = lv.y;
+      basePositions[v * 3 + 2] = lv.z;
+    }
     const baseGeometry = new BufferGeometry();
     baseGeometry.setAttribute('position', new Float32BufferAttribute(Float32Array.from(basePositions), 3));
     baseGeometry.setIndex(new Uint32BufferAttribute(region.index, 1));
@@ -698,8 +839,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const W = nx + 1;
     const bottom = new Float64Array(W * (ny + 1)).fill(NaN);
     const top = new Float64Array(W * (ny + 1)).fill(NaN);
+    const exit = new Float64Array(W * (ny + 1)).fill(NaN);
     const budget = 2 * radius + COVER_PROTRUDE;
-    let consumed = false;
     for (let j = 0; j <= ny; j++) {
       for (let i = 0; i <= nx; i++) {
         const x = x0 + i * cell;
@@ -707,23 +848,41 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         if (x * x + y * y > radius * radius) continue;
         const b0 = baseSampler.heightAt(x, y);
         if (!Number.isFinite(b0)) continue;
-        const z0 = b0 + 0.15; // a hair above the spanned surface, so the cut floor is that surface
+        const z0 = b0 + 0.05; // a hair above the spanned surface, so the cut floor is that surface
         const k = j * W + i;
         bottom[k] = z0;
-        top[k] = z0 + 0.01;
-        let cutTo = NaN;
         for (const c of surface.crossingsAt(x, y)) {
           if (c.z <= z0) continue;
           if (c.z - z0 > budget) break;
-          if (c.exit) cutTo = c.z;
-        }
-        if (Number.isFinite(cutTo)) {
-          top[k] = cutTo + COVER_EPSILON;
-          consumed = true;
+          if (c.exit) exit[k] = c.z;
         }
       }
     }
     baseSampler.dispose();
+    // as for a cover: the cut's top takes the highest exit around each node, so the detail's steep flank between
+    // grid nodes is removed too instead of being left as floating slivers
+    let consumed = false;
+    for (let j = 0; j <= ny; j++) {
+      for (let i = 0; i <= nx; i++) {
+        const k = j * W + i;
+        if (!Number.isFinite(bottom[k])) continue;
+        top[k] = bottom[k] + 0.01;
+        let high = NaN;
+        for (let dj = -1; dj <= 1; dj++) {
+          for (let di = -1; di <= 1; di++) {
+            const ii = i + di;
+            const jj = j + dj;
+            if (ii < 0 || jj < 0 || ii > nx || jj > ny) continue;
+            const e = exit[jj * W + ii];
+            if (Number.isFinite(e) && !(high >= e)) high = e;
+          }
+        }
+        if (Number.isFinite(high) && high > bottom[k]) {
+          top[k] = high + COVER_EPSILON;
+          consumed = true;
+        }
+      }
+    }
     if (!consumed) return null;
     const slab = heightFieldSlab({ x0, y0, cell, nx, ny, bottom, top });
     if (!slab) return null;
@@ -747,12 +906,14 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     if (!entry) {
       const temps = scope();
       try {
-        const { covers: solids } = coverSolidsFor(covers, temps);
-        if (!solids.length) return null;
+        const { covers: solids, removed } = coverSolidsFor(covers, temps);
         const model = stageManifold(stage);
-        if (!model) return null;
-        const carved = Manifold.difference(model, temps.add(Manifold.union(solids)));
-        entry = { stage: makeStage({ manifold: carved, input: stage }), count: solids.length };
+        if (!solids.length || !model) {
+          entry = { stage: null, count: 0, removed };
+        } else {
+          const carved = Manifold.difference(model, temps.add(Manifold.union(solids)));
+          entry = { stage: makeStage({ manifold: carved, input: stage }), count: solids.length, removed };
+        }
       } finally {
         temps.dispose();
       }
@@ -813,7 +974,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     if (watertight && covers?.length) {
       progress?.('Clearing under the parts…');
       const shown = coveredFor(stage, covers, `${transformsKey}|${simplify}|${JSON.stringify(enhance)}|${JSON.stringify(spots)}`);
-      if (shown) {
+      base.current.removed = shown?.removed ?? [];
+      if (shown?.stage) {
         covered = shown.count;
         built = views.build(shown.stage.view ?? shown.stage.mesh, { normals: shown.stage.normals, passthrough });
         shown.stage.normals = built.normals;
@@ -1350,11 +1512,13 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         return notes;
       }
       if (item.remove) {
-        notes.push(
-          base?.current?.watertight
-            ? { level: 'ok', code: 'SPOT', text: 'Removes the detail under it, down to the surface it stands on. The model is shown and downloaded without it.' }
-            : { level: 'warn', code: 'SPOT_UNAVAILABLE', text: "This model couldn't be made watertight, so nothing can be cut from it." },
-        );
+        if (!base?.current?.watertight) {
+          notes.push({ level: 'warn', code: 'SPOT_UNAVAILABLE', text: "This model couldn't be made watertight, so nothing can be cut from it." });
+        } else if (base.current.removed && !base.current.removed.includes(item.id)) {
+          notes.push({ level: 'warn', code: 'REMOVE_EMPTY', text: 'Nothing stands above the surface inside this spot – move it onto the detail or make it larger.' });
+        } else {
+          notes.push({ level: 'ok', code: 'SPOT', text: 'Removes the detail under it, down to the surface it stands on. The model is shown and downloaded without it.' });
+        }
         return notes;
       }
       if (!isEnhanceActive(item)) {
@@ -1771,13 +1935,21 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       let mesh = stage.view ?? stage.mesh;
       const bounds = b.current.bounds;
       const diag = bounds ? Math.hypot(...[0, 1, 2].map((k) => bounds.max[k] - bounds.min[k])) : 100;
-      const F = featureSize > 0 ? featureSize : 0.05 * diag;
+      const F = featureSize > 0 ? featureSize : 0.15 * diag; // the same automatic scale as details.js
       const solid = b.current.watertight ? stageManifold(stage) : null;
-      if (solid && mesh.index.length / 3 > 20_000) {
-        const lighter = temps.add(solid.simplify(F / 40));
-        if (lighter.numTri() >= 1000) mesh = meshOf(lighter);
+      if (solid) {
+        // the smoothing works per edge, so the copy it runs on has evenly sized edges: a dense model is first
+        // lightened, a coarse one (long thin triangles) refined, both to about a twelfth of the feature scale
+        const edge = F / 12;
+        let lighter = mesh.index.length / 3 > 20_000 ? temps.add(solid.simplify(F / 40)) : solid;
+        const area = lighter.surfaceArea();
+        if (area / (0.43 * edge * edge) < 600_000) lighter = temps.add(lighter.refineToLength(edge));
+        if (lighter.numTri() >= 100) mesh = meshOf(lighter);
       }
       const found = findDetails(mesh, { featureSize: F, minHeight });
+      // the copy's vertices lie a little off the surface, so round details take their sphere from the model itself
+      const own = stage.view ?? stage.mesh;
+      if (mesh !== own) refitSpheres(found.details, own.positions);
       return { message: { details: found.details, featureSize: found.featureSize, threshold: found.threshold, triangles: mesh.index.length / 3 }, transfer: [] };
     } finally {
       temps.dispose();

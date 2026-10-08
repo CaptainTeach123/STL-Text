@@ -110,28 +110,28 @@
               <input type="range" data-key="radius" min="1" max="40" step="0.5" value="8" aria-label="Radius" />
             </label>
             <label class="check" title="Instead of cleaning up: cut the detail under the spot off the model, down to the surface it stands on"><input type="checkbox" data-key="remove" /> Remove this detail</label>
-            <label class="field num" title="How much of the radius fades out gently so the clean-up blends into the rest of the model">
+            <label class="field num cleanup" title="How much of the radius fades out gently so the clean-up blends into the rest of the model">
               <span>Soft edge <small>%</small></span>
               <input type="number" data-key="feather" min="0" max="100" step="5" value="50" />
               <input type="range" data-key="feather" min="0" max="100" step="5" value="50" aria-label="Soft edge" />
             </label>
           </div>
-          <label class="field num" title="Deepens the valleys between details so merged berries, leaves and scrolls read as separate shapes">
+          <label class="field num cleanup" title="Deepens the valleys between details so merged berries, leaves and scrolls read as separate shapes">
             <span>Separate details <small>%</small></span>
             <input type="number" data-key="deepen" min="0" max="100" step="5" value="60" />
             <input type="range" data-key="deepen" min="0" max="100" step="5" value="60" aria-label="Separate details" />
           </label>
-          <label class="field num" title="Gives weak details more depth and very strong ones a little less, so the area reads evenly">
+          <label class="field num cleanup" title="Gives weak details more depth and very strong ones a little less, so the area reads evenly">
             <span>Even out depth <small>%</small></span>
             <input type="number" data-key="evenOut" min="0" max="100" step="5" value="40" />
             <input type="range" data-key="evenOut" min="0" max="100" step="5" value="40" aria-label="Even out depth" />
           </label>
-          <label class="field num" title="Deepens fine relief so it stands out">
+          <label class="field num cleanup" title="Deepens fine relief so it stands out">
             <span>Boost relief <small>%</small></span>
             <input type="number" data-key="detail" min="0" max="100" step="5" value="50" />
             <input type="range" data-key="detail" min="0" max="100" step="5" value="50" aria-label="Boost relief" />
           </label>
-          <div class="grid2">
+          <div class="grid2 cleanup">
             <label class="field num" title="Makes edges inside the spot crisp">
               <span>Sharpen edges <small>%</small></span>
               <input type="number" data-key="sharpen" min="0" max="100" step="5" value="0" />
@@ -141,7 +141,7 @@
               <input type="number" data-key="smooth" min="0" max="100" step="5" value="0" />
             </label>
           </div>
-          <details class="disclosure">
+          <details class="disclosure cleanup">
             <summary>Fine-tune</summary>
             <div class="grid2">
               <label class="field num" title="How large the details to work on are. 0 picks a size from the mesh.">

@@ -4,8 +4,9 @@ import { buildTopology, faceData, pairEdges, smoothField } from './enhance.js';
  * The "base" of a mesh: its surface smoothed at a scale larger than the
  * details standing on it, so that berries, leaves and the like are gone
  * while the shape they stand on remains. Plain smoothing also shrinks a
- * curved surface; that shrink is measured by smoothing the base once more
- * and added back, so the base of a plain cane is the cane itself.
+ * curved surface; that bias varies slowly, so it is taken as the local mean
+ * of the raw height over a window far larger than any detail and removed,
+ * and the base of a plain cane is the cane itself.
  * Vertices on an open border (a cut-out region) are pinned.
  * @returns {{ base: Float64Array, normals: Float64Array, height: Float64Array, areas: Float64Array, topo: object, featureSize: number }}
  *   `height` is how far each vertex stands above the base along its normal.
@@ -42,7 +43,7 @@ export function baseSurface(mesh, { featureSize = 0, pinBorder = true } = {}) {
       normals[v * 3 + 2] /= l;
     }
   }
-  const F = featureSize > 0 ? featureSize : Math.max(10 * hMean, 0.05 * diag);
+  const F = featureSize > 0 ? featureSize : Math.max(10 * hMean, 0.15 * diag);
   const K = Math.max(2, Math.min(600, Math.round(0.5 * (F / hMean) ** 2)));
   // the step is normalised by ring size so the kernel is uniform in millimetres, and border vertices stay put
   const ring = new Float64Array(V);
@@ -70,17 +71,25 @@ export function baseSurface(mesh, { featureSize = 0, pinBorder = true } = {}) {
     lam[v] = 0.5 * rho * free[v] * (adjStart[v + 1] > adjStart[v] ? 1 : 0);
   }
   const q = smoothField(pos, topo, lam, K, 3);
-  const q2 = smoothField(q, topo, lam, K, 3);
+  const h = new Float64Array(V);
+  for (let v = 0; v < V; v++) {
+    h[v] = (pos[v * 3] - q[v * 3]) * normals[v * 3] + (pos[v * 3 + 1] - q[v * 3 + 1]) * normals[v * 3 + 1] + (pos[v * 3 + 2] - q[v * 3 + 2]) * normals[v * 3 + 2];
+  }
+  // smoothing also pulls a curved surface inwards, by an amount that varies slowly with the curvature: that bias is
+  // the local mean of the raw height over a window far larger than any detail, which details themselves barely move.
+  // The mean is weighted by area (the smoothed height-times-area over the smoothed area), so that a detail meshed
+  // much more densely than what it stands on does not sway it
+  const passes = Math.min(4 * K, 2400);
+  const weighted = smoothField(Float64Array.from(h, (x, v) => x * areas[v]), topo, lam, passes, 1);
+  const weight = smoothField(areas, topo, lam, passes, 1);
   const base = new Float64Array(V * 3);
   const height = new Float64Array(V);
   for (let v = 0; v < V; v++) {
-    // the shrink the smoothing causes on the base itself, measured by smoothing it again, is added back
-    const sx = q[v * 3] - q2[v * 3], sy = q[v * 3 + 1] - q2[v * 3 + 1], sz = q[v * 3 + 2] - q2[v * 3 + 2];
-    const shrink = sx * normals[v * 3] + sy * normals[v * 3 + 1] + sz * normals[v * 3 + 2];
-    base[v * 3] = q[v * 3] + shrink * normals[v * 3];
-    base[v * 3 + 1] = q[v * 3 + 1] + shrink * normals[v * 3 + 1];
-    base[v * 3 + 2] = q[v * 3 + 2] + shrink * normals[v * 3 + 2];
-    height[v] = (pos[v * 3] - base[v * 3]) * normals[v * 3] + (pos[v * 3 + 1] - base[v * 3 + 1]) * normals[v * 3 + 1] + (pos[v * 3 + 2] - base[v * 3 + 2]) * normals[v * 3 + 2];
+    const bias = weight[v] > 1e-12 ? weighted[v] / weight[v] : 0;
+    height[v] = h[v] - bias;
+    base[v * 3] = pos[v * 3] - height[v] * normals[v * 3];
+    base[v * 3 + 1] = pos[v * 3 + 1] - height[v] * normals[v * 3 + 1];
+    base[v * 3 + 2] = pos[v * 3 + 2] - height[v] * normals[v * 3 + 2];
   }
   return { base, normals, height, areas, topo, featureSize: F };
 }
@@ -100,7 +109,7 @@ export function baseSurface(mesh, { featureSize = 0, pinBorder = true } = {}) {
  * @param {{ positions: Float32Array|Float64Array, index: Uint32Array }} mesh
  * @param {object} [options]
  * @param {number} [options.featureSize]  scale of the base smoothing, mm – about three times the size of the details
- *   (0: automatic, 5 % of the model's extent)
+ *   (0: automatic, 15 % of the model's extent)
  * @param {number} [options.minHeight]    details lower than this are ignored, mm (0: automatic)
  * @param {number} [options.maxCount]     at most this many details, the tallest first (default 400)
  * @returns {{ details: Detail[], featureSize: number, threshold: number }}
@@ -115,7 +124,7 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
   const V = pos.length / 3;
   const T = index.length / 3;
   if (V < 4 || T < 4) return { details: [], featureSize: 0, threshold: 0 };
-  const { normals: vn, height: r, areas: va, topo, featureSize: F } = baseSurface(mesh, { featureSize, pinBorder: false });
+  const { normals: vn, height: r, areas: va, base, topo, featureSize: F } = baseSurface(mesh, { featureSize, pinBorder: false });
   const { adjStart, adj } = topo;
   // vertices on a sharp crease (faces meeting at more than 50°): the rim of a plateau, the edge of a block
   const sharp = new Uint8Array(V);
@@ -127,8 +136,11 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
       const a = edges.faceA[e] * 3, b = edges.faceB[e] * 3;
       const dot = fd.n[a] * fd.n[b] + fd.n[a + 1] * fd.n[b + 1] + fd.n[a + 2] * fd.n[b + 2];
       if (dot < cosSharp) {
-        sharp[edges.lo[e]] = 1;
-        sharp[edges.hi[e]] = 1;
+        // the edge's vertices are the two the faces share
+        for (let k = 0; k < 3; k++) {
+          const v = index[a + k];
+          if (index[b] === v || index[b + 1] === v || index[b + 2] === v) sharp[v] = 1;
+        }
       }
     }
   }
@@ -165,16 +177,57 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
     regions.push(members);
   }
 
+  // a region that rings a hollow – the rim around a dent or a hole, which stands above the sunken base too – is not a
+  // detail: what a detail's region encloses is raised as well. The flood beyond a region's neighbour stops at the
+  // region; one that stays small is what the region encloses, and the region goes if that lies, on average, below
+  // the level of the region's own base along the region's direction (judging each vertex along its own normal would
+  // not do: a thin fin's flanks read as sunken that way, and a bowl's steep walls as hardly sunken at all)
+  const sunken = median - (high - median);
+  const mark = new Int32Array(V).fill(-1);
+  const queue = new Int32Array(V);
+  const enclosesHollow = (members, id, N, C) => {
+    const cap = 4 * members.length + 50;
+    for (const m of members) {
+      for (let i = adjStart[m]; i < adjStart[m + 1]; i++) {
+        const u = adj[i];
+        if (label[u] === id || mark[u] === id) continue;
+        let head = 0, tail = 0, depth = 0, outside = false;
+        queue[tail++] = u;
+        mark[u] = id;
+        while (head < tail) {
+          const v = queue[head++];
+          depth += (pos[v * 3] - C[0]) * N[0] + (pos[v * 3 + 1] - C[1]) * N[1] + (pos[v * 3 + 2] - C[2]) * N[2];
+          if (tail > cap) {
+            outside = true;
+            break;
+          }
+          for (let k = adjStart[v]; k < adjStart[v + 1]; k++) {
+            const w = adj[k];
+            if (label[w] === id || mark[w] === id) continue;
+            mark[w] = id;
+            queue[tail++] = w;
+          }
+        }
+        if (!outside && depth / head < sunken) return true;
+      }
+    }
+    return false;
+  };
+
   const details = [];
   for (let id = 0; id < regions.length; id++) {
     const members = regions[id];
     if (members.length < 6) continue;
     let cx = 0, cy = 0, cz = 0, nx = 0, ny = 0, nz = 0, area = 0, height = 0, creased = 0;
+    let bx = 0, by = 0, bz = 0; // the region's base: where the surface it stands on runs under it
     for (const v of members) {
       creased += sharp[v];
       cx += pos[v * 3];
       cy += pos[v * 3 + 1];
       cz += pos[v * 3 + 2];
+      bx += base[v * 3];
+      by += base[v * 3 + 1];
+      bz += base[v * 3 + 2];
       nx += vn[v * 3] * va[v];
       ny += vn[v * 3 + 1] * va[v];
       nz += vn[v * 3 + 2] * va[v];
@@ -197,7 +250,9 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
     if (size < 0.15 * F || size > 1.5 * F) continue; // vertex-scale noise, or larger than what the feature scale looks for
     if (area < 0.3 * Math.PI * far) continue; // long and thin: the rim of an edge, not a detail
     if (height < 0.06 * size) continue; // broad and very low: not something standing on the surface
-    if (size > 0.8 * F && creased / n > 0.1) continue; // a large region with a sharp rim: the end of the body, not a detail
+    // a large region with a sharp crease running most of the way round it is the end of the body, not a detail
+    if (size > 0.8 * F && creased > 0.3 * ((Math.PI * size) / topo.hMean)) continue;
+    if (enclosesHollow(members, id, normal, [bx / n, by / n, bz / n])) continue;
     const fit = fitSphere(pos, members);
     let kind = 'other';
     let center = [cx, cy, cz];
@@ -206,7 +261,9 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
     if (fit) {
       roundness = fit.rms / fit.radius;
       const coverage = area / (4 * Math.PI * fit.radius * fit.radius);
-      if (roundness < 0.08 && fit.radius > 0.35 * size && fit.radius < 1.1 * size && coverage > 0.2) {
+      // round: a tight fit, a radius in keeping with the extent, a fair share of the sphere covered, and standing
+      // a fair part of that radius proud of the base (the rounded end of a body fits a big sphere but barely rises)
+      if (roundness < 0.08 && fit.radius > 0.35 * size && fit.radius < 1.1 * size && coverage > 0.2 && height > 0.35 * fit.radius) {
         kind = 'round';
         center = fit.center;
         radius = fit.radius;
@@ -216,6 +273,68 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
   }
   details.sort((a, b) => b.height - a.height);
   return { details: details.slice(0, maxCount), featureSize: F, threshold: high };
+}
+
+/**
+ * Fit the round details' spheres again to another mesh of the same surface –
+ * the model itself, when the details were found on a lightened copy whose
+ * vertices lie a little off the surface. Each sphere is refitted to the
+ * vertices within a band around it, the band narrowing with each pass, so
+ * the surrounding surface drops out of the fit. Details are updated in
+ * place; a fit that drifts away from the found one is left as it was.
+ * @param {Array<{ kind: string, center: number[], radius: number }>} details
+ * @param {Float32Array|Float64Array} positions
+ */
+export function refitSpheres(details, positions) {
+  const round = details.filter((d) => d.kind === 'round');
+  if (!round.length) return;
+  const V = positions.length / 3;
+  // a grid of the vertices, cells as large as the biggest sphere's reach
+  const cell = Math.max(1e-6, 1.5 * Math.max(...round.map((d) => d.radius)));
+  const grid = new Map();
+  const keyOf = (x, y, z) => `${Math.floor(x / cell)},${Math.floor(y / cell)},${Math.floor(z / cell)}`;
+  for (let v = 0; v < V; v++) {
+    const k = keyOf(positions[v * 3], positions[v * 3 + 1], positions[v * 3 + 2]);
+    let list = grid.get(k);
+    if (!list) grid.set(k, (list = []));
+    list.push(v);
+  }
+  for (const d of round) {
+    let { center, radius } = d;
+    const found = { center, radius };
+    let ok = true;
+    for (const band of [0.25, 0.12, 0.08]) {
+      const members = [];
+      const reach = radius * (1 + band);
+      const i0 = Math.floor((center[0] - reach) / cell), i1 = Math.floor((center[0] + reach) / cell);
+      const j0 = Math.floor((center[1] - reach) / cell), j1 = Math.floor((center[1] + reach) / cell);
+      const k0 = Math.floor((center[2] - reach) / cell), k1 = Math.floor((center[2] + reach) / cell);
+      for (let i = i0; i <= i1; i++) {
+        for (let j = j0; j <= j1; j++) {
+          for (let k = k0; k <= k1; k++) {
+            const list = grid.get(`${i},${j},${k}`);
+            if (!list) continue;
+            for (const v of list) {
+              const dist = Math.hypot(positions[v * 3] - center[0], positions[v * 3 + 1] - center[1], positions[v * 3 + 2] - center[2]);
+              if (Math.abs(dist - radius) <= band * radius) members.push(v);
+            }
+          }
+        }
+      }
+      const fit = members.length >= 12 ? fitSphere(positions, members) : null;
+      if (!fit || fit.rms > 0.1 * fit.radius) {
+        ok = false;
+        break;
+      }
+      center = fit.center;
+      radius = fit.radius;
+    }
+    // the refit stays with what was found: a sphere that wandered off or changed size a lot is not the same detail
+    const drift = Math.hypot(center[0] - found.center[0], center[1] - found.center[1], center[2] - found.center[2]);
+    if (!ok || drift > 0.3 * found.radius || radius < 0.7 * found.radius || radius > 1.3 * found.radius) continue;
+    d.center = center;
+    d.radius = radius;
+  }
 }
 
 /** Least-squares sphere through the vertices (Kåsa's algebraic fit): { center, radius, rms } or null. */

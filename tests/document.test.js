@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Matrix4 } from 'three';
-import { Document, coversKey, coversOf, createItem, createPart, createSpot, fontIds, frameOf, hasText, isSpot, itemLabel, itemText, linesOf, maxSize, placeKey, shapeKey, spotsKey, stableKey, transformItems } from '../src/document.js';
+import { Document, coversKey, coversOf, createItem, createPart, createSpot, fontIds, frameOf, hasText, isSpot, itemLabel, itemText, linesOf, maxSize, modelPlacementKey, placeKey, shapeKey, spotsKey, stableKey, transformItems } from '../src/document.js';
 
 describe('keys', () => {
   it('stableKey ignores key order and slider jitter', () => {
@@ -271,5 +271,45 @@ describe('covering items', () => {
     // a cutter part never covers
     doc.updateItem(part.id, { mode: 'engrave' });
     expect(coversOf(doc.items)).toHaveLength(0);
+  });
+
+  it('a removing spot is keyed by where it is and how large, not by clean-up amounts it does not use', () => {
+    const doc = new Document();
+    doc.setBase('sample', 'plaque');
+    const spot = doc.addItem(createSpot({ remove: true, position: [0, 0, 4], normal: [0, 0, 1], radius: 4 }));
+    const v0 = doc.state.baseVersion;
+    const key = coversKey(doc.items);
+    doc.updateItem(spot.id, { sharpen: 0.5, deepen: 0.1, featureSize: 2 });
+    expect(coversKey(doc.items)).toBe(key);
+    expect(doc.state.baseVersion).toBe(v0); // nothing to re-derive
+    doc.updateItem(spot.id, { radius: 6 });
+    expect(coversKey(doc.items)).not.toBe(key);
+    expect(doc.state.baseVersion).toBe(v0 + 1);
+    doc.updateItem(spot.id, { position: [1, 0, 4] });
+    expect(doc.state.baseVersion).toBe(v0 + 2);
+  });
+
+  it('adds several items as one undo step, and the model placement key follows loads and transforms only', () => {
+    const doc = new Document();
+    doc.setBase('sample', 'plaque');
+    const k0 = modelPlacementKey(doc.base);
+    const added = doc.addItems([createSpot({ remove: true, position: [0, 0, 4], normal: [0, 0, 1] }), createSpot({ remove: true, position: [5, 0, 4], normal: [0, 0, 1] }), { text: 'A' }]);
+    expect(added).toHaveLength(3);
+    expect(doc.items).toHaveLength(3);
+    expect(doc.selected.id).toBe(added[2].id);
+    expect(modelPlacementKey(doc.base)).toBe(k0); // items do not move the model
+    expect(doc.undo()).toBe(true);
+    expect(doc.items).toHaveLength(0);
+    expect(doc.canUndo).toBe(false);
+    expect(doc.addItems([])).toEqual([]);
+    expect(doc.canUndo).toBe(false);
+    doc.enhanceBase({ sharpen: 0.5 });
+    expect(modelPlacementKey(doc.base)).toBe(k0); // nor does an enhancement
+    doc.transformBase(new Matrix4().makeRotationZ(Math.PI / 2));
+    const k1 = modelPlacementKey(doc.base);
+    expect(k1).not.toBe(k0); // a transform moves everything on the model
+    doc.setBase('sample', 'plaque');
+    expect(modelPlacementKey(doc.base)).not.toBe(k0); // a model loaded again is another model
+    expect(modelPlacementKey(doc.base)).not.toBe(k1);
   });
 });

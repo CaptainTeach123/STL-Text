@@ -603,13 +603,22 @@ try {
     await idle();
     const itemsAfterRemove = await page.locator('#itemList li').count();
     check(itemsAfterRemove > itemsBeforeRemove && /removes/.test(await page.locator('#itemList li[aria-selected="true"] .meta').innerText()), '"Remove all found" adds removing spots', `${itemsBeforeRemove} → ${itemsAfterRemove}`);
+    check((await page.locator('#spotCard input[data-key="deepen"]').first().isDisabled()) && !(await page.locator('#spotCard input[data-key="radius"]').first().isDisabled()), 'a removing spot has its clean-up amounts disabled, its radius not');
     check(/cuts? the model/.test(await page.locator('#modelNotes').innerText()), 'the model notes say the details are being cut away', (await page.locator('#modelNotes').innerText()).replace(/\s+/g, ' ').slice(0, 160));
     const removedStl = await download('clump-removed.stl');
-    check(removedStl.volume < clumpBefore.volume - 1 && removedStl.sizeOk, 'the download has the bumps cut away', `${removedStl.volume?.toFixed(0)} < ${clumpBefore.volume?.toFixed(0)}`);
+    // the two bumps that ran together hold about 14.5 mm³ (less the part the engraved text already took); the spot covers most of their skirts
+    check(removedStl.volume < clumpBefore.volume - 5 && removedStl.sizeOk, 'the download has the bumps cut away', `${removedStl.volume?.toFixed(1)} vs ${clumpBefore.volume?.toFixed(1)}`);
     while ((await page.locator('#itemList li').count()) > itemsBeforeRemove) {
       await page.click('#deleteBtn');
       await idle();
     }
+    // the details were found on the model as it lay: turning it puts them out of place, so the actions go
+    check(!(await page.locator('#removeAllBtn').isDisabled()), 'the found details are still on offer after the removing spots are deleted');
+    await page.click('[data-fix="rotZ"]');
+    await idle();
+    check((await page.locator('#removeAllBtn').isDisabled()) && /model changed/.test(await page.locator('#detailsSummary').innerText()), 'turning the model drops the found details', (await page.locator('#detailsSummary').innerText()).slice(0, 100));
+    await page.click('#undoBtn');
+    await idle();
     await page.click('#itemList li:first-child');
     await idle();
   }

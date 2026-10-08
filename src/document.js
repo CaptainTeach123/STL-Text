@@ -30,6 +30,7 @@ export const ITEM_DEFAULTS = Object.freeze({
   sharpen: 0, smooth: 0, detail: 0.5, deepen: 0.6, evenOut: 0.4, // amounts 0..1
   featureSize: 0, maxMove: 0, // mm, 0 = automatic
   sink: 0.4, // how deep the part sits into the surface
+  fit: true, // push the part in until its body meets the surface, not just its nearest point
   join: 'fuse', // 'fuse' | 'fillet' | 'pegs'
   filletRadius: 1.5,
   pegCount: 2,
@@ -56,7 +57,7 @@ const SHAPE_KEYS = [
   'kind', 'lines', 'letterSpacing', 'lineSpacing', 'align', 'weight',
   'cornerRadius', 'mirror', 'quality', 'mode', 'depth', 'overlap',
   'plate', 'plateThickness', 'platePadding',
-  'partId', 'scale', 'attach', 'tilt', 'roll', 'sink', 'join', 'filletRadius', 'pegCount', 'pegDiameter', 'pegLength', 'pegClearance',
+  'partId', 'scale', 'attach', 'tilt', 'roll', 'sink', 'fit', 'join', 'filletRadius', 'pegCount', 'pegDiameter', 'pegLength', 'pegClearance',
   'radius', 'feather', 'sharpen', 'smooth', 'detail', 'deepen', 'evenOut', 'featureSize', 'maxMove',
 ];
 const PLACE_KEYS = ['position', 'normal', 'spin', 'conform'];

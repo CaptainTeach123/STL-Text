@@ -1,5 +1,6 @@
 import { BufferGeometry, DoubleSide, Ray, Vector3 } from 'three';
 import { MeshBVH } from 'three-mesh-bvh';
+import { manifoldToGeometry } from './mesh.js';
 
 /**
  * Make flat text follow a curved surface.
@@ -355,4 +356,69 @@ export function conformNotes(stats, { mode = 'emboss', depth = 1, overlap = 0.4,
   }
   void overlap;
   return notes;
+}
+
+/**
+ * Sampler of a rigid part's underside in its own (seated) frame: the lowest
+ * z of the part at (x, y), or NaN where the part does not reach.
+ * @param {import('manifold-3d').Manifold} partSolid  the part as placed, before any lowering
+ */
+export function createUndersideSampler(partSolid) {
+  const geometry = manifoldToGeometry(partSolid);
+  const bvh = new MeshBVH(geometry);
+  const { min, max } = partSolid.boundingBox();
+  const ray = new Ray(new Vector3(), new Vector3(0, 0, 1));
+  return {
+    bounds: { min, max },
+    heightAt(x, y) {
+      ray.origin.set(x, y, min[2] - 1);
+      const hit = bvh.raycastFirst(ray, DoubleSide);
+      return hit ? hit.point.z : NaN;
+    },
+  };
+}
+
+/**
+ * How far a rigid part has to come down (local -Z) so that its body – not
+ * just its nearest point – meets the model: the gap between the part's
+ * underside and the surface is measured on a grid over the part, and the
+ * part is lowered by the gap that 30 % of its covered area has closed. A
+ * flat part on a flat surface stays where it is (gap 0 everywhere); a flat
+ * part across a cylinder sinks a little past the tangent line; a scroll
+ * attached by its hollow side comes down until its back rests on the model
+ * while its tips pass into it. The depth is capped by the part's own height:
+ * a part hovering farther away than that is not touching the model at all.
+ * @param {{ bounds, heightAt }} underside  from createUndersideSampler()
+ * @param {{ heightAt(x: number, y: number): number }} surface  from createSurfaceSampler()
+ * @returns {{ depth: number, reachable: boolean, firstContact: number, cells: number, covered: number }}
+ *   `depth` ≥ 0 (0 when the part already meets or penetrates the surface),
+ *   `reachable` false when the body cannot reach the surface within the
+ *   part's height (`depth` then holds the capped value), `firstContact` the
+ *   smallest gap (negative when the surface already pokes into the part).
+ */
+export function fitDepth(underside, surface, { fraction = 0.3 } = {}) {
+  const { min, max } = underside.bounds;
+  const width = max[0] - min[0];
+  const height = max[1] - min[1];
+  const tall = max[2] - min[2];
+  const empty = { depth: 0, reachable: false, firstContact: NaN, cells: 0, covered: 0 };
+  if (!(width > 0 && height > 0 && tall > 0)) return empty;
+  let cell = Math.max(0.4, Math.min(width, height) / 24);
+  cell = Math.max(cell, width / (MAX_GRID - 1), height / (MAX_GRID - 1));
+  const gaps = [];
+  let covered = 0;
+  for (let y = min[1] + cell / 2; y < max[1]; y += cell) {
+    for (let x = min[0] + cell / 2; x < max[0]; x += cell) {
+      const u = underside.heightAt(x, y);
+      if (!Number.isFinite(u)) continue;
+      covered++;
+      const h = surface.heightAt(x, y);
+      if (Number.isFinite(h)) gaps.push(u - h);
+    }
+  }
+  if (!gaps.length) return { ...empty, covered };
+  gaps.sort((a, b) => a - b);
+  const gap = gaps[Math.min(gaps.length - 1, Math.floor(fraction * gaps.length))];
+  const depth = Math.max(0, gap);
+  return { depth: Math.min(depth, tall), reachable: depth <= tall, firstContact: gaps[0], cells: gaps.length, covered };
 }

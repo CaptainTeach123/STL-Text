@@ -314,6 +314,64 @@ describe('parts really merge with the model', () => {
     m.delete();
   });
 
+  it('a scroll attached by its hollow side is pushed in until its back meets a cane, so it wraps it instead of hovering', async () => {
+    // model: a vertical cane on a plinth
+    const cane = wasm.Manifold.cylinder(120, 12, 12, 96);
+    const plinth = wasm.Manifold.cube([60, 60, 10], true).translate(0, 0, -5);
+    const trophy = cane.add(plinth);
+    await client.loadBase({ kind: 'stl', bytes: stlOf(trophy), name: 'trophy', version: ++version });
+    cane.delete();
+    plinth.delete();
+    trophy.delete();
+    // part: a half-pipe scroll, 40 wide, 60 long, 20 deep; attached by its "bottom" (its hollow side after the turn below)
+    const ring = wasm.CrossSection.circle(20, 96).subtract(wasm.CrossSection.circle(17, 96));
+    const half = ring.intersect(wasm.CrossSection.square([40, 20]).translate(-20, 0));
+    const scroll = wasm.Manifold.extrude(half, 60).rotate([90, 0, 0]);
+    await client.addPart('scroll', stlOf(scroll), 'scroll');
+    ring.delete();
+    half.delete();
+    scroll.delete();
+    // the scroll beside the cane, hollow side toward it: its tips (40 apart) clear the cane (24 wide) on both sides
+    const beside = createPart('scroll', 'scroll', { position: [12, 0, 60], normal: [1, 0, 0], attach: 'bottom' });
+    const fitted = await client.preview(beside, version);
+    const codes = fitted.notes.map((n) => n.code);
+    expect(codes).not.toContain('NOT_TOUCHING');
+    expect(codes).toContain('SETTLED');
+    expect(fitted.notes.find((n) => n.code === 'SETTLED').text).toMatch(/body meets the model/);
+    expect(fitted.stats.settled).toBeGreaterThan(15); // the back of the scroll comes down to the cane (~17 mm)
+    expect(fitted.stats.settled).toBeLessThan(20);
+    expect(codes).not.toContain('TOO_CURVED'); // notes about stretching letters do not apply to a part
+    const ex = await client.export([beside], version, 'x');
+    expect(ex.notes.map((n) => n.code)).not.toContain('NOT_MERGED');
+    const m = solidOfStl(ex.stl);
+    expect(m.decompose().length).toBe(1); // one solid: the cane passes through the scroll's hollow
+    m.delete();
+    expect(fitted.bounds.max[2]).toBeLessThan(20 - 15); // the scroll sits around the cane (its back ~3 mm out), not 20 mm out in the air
+    // without the fit the scroll stays where its tips touch the contact plane: its back hovers 20 mm out
+    const loose = await client.preview({ ...beside, fit: false }, version);
+    expect(loose.stats.settled ?? 0).toBeLessThan(0.1);
+    expect(loose.bounds.max[2]).toBeGreaterThan(19);
+  });
+
+  it('a flat plate across a cylinder sinks a little past the tangent line; on flat ground it stays put', async () => {
+    const cane = wasm.Manifold.cylinder(120, 12, 12, 96);
+    await client.loadBase({ kind: 'stl', bytes: stlOf(cane), name: 'cane', version: ++version });
+    cane.delete();
+    const plate = wasm.Manifold.cube([40, 30, 3], true);
+    await client.addPart('plate', stlOf(plate), 'plate');
+    plate.delete();
+    const across = createPart('plate', 'plate', { position: [12, 0, 60], normal: [1, 0, 0] });
+    const p = await client.preview(across, version);
+    expect(p.stats.settled).toBeGreaterThan(0.3);
+    expect(p.stats.settled).toBeLessThan(3);
+    expect(p.notes.map((n) => n.code)).not.toContain('NOT_TOUCHING');
+    const flat = await client.preview({ ...across, fit: false }, version);
+    expect(flat.stats.settled ?? 0).toBeLessThan(0.1); // first contact only
+    await loadBox();
+    const onBox = await client.preview(createPart('plate', 'plate', { position: [0, 0, 3], normal: [0, 0, 1] }), version);
+    expect(onBox.stats.settled ?? 0).toBeLessThan(1e-6);
+  });
+
   it('a raised text that hovers without overlapping is reported as not merged', async () => {
     await loadBox();
     const hover = createItem({ text: 'Hi', fontId: 'inter', size: 8, position: [0, 0, 4], normal: [0, 0, 1], conform: false, overlap: 0.4 });

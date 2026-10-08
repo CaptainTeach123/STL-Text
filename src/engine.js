@@ -1,6 +1,6 @@
 import { Matrix4, Vector3 } from 'three';
 import { describeRepair, repairToManifold } from './repair.js';
-import { conformNotes, conformSolid, createSurfaceSampler } from './conform.js';
+import { conformNotes, conformSolid, createSurfaceSampler, createUndersideSampler, fitDepth } from './conform.js';
 import { buildCrossSectionInfo, printLimits, textZRange, thinStrokeReport } from './textGeometry.js';
 import { labelFor, parseFont } from './fontParse.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from './stl.js';
@@ -280,6 +280,15 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     }
   }
 
+  /** How many stages a cache keeps: fewer for very dense models, whose solids weigh hundreds of MB each. */
+  const cacheLimit = (stage, max) => (stage.mesh.index.length / 3 > 500_000 ? Math.max(1, Math.floor(max / 2)) : max);
+
+  /** A cached stage is reused with the live stage it derives from (its old input may have been evicted since). */
+  const rebase = (stage, input) => {
+    if (stage.input !== input) stage.input = input;
+    return stage;
+  };
+
   /* ------------------------------------------------------------ stages */
 
   const EMPTY_MESH = { positions: new Float32Array(0), index: new Uint32Array(0) };
@@ -306,7 +315,13 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     return { positions: xyzOf(m), index: m.triVerts };
   }
 
-  /** The same mesh with its vertices moved by a matrix (the index is shared, so the view keeps its BVH). */
+  /**
+   * The same mesh with its vertices moved by a matrix. The index is shared, so
+   * the view keeps its BVH – except under a mirroring transform, which turns
+   * the triangles inside out: then each gets two corners swapped (a new index,
+   * as Manifold's own transform does), so normals and the enhancer see an
+   * outward-facing mesh.
+   */
   function movedMesh(mesh, matrix) {
     const positions = new Float32Array(mesh.positions.length);
     const v = new Vector3();
@@ -316,7 +331,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       positions[i + 1] = v.y;
       positions[i + 2] = v.z;
     }
-    return { positions, index: mesh.index };
+    let index = mesh.index;
+    if (matrix.determinant() < 0) {
+      index = new Uint32Array(mesh.index.length);
+      for (let t = 0; t < index.length; t += 3) {
+        index[t] = mesh.index[t];
+        index[t + 1] = mesh.index[t + 2];
+        index[t + 2] = mesh.index[t + 1];
+      }
+    }
+    return { positions, index };
   }
 
   /**
@@ -331,7 +355,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * the input stage's solid when that is still around (half the cost of
    * building one from scratch), else from the mesh.
    */
-  function makeStage({ manifold, input = null, mesh = null, view, lod, stats = null, failed = false, keepNormals = true }) {
+  function makeStage({ manifold, input = null, mesh = null, view, stats = null, failed = false, keepNormals = true }) {
     const stage = {
       manifold, // Manifold | null | undefined (not built yet)
       input,
@@ -342,7 +366,6 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       disposed: false,
       _mesh: mesh,
       _view: view, // undefined: decide lazily (a LOD when dense); null: show the mesh itself; or a mesh
-      lod, // undefined: not made yet
       get mesh() {
         if (!this._mesh) this._mesh = meshOf(this.materialise());
         return this._mesh;
@@ -353,8 +376,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           this._view = null;
           if (this.mesh.index.length / 3 > lodTriangles) {
             const solid = this.materialise();
-            if (this.lod === undefined) this.lod = solid ? lodFor(solid) : null;
-            if (this.lod) this._view = meshOf(this.lod);
+            const lod = solid ? lodFor(solid) : null;
+            if (lod) {
+              this._view = meshOf(lod); // only the mesh is kept: the solid copy would hold tens of MB for nothing
+              lod.delete();
+            }
           }
         }
         return this._view;
@@ -393,13 +419,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         }
         this.manifold = m;
         this.failed = !m;
+        if (!m) {
+          // the preview already showed this stage; its stats now say that it could not be built into a solid
+          if (Array.isArray(this.stats)) this.stats.forEach((st) => (st.failed = true));
+          else if (this.stats) this.stats.failed = true;
+        }
         return m;
       },
       dispose() {
         this.manifold?.delete();
-        this.lod?.delete();
         this.manifold = null;
-        this.lod = null;
         this.disposed = true;
       },
     };
@@ -430,7 +459,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         view: view ? movedMesh(view, matrix) : null,
       });
       movedCache.set(key, stage);
-      trimCache(movedCache, 2);
+      trimCache(movedCache, cacheLimit(original, 2));
     }
     return stage;
   }
@@ -442,9 +471,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     if (!stage) {
       stage = makeStage({ manifold: input.materialise().simplify(tolerance), input });
       simplifyCache.set(key, stage);
-      trimCache(simplifyCache, 2);
+      trimCache(simplifyCache, cacheLimit(input, 2));
     }
-    return stage;
+    return rebase(stage, input);
   }
 
   /** A lighter copy of a solid for display when it is very dense (null when not needed). */
@@ -529,9 +558,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       }
       stage = makeStage({ manifold: failed ? null : undefined, input, mesh, view, stats: stats.map((s) => ({ ...s, failed })), failed, keepNormals: false });
       spotCache.set(key, stage);
-      trimCache(spotCache, 4);
+      trimCache(spotCache, cacheLimit(input, 4));
     }
-    return stage;
+    return rebase(stage, input);
   }
 
   /**
@@ -562,9 +591,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         ? makeStage({ manifold: undefined, input, mesh: { positions: out.positions, index: mesh.index }, stats })
         : makeStage({ manifold: null, input, mesh, view: null, stats, failed: true });
       enhanceCache.set(key, stage);
-      trimCache(enhanceCache, 4);
+      trimCache(enhanceCache, cacheLimit(input, 4));
     }
-    return stage;
+    return rebase(stage, input);
   }
 
   const composeTransforms = (transforms) =>
@@ -647,7 +676,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       hasModel: base.kind !== 'none',
       enhanced,
       spots: spotStats,
-      suggestions: base.kind === 'stl' && transforms.length === 0 && !simplify && !enhanced ? modelSuggestions({ size, triangles }) : [],
+      suggestions: base.kind === 'stl' && transforms.length === 0 && !simplify && !enhanced ? modelSuggestions({ size, triangles: stage.mesh.index.length / 3 + passthrough.length / 9 }) : [],
     };
     return {
       message: { info, report: base.original.report, display: built.display },
@@ -889,7 +918,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         // keep only pegs whose whole disc sits under the part
         const discArea = Math.PI * radius * radius;
         const centres = candidates.filter(([x, y]) => {
-          const disc = temps.add(wasm.CrossSection.circle(radius, 32).translate(x, y));
+          const disc = temps.add(temps.add(wasm.CrossSection.circle(radius, 32)).translate(x, y));
           const under = temps.add(disc.intersect(footprint));
           return under.area() >= 0.95 * discArea;
         });
@@ -986,17 +1015,44 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         // a rigid part rests on the surface: when the highest point of the surface under its foot lies below the
         // contact plane (a curved or sloping surface, a click that landed a little high) the part comes down to it,
         // so that it really overlaps the model by its sink instead of hovering with an air gap
-        if (isPart(item) && stats?.touches && Number.isFinite(stats.maxHeight) && stats.maxHeight < -1e-6) {
-          settle = stats.maxHeight;
+        let drop = 0;
+        if (isPart(item) && stats?.touches && Number.isFinite(stats.maxHeight) && stats.maxHeight < -1e-6) drop = -stats.maxHeight;
+        // ... and with "fit to surface" it comes down further, until its body meets the model: a scroll attached by
+        // its hollow side, or a plate across a curved surface, would otherwise touch at a point and hover elsewhere
+        // (a tilted or rolled part leans on purpose: it keeps resting on its lowest edge)
+        if (isPart(item) && item.fit !== false && !(item.tilt || item.roll)) {
+          flatEntry.underside ??= createUndersideSampler(flatEntry.solid);
+          const fit = fitDepth(flatEntry.underside, s);
+          if (fit.reachable && fit.cells > 0) {
+            drop = Math.max(drop, fit.depth);
+            if (!stats) stats = { conformed: false };
+            stats.touches = true; // its body reaches the surface even where its foot found none
+            stats.fitted = fit.depth > drop - 1e-9 && fit.depth > (stats.maxHeight < 0 ? -stats.maxHeight : 0) + 0.05;
+          }
+        }
+        if (drop > 1e-6) {
+          settle = -drop;
           solid.delete();
           solid = flatEntry.solid.translate(0, 0, settle);
-          stats.settled = -settle;
+          stats.settled = drop;
         }
       }
     }
     entry = { solid, stats, settle };
     conformed.set(key, entry);
     return { ...entry, flat: flatEntry, placement };
+  }
+
+  /** Placement notes reworded for a rigid part (the conform notes speak of text). */
+  function partWording(notes) {
+    const out = [];
+    for (const n of notes) {
+      if (n.code === 'TOO_CURVED' || n.code === 'CROSSES_EDGE') continue; // about warping text: a part is not warped
+      if (n.code === 'NOT_TOUCHING') out.push({ ...n, text: "This part isn't touching the model. Click the model to place it, or use Snap to model." });
+      else if (n.code === 'OVERHANG') out.push({ ...n, text: 'Part of the part reaches past the edge of the surface it sits on.' });
+      else out.push(n);
+    }
+    return out;
   }
 
   /** Human notes about one item (printability, placement). */
@@ -1045,12 +1101,20 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     }
     if (stats) {
       const cut = isPart(item) ? flatEntry.cut : { mode: meets, depth: item.plate !== 'none' ? item.plateThickness : item.depth };
-      notes.push(...conformNotes(stats, { mode: cut.mode, depth: cut.depth, overlap: item.overlap, nozzle }));
+      const raw_ = conformNotes(stats, { mode: cut.mode, depth: cut.depth, overlap: item.overlap, nozzle });
+      // a rigid part is never warped, so notes about stretching letters do not apply, and the others speak of a part
+      notes.push(...(isPart(item) ? partWording(raw_) : raw_));
     }
     if (isPart(item)) {
       notes.push(...(flatEntry.warnings ?? []));
       if (stats?.settled > 0.05) {
-        notes.push({ level: 'info', code: 'SETTLED', text: `Lowered the part ${stats.settled.toFixed(1)} mm so it rests on the surface here.` });
+        notes.push({
+          level: 'info',
+          code: 'SETTLED',
+          text: stats.fitted
+            ? `Pushed the part ${stats.settled.toFixed(1)} mm into the surface so its body meets the model, not just its nearest point.`
+            : `Lowered the part ${stats.settled.toFixed(1)} mm so it rests on the surface here.`,
+        });
       }
       if (base?.kind !== 'none' && !base?.current?.watertight && item.mode !== 'engrave') {
         notes.push({

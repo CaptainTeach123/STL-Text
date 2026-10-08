@@ -801,7 +801,17 @@ async function download() {
 /* ----------------------------------------------------------------- render */
 
 /** The Part card's summary line: what the part is, and whether it is touching the model. */
+/** Fit to surface has nothing to do for a part that leans on purpose: the control says so. */
+function syncFitControl(item) {
+  const box = document.querySelector('input[data-key="fit"]');
+  if (!box) return;
+  const turned = !!(item && isPart(item) && (item.tilt || item.roll));
+  box.disabled = turned;
+  box.closest('label')?.classList.toggle('muted', turned);
+}
+
 function renderPartHint(item) {
+  syncFitControl(item);
   const asset = partAssets.get(item.partId);
   const info = asset?.info;
   const about = info

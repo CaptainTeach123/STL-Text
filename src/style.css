@@ -780,3 +780,7 @@ body.deriving .deriving-note {
 @keyframes deriving-pulse {
   50% { opacity: 0.35; }
 }
+
+label.check.muted {
+  opacity: 0.5;
+}

@@ -337,7 +337,7 @@ describe('parts really merge with the model', () => {
     const codes = fitted.notes.map((n) => n.code);
     expect(codes).not.toContain('NOT_TOUCHING');
     expect(codes).toContain('SETTLED');
-    expect(fitted.notes.find((n) => n.code === 'SETTLED').text).toMatch(/body meets the model/);
+    expect(fitted.notes.find((n) => n.code === 'SETTLED').text).toMatch(/Lowered the part 1[5-9]\.\d mm/);
     expect(fitted.stats.settled).toBeGreaterThan(15); // the back of the scroll comes down to the cane (~17 mm)
     expect(fitted.stats.settled).toBeLessThan(20);
     expect(codes).not.toContain('TOO_CURVED'); // notes about stretching letters do not apply to a part
@@ -353,23 +353,56 @@ describe('parts really merge with the model', () => {
     expect(loose.bounds.max[2]).toBeGreaterThan(19);
   });
 
-  it('a flat plate across a cylinder sinks a little past the tangent line; on flat ground it stays put', async () => {
+  it('a flat part rests where it first touches: across a cylinder, on two posts, and on flat ground', async () => {
     const cane = wasm.Manifold.cylinder(120, 12, 12, 96);
     await client.loadBase({ kind: 'stl', bytes: stlOf(cane), name: 'cane', version: ++version });
     cane.delete();
     const plate = wasm.Manifold.cube([40, 30, 3], true);
     await client.addPart('plate', stlOf(plate), 'plate');
     plate.delete();
-    const across = createPart('plate', 'plate', { position: [12, 0, 60], normal: [1, 0, 0] });
-    const p = await client.preview(across, version);
-    expect(p.stats.settled).toBeGreaterThan(0.3);
-    expect(p.stats.settled).toBeLessThan(3);
-    expect(p.notes.map((n) => n.code)).not.toContain('NOT_TOUCHING');
-    const flat = await client.preview({ ...across, fit: false }, version);
-    expect(flat.stats.settled ?? 0).toBeLessThan(0.1); // first contact only
+    // across the cane: it kisses the cane along the tangent line (its underside is flat, there is no recess to close)
+    const across = await client.preview(createPart('plate', 'plate', { position: [12, 0, 60], normal: [1, 0, 0] }), version);
+    expect(across.stats.settled ?? 0).toBeLessThan(0.05);
+    expect(across.notes.map((n) => n.code)).not.toContain('NOT_TOUCHING');
+    // on two narrow posts: the beam is NOT pushed down through them onto the plinth
+    const plinth = wasm.Manifold.cube([60, 30, 6], true);
+    const postA = wasm.Manifold.cube([3, 6, 8], true).translate(-12, 0, 3 + 4);
+    const postB = wasm.Manifold.cube([3, 6, 8], true).translate(12, 0, 3 + 4);
+    const posts = plinth.add(postA).add(postB);
+    await client.loadBase({ kind: 'stl', bytes: stlOf(posts), name: 'posts', version: ++version });
+    [plinth, postA, postB, posts].forEach((m) => m.delete());
+    const onPosts = await client.preview(createPart('plate', 'plate', { position: [0, 0, 11], normal: [0, 0, 1] }), version);
+    expect(onPosts.stats.settled ?? 0).toBeLessThan(0.05);
+    expect(onPosts.bounds.min[2]).toBeCloseTo(-0.4, 3); // only its sink below the post tops
+    // on flat ground: unchanged
     await loadBox();
     const onBox = await client.preview(createPart('plate', 'plate', { position: [0, 0, 3], normal: [0, 0, 1] }), version);
     expect(onBox.stats.settled ?? 0).toBeLessThan(1e-6);
+  });
+
+  it('a part whose tips touch while its body is recessed is pushed in until the body meets the model', async () => {
+    await loadBox(); // 60 × 30 × 6, top at z = 3
+    // a U-shaped part: a 40 × 20 × 3 body with two 10 mm lips at its ends (lips down)
+    const body = wasm.Manifold.cube([40, 20, 3], true).translate(0, 0, 11.5);
+    const lipA = wasm.Manifold.cube([3, 20, 13], true).translate(-18.5, 0, 6.5);
+    const lipB = wasm.Manifold.cube([3, 20, 13], true).translate(18.5, 0, 6.5);
+    const u = body.add(lipA).add(lipB);
+    await client.addPart('u', stlOf(u), 'u');
+    [body, lipA, lipB, u].forEach((m) => m.delete());
+    const item = createPart('u', 'u', { position: [0, 0, 3], normal: [0, 0, 1] });
+    const p = await client.preview(item, version);
+    // the body is 10 mm above the lips' feet; the sink already took 0.4 of that, the push closes the remaining 9.6
+    expect(p.stats.settled).toBeCloseTo(9.6, 1);
+    expect(p.notes.find((n) => n.code === 'SETTLED').text).toMatch(/Pushed the part 9\.6 mm into the surface/);
+    expect(p.bounds.min[2]).toBeCloseTo(-10, 1); // the lips pass 10 mm into the box
+    const ex = await client.export([item], version, 'x');
+    const m = solidOfStl(ex.stl);
+    expect(m.decompose().length).toBe(1);
+    expect(m.boundingBox().max[2]).toBeCloseTo(3 + 13 - 10, 1); // the body (3 thick) now sits on the box top
+    m.delete();
+    // a part buried deeper than its own height is not "touching", it would just vanish inside the model
+    const buried = await client.preview(createPart('u', 'u', { position: [0, 0, -20], normal: [0, 0, 1] }), version);
+    expect(buried.notes.map((n) => n.code)).toContain('NOT_TOUCHING');
   });
 
   it('"Consume what it covers": details under a part are cut away so nothing pokes through it', async () => {

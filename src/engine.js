@@ -200,6 +200,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   const flat = new LRU(FLAT_CACHE, (v) => {
     v.solid.delete();
     v.cutter?.delete();
+    v.body?.delete();
   });
   const conformed = new LRU(CONFORM_CACHE, (v) => v.solid.delete());
   let result = null; // { key, solid, notes, skipped }
@@ -872,6 +873,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       }
       let solid;
       let cutter = null;
+      let body = null;
       let cut = { mode: cutter_ ? 'engrave' : 'emboss', depth: sink };
       if (join === 'fillet' && item.filletRadius > 0) {
         const r = item.filletRadius;
@@ -941,6 +943,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
             return temps.add(c.translate(x, y, -(length + clearance)));
           });
           solid = m.add(temps.add(Manifold.union(pegs)));
+          body = m.translate(0, 0, 0); // the part without its pegs: what it covers (the pegs go into holes, not through details)
           cutter = Manifold.union(holes);
           cut = { mode: 'engrave', depth: length + clearance };
         } else {
@@ -949,7 +952,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       } else {
         solid = m.translate(0, 0, -sink);
       }
-      return { solid, cutter, size, rounding: null, cut, warnings, part: { name: part.info.name, triangles: part.info.triangles }, pegged: !!cutter };
+      return { solid, cutter, body, size, rounding: null, cut, warnings, part: { name: part.info.name, triangles: part.info.triangles }, pegged: !!cutter };
     } finally {
       temps.dispose();
     }
@@ -1021,10 +1024,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     return report;
   }
 
-  function sampler(placement) {
+  function sampler(placement, options) {
     const current = base.current;
     if (!current?.geometry || !current.geometry.index?.count) return null;
-    return createSurfaceSampler(current.geometry, placement);
+    return createSurfaceSampler(current.geometry, placement, options);
   }
 
   /** Conformed (or plain) solid for an item on the current base, cached. */
@@ -1039,7 +1042,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     let stats = null;
     let settle = 0; // how far a rigid part was lowered to meet the surface (local z, ≤ 0)
     const wantsStats = base.kind !== 'none';
-    const s = wantsStats && (item.conform || isPart(item)) ? sampler(placement) : null;
+    // a part may be pulled down by as much as its own height, so the surface search reaches at least that far
+    const partReach = isPart(item) ? Math.max(50, flatEntry.solid.boundingBox().max[2] - flatEntry.solid.boundingBox().min[2] + 1) : 50;
+    const s = wantsStats && (item.conform || isPart(item)) ? sampler(placement, { searchAbove: partReach, searchBelow: partReach }) : null;
     if (s && item.conform && !isPart(item)) {
       const out = conformSolid(flatEntry.solid, s);
       solid = out.solid;
@@ -1071,11 +1076,15 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         if (isPart(item) && item.fit !== false && !(item.tilt || item.roll)) {
           flatEntry.underside ??= createUndersideSampler(flatEntry.solid);
           const fit = fitDepth(flatEntry.underside, s);
-          if (fit.reachable && fit.cells > 0) {
-            drop = Math.max(drop, fit.depth);
+          const tall = flatEntry.solid.boundingBox().max[2] - flatEntry.solid.boundingBox().min[2];
+          // the part meets the surface when it comes down to it, or already touches it no deeper than its own height
+          // (a part buried deeper than that is not "touching": it would just vanish inside the model)
+          if (fit.reachable && fit.cells > 0 && (fit.lower > 0 || fit.firstContact >= -tall)) {
+            drop = Math.max(drop, fit.lower + fit.push);
             if (!stats) stats = { conformed: false };
             stats.touches = true; // its body reaches the surface even where its foot found none
-            stats.fitted = fit.depth > drop - 1e-9 && fit.depth > (stats.maxHeight < 0 ? -stats.maxHeight : 0) + 0.05;
+            stats.lowered = fit.lower;
+            stats.pushed = Math.max(0, drop - fit.lower);
           }
         }
         if (drop > 1e-6) {
@@ -1083,6 +1092,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           solid.delete();
           solid = flatEntry.solid.translate(0, 0, settle);
           stats.settled = drop;
+          stats.lowered ??= drop;
+          stats.pushed ??= 0;
         }
       }
     }
@@ -1156,12 +1167,17 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     if (isPart(item)) {
       notes.push(...(flatEntry.warnings ?? []));
       if (stats?.settled > 0.05) {
+        const lowered = stats.lowered ?? stats.settled;
+        const pushed = stats.pushed ?? 0;
         notes.push({
           level: 'info',
           code: 'SETTLED',
-          text: stats.fitted
-            ? `Pushed the part ${stats.settled.toFixed(1)} mm into the surface so its body meets the model, not just its nearest point.`
-            : `Lowered the part ${stats.settled.toFixed(1)} mm so it rests on the surface here.`,
+          text:
+            pushed > 0.05 && lowered > 0.05
+              ? `Lowered the part ${lowered.toFixed(1)} mm onto the surface and pushed it ${pushed.toFixed(1)} mm in so its body meets the model.`
+              : pushed > 0.05
+                ? `Pushed the part ${pushed.toFixed(1)} mm into the surface so its body meets the model, not just its nearest point.`
+                : `Lowered the part ${lowered.toFixed(1)} mm so it rests on the surface here.`,
         });
       }
       if (base?.kind !== 'none' && !base?.current?.watertight && item.mode !== 'engrave') {
@@ -1255,7 +1271,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const active = items.filter((i) => hasText(i) && !isSpot(i)); // spots change the model itself, not what is added to it
     requireFonts(active.filter((i) => !isPart(i)));
     requireParts(active);
-    const key = `${baseVersion}|${active.map((i) => `${shapeKey(i, fontKeyOf(i))}|${placeKey(i)}`).sort().join(';')}`;
+    const key = `${baseVersion}|${active.map((i) => `${shapeKey(i, fontKeyOf(i))}|${placeKey(i)}|${i.cover ? 'cover' : ''}`).sort().join(';')}`;
     if (result?.key === key) return result;
 
     progress?.('Preparing the model…');
@@ -1304,7 +1320,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         }
         const world = temps.add(placed.solid.transform(toMat4(placed.placement)));
         if (item.cover && meets === 'emboss' && model && (isPart(item) || item.plate !== 'none')) {
-          const cover = coverSolidFor(placed.solid, reach);
+          // a pegged part covers with its body only (its pegs go into holes), lowered like the part itself
+          const covering = placed.flat.body ? temps.add(placed.flat.body.translate(0, 0, placed.settle)) : placed.solid;
+          const cover = coverSolidFor(covering, reach);
           if (cover) {
             covers.push(temps.add(temps.add(cover).transform(toMat4(placed.placement))));
             notes.push({ level: 'info', code: 'COVERED', itemId: item.id, text: `${quote(item)} covers what is under it: the model's details there were cut away so nothing pokes through.` });

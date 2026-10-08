@@ -4,7 +4,8 @@ import { conformNotes, conformSolid, createSurfaceSampler } from './conform.js';
 import { buildCrossSectionInfo, printLimits, textZRange, thinStrokeReport } from './textGeometry.js';
 import { labelFor, parseFont } from './fontParse.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from './stl.js';
-import { buildBVH, concatSoups, displayBuffers, geometryFromBuffers, manifoldToSoup } from './mesh.js';
+import { concatSoups, displayBuffers, manifoldToSoup } from './mesh.js';
+import { ViewCache, passthroughRangesOf } from './view.js';
 import { ATTACH_ROTATIONS, placementMatrix, toMat4 } from './placement.js';
 import { baseMode, fontIds, hasText, isPart, isSpot, itemLabel, placeKey, shapeKey } from './document.js';
 import { enhanceMesh, extractRegion, isEnhanceActive, regionWeights } from './enhance.js';
@@ -106,21 +107,7 @@ function scope() {
  * solid's vertex range, i.e. the unrepaired soup, in whatever order the index
  * is in (a BVH build reorders it).
  */
-export function passthroughRangesOf(index, solidVertexCount) {
-  const ranges = [];
-  let start = -1;
-  const triangles = index.length / 3;
-  for (let t = 0; t < triangles; t++) {
-    const pass = index[t * 3] >= solidVertexCount;
-    if (pass && start < 0) start = t;
-    if (!pass && start >= 0) {
-      ranges.push([start, t - start]);
-      start = -1;
-    }
-  }
-  if (start >= 0) ranges.push([start, triangles - start]);
-  return ranges;
-}
+export { passthroughRangesOf };
 
 /** A small rounded plaque, handy as a starting model. */
 export function samplePlaque(wasm, { width = 70, depth = 30, height = 4, radius = 4 } = {}) {
@@ -281,12 +268,183 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   }
 
   function disposeCurrent() {
-    if (!base?.current) return;
-    base.current.manifold?.delete();
-    base.current.lod?.delete();
-    base.current.geometry?.dispose?.();
-    base.current.sampler?.dispose?.();
-    base.current = null;
+    base.current = null; // the stages and their views live in the caches below
+  }
+
+  /** Drop the oldest stages of a derivation cache beyond `max`. */
+  function trimCache(map, max) {
+    while (map.size > max) {
+      const key = map.keys().next().value;
+      map.get(key).dispose();
+      map.delete(key);
+    }
+  }
+
+  /* ------------------------------------------------------------ stages */
+
+  const EMPTY_MESH = { positions: new Float32Array(0), index: new Uint32Array(0) };
+  const views = new ViewCache();
+
+  /** xyz positions of a MeshGL as a plain Float32Array (a copy when it carries more properties). */
+  function xyzOf(mesh) {
+    const stride = mesh.numProp;
+    if (stride === 3) return mesh.vertProperties;
+    const count = mesh.vertProperties.length / stride;
+    const xyz = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++) {
+      xyz[i * 3] = mesh.vertProperties[i * stride];
+      xyz[i * 3 + 1] = mesh.vertProperties[i * stride + 1];
+      xyz[i * 3 + 2] = mesh.vertProperties[i * stride + 2];
+    }
+    return xyz;
+  }
+
+  /** { positions, index } of a solid (empty for null). */
+  function meshOf(solid) {
+    if (!solid) return EMPTY_MESH;
+    const m = solid.getMesh();
+    return { positions: xyzOf(m), index: m.triVerts };
+  }
+
+  /** The same mesh with its vertices moved by a matrix (the index is shared, so the view keeps its BVH). */
+  function movedMesh(mesh, matrix) {
+    const positions = new Float32Array(mesh.positions.length);
+    const v = new Vector3();
+    for (let i = 0; i < positions.length; i += 3) {
+      v.set(mesh.positions[i], mesh.positions[i + 1], mesh.positions[i + 2]).applyMatrix4(matrix);
+      positions[i] = v.x;
+      positions[i + 1] = v.y;
+      positions[i + 2] = v.z;
+    }
+    return { positions, index: mesh.index };
+  }
+
+  /**
+   * A stage of the model's derivation: the original, the original moved by
+   * the transforms, or a cached result of simplifying, enhancing or cleaning
+   * it up. `mesh` is its full-resolution geometry; `view` a lighter copy for
+   * display when the mesh is very dense (null when the mesh itself is shown).
+   * `manifold` is the solid for booleans and export. For an enhanced or
+   * cleaned-up stage it is built only when first needed (`undefined` until
+   * then): the display works from the mesh alone, so sliders never wait for
+   * a solid to be rebuilt. The solid is then made by moving the vertices of
+   * the input stage's solid when that is still around (half the cost of
+   * building one from scratch), else from the mesh.
+   */
+  function makeStage({ manifold, input = null, mesh = null, view, lod, stats = null, failed = false, keepNormals = true }) {
+    const stage = {
+      manifold, // Manifold | null | undefined (not built yet)
+      input,
+      stats,
+      failed,
+      keepNormals, // whether to remember the display normals (not for clean-up spots, whose states change constantly)
+      normals: null, // per-corner normals of the shown mesh (view or mesh), cached for re-showing
+      disposed: false,
+      _mesh: mesh,
+      _view: view, // undefined: decide lazily (a LOD when dense); null: show the mesh itself; or a mesh
+      lod, // undefined: not made yet
+      get mesh() {
+        if (!this._mesh) this._mesh = meshOf(this.materialise());
+        return this._mesh;
+      },
+      /** The display-level mesh when the stage is too dense to show in full, else null. */
+      get view() {
+        if (this._view === undefined) {
+          this._view = null;
+          if (this.mesh.index.length / 3 > lodTriangles) {
+            const solid = this.materialise();
+            if (this.lod === undefined) this.lod = solid ? lodFor(solid) : null;
+            if (this.lod) this._view = meshOf(this.lod);
+          }
+        }
+        return this._view;
+      },
+      /** The solid of this stage, built on first use; null when it could not be built (then `failed` is set). */
+      materialise() {
+        if (this.manifold !== undefined) return this.manifold;
+        const { positions, index } = this._mesh;
+        let m = null;
+        try {
+          const src = this.input && !this.input.disposed && this.input.manifold ? this.input.manifold : null;
+          if (src && this.input._mesh?.index === index) {
+            // same topology as the input solid: move its vertices (they come in the mesh's order; checked on a sample)
+            const ref = this.input._mesh.positions;
+            let ok = true;
+            m = src.warpBatch((v, n) => {
+              if (n * 3 !== positions.length) ok = false;
+              for (let k = 0; k < 8 && ok; k++) {
+                const i = Math.floor(((k + 0.5) * n) / 8) * 3;
+                if (Math.abs(v[i] - ref[i]) + Math.abs(v[i + 1] - ref[i + 1]) + Math.abs(v[i + 2] - ref[i + 2]) > 1e-4) ok = false;
+              }
+              if (ok) v.set(positions.subarray(0, n * 3));
+            });
+            if (!ok) {
+              m.delete();
+              m = null;
+            }
+          }
+          if (!m) m = Manifold.ofMesh(new wasm.Mesh({ numProp: 3, vertProperties: positions, triVerts: index }));
+          if (m.status() !== 'NoError' || m.isEmpty() || m.volume() <= 0) {
+            m.delete();
+            m = null;
+          }
+        } catch {
+          m = null;
+        }
+        this.manifold = m;
+        this.failed = !m;
+        return m;
+      },
+      dispose() {
+        this.manifold?.delete();
+        this.lod?.delete();
+        this.manifold = null;
+        this.lod = null;
+        this.disposed = true;
+      },
+    };
+    return stage;
+  }
+
+  /** The solid to build on: this stage's, or – when it could not be built – the nearest input that could. */
+  function stageManifold(stage) {
+    for (let s = stage; s; s = s.input) {
+      const m = s.materialise();
+      if (m) return m;
+    }
+    return null;
+  }
+  const currentManifold = () => (base?.current ? stageManifold(base.current.stage) : null);
+
+  /** The original moved by the transforms, cached (the input of everything else). */
+  const movedCache = new Map();
+  function movedFor(original, matrix, key) {
+    let stage = movedCache.get(key);
+    if (!stage) {
+      const mat = toMat4(matrix);
+      const view = original.view;
+      stage = makeStage({
+        manifold: original.manifold ? original.manifold.transform(mat) : null,
+        input: original,
+        mesh: movedMesh(original.mesh, matrix),
+        view: view ? movedMesh(view, matrix) : null,
+      });
+      movedCache.set(key, stage);
+      trimCache(movedCache, 2);
+    }
+    return stage;
+  }
+
+  /** The model simplified by a tolerance, cached: the user's simplification is redone only when the model or the tolerance changes. */
+  const simplifyCache = new Map();
+  function simplifiedFor(input, tolerance, key) {
+    let stage = simplifyCache.get(key);
+    if (!stage) {
+      stage = makeStage({ manifold: input.materialise().simplify(tolerance), input });
+      simplifyCache.set(key, stage);
+      trimCache(simplifyCache, 2);
+    }
+    return stage;
   }
 
   /** A lighter copy of a solid for display when it is very dense (null when not needed). */
@@ -303,141 +461,110 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   function disposeBase() {
     if (!base) return;
     disposeCurrent();
-    base.original?.manifold?.delete();
+    base.original?.stage?.dispose();
     base = null;
-    enhanceCache.forEach((e) => e.manifold?.delete());
-    enhanceCache.clear();
-    spotCache.forEach((e) => e.manifold?.delete());
-    spotCache.clear();
+    for (const cache of [movedCache, simplifyCache, enhanceCache, spotCache]) trimCache(cache, 0);
   }
 
   /**
-   * The model with its clean-up spots applied: each spot enhances only the
-   * part of the mesh within its radius (cut out, enhanced with a soft-edged
-   * weight and a larger movement allowance, written back). Cached by
-   * settings. Returns { manifold (caller owns, or null), stats per spot }.
+   * Clean-up spots applied to a mesh: each spot enhances only the part of the
+   * mesh within its radius (cut out, enhanced with a soft-edged weight and a
+   * larger movement allowance, written back). Returns the moved positions and,
+   * when `collect` is given, pushes one stats record per spot into it.
+   */
+  function applySpots(mesh, spots, edgeAngle, collect, progress) {
+    const positions = mesh.positions.slice();
+    const { index } = mesh;
+    spots.forEach((spot, n) => {
+      progress?.('Cleaning up spots…', { done: n + 1, total: spots.length });
+      const radius = Math.max(0.1, spot.radius ?? 8);
+      const region = extractRegion(positions, index, spot.position, radius * 1.5);
+      // a spot that floats away from the surface (further than the ring's reach) does nothing, like a floating text
+      let nearest = Infinity;
+      for (let i = 0; i < region.positions.length; i += 3) {
+        const d = Math.hypot(region.positions[i] - spot.position[0], region.positions[i + 1] - spot.position[1], region.positions[i + 2] - spot.position[2]);
+        if (d < nearest) nearest = d;
+      }
+      const detached = nearest > Math.min(5, radius);
+      if (!isEnhanceActive(spot) || region.index.length < 12 || detached) {
+        collect?.push({ id: spot.id, verticesMoved: 0, maxDisplacement: 0, empty: region.index.length < 12 || detached, detached });
+        return;
+      }
+      const weights = regionWeights(region.positions, spot.position, radius, spot.feather ?? 0.5);
+      // details inside a spot are sized to the spot: by default their size is taken as a third of its radius
+      const out = enhanceMesh(region, {
+        sharpen: spot.sharpen, smooth: spot.smooth, detail: spot.detail, deepen: spot.deepen, evenOut: spot.evenOut,
+        featureSize: spot.featureSize > 0 ? spot.featureSize : radius / 3, maxMove: spot.maxMove, edgeAngle, capFactor: 1, weights,
+      });
+      for (let i = 0; i < region.vertexMap.length; i++) {
+        const v = region.vertexMap[i];
+        positions[v * 3] = out.positions[i * 3];
+        positions[v * 3 + 1] = out.positions[i * 3 + 1];
+        positions[v * 3 + 2] = out.positions[i * 3 + 2];
+      }
+      collect?.push({ id: spot.id, verticesMoved: out.stats.verticesMoved, maxDisplacement: out.stats.maxDisplacement, empty: false });
+    });
+    return positions;
+  }
+
+  /**
+   * The stage with the clean-up spots applied to `input`, cached by settings.
+   * The full-resolution mesh (what is exported) and, for a dense model, its
+   * lighter display copy are both cleaned up, so the view follows every
+   * tweak without simplifying the whole model again.
    */
   const spotCache = new Map();
-  function spottedFor(solid, spots, edgeAngle, key, progress) {
-    let entry = spotCache.get(key);
-    if (!entry) {
-      const mesh = solid.getMesh();
-      const stride = mesh.numProp;
-      const count = mesh.vertProperties.length / stride;
-      const positions = new Float32Array(count * 3);
-      for (let i = 0; i < count; i++) {
-        positions[i * 3] = mesh.vertProperties[i * stride];
-        positions[i * 3 + 1] = mesh.vertProperties[i * stride + 1];
-        positions[i * 3 + 2] = mesh.vertProperties[i * stride + 2];
-      }
-      const index = mesh.triVerts;
+  function spottedFor(input, spots, edgeAngle, key, progress) {
+    let stage = spotCache.get(key);
+    if (!stage) {
       const stats = [];
-      let result = null;
+      let failed = false;
+      let mesh = input.mesh;
+      let view = input.view;
       try {
-        spots.forEach((spot, n) => {
-          progress?.('Cleaning up spots…', { done: n + 1, total: spots.length });
-          const radius = Math.max(0.1, spot.radius ?? 8);
-          const region = extractRegion(positions, index, spot.position, radius * 1.5);
-          // a spot that floats away from the surface (further than the ring's reach) does nothing, like a floating text
-          let nearest = Infinity;
-          for (let i = 0; i < region.positions.length; i += 3) {
-            const d = Math.hypot(region.positions[i] - spot.position[0], region.positions[i + 1] - spot.position[1], region.positions[i + 2] - spot.position[2]);
-            if (d < nearest) nearest = d;
-          }
-          const detached = nearest > Math.min(5, radius);
-          if (!isEnhanceActive(spot) || region.index.length < 12 || detached) {
-            stats.push({ id: spot.id, verticesMoved: 0, maxDisplacement: 0, empty: region.index.length < 12 || detached, detached });
-            return;
-          }
-          const weights = regionWeights(region.positions, spot.position, radius, spot.feather ?? 0.5);
-          // details inside a spot are sized to the spot: by default their size is taken as a third of its radius
-          const out = enhanceMesh(region, {
-            sharpen: spot.sharpen, smooth: spot.smooth, detail: spot.detail, deepen: spot.deepen, evenOut: spot.evenOut,
-            featureSize: spot.featureSize > 0 ? spot.featureSize : radius / 3, maxMove: spot.maxMove, edgeAngle, capFactor: 1, weights,
-          });
-          for (let i = 0; i < region.vertexMap.length; i++) {
-            const v = region.vertexMap[i];
-            positions[v * 3] = out.positions[i * 3];
-            positions[v * 3 + 1] = out.positions[i * 3 + 1];
-            positions[v * 3 + 2] = out.positions[i * 3 + 2];
-          }
-          stats.push({ id: spot.id, verticesMoved: out.stats.verticesMoved, maxDisplacement: out.stats.maxDisplacement, empty: false });
-        });
-        const built = new wasm.Mesh({ numProp: 3, vertProperties: positions, triVerts: index });
-        result = wasm.Manifold.ofMesh(built);
-        if (result.status() !== 'NoError' || result.isEmpty() || result.volume() <= 0) {
-          result.delete();
-          result = null;
-        }
+        mesh = { positions: applySpots(input.mesh, spots, edgeAngle, stats, progress), index: input.mesh.index };
+        if (view) view = { positions: applySpots(view, spots, edgeAngle, null), index: view.index };
       } catch {
-        result = null;
+        failed = true;
       }
-      entry = { manifold: result, stats: stats.map((s) => ({ ...s, failed: !result })) };
-      spotCache.set(key, entry);
-      if (spotCache.size > 4) {
-        const oldest = spotCache.keys().next().value;
-        spotCache.get(oldest).manifold?.delete();
-        spotCache.delete(oldest);
-      }
+      stage = makeStage({ manifold: failed ? null : undefined, input, mesh, view, stats: stats.map((s) => ({ ...s, failed })), failed, keepNormals: false });
+      spotCache.set(key, stage);
+      trimCache(spotCache, 4);
     }
-    return { manifold: entry.manifold ? entry.manifold.translate(0, 0, 0) : null, stats: entry.stats };
+    return stage;
   }
 
   /**
-   * The model with soft edges sharpened, bumps smoothed and relief boosted
-   * (see enhance.js). Cached by settings so comparing against the original
+   * The stage with soft edges sharpened, bumps smoothed and relief boosted
+   * (see enhance.js), cached by settings so comparing against the original
    * and nudging one slider back and forth do not redo the work.
-   * Returns { manifold (caller owns, or null when the result was unusable), stats }.
    */
   const enhanceCache = new Map();
-  function enhancedFor(solid, enhance, key, progress) {
-    let entry = enhanceCache.get(key);
-    if (!entry) {
-      const mesh = solid.getMesh();
-      const stride = mesh.numProp;
-      let positions = mesh.vertProperties;
-      if (stride !== 3) {
-        const count = positions.length / stride;
-        const xyz = new Float32Array(count * 3);
-        for (let i = 0; i < count; i++) {
-          xyz[i * 3] = positions[i * stride];
-          xyz[i * 3 + 1] = positions[i * stride + 1];
-          xyz[i * 3 + 2] = positions[i * stride + 2];
-        }
-        positions = xyz;
-      }
-      let out = { positions: positions, stats: null };
-      let result = null;
+  function enhancedFor(input, enhance, key, progress) {
+    let stage = enhanceCache.get(key);
+    if (!stage) {
+      const mesh = input.mesh;
+      let out = null;
       try {
-        out = enhanceMesh({ positions, index: mesh.triVerts }, enhance, (stage, fraction) =>
-          progress?.(`${stage}…`, { done: Math.round(fraction * 100), total: 100 }),
+        out = enhanceMesh({ positions: mesh.positions, index: mesh.index }, enhance, (stage_, fraction) =>
+          progress?.(`${stage_}…`, { done: Math.round(fraction * 100), total: 100 }),
         );
-        const built = new wasm.Mesh({ numProp: 3, vertProperties: out.positions, triVerts: mesh.triVerts });
-        result = wasm.Manifold.ofMesh(built);
-        if (result.status() !== 'NoError' || result.isEmpty() || result.volume() <= 0) {
-          result.delete();
-          result = null;
-        }
       } catch {
-        result = null;
+        out = null;
       }
       // only plain numbers travel to the main thread (the module also returns diagnostic fields)
-      const s = out.stats ?? {};
-      entry = {
-        manifold: result,
-        stats: {
-          verticesMoved: s.verticesMoved ?? 0, maxDisplacement: s.maxDisplacement ?? 0, meanDisplacement: s.meanDisplacement ?? 0,
-          flipsPrevented: s.flipsPrevented ?? 0, crossingsPrevented: s.crossingsPrevented ?? 0, featureEdges: s.featureEdges ?? 0, iterations: s.iterations ?? 0,
-        },
+      const st = out?.stats ?? {};
+      const stats = {
+        verticesMoved: st.verticesMoved ?? 0, maxDisplacement: st.maxDisplacement ?? 0, meanDisplacement: st.meanDisplacement ?? 0,
+        flipsPrevented: st.flipsPrevented ?? 0, crossingsPrevented: st.crossingsPrevented ?? 0, featureEdges: st.featureEdges ?? 0, iterations: st.iterations ?? 0,
       };
-      enhanceCache.set(key, entry);
-      if (enhanceCache.size > 4) {
-        const oldest = enhanceCache.keys().next().value;
-        enhanceCache.get(oldest).manifold?.delete();
-        enhanceCache.delete(oldest);
-      }
+      stage = out
+        ? makeStage({ manifold: undefined, input, mesh: { positions: out.positions, index: mesh.index }, stats })
+        : makeStage({ manifold: null, input, mesh, view: null, stats, failed: true });
+      enhanceCache.set(key, stage);
+      trimCache(enhanceCache, 4);
     }
-    return { manifold: entry.manifold ? entry.manifold.translate(0, 0, 0) : null, stats: entry.stats };
+    return stage;
   }
 
   const composeTransforms = (transforms) =>
@@ -456,81 +583,65 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     return out;
   }
 
-  /** (Re)build the displayed model from the original + transforms + simplify. */
+  /**
+   * (Re)build the displayed model from the original + transforms + simplify
+   * + enhancement + clean-up spots. Every stage is cached by its settings
+   * (see makeStage), so a change to one setting redoes only that stage, and
+   * the view is refit rather than rebuilt when only vertices moved.
+   */
   function deriveCurrent(progress) {
     disposeCurrent();
     clearDerived();
     const { original, transforms, simplify, enhance, spots } = base;
     const matrix = composeTransforms(transforms);
-    let manifold = original.manifold ? original.manifold.transform(toMat4(matrix)) : null;
-    if (manifold && simplify > 0) {
+    const transformsKey = JSON.stringify(transforms);
+    const watertight = !!original.manifold;
+    let stage = transforms.length ? movedFor(original.stage, matrix, transformsKey) : original.stage;
+    if (watertight && simplify > 0) {
       progress?.('Simplifying…');
-      const simpler = manifold.simplify(simplify);
-      manifold.delete();
-      manifold = simpler;
+      stage = simplifiedFor(stage, simplify, `${transformsKey}|${simplify}`);
     }
     let enhanced = null; // { ...stats, failed }
-    if (manifold && isEnhanceActive(enhance)) {
+    if (watertight && isEnhanceActive(enhance)) {
       progress?.('Enhancing…');
-      const key = `${JSON.stringify(transforms)}|${simplify}|${JSON.stringify(enhance)}`;
-      const out = enhancedFor(manifold, enhance, key, progress);
-      enhanced = { ...out.stats, failed: !out.manifold };
-      if (out.manifold) {
-        manifold.delete();
-        manifold = out.manifold;
-      }
+      const out = enhancedFor(stage, enhance, `${transformsKey}|${simplify}|${JSON.stringify(enhance)}`, progress);
+      enhanced = { ...out.stats, failed: out.failed };
+      if (!out.failed) stage = out;
     }
     let spotStats = null;
-    if (manifold && spots?.length) {
+    if (watertight && spots?.length) {
       progress?.('Cleaning up spots…');
-      const key = `${JSON.stringify(transforms)}|${simplify}|${JSON.stringify(enhance)}|${JSON.stringify(spots)}`;
-      const out = spottedFor(manifold, spots, enhance?.edgeAngle ?? 30, key, progress);
+      const out = spottedFor(stage, spots, enhance?.edgeAngle ?? 30, `${transformsKey}|${simplify}|${JSON.stringify(enhance)}|${JSON.stringify(spots)}`, progress);
       spotStats = out.stats;
-      if (out.manifold) {
-        manifold.delete();
-        manifold = out.manifold;
-      }
+      if (!out.failed) stage = out;
     }
     const passthrough = transformSoup(original.passthrough, matrix);
     progress?.('Preparing the view…');
-    const lod = lodFor(manifold);
-    const buffers = displayBuffers(lod ?? manifold, passthrough);
-    const geometry = geometryFromBuffers({ positions: buffers.positions, index: buffers.index });
-    let bvhRoots = [];
-    let bvhVersion = null;
-    if (buffers.index.length) {
-      const built = buildBVH(geometry); // reorders geometry.index in place
-      bvhRoots = built.roots;
-      bvhVersion = built.version;
-      buffers.index = built.index; // the reordered copy, for the main thread
-      geometry.boundsTree = built.bvh;
-    }
-    // which triangles (in the reordered index) belong to the unrepaired soup
-    const passthroughRanges = passthroughRangesOf(buffers.index, buffers.solidVertexCount);
-    geometry.computeBoundingBox();
-    const bb = geometry.boundingBox;
-    const size = buffers.index.length ? [bb.max.x - bb.min.x, bb.max.y - bb.min.y, bb.max.z - bb.min.z] : [0, 0, 0];
-    const triangles = buffers.index.length / 3;
+    const view = stage.view;
+    const built = views.build(view ?? stage.mesh, { normals: stage.normals, passthrough });
+    if (stage.keepNormals) stage.normals = built.normals;
+    const triangles = built.display.index.length / 3;
     base.current = {
-      manifold,
-      lod,
+      stage,
+      watertight,
       passthrough,
-      geometry,
-      bounds: buffers.index.length ? { min: bb.min.toArray(), max: bb.max.toArray() } : null,
+      geometry: built.geometry,
+      bounds: built.bounds,
       shellVolumes: null, // filled lazily: volumes of the model's own shells
       spotStats,
     };
+    const size = built.bounds ? [0, 1, 2].map((k) => built.bounds.max[k] - built.bounds.min[k]) : [0, 0, 0];
     const info = {
       name: base.name,
       kind: base.kind,
       version: base.version,
       size,
-      bounds: base.current.bounds,
-      triangles: (manifold ? manifold.numTri() : 0) + passthrough.length / 9,
+      bounds: built.bounds,
+      triangles: stage.mesh.index.length / 3 + passthrough.length / 9,
       displayTriangles: triangles,
-      simplifiedView: !!lod,
+      simplifiedView: !!view,
       originalTriangles: original.inputTriangles,
-      watertight: !!manifold,
+      watertight,
       repaired: !!original.report?.repaired,
       passthroughTriangles: passthrough.length / 9,
       hasModel: base.kind !== 'none',
@@ -538,18 +649,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       spots: spotStats,
       suggestions: base.kind === 'stl' && transforms.length === 0 && !simplify && !enhanced ? modelSuggestions({ size, triangles }) : [],
     };
-    const display = {
-      positions: buffers.positions.slice(), // the worker keeps its own copy for sampling
-      normals: buffers.normals,
-      index: buffers.index,
-      passthroughStart: buffers.passthroughStart,
-      passthroughRanges,
-      bvhRoots,
-      bvhVersion,
-    };
     return {
-      message: { info, report: base.original.report, display },
-      transfer: [display.positions.buffer, display.normals.buffer, display.index.buffer, ...bvhRoots],
+      message: { info, report: base.original.report, display: built.display },
+      transfer: built.transfer,
     };
   }
 
@@ -570,7 +672,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       } catch (err) {
         fail('STL_INVALID', err.message);
       }
-      const soup = triangleSoup(geometry);
+      // a parsed STL is already a plain triangle soup: use its positions as they are rather than copying them
+      const pos = geometry.attributes.position.array;
+      const soup = !geometry.index && pos instanceof Float32Array ? pos : triangleSoup(geometry);
       geometry.dispose();
       progress?.('Checking the mesh…');
       const repaired = repairToManifold(soup, { onProgress: (stage) => progress?.(`${stage}…`) });
@@ -587,6 +691,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     } else {
       fail('INTERNAL', `Unknown model kind "${kind}"`);
     }
+    original.stage = makeStage({ manifold: original.manifold });
     base = { version, kind, name, original, transforms, simplify, enhance, spots };
     return deriveCurrent(progress);
   }
@@ -610,7 +715,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    */
   const effective = (item) => {
     const noModel = base?.kind === 'none';
-    const cuttable = !noModel && !!base?.current?.manifold;
+    const cuttable = !noModel && !!base?.current?.watertight;
     if (isPart(item)) {
       let out = item;
       if (noModel && out.sink) out = { ...out, sink: 0 };
@@ -912,7 +1017,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         notes.push({ level: 'info', code: 'SPOT', text: 'All amounts are 0, so this spot changes nothing yet.' });
         return notes;
       }
-      if (!base?.current?.manifold) {
+      if (!base?.current?.watertight) {
         notes.push({ level: 'warn', code: 'SPOT_UNAVAILABLE', text: "This model couldn't be made watertight, so clean-up spots can't change it." });
         return notes;
       }
@@ -931,7 +1036,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       return notes;
     }
     const meets = baseMode(item);
-    if (meets === 'engrave' && base?.kind !== 'none' && !base?.current?.manifold) {
+    if (meets === 'engrave' && base?.kind !== 'none' && !base?.current?.watertight) {
       notes.push({
         level: 'warn',
         code: 'ENGRAVE_UNAVAILABLE',
@@ -947,7 +1052,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       if (stats?.settled > 0.05) {
         notes.push({ level: 'info', code: 'SETTLED', text: `Lowered the part ${stats.settled.toFixed(1)} mm so it rests on the surface here.` });
       }
-      if (base?.kind !== 'none' && !base?.current?.manifold && item.mode !== 'engrave') {
+      if (base?.kind !== 'none' && !base?.current?.watertight && item.mode !== 'engrave') {
         notes.push({
           level: 'warn',
           code: 'FUSE_UNAVAILABLE',
@@ -955,7 +1060,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         });
       }
       if (item.mode !== 'engrave' && item.join === 'pegs') {
-        if (base?.kind !== 'none' && !base?.current?.manifold) {
+        if (base?.kind !== 'none' && !base?.current?.watertight) {
           notes.push({ level: 'warn', code: 'PEGS_UNAVAILABLE', text: 'Pegs need holes in a watertight model; this model has gaps, so the part is fused instead.' });
         } else if (base?.kind === 'none') {
           notes.push({ level: 'warn', code: 'PEGS_UNAVAILABLE', text: 'Pegs need a model to make holes in. Load a model, or use the fused connection.' });
@@ -1041,7 +1146,15 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const key = `${baseVersion}|${active.map((i) => `${shapeKey(i, fontKeyOf(i))}|${placeKey(i)}`).sort().join(';')}`;
     if (result?.key === key) return result;
 
+    progress?.('Preparing the model…');
+    const model = currentManifold(); // built now if the shown stage never needed its solid before
     const notes = [];
+    for (let s = b.current.stage; s; s = s.input) {
+      if (s.failed && s.stats) {
+        notes.push({ level: 'warn', code: 'STAGE_FAILED', text: 'Part of the enhancement shown could not be applied to the exported solid, which is exported without it.' });
+        break;
+      }
+    }
     const skipped = [];
     const emboss = [];
     const engrave = [];
@@ -1065,7 +1178,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         const meets = baseMode(item);
         const pegged = isPart(item) && meets === 'emboss' && placed.flat.pegged; // effective() already ruled pegs out when they can't be cut
         const needsCut = meets === 'engrave';
-        if (needsCut && !b.current.manifold) {
+        if (needsCut && !model) {
           skipped.push(item.id);
           notes.push({
             level: 'warn',
@@ -1090,14 +1203,14 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       });
 
       let solid = null;
-      if (b.current.manifold) {
+      if (model) {
         progress?.('Merging text into the model…');
-        solid = emboss.length ? temps.add(Manifold.union([b.current.manifold, ...emboss])) : null;
+        solid = emboss.length ? temps.add(Manifold.union([model, ...emboss])) : null;
         if (engrave.length) {
           const cutter = temps.add(Manifold.union(engrave));
-          solid = temps.add(Manifold.difference(solid ?? b.current.manifold, cutter));
+          solid = temps.add(Manifold.difference(solid ?? model, cutter));
         }
-        if (!solid) solid = temps.add(b.current.manifold.translate(0, 0, 0));
+        if (!solid) solid = temps.add(model.translate(0, 0, 0));
       } else if (emboss.length) {
         progress?.('Merging text…');
         solid = temps.add(Manifold.union(emboss));
@@ -1110,7 +1223,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         // text – but never a small part the model had to begin with
         if (emboss.length + engrave.length > 0) {
           if (!b.current.shellVolumes) {
-            const own = b.current.manifold ? b.current.manifold.decompose() : [];
+            const own = model ? model.decompose() : [];
             b.current.shellVolumes = own.map((s) => s.volume());
             own.forEach((s) => s.delete());
           }
@@ -1128,9 +1241,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
             shells.forEach((s) => s.delete());
           }
           // more pieces than the model had: something raised did not actually overlap the model and stayed loose
-          if (b.current.manifold && keep.length > b.current.shellVolumes.length) {
+          if (model && keep.length > b.current.shellVolumes.length) {
             for (const { item, world } of raised) {
-              const overlap = temps.add(b.current.manifold.intersect(world));
+              const overlap = temps.add(model.intersect(world));
               if (!overlap.isEmpty()) continue;
               notes.push({
                 level: 'warn',
@@ -1161,30 +1274,38 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
 
   function resultDisplay({ items, baseVersion, printing }, progress) {
     const final = finalFor(items, baseVersion, printing, progress);
-    progress?.('Preparing the view…');
-    const temps = scope();
-    let shown = final.solid;
-    if (final.separate.length) {
-      shown = temps.add(Manifold.compose([...(final.solid ? [final.solid] : []), ...final.separate.map((p) => p.world)]));
+    if (!final.display) {
+      // the view of a final result is built once per result: showing it again (after a preview, a selection change,
+      // or toggling back to it) reuses the buffers instead of simplifying and shading the whole model again
+      progress?.('Preparing the view…');
+      const temps = scope();
+      let shown = final.solid;
+      if (final.separate.length) {
+        shown = temps.add(Manifold.compose([...(final.solid ? [final.solid] : []), ...final.separate.map((p) => p.world)]));
+      }
+      const lod = shown ? temps.add(lodFor(shown)) : null;
+      const buffers = displayBuffers(lod ?? shown, final.passthrough);
+      temps.dispose();
+      final.display = {
+        positions: buffers.positions,
+        normals: buffers.normals,
+        index: buffers.index,
+        passthroughStart: buffers.passthroughStart,
+        passthroughRanges: passthroughRangesOf(buffers.index, buffers.solidVertexCount),
+      };
     }
-    const lod = shown ? temps.add(lodFor(shown)) : null;
-    const buffers = displayBuffers(lod ?? shown, final.passthrough);
-    temps.dispose();
+    const d = final.display;
+    const display = {
+      positions: d.positions.slice(), // copies: the originals stay with the cached result
+      normals: d.normals.slice(),
+      index: d.index.slice(),
+      passthroughStart: d.passthroughStart,
+      passthroughRanges: d.passthroughRanges,
+      bvhRoots: [],
+    };
     return {
-      message: {
-        display: {
-          positions: buffers.positions,
-          normals: buffers.normals,
-          index: buffers.index,
-          passthroughStart: buffers.passthroughStart,
-          passthroughRanges: passthroughRangesOf(buffers.index, buffers.solidVertexCount),
-          bvhRoots: [],
-        },
-        notes: final.notes,
-        skipped: final.skipped,
-        info: { triangles: buffers.index.length / 3 },
-      },
-      transfer: [buffers.positions.buffer, buffers.normals.buffer, buffers.index.buffer],
+      message: { display, notes: final.notes, skipped: final.skipped, info: { triangles: d.index.length / 3 } },
+      transfer: [display.positions.buffer, display.normals.buffer, display.index.buffer],
     };
   }
 

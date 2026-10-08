@@ -558,9 +558,16 @@ try {
     await idle();
     check(!(await page.locator('#spotCard').isHidden()) && (await page.locator('#textCard').isHidden()) && (await page.locator('#styleCard').isHidden()), 'selecting a spot shows the Clean-up spot card only');
     check(/mm$/.test(await page.locator('#itemList li[aria-selected="true"] .meta').innerText()), 'the spot is listed with its radius');
+    // a spot's amounts re-derive the whole model, so dragging a slider only follows live in the paired control: the model
+    // gets the value on release (change), not on every input tick
+    const listedBefore = await page.locator('#itemList li[aria-selected="true"] .meta').innerText();
     await page.fill('input[type="number"][data-key="radius"]', '6');
+    await page.dispatchEvent('input[type="number"][data-key="radius"]', 'input');
+    await idle();
+    check((await page.locator('#itemList li[aria-selected="true"] .meta').innerText()) === listedBefore && Number(await page.inputValue('input[type="range"][data-key="radius"]')) === 6, 'typing a spot radius follows in the slider but does not re-derive the model until committed', await page.locator('#itemList li[aria-selected="true"] .meta').innerText());
     await page.dispatchEvent('input[type="number"][data-key="radius"]', 'change');
     await idle();
+    check(/6\.0 mm|6 mm/.test(await page.locator('#itemList li[aria-selected="true"] .meta').innerText()), 'committing the radius applies it', await page.locator('#itemList li[aria-selected="true"] .meta').innerText());
     const spotNotes = await page.locator('#spotNotes').innerText();
     check(/Moved [1-9][\d,]* points inside the spot/.test(spotNotes), 'the spot reports what it moved on the clumped bumps', spotNotes.replace(/\s+/g, ' ').slice(0, 120));
     check(/1 clean-up spot applied/.test(await page.locator('#modelNotes').innerText()), 'the model notes count the spot');

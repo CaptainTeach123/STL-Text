@@ -104,6 +104,13 @@ export function repairToManifold(soup, options = {}) {
   let collapsed = 0;
   const attempt = (tolerance) => {
     const before = { tri, edges, weldedVertices, collapsed, weldTolerance: report.weldTolerance };
+    if (tolerance === 0) {
+      // the exact weld above already joined identical corners: when that alone closes the mesh (a clean STL), the
+      // solid is built straight away and merge(), which would weld nothing more, is skipped
+      const { Mesh } = manifold();
+      solid = tryOfMesh(new Mesh({ numProp: 3, vertProperties: vp, triVerts: tri, tolerance: 0 }));
+      if (solid) return;
+    }
     const mesh = mergedMesh(vp, tri, tolerance);
     const merged = mesh.mergeFromVert?.length ?? 0;
     if (merged) { // carry the welds over to our own index buffer

@@ -122,6 +122,13 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
       return;
     }
     const code = msg.error?.code;
+    // the engine has a model, just not the version this request was for: the request is stale (a newer base
+    // update is on its way or already landed) – not a lost model, so never reload the model for it
+    if (code === 'BASE_MISSING' && msg.error.details?.have != null) {
+      finish(entry);
+      entry.resolve(undefined);
+      return;
+    }
     // a fresh worker may lack the model AND a font: rehydrate as often as needed (bounded)
     if ((entry.retries ?? 0) < 3 && (code === 'FONT_MISSING' || code === 'BASE_MISSING' || code === 'PART_MISSING')) {
       finish(entry);
@@ -159,27 +166,26 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
   async function rehydrateFont(fontId) {
     const bytes = fonts.get(fontId);
     if (!bytes) throw new EngineError({ code: 'FONT_MISSING', message: `Font ${fontId} is not loaded`, details: { fontId } });
-    await request(`font:${fontId}`, 'font.add', { fontId, bytes: copy(bytes) });
+    const bytes_ = copy(bytes);
+    await request(`font:${fontId}`, 'font.add', { fontId, bytes: bytes_ }, [bytes_]);
   }
 
   async function rehydratePart(partId) {
     const part = parts.get(partId);
     if (!part) throw new EngineError({ code: 'PART_MISSING', message: `Part ${partId} is not loaded`, details: { partId } });
-    await request(`part:${partId}`, 'part.add', { partId, name: part.name, bytes: copy(part.bytes) });
+    const bytes = copy(part.bytes);
+    await request(`part:${partId}`, 'part.add', { partId, name: part.name, bytes }, [bytes]);
   }
 
   async function rehydrateBase() {
     if (!base) throw new EngineError({ code: 'BASE_MISSING', message: 'No model is loaded' });
-    await request('base', 'base.load', {
-      kind: base.kind,
-      name: base.name,
-      bytes: base.bytes ? copy(base.bytes) : null,
-      version: base.version,
-      transforms: base.transforms,
-      simplify: base.simplify,
-      enhance: base.enhance ?? null,
-      spots: base.spots ?? [],
-    });
+    const bytes = base.bytes ? copy(base.bytes) : null;
+    await request(
+      'base',
+      'base.load',
+      { kind: base.kind, name: base.name, bytes, version: base.version, transforms: base.transforms, simplify: base.simplify, enhance: base.enhance ?? null, spots: base.spots ?? [] },
+      bytes ? [bytes] : [],
+    );
   }
 
   /* ------------------------------------------------------------- API */
@@ -196,13 +202,15 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
     addFont(fontId, bytes) {
       fonts.set(fontId, bytes);
       // one channel per font: adding several fonts at once must not drop any
-      return request(`font:${fontId}`, 'font.add', { fontId, bytes: copy(bytes) });
+      const sent = copy(bytes);
+      return request(`font:${fontId}`, 'font.add', { fontId, bytes: sent }, [sent]);
     },
 
     /** Register an STL part to attach (bytes are kept on this side for restarts). */
     addPart(partId, bytes, name) {
       parts.set(partId, { bytes, name });
-      return request(`part:${partId}`, 'part.add', { partId, name, bytes: copy(bytes) });
+      const sent = copy(bytes);
+      return request(`part:${partId}`, 'part.add', { partId, name, bytes: sent }, [sent]);
     },
 
     /**
@@ -211,7 +219,8 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
      */
     loadBase({ kind, bytes = null, name = 'model', version, spots = [] }) {
       base = { kind, bytes, name, version, transforms: [], simplify: null, enhance: null, spots };
-      return request('base', 'base.load', { kind, name, bytes: bytes ? copy(bytes) : null, version, transforms: [], simplify: null, enhance: null, spots });
+      const sent = bytes ? copy(bytes) : null;
+      return request('base', 'base.load', { kind, name, bytes: sent, version, transforms: [], simplify: null, enhance: null, spots }, sent ? [sent] : []);
     },
 
     /** Re-derive the model with a new transform list / simplify tolerance / enhancement / clean-up spots. */

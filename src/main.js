@@ -239,6 +239,7 @@ function renderSuggestions() {
 
 function onBase(result, { frame = false } = {}) {
   fatalCount = 0;
+  engineVersion = result.info.version;
   modelInfo = result.info;
   modelReport = result.report;
   viewer.setBase(result.display);
@@ -297,27 +298,54 @@ async function loadModel(kind, { bytes = null, name = 'model' } = {}) {
 }
 
 /** Make sure the engine has the document's current model state. */
-async function syncBase() {
-  if (sentVersion === version()) {
-    if (basePending) await basePending; // previews must wait for the model they are for
+let engineVersion = null; // the document version the engine has derived (set by onBase)
+let derivingTimer = 0;
+
+/** Mark the model as being re-derived: the view dims and the enhance / spot cards say so (only when it takes a moment, so quick updates do not flicker). */
+function setDeriving(on) {
+  clearTimeout(derivingTimer);
+  if (on) {
+    derivingTimer = setTimeout(() => {
+      document.body.classList.add('deriving');
+      viewer.setBaseDimmed(true);
+    }, 300);
     return;
   }
-  const v = version();
-  sentVersion = v;
-  const pending = doc.base
-    ? client.updateBase({ version: v, transforms: doc.base.transforms, simplify: doc.base.simplify, enhance: compareOriginal ? null : doc.base.enhance, spots: spotsOf(doc.items) })
-    : client.loadBase({ kind: 'none', version: v });
-  basePending = pending;
-  try {
-    const result = await pending;
-    if (result) onBase(result);
-    else if (sentVersion === v) sentVersion = null; // superseded: let the next render re-sync
-  } catch (err) {
-    sentVersion = null;
-    setStatus(friendly(err), 'error');
-  } finally {
-    if (basePending === pending) basePending = null;
+  document.body.classList.remove('deriving');
+  viewer.setBaseDimmed(false);
+}
+
+/**
+ * Send the base (model + transforms + enhancement + spots) to the engine when
+ * it changed. Resolves to whether the engine now has the current version –
+ * previews and results for it are only worth asking for when it does.
+ */
+async function syncBase() {
+  if (sentVersion !== version()) {
+    const v = version();
+    sentVersion = v;
+    const pending = doc.base
+      ? client.updateBase({ version: v, transforms: doc.base.transforms, simplify: doc.base.simplify, enhance: compareOriginal ? null : doc.base.enhance, spots: spotsOf(doc.items) })
+      : client.loadBase({ kind: 'none', version: v });
+    basePending = pending;
+    setDeriving(true);
+    try {
+      const result = await pending;
+      if (result) onBase(result);
+      else if (sentVersion === v) sentVersion = null; // superseded: let the next render re-sync
+    } catch (err) {
+      sentVersion = null;
+      setStatus(friendly(err), 'error');
+    } finally {
+      if (basePending === pending) {
+        basePending = null;
+        setDeriving(false);
+      }
+    }
+  } else if (basePending) {
+    await basePending; // previews must wait for the model they are for
   }
+  return engineVersion === version();
 }
 
 /** Bounding box of `bounds` after `matrix` (for chaining rotations with re-centring). */
@@ -420,21 +448,35 @@ function fillEnhance() {
       : 'For soft, low-definition models: crisper edges, flatter surfaces and bolder relief print better and look sharper.';
 }
 
+/**
+ * Re-deriving the model is the slow part on a big model, so the controls
+ * that change it (enhancement and clean-up spot amounts) apply when a slider
+ * is released or a number is committed, not on every tick of a drag; the
+ * paired number / slider follow each other live meanwhile.
+ */
+const HEAVY_SPOT_KEYS = new Set(['radius', 'feather', 'sharpen', 'smooth', 'detail', 'deepen', 'evenOut', 'featureSize', 'maxMove']);
+
 function bindEnhance() {
   document.querySelectorAll('[data-enhance]').forEach((el) => {
     const key = el.dataset.enhance;
+    const mirror = () => {
+      document.querySelectorAll(`[data-enhance="${key}"]`).forEach((other) => {
+        if (other !== el) other.value = el.value;
+      });
+    };
     el.addEventListener('input', () => {
+      if (filling || !doc.base) return;
+      mirror();
+    });
+    el.addEventListener('change', () => {
       if (filling || !doc.base) return;
       let value = Number.parseFloat(el.value);
       if (Number.isNaN(value)) return;
       if (ENHANCE_PERCENT.has(key)) value = Math.min(1, Math.max(0, value / 100));
-      document.querySelectorAll(`[data-enhance="${key}"]`).forEach((other) => {
-        if (other !== el) other.value = el.value;
-      });
+      mirror();
       compareOriginal = false;
-      doc.enhanceBase({ [key]: value }, { coalesce: `enhance:${key}` });
+      doc.enhanceBase({ [key]: value });
     });
-    el.addEventListener('change', () => doc.endCoalescing());
   });
   $('enhanceReset').addEventListener('click', () => {
     compareOriginal = false;
@@ -702,6 +744,7 @@ async function showResult(on) {
   resultBusy = true;
   const requestedFor = lastContentKey;
   try {
+    if (!(await syncBase())) return; // the model is still being re-derived for a newer change, which re-renders
     const r = await client.result(doc.items, version(), { printing });
     if (!r || !$('resultToggle').checked || lastContentKey !== requestedFor) return; // stale
     viewer.setResult(r.display);
@@ -724,6 +767,7 @@ async function download() {
   if (!items.length && !modelInfo?.hasModel) return setStatus('Type some text or open a model first.', 'error');
   const name = modelInfo?.hasModel ? `${modelInfo.name}-text` : items.map((i) => itemLabel(i, '')).filter(Boolean).join('-').slice(0, 40) || 'text';
   try {
+    await syncBase();
     const r = await client.export(doc.items, version(), name, { printing });
     if (!r) return;
     const save = (bytes, fileName) => {
@@ -781,8 +825,8 @@ function fillPanel(item) {
       if (el.type === 'radio') el.checked = el.value === String(value);
       else if (el.type === 'checkbox') el.checked = !!value;
       else if (el.type === 'number' || el.type === 'range') {
-        // "0.0" being typed is numerically 0: leave it alone rather than mangle it
-        if (Number.parseFloat(el.value) !== shown) el.value = shown ?? '';
+        // "0.0" being typed is numerically 0: leave it alone rather than mangle it; a control being dragged keeps its value
+        if (el !== document.activeElement && Number.parseFloat(el.value) !== shown) el.value = shown ?? '';
       } else if (el.value !== String(shown ?? '')) el.value = shown ?? '';
     });
     const part = isPart(item);
@@ -1112,7 +1156,9 @@ function render() {
     viewer.showResult(false);
   }
   if (booted && !halted) {
-    syncBase().then(refreshPreviews);
+    syncBase().then((ok) => {
+      if (ok) refreshPreviews(); // a superseded sync leaves the previews to the sync that follows it
+    });
   }
 }
 
@@ -1178,7 +1224,13 @@ function bindControls() {
   document.querySelectorAll('[data-key]').forEach((el) => {
     const key = el.dataset.key;
     const continuous = el.type === 'range' || el.type === 'number' || el.tagName === 'TEXTAREA';
-    el.addEventListener(continuous ? 'input' : 'change', () => {
+    const mirror = (value) => {
+      // keep paired slider/number inputs in sync
+      document.querySelectorAll(`[data-key="${key}"]`).forEach((other) => {
+        if (other !== el && (other.type === 'range' || other.type === 'number')) other.value = value;
+      });
+    };
+    const apply = (event) => {
       if (filling) return;
       if (el.type === 'radio' && !el.checked) return;
       let value = readValue(el);
@@ -1186,17 +1238,25 @@ function bindControls() {
       if (PERCENT_KEYS.has(key)) value = key === 'scale' ? Math.max(0.01, value / 100) : Math.min(1, Math.max(0, value / 100));
       let sel = doc.selected;
       if (!sel) sel = addItem('', {}, { focus: false });
-      // keep paired slider/number inputs in sync
-      document.querySelectorAll(`[data-key="${key}"]`).forEach((other) => {
-        if (other !== el && (other.type === 'range' || other.type === 'number')) other.value = value;
-      });
+      mirror(readValue(el));
+      // a clean-up spot's amounts re-derive the whole model: apply them on release, not on every tick
+      if (event.type === 'input' && continuous && isSpot(sel) && HEAVY_SPOT_KEYS.has(key)) return;
+      // the value already in force (the browser's own change event when a typed field loses focus) is not a change:
+      // re-committing it would re-render the panel under whatever the user is clicking on
+      if (sel[key] === value) return;
       doc.updateItem(sel.id, { [key]: value }, continuous ? { coalesce: `${key}:${sel.id}` } : undefined);
       if (key in defaults && !isPart(sel)) {
         defaults[key] = value;
         saveSettings();
       }
-    });
-    if (continuous) el.addEventListener('change', () => doc.endCoalescing());
+    };
+    el.addEventListener(continuous ? 'input' : 'change', apply);
+    if (continuous) {
+      el.addEventListener('change', (event) => {
+        apply(event);
+        doc.endCoalescing();
+      });
+    }
   });
 
   ['posX', 'posY', 'posZ'].forEach((id, i) => {

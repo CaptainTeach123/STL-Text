@@ -295,6 +295,9 @@ export class Document {
    */
   enhanceBase(patch, { coalesce = null } = {}) {
     if (!this.state.base) return;
+    // committing the settings already in force (a slider released where it was) is not a change to undo
+    const next = patch ? { ...ENHANCE_DEFAULTS, ...(this.state.base.enhance ?? {}), ...patch } : null;
+    if (JSON.stringify(next) === JSON.stringify(this.state.base.enhance ?? null)) return;
     this.commit(
       (s) => {
         s.base.enhance = patch ? { ...ENHANCE_DEFAULTS, ...(s.base.enhance ?? {}), ...patch } : null;

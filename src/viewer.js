@@ -5,6 +5,7 @@ import {
   CylinderGeometry,
   DirectionalLight,
   DoubleSide,
+  FrontSide,
   GridHelper,
   Group,
   HemisphereLight,
@@ -79,7 +80,7 @@ export class Viewer {
     this.scene.add(this.camera);
 
     this.materials = {
-      model: new MeshStandardMaterial({ color: COLORS.model, roughness: 0.55, metalness: 0.05, side: DoubleSide }),
+      model: new MeshStandardMaterial({ color: COLORS.model, roughness: 0.55, metalness: 0.05, side: FrontSide }), // a closed solid: back faces never show, and culling them halves the fill work on every frame
       passthrough: new MeshStandardMaterial({ color: COLORS.passthrough, roughness: 0.6, metalness: 0.05, side: DoubleSide }),
     };
     this.baseMesh = null;
@@ -187,6 +188,14 @@ export class Viewer {
       this.scene.add(this.resultMesh);
     }
     this.showResult(this.resultShown);
+  }
+
+  /** Dim the model while the worker re-derives it (a material change only: no geometry work). */
+  setBaseDimmed(on) {
+    const m = this.materials.model;
+    m.transparent = !!on;
+    m.opacity = on ? 0.75 : 1;
+    this.requestRender();
   }
 
   showResult(on) {

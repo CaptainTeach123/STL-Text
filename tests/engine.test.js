@@ -322,6 +322,34 @@ describe('result and export', () => {
 });
 
 describe('client scheduler', () => {
+  it('a request for a model version the engine does not have is superseded, not a reason to reload the model', async () => {
+    // the engine says BASE_MISSING with the version it does have: the request was simply overtaken by a newer base
+    const seen = [];
+    const have = { current: 7 };
+    const engine = {
+      handle: async (req) => {
+        seen.push(req.type);
+        if (req.type === 'base.load' || req.type === 'base.update') {
+          have.current = req.version;
+          return { message: { id: req.id, ok: true, result: { info: { version: req.version } } }, transfer: [] };
+        }
+        if (req.baseVersion !== have.current) {
+          return { message: { id: req.id, ok: false, error: { code: 'BASE_MISSING', message: 'no', details: { version: req.baseVersion, have: have.current } } }, transfer: [] };
+        }
+        return { message: { id: req.id, ok: true, result: { fine: true } }, transfer: [] };
+      },
+    };
+    const c = createEngineClient({ createWorker: () => createLocalWorker(Promise.resolve(engine)) });
+    await c.loadBase({ kind: 'sample', version: 7 });
+    expect(await c.preview(topItem('x'), 5)).toBeUndefined(); // stale: resolves like a superseded request
+    expect(seen.filter((t) => t === 'base.load')).toHaveLength(1); // and the model was NOT loaded again
+    expect(await c.preview(topItem('x'), 7)).toEqual({ fine: true });
+    // a fresh worker that really lost the model (no version at all) is still rehydrated
+    have.current = null;
+    expect(await c.preview(topItem('x'), 7)).toEqual({ fine: true });
+    expect(seen.filter((t) => t === 'base.load')).toHaveLength(2);
+  });
+
   it('supersedes queued previews: only the latest waiting one runs', async () => {
     await client.loadBase({ kind: 'sample', version: ++version });
     const item = topItem('A', { position: [0, 0, 4] });

@@ -764,3 +764,19 @@ body[data-engine='busy'] .stage canvas {
   color: var(--warn, #c77700);
   font-weight: 600;
 }
+
+/* the model is being re-derived: the cards that changed it say so */
+.deriving-note {
+  display: none;
+  margin-left: 0.5em;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--accent, #4b8df8);
+}
+body.deriving .deriving-note {
+  display: inline;
+  animation: deriving-pulse 1.2s ease-in-out infinite;
+}
+@keyframes deriving-pulse {
+  50% { opacity: 0.35; }
+}

@@ -372,6 +372,41 @@ describe('parts really merge with the model', () => {
     expect(onBox.stats.settled ?? 0).toBeLessThan(1e-6);
   });
 
+  it('"Consume what it covers": details under a part are cut away so nothing pokes through it', async () => {
+    // a box with two berries on top: one under the plate, one beside it
+    const box = wasm.Manifold.cube([60, 30, 6], true);
+    const under = wasm.Manifold.sphere(2, 32).translate(10, 0, 3 + 1.2);
+    const beside = wasm.Manifold.sphere(2, 32).translate(-20, 0, 3 + 1.2);
+    const model = box.add(under).add(beside);
+    await client.loadBase({ kind: 'stl', bytes: stlOf(model), name: 'berries', version: ++version });
+    [box, under, beside, model].forEach((m) => m.delete());
+    const plate = wasm.Manifold.cube([20, 10, 2], true);
+    await client.addPart('plate', stlOf(plate), 'plate');
+    plate.delete();
+    const over = createPart('plate', 'plate', { position: [10, 0, 3], normal: [0, 0, 1], fit: false });
+    const plateTop = 3 + 2 - 0.4;
+    // material above the plate's top within its footprint, and the volume of the berry beside it
+    const measure = async (item) => {
+      const ex = await client.export([item], version, 'x');
+      const m = solidOfStl(ex.stl);
+      const above = wasm.Manifold.cube([20, 10, 10], true).translate(10, 0, plateTop + 5 + 0.01);
+      const poking = m.intersect(above);
+      const asideBox = wasm.Manifold.cube([8, 8, 10], true).translate(-20, 0, 3 + 5);
+      const aside = m.intersect(asideBox);
+      const out = { poking: poking.volume(), aside: aside.volume(), shells: m.decompose().length, notes: ex.notes.map((n) => n.code) };
+      [m, above, poking, asideBox, aside].forEach((x) => x.delete());
+      return out;
+    };
+    const plain = await measure(over);
+    expect(plain.poking).toBeGreaterThan(1); // the berry's top pokes through the plate
+    const covered = await measure({ ...over, cover: true });
+    expect(covered.poking).toBeLessThan(1e-6); // consumed
+    expect(covered.aside).toBeCloseTo(plain.aside, 3); // the berry beside the plate is untouched
+    expect(covered.shells).toBe(1); // still one solid: a skin of the model is left inside the plate
+    expect(covered.notes).toContain('COVERED');
+    expect(covered.notes).not.toContain('NOT_MERGED');
+  });
+
   it('a raised text that hovers without overlapping is reported as not merged', async () => {
     await loadBox();
     const hover = createItem({ text: 'Hi', fontId: 'inter', size: 8, position: [0, 0, 4], normal: [0, 0, 1], conform: false, overlap: 0.4 });

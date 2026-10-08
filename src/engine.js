@@ -955,6 +955,54 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     }
   }
 
+  /**
+   * The volume an item "covers": its outline, extruded from just inside its
+   * underside out to beyond the model, so that subtracting it from the model
+   * removes every detail that would poke through the item. A thin skin of
+   * the model (COVER_SKIN) is left inside the item so the two still overlap
+   * and fuse. Returns a solid in the item's local frame, or null.
+   */
+  const COVER_SKIN = 0.2;
+  const COVER_OFFSETS = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]];
+  function coverSolidFor(solid, reach) {
+    const temps = scope();
+    try {
+      const bb = solid.boundingBox();
+      const thickness = bb.max[2] - bb.min[2];
+      if (!(thickness > 0)) return null;
+      const skin = Math.min(COVER_SKIN, Math.max(0.02, thickness / 4));
+      const outline = temps.add(solid.project());
+      if (outline.isEmpty()) return null;
+      const ob = outline.bounds();
+      const cell = Math.max(0.5, Math.min(ob.max[0] - ob.min[0], ob.max[1] - ob.min[1]) / 24);
+      const top = bb.max[2] + reach + 10; // far beyond anything the model can reach
+      // a thin prism: its walls stay single quads (no rows to fold), its bottom is refined so it can follow the underside
+      const thin = temps.add(temps.add(Manifold.extrude(outline, 1)).refineToLength(cell));
+      const under = createUndersideSampler(solid);
+      const probe = (x, y) => {
+        let u = under.heightAt(x, y);
+        if (Number.isFinite(u)) return u;
+        for (const [dx, dy] of COVER_OFFSETS) {
+          u = under.heightAt(x + dx * cell * 0.1, y + dy * cell * 0.1);
+          if (Number.isFinite(u)) return u;
+        }
+        return bb.min[2];
+      };
+      const cover = thin.warpBatch((v, n) => {
+        for (let i = 0; i < n; i++) {
+          v[i * 3 + 2] = v[i * 3 + 2] > 0.5 ? top : probe(v[i * 3], v[i * 3 + 1]) + skin;
+        }
+      });
+      if (cover.status() !== 'NoError' || cover.isEmpty()) {
+        cover.delete();
+        return null;
+      }
+      return cover;
+    } finally {
+      temps.dispose();
+    }
+  }
+
   /** Printability report for an item's outline, per nozzle setting (small cache). */
   const strokeCache = new Map();
   function strokeFor(item, printing) {
@@ -1224,6 +1272,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const engrave = [];
     const separate = []; // parts joined with pegs: printed on their own
     const raised = []; // raised items and their world solids, to check that each really merged
+    const covers = []; // what covering items consume: cut from the model before anything is added
+    const reach = b.current.bounds ? Math.hypot(...[0, 1, 2].map((k) => b.current.bounds.max[k] - b.current.bounds.min[k])) : 1000;
     const temps = scope();
     try {
       active.forEach((item, n) => {
@@ -1253,6 +1303,13 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           return;
         }
         const world = temps.add(placed.solid.transform(toMat4(placed.placement)));
+        if (item.cover && meets === 'emboss' && model && (isPart(item) || item.plate !== 'none')) {
+          const cover = coverSolidFor(placed.solid, reach);
+          if (cover) {
+            covers.push(temps.add(temps.add(cover).transform(toMat4(placed.placement))));
+            notes.push({ level: 'info', code: 'COVERED', itemId: item.id, text: `${quote(item)} covers what is under it: the model's details there were cut away so nothing pokes through.` });
+          }
+        }
         if (pegged) {
           const holes = placed.settle ? temps.add(placed.flat.cutter.translate(0, 0, placed.settle)) : placed.flat.cutter;
           engrave.push(temps.add(holes.transform(toMat4(placed.placement))));
@@ -1268,13 +1325,18 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
 
       let solid = null;
       if (model) {
+        let ground = model;
+        if (covers.length) {
+          progress?.('Clearing under the parts…');
+          ground = temps.add(Manifold.difference(model, temps.add(Manifold.union(covers))));
+        }
         progress?.('Merging text into the model…');
-        solid = emboss.length ? temps.add(Manifold.union([model, ...emboss])) : null;
+        solid = emboss.length ? temps.add(Manifold.union([ground, ...emboss])) : null;
         if (engrave.length) {
           const cutter = temps.add(Manifold.union(engrave));
-          solid = temps.add(Manifold.difference(solid ?? model, cutter));
+          solid = temps.add(Manifold.difference(solid ?? ground, cutter));
         }
-        if (!solid) solid = temps.add(model.translate(0, 0, 0));
+        if (!solid) solid = temps.add(ground.translate(0, 0, 0));
       } else if (emboss.length) {
         progress?.('Merging text…');
         solid = temps.add(Manifold.union(emboss));
@@ -1285,7 +1347,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         if (solid.isEmpty()) fail('EMPTY_RESULT', 'The result would be empty – the cut-in text removes the whole model.');
         // drop floating slivers that the booleans can leave behind on curved
         // text – but never a small part the model had to begin with
-        if (emboss.length + engrave.length > 0) {
+        if (emboss.length + engrave.length + covers.length > 0) {
           if (!b.current.shellVolumes) {
             const own = model ? model.decompose() : [];
             b.current.shellVolumes = own.map((s) => s.volume());

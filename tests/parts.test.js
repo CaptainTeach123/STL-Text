@@ -438,6 +438,62 @@ describe('parts really merge with the model', () => {
     expect(covered.shells).toBe(1); // still one solid: a skin of the model is left inside the plate
     expect(covered.notes).toContain('COVERED');
     expect(covered.notes).not.toContain('NOT_MERGED');
+    expect(covered.notes).not.toContain('FRAGMENTS_REMOVED'); // a clean cut leaves no slivers behind
+  });
+
+  it('a cover only consumes details: not a structure passing through the item, nor anything across a hollow', async () => {
+    // a plinth with a tall pin rising through where a plate will sit, and a tube with a tag on its inner wall
+    const plinth = wasm.Manifold.cube([60, 60, 6], true);
+    const pin = wasm.Manifold.cylinder(60, 3, 3, 32).translate(10, 0, 3);
+    const outer = wasm.Manifold.cylinder(30, 20, 20, 96).translate(0, 60, -15);
+    const inner = wasm.Manifold.cylinder(32, 17, 17, 96).translate(0, 60, -16);
+    const tube = outer.subtract(inner);
+    const model = plinth.add(pin).add(tube);
+    await client.loadBase({ kind: 'stl', bytes: stlOf(model), name: 'pin-and-tube', version: ++version });
+    [plinth, pin, outer, inner, tube, model].forEach((m) => m.delete());
+    const plate = wasm.Manifold.cube([30, 20, 2], true);
+    await client.addPart('plate', stlOf(plate), 'plate');
+    plate.delete();
+    const tag = wasm.Manifold.cube([12, 8, 2], true);
+    await client.addPart('tag', stlOf(tag), 'tag');
+    tag.delete();
+    const items = (cover) => [
+      createPart('plate', 'plate', { position: [10, 0, 3], normal: [0, 0, 1], fit: false, cover }),
+      createPart('tag', 'tag', { position: [17, 60, 0], normal: [-1, 0, 0], fit: false, cover }), // inside the tube, facing its axis
+    ];
+    const pinAbove = wasm.Manifold.cube([8, 8, 50], true).translate(10, 0, 3 + 4 + 25);
+    const farWall = wasm.Manifold.cube([3, 12, 8], true).translate(-18.5, 60, 0);
+    const measure = async (cover) => {
+      const ex = await client.export(items(cover), version, 'x');
+      const m = solidOfStl(ex.stl);
+      const pinKept = m.intersect(pinAbove);
+      const wallKept = m.intersect(farWall);
+      const out = { pin: pinKept.volume(), wall: wallKept.volume() };
+      [m, pinKept, wallKept].forEach((x) => x.delete());
+      return out;
+    };
+    const plain = await measure(false);
+    const covered = await measure(true);
+    expect(plain.pin).toBeGreaterThan(1000);
+    expect(covered.pin).toBeCloseTo(plain.pin, 3); // the pin still rises through the plate, untouched
+    expect(plain.wall).toBeGreaterThan(250);
+    expect(covered.wall).toBeCloseTo(plain.wall, 3); // the tube's far wall is intact
+    [pinAbove, farWall].forEach((x) => x.delete());
+  });
+
+  it('a pegged part consumes a bead under it right down to the surface, so it can seat flat', async () => {
+    const box = wasm.Manifold.cube([60, 30, 6], true);
+    const bead = wasm.Manifold.sphere(1.5, 32).translate(0, 0, 3);
+    const model = box.add(bead);
+    await client.loadBase({ kind: 'stl', bytes: stlOf(model), name: 'bead', version: ++version });
+    [box, bead, model].forEach((m) => m.delete());
+    const item = onTop({ join: 'pegs', pegCount: 2, pegDiameter: 3, pegLength: 5, pegClearance: 0.15, cover: true, fit: false });
+    const ex = await client.export([item], version, 'x');
+    const m = solidOfStl(ex.stl);
+    const above = wasm.Manifold.cube([20, 6, 5], true).translate(0, 0, 3 + 2.5 + 0.001);
+    const stub = m.intersect(above);
+    expect(stub.volume()).toBeLessThan(1e-6); // nothing of the bead stands above the surface the part seats on
+    [m, above, stub].forEach((x) => x.delete());
   });
 
   it('a raised text that hovers without overlapping is reported as not merged', async () => {

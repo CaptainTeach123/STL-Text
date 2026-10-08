@@ -106,6 +106,29 @@ export function createSurfaceSampler(geometry, placement, options = {}) {
     heightAt(x, y) {
       return sample(x, y).z;
     },
+    /**
+     * Every crossing of the surface along the column at (x, y), sorted by local-Z height: { z, exit } where
+     * `exit` is true when going up (+Z) leaves the solid there (the face points up). Duplicate hits on shared
+     * edges are merged; a grazing touch (an entry and an exit at the same height) is dropped.
+     */
+    crossingsAt(x, y) {
+      if (!bvh) return [];
+      ray.origin.set(x, y, above).applyMatrix4(placement);
+      const hits = bvh.raycast(ray, DoubleSide, 0, above + below);
+      const out = hits
+        .map((hit) => ({ z: local.copy(hit.point).applyMatrix4(inverse).z, exit: hit.face.normal.dot(normal) > 0 }))
+        .sort((a, b) => a.z - b.z);
+      const merged = [];
+      for (const c of out) {
+        const last = merged[merged.length - 1];
+        if (last && Math.abs(last.z - c.z) < 1e-6) {
+          if (last.exit !== c.exit) merged.pop(); // a touch: in and out at once
+          continue;
+        }
+        merged.push(c);
+      }
+      return merged;
+    },
     dispose() {
       if (bvh && bvhCache.get(geometry) === bvh) bvhCache.delete(geometry);
       bvh = null;
@@ -368,6 +391,7 @@ export function createUndersideSampler(partSolid) {
   const bvh = new MeshBVH(geometry);
   const { min, max } = partSolid.boundingBox();
   const ray = new Ray(new Vector3(), new Vector3(0, 0, 1));
+  const down = new Ray(new Vector3(), new Vector3(0, 0, -1));
   return {
     bounds: { min, max },
     heightAt(x, y) {
@@ -375,8 +399,69 @@ export function createUndersideSampler(partSolid) {
       const hit = bvh.raycastFirst(ray, DoubleSide);
       return hit ? hit.point.z : NaN;
     },
+    /** The part's top at (x, y): the highest z of the part in that column, or NaN where the part does not reach. */
+    topAt(x, y) {
+      down.origin.set(x, y, max[2] + 1);
+      const hit = bvh.raycastFirst(down, DoubleSide);
+      return hit ? hit.point.z : NaN;
+    },
   };
 }
+
+/**
+ * A closed solid between two height fields on a grid: for each grid node
+ * (i, j) `bottom[k]` and `top[k]` (k = j * (nx + 1) + i) give the local-Z
+ * extent of the column, NaN where there is none. Cells whose four nodes all
+ * exist get a bottom and a top; walls close the slab where a cell meets a
+ * missing one or the grid's edge. Shared nodes make it watertight.
+ * @returns {{ vertProperties: Float32Array, triVerts: Uint32Array } | null}  (null when no cell exists)
+ */
+export function heightFieldSlab({ x0, y0, cell, nx, ny, bottom, top }) {
+  const W = nx + 1;
+  const node = (i, j) => j * W + i;
+  const ok = (i, j) => {
+    const k = node(i, j);
+    return Number.isFinite(bottom[k]) && Number.isFinite(top[k]);
+  };
+  const active = (i, j) => i >= 0 && j >= 0 && i < nx && j < ny && ok(i, j) && ok(i + 1, j) && ok(i + 1, j + 1) && ok(i, j + 1);
+  const index = new Int32Array(W * (ny + 1) * 2).fill(-1); // (node, bottom|top) -> vertex id
+  const verts = [];
+  const tris = [];
+  const vid = (i, j, isTop) => {
+    const slot = node(i, j) * 2 + (isTop ? 1 : 0);
+    if (index[slot] < 0) {
+      index[slot] = verts.length / 3;
+      verts.push(x0 + i * cell, y0 + j * cell, isTop ? top[node(i, j)] : bottom[node(i, j)]);
+    }
+    return index[slot];
+  };
+  const tri = (a, b, c) => tris.push(a, b, c);
+  const wall = (i1, j1, i2, j2) => {
+    // outward winding: along the edge, then up
+    const b1 = vid(i1, j1, false), b2 = vid(i2, j2, false), t1 = vid(i1, j1, true), t2 = vid(i2, j2, true);
+    tri(b1, b2, t2);
+    tri(b1, t2, t1);
+  };
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      if (!active(i, j)) continue;
+      // a=(i,j) b=(i+1,j) c=(i+1,j+1) d=(i,j+1), counter-clockwise seen from +Z
+      const at = vid(i, j, true), bt = vid(i + 1, j, true), ct = vid(i + 1, j + 1, true), dt = vid(i, j + 1, true);
+      const ab = vid(i, j, false), bb = vid(i + 1, j, false), cb = vid(i + 1, j + 1, false), db = vid(i, j + 1, false);
+      tri(at, bt, ct);
+      tri(at, ct, dt);
+      tri(ab, cb, bb);
+      tri(ab, db, cb);
+      if (!active(i, j - 1)) wall(i, j, i + 1, j); // -Y side
+      if (!active(i + 1, j)) wall(i + 1, j, i + 1, j + 1); // +X side
+      if (!active(i, j + 1)) wall(i + 1, j + 1, i, j + 1); // +Y side
+      if (!active(i - 1, j)) wall(i, j + 1, i, j); // -X side
+    }
+  }
+  if (!tris.length) return null;
+  return { vertProperties: Float32Array.from(verts), triVerts: Uint32Array.from(tris) };
+}
+
 
 /**
  * How far a rigid part has to come down (local -Z) to meet the model. The

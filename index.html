@@ -221,7 +221,7 @@
             <label title="A smooth fillet around the foot: the strongest and cleanest joint"><input type="radio" name="join" data-key="join" value="fillet" /><span>Fused + fillet</span></label>
             <label title="Print the part separately and glue it into matching holes"><input type="radio" name="join" data-key="join" value="pegs" /><span>Pegs &amp; holes</span></label>
           </fieldset>
-          <label class="check join-only" title="Cut away the model's details under the part so nothing pokes through it: everything in front of the part's underside, within its outline, is removed before the part is added."><input type="checkbox" data-key="cover" /> Consume what it covers <small>nothing pokes through</small></label>
+          <label class="check join-only" title="Cut away the model's details under the part so nothing pokes through it: details up to about 5 mm proud of the part are removed before it is added (larger structures passing through it are left alone)."><input type="checkbox" data-key="cover" /> Consume what it covers <small>nothing pokes through</small></label>
           <label class="field num fillet-only">
             <span>Fillet radius <small>mm</small></span>
             <input type="number" data-key="filletRadius" min="0.2" max="20" step="0.1" value="1.5" />
@@ -328,7 +328,7 @@
               <input type="range" data-key="platePadding" min="0" max="15" step="0.5" value="3" aria-label="Plate margin" />
             </label>
           </div>
-          <label class="check plate-only" title="Cut away the model's details under the plate so nothing pokes through it: everything in front of the plate's underside, within its outline, is removed before the plate is added."><input type="checkbox" data-key="cover" /> Consume what it covers <small>nothing pokes through</small></label>
+          <label class="check plate-only" title="Cut away the model's details under the plate so nothing pokes through it: details up to about 5 mm proud of the plate are removed before it is added (larger structures passing through it are left alone)."><input type="checkbox" data-key="cover" /> Consume what it covers <small>nothing pokes through</small></label>
           <p class="hint plate-only">Raised text sits on the plate; cut-in text is engraved into it. The plate follows curved surfaces, so a banner wraps around a cane or a mug.</p>
           <label class="check text-only" title="Rounds sharp corners by half the nozzle width so they print cleanly"><input type="checkbox" id="roundCorners" /> Round sharp corners (printer-friendly)</label>
           <ul class="notes" id="textNotes" aria-live="polite"></ul>

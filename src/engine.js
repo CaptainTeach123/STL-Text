@@ -1,6 +1,6 @@
 import { Matrix4, Vector3 } from 'three';
 import { describeRepair, repairToManifold } from './repair.js';
-import { conformNotes, conformSolid, createSurfaceSampler, createUndersideSampler, fitDepth } from './conform.js';
+import { conformNotes, conformSolid, createSurfaceSampler, createUndersideSampler, fitDepth, heightFieldSlab } from './conform.js';
 import { buildCrossSectionInfo, printLimits, textZRange, thinStrokeReport } from './textGeometry.js';
 import { labelFor, parseFont } from './fontParse.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from './stl.js';
@@ -959,51 +959,109 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   }
 
   /**
-   * The volume an item "covers": its outline, extruded from just inside its
-   * underside out to beyond the model, so that subtracting it from the model
-   * removes every detail that would poke through the item. A thin skin of
-   * the model (COVER_SKIN) is left inside the item so the two still overlap
-   * and fuse. Returns a solid in the item's local frame, or null.
+   * The volume an item "covers": for every column of the item's footprint,
+   * from just inside its underside up to where the model is first left
+   * again – so a detail that would poke through the item is cut away, but
+   * only a detail: a column where the model goes on for more than
+   * COVER_PROTRUDE beyond the item's top (a cane rising through a plate, the
+   * far wall of a tube) is left alone, as is a column where the item hovers
+   * over air. A thin skin of the model (COVER_SKIN, never more than half the
+   * item's thickness there) is left inside the item so the two still overlap
+   * and fuse; a separately printed (pegged) part gets a hair of clearance
+   * instead. Returns a solid in the item's local frame, or null.
+   * @param {import('manifold-3d').Manifold} solid  the item as placed (local frame)
+   * @param {{ crossingsAt(x: number, y: number): number[] }} surface  the model sampler in the same frame
    */
   const COVER_SKIN = 0.2;
-  const COVER_OFFSETS = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]];
-  function coverSolidFor(solid, reach) {
-    const temps = scope();
+  const COVER_PROTRUDE = 5; // mm a detail may stand proud of the item and still be consumed
+  const COVER_EPSILON = 0.3; // how far above a detail's top the cut reaches (air there): covers the sag of the grid between nodes
+  function coverSolidFor(solid, surface, { pegged = false } = {}) {
+    const bb = solid.boundingBox();
+    const thickness = bb.max[2] - bb.min[2];
+    const width = bb.max[0] - bb.min[0];
+    const depth = bb.max[1] - bb.min[1];
+    if (!(thickness > 0 && width > 0 && depth > 0)) return null;
+    let cell = Math.min(1, Math.max(0.25, Math.min(width, depth) / 60));
+    cell = Math.max(cell, width / 200, depth / 200);
+    const x0 = bb.min[0] - cell;
+    const y0 = bb.min[1] - cell;
+    const nx = Math.ceil((width + 2 * cell) / cell);
+    const ny = Math.ceil((depth + 2 * cell) / cell);
+    const under = createUndersideSampler(solid);
+    const W = nx + 1;
+    const bottom = new Float64Array(W * (ny + 1)).fill(NaN);
+    const top = new Float64Array(W * (ny + 1)).fill(NaN);
+    const exit = new Float64Array(W * (ny + 1)).fill(NaN); // where the model is left again above the column's start
+    const blocked = new Uint8Array(W * (ny + 1)); // the column starts inside something that goes on beyond reach
+    for (let j = 0; j <= ny; j++) {
+      for (let i = 0; i <= nx; i++) {
+        const x = x0 + i * cell;
+        const y = y0 + j * cell;
+        const u = under.heightAt(x, y);
+        if (!Number.isFinite(u)) continue;
+        const t = under.topAt(x, y);
+        const local = Number.isFinite(t) ? Math.max(0, t - u) : thickness;
+        const skin = pegged ? -0.05 : Math.min(COVER_SKIN, local / 2);
+        const z0 = u + skin;
+        const k = j * W + i;
+        bottom[k] = z0;
+        // cut up to the highest point within reach where the model is left again: a detail sitting on the surface
+        // under the item (even one that overhangs a little, like a berry) is removed whole, while a structure that
+        // goes on beyond reach (a cane through a plate, the far wall of a tube) is not touched
+        const budget = local + COVER_PROTRUDE;
+        let inside = false;
+        let first = true;
+        for (const c of surface.crossingsAt(x, y)) {
+          if (c.z <= z0) continue;
+          if (first) {
+            inside = c.exit; // the next surface above us is where the solid ends: we are inside it
+            first = false;
+          }
+          if (c.z - z0 > budget) break;
+          if (c.exit) exit[k] = c.z;
+        }
+        if (inside && !Number.isFinite(exit[k])) blocked[k] = 1;
+      }
+    }
+    // the cut's top takes the highest exit around each node, so a detail's steep flanks between grid nodes are
+    // covered too; a column inside a structure that goes on beyond reach keeps a hair-thin cut inside the item
+    let consumed = false;
+    for (let j = 0; j <= ny; j++) {
+      for (let i = 0; i <= nx; i++) {
+        const k = j * W + i;
+        if (!Number.isFinite(bottom[k])) continue;
+        top[k] = bottom[k] + 0.01;
+        if (blocked[k]) continue;
+        let high = NaN;
+        for (let dj = -1; dj <= 1; dj++) {
+          for (let di = -1; di <= 1; di++) {
+            const ii = i + di;
+            const jj = j + dj;
+            if (ii < 0 || jj < 0 || ii > nx || jj > ny) continue;
+            const e = exit[jj * W + ii];
+            if (Number.isFinite(e) && !(high >= e)) high = e;
+          }
+        }
+        if (Number.isFinite(high) && high > bottom[k]) {
+          top[k] = high + COVER_EPSILON;
+          consumed = true;
+        }
+      }
+    }
+    if (!consumed) return null;
+    const mesh = heightFieldSlab({ x0, y0, cell, nx, ny, bottom, top });
+    if (!mesh) return null;
+    let cover = null;
     try {
-      const bb = solid.boundingBox();
-      const thickness = bb.max[2] - bb.min[2];
-      if (!(thickness > 0)) return null;
-      const skin = Math.min(COVER_SKIN, Math.max(0.02, thickness / 4));
-      const outline = temps.add(solid.project());
-      if (outline.isEmpty()) return null;
-      const ob = outline.bounds();
-      const cell = Math.max(0.5, Math.min(ob.max[0] - ob.min[0], ob.max[1] - ob.min[1]) / 24);
-      const top = bb.max[2] + reach + 10; // far beyond anything the model can reach
-      // a thin prism: its walls stay single quads (no rows to fold), its bottom is refined so it can follow the underside
-      const thin = temps.add(temps.add(Manifold.extrude(outline, 1)).refineToLength(cell));
-      const under = createUndersideSampler(solid);
-      const probe = (x, y) => {
-        let u = under.heightAt(x, y);
-        if (Number.isFinite(u)) return u;
-        for (const [dx, dy] of COVER_OFFSETS) {
-          u = under.heightAt(x + dx * cell * 0.1, y + dy * cell * 0.1);
-          if (Number.isFinite(u)) return u;
-        }
-        return bb.min[2];
-      };
-      const cover = thin.warpBatch((v, n) => {
-        for (let i = 0; i < n; i++) {
-          v[i * 3 + 2] = v[i * 3 + 2] > 0.5 ? top : probe(v[i * 3], v[i * 3 + 1]) + skin;
-        }
-      });
+      cover = Manifold.ofMesh(new wasm.Mesh({ numProp: 3, vertProperties: mesh.vertProperties, triVerts: mesh.triVerts }));
       if (cover.status() !== 'NoError' || cover.isEmpty()) {
         cover.delete();
-        return null;
+        cover = null;
       }
-      return cover;
-    } finally {
-      temps.dispose();
+    } catch {
+      cover = null;
     }
+    return cover;
   }
 
   /** Printability report for an item's outline, per nozzle setting (small cache). */
@@ -1289,7 +1347,6 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const separate = []; // parts joined with pegs: printed on their own
     const raised = []; // raised items and their world solids, to check that each really merged
     const covers = []; // what covering items consume: cut from the model before anything is added
-    const reach = b.current.bounds ? Math.hypot(...[0, 1, 2].map((k) => b.current.bounds.max[k] - b.current.bounds.min[k])) : 1000;
     const temps = scope();
     try {
       active.forEach((item, n) => {
@@ -1322,7 +1379,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         if (item.cover && meets === 'emboss' && model && (isPart(item) || item.plate !== 'none')) {
           // a pegged part covers with its body only (its pegs go into holes), lowered like the part itself
           const covering = placed.flat.body ? temps.add(placed.flat.body.translate(0, 0, placed.settle)) : placed.solid;
-          const cover = coverSolidFor(covering, reach);
+          const cbb = covering.boundingBox();
+          const range = Math.max(50, cbb.max[2] - cbb.min[2] + COVER_PROTRUDE + 10);
+          const surface = sampler(placed.placement, { searchAbove: range, searchBelow: range });
+          const cover = surface ? coverSolidFor(covering, surface, { pegged }) : null;
           if (cover) {
             covers.push(temps.add(temps.add(cover).transform(toMat4(placed.placement))));
             notes.push({ level: 'info', code: 'COVERED', itemId: item.id, text: `${quote(item)} covers what is under it: the model's details there were cut away so nothing pokes through.` });
@@ -1342,8 +1402,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       });
 
       let solid = null;
+      let ground = model; // the model with what the covering items consumed cut away
       if (model) {
-        let ground = model;
         if (covers.length) {
           progress?.('Clearing under the parts…');
           ground = temps.add(Manifold.difference(model, temps.add(Manifold.union(covers))));
@@ -1385,10 +1445,12 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
             shells.forEach((s) => s.delete());
           }
           // more pieces than the model had: something raised did not actually overlap the model and stayed loose
+          // (judged against the model as it is after the covers, and against the other raised items it may rest on)
           if (model && keep.length > b.current.shellVolumes.length) {
             for (const { item, world } of raised) {
-              const overlap = temps.add(model.intersect(world));
+              const overlap = temps.add(ground.intersect(world));
               if (!overlap.isEmpty()) continue;
+              if (raised.some((other) => other !== world && other.world !== world && !temps.add(other.world.intersect(world)).isEmpty())) continue;
               notes.push({
                 level: 'warn',
                 code: 'NOT_MERGED',

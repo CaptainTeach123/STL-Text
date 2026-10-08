@@ -1,6 +1,6 @@
 import { Matrix4, Vector3 } from 'three';
 import { Document, ITEM_DEFAULTS, coversOf, createPart, createSpot, fontIds, frameOf, hasText, isPart, isSpot, itemLabel, maxSize, placeKey, shapeKey, spotsOf, stableKey, modelPlacementKey } from './document.js';
-import { planRebuild, specForKind } from './rebuild.js';
+import { planRebuild, removalSpotsFor, specForKind } from './rebuild.js';
 import { DECOR_KINDS, decorPartId, normaliseDecorSpec } from './decor.js';
 import { createEngineClient } from './engineClient.js';
 import { ENHANCE_DEFAULTS, isEnhanceActive } from './enhance.js';
@@ -624,9 +624,8 @@ async function rebuildDetails() {
   const items = [];
   try {
     for (const item of picked) {
-      // the smudgy original goes: a removing spot the size of what was found cuts it back to the surface
-      const radius = Math.round(Math.max(1.5, 0.55 * item.size + 0.5) * 2) / 2;
-      items.push({ ...createSpot(), id: undefined, radius, remove: true, position: item.position, normal: item.normal });
+      // the smudgy original goes: removing spots over what was found cut it back to the surface
+      for (const spot of removalSpotsFor(item)) items.push({ ...createSpot(), id: undefined, radius: spot.radius, remove: true, position: spot.position, normal: spot.normal });
       if (item.kind === 'remove') continue;
       const spec = normaliseDecorSpec(item.spec);
       const partId = decorPartId(spec);
@@ -635,7 +634,7 @@ async function rebuildDetails() {
         const { info } = await client.addGeneratedPart(partId, spec, label);
         partAssets.set(partId, { name: label, info });
       }
-      items.push({ ...createPart(partId, label, { attach: 'bottom', sink: item.sink, spin: item.spin, fit: false, cover: false, join: 'fuse' }), id: undefined, position: item.position, normal: item.normal });
+      items.push({ ...createPart(partId, label, { attach: 'bottom', sink: item.sink, spin: item.spin, fit: false, cover: false, join: 'fuse', conform: item.conform !== false }), id: undefined, position: item.position, normal: item.normal });
     }
   } catch (err) {
     setStatus(friendly(err), 'error');

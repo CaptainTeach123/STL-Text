@@ -981,6 +981,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         built = views.build(shown.stage.view ?? shown.stage.mesh, { normals: shown.stage.normals, passthrough });
         shown.stage.normals = built.normals;
         base.current.bounds = built.bounds;
+        base.current.cutGeometry = built.geometry; // the surface after the cuts: what everything else is placed on
       }
     }
     const triangles = built.display.index.length / 3;
@@ -1408,10 +1409,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     return report;
   }
 
-  function sampler(placement, options) {
+  /**
+   * A sampler of the model's surface in an item's frame. Items are placed on the model after the cuts of covering
+   * items and removing spots (`cut`), so a decoration goes where a detail was cut away; a covering item itself is
+   * placed on the uncut surface, so its own cut does not move it.
+   */
+  function sampler(placement, options, { cut = false } = {}) {
     const current = base.current;
-    if (!current?.geometry || !current.geometry.index?.count) return null;
-    return createSurfaceSampler(current.geometry, placement, options);
+    const geometry = (cut && current?.cutGeometry) || current?.geometry;
+    if (!geometry || !geometry.index?.count) return null;
+    return createSurfaceSampler(geometry, placement, options);
   }
 
   /** Conformed (or plain) solid for an item on the current base, cached. */
@@ -1428,8 +1435,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const wantsStats = base.kind !== 'none';
     // a part may be pulled down by as much as its own height, so the surface search reaches at least that far
     const partReach = isPart(item) ? Math.max(50, flatEntry.solid.boundingBox().max[2] - flatEntry.solid.boundingBox().min[2] + 1) : 50;
-    const s = wantsStats && (item.conform || isPart(item)) ? sampler(placement, { searchAbove: partReach, searchBelow: partReach }) : null;
-    if (s && item.conform && !isPart(item)) {
+    const covering = isPart(item) ? !!item.cover : item.cover && item.mode !== 'engrave' && item.plate !== 'none';
+    const s = wantsStats && (item.conform || isPart(item)) ? sampler(placement, { searchAbove: partReach, searchBelow: partReach }, { cut: !covering }) : null;
+    // text follows curved surfaces when asked; so does a generated decoration (a leaf or sprig draped over a horn),
+    // never a rigid imported part
+    if (s && item.conform && (!isPart(item) || parts.get(item.partId)?.info?.generated)) {
       const out = conformSolid(flatEntry.solid, s);
       solid = out.solid;
       stats = { ...out.stats, conformed: out.conformed };

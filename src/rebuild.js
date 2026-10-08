@@ -16,9 +16,11 @@ import { placementFrame } from './placement.js';
  * @param {object} [options]
  * @param {number} [options.featureSize]  the scale the details were found at
  * @returns {{ items: PlanItem[] }}
- *   PlanItem = { id, kind, label, confidence, spec, position, normal, spin, sink, size, height, sources, note }
- *   where `spec` is the decoration to generate (see decor.js), `position`/`normal`/`spin`/`sink` place it as a
- *   part by its bottom, `sources` are the ids of the details it replaces.
+ *   PlanItem = { id, kind, label, confidence, spec, position, normal, direction, spin, sink, conform, size, height, extent,
+ *     sources, note }
+ *   where `spec` is the decoration to generate (see decor.js), `position`/`normal`/`spin`/`sink`/`conform` place it
+ *   as a part by its bottom, draped over the surface, `extent` is the footprint it covers (length along `direction`,
+ *   width across), `sources` are the ids of the details it replaces.
  */
 export function planRebuild(details, { featureSize = 0 } = {}) {
   const F = featureSize > 0 ? featureSize : Math.max(1, ...details.map((d) => d.size)) * 3;
@@ -77,10 +79,12 @@ function footPoint(d) {
   return [middle[0] - d.normal[0] * above, middle[1] - d.normal[1] * above, middle[2] - d.normal[2] * above];
 }
 
-function place(kind, spec, { position, normal, direction, sag, height, confidence, sources, size, note }) {
-  // the skirt reaches into a curved surface by the sag across the footprint, within reason
-  const skirt = Math.round((Math.min(Math.max(0, sag), 0.6 * height + 0.5, 3) + 0.3) * 10) / 10;
+function place(kind, spec, { position, normal, direction, sag, height, confidence, sources, size, note, extent }) {
+  // the decoration is draped over the surface it stands on (it follows a curve), so its skirt only has to reach a
+  // little into the surface; the sag across the footprint adds some, within reason
+  const skirt = Math.round((Math.min(Math.max(0, sag), 0.5 * height + 0.3, 1.5) * 0.5 + 0.3) * 10) / 10;
   const full = normaliseDecorSpec({ ...spec, kind, skirt });
+  const dir = unit(direction ?? [1, 0, 0]);
   return {
     kind,
     label: DECOR_KINDS[kind].label,
@@ -88,37 +92,67 @@ function place(kind, spec, { position, normal, direction, sag, height, confidenc
     spec: full,
     position,
     normal: unit(normal),
-    spin: spinFor(normal, direction ?? [1, 0, 0]),
+    direction: dir,
+    spin: spinFor(normal, dir),
     sink: Math.round((skirt + 0.05) * 100) / 100, // the skirt sunk, and a hair more so the base never lies in the surface
+    conform: true,
     size,
     height,
+    extent: extent ?? { length: size, width: size },
     sources,
     note,
   };
 }
 
+/**
+ * The removing spots that cut a detail's smudgy original away before its clean version goes on: one round spot for
+ * a compact detail, a row of them along a long one, each a little larger than the footprint they cover.
+ * @returns {Array<{ position: number[], normal: number[], radius: number }>}
+ */
+export function removalSpotsFor(item) {
+  const { length, width } = item.extent ?? { length: item.size, width: item.size };
+  const across = Math.max(0.5, Math.min(length, width));
+  const along = Math.max(length, width);
+  const radius = Math.round(Math.max(1.5, 0.55 * across + 0.5) * 2) / 2;
+  if (along <= 1.3 * across) return [{ position: item.position, normal: item.normal, radius: Math.round(Math.max(1.5, 0.55 * along + 0.5) * 2) / 2 }];
+  // along the long axis, overlapping by a third
+  const step = radius * 1.3;
+  const span = along - 2 * radius * 0.7;
+  const count = Math.max(2, Math.ceil(span / step) + 1);
+  const dir = length >= width ? item.direction : unit(cross(item.normal, item.direction));
+  const spots = [];
+  for (let i = 0; i < count; i++) {
+    const t = count === 1 ? 0 : -span / 2 + (span * i) / (count - 1);
+    spots.push({ position: [item.position[0] + dir[0] * t, item.position[1] + dir[1] * t, item.position[2] + dir[2] * t], normal: item.normal, radius });
+  }
+  return spots;
+}
+
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+
 /** What one detail was meant to be. */
 function readOne(d) {
   const height = Math.max(0.1, d.crest ?? d.height);
-  const common = { position: footPoint(d), normal: d.normal, sag: d.sag ?? 0, height, sources: [d.id], size: d.size };
+  const common = { position: footPoint(d), normal: d.normal, sag: d.sag ?? 0, height, sources: [d.id], size: d.size, direction: d.direction, extent: { length: 1.05 * (d.footLength ?? d.length ?? d.size), width: 1.05 * (d.footWidth ?? d.width ?? d.size) } };
   if (d.kind === 'round') {
     const radius = d.radius;
     // the sphere's centre stays where the fitted one is: the berry's base lies 0.65 radius below its centre
     const centreAbove = dot(d.center, d.normal) - (d.footLevel ?? dot(d.center, d.normal));
     const position = [d.center[0] - d.normal[0] * centreAbove, d.center[1] - d.normal[1] * centreAbove, d.center[2] - d.normal[2] * centreAbove];
-    return place('berry', { radius }, { ...common, position, sag: Math.max(0, (d.sag ?? 0) + centreAbove - 0.65 * radius), confidence: 0.9, note: 'a sphere fits it closely' });
+    return place('berry', { radius }, { ...common, position, extent: { length: 2 * radius, width: 2 * radius }, sag: Math.max(0, (d.sag ?? 0) + centreAbove - 0.65 * radius), confidence: 0.9, note: 'a sphere fits it closely' });
   }
   const el = d.elongation ?? 1;
   const lobes = d.lobes ?? 0;
   // the region stops a ring short of the foot and the thin tips of a star or leaf read low: the footprint is a
   // little larger than measured
-  const L = 1.12 * (d.footLength ?? d.length), W = 1.12 * (d.footWidth ?? d.width);
+  const L = 1.05 * (d.footLength ?? d.length), W = 1.05 * (d.footWidth ?? d.width);
   const across = Math.max(L, W);
-  if (lobes >= 8 && el < 1.4) {
+  if (lobes >= 7 && el < 1.4) {
     return place('rosette', { radius: across / 2, height, petals: Math.min(16, lobes) }, { ...common, confidence: 0.6, note: `${lobes} lobes around a round footprint` });
   }
   if (lobes >= 4 && el < 1.35) {
-    return place('star', { radius: across / 2, height, points: Math.min(12, Math.max(4, lobes)) }, { ...common, direction: d.lobeDirection, confidence: lobes === 5 ? 0.85 : 0.6, note: `${lobes} points around a round footprint` });
+    // four to six lobes read on a smudgy outline: a five-point star, the usual one
+    return place('star', { radius: across / 2, height, points: 5 }, { ...common, direction: d.lobeDirection, confidence: lobes === 5 ? 0.85 : 0.6, note: `${lobes} points around a round footprint` });
   }
   if (el >= 1.7) {
     const spiky = lobes >= 4;
@@ -177,7 +211,7 @@ function readGroup(group, F) {
   const sources = group.map((d) => d.id);
   const el = width > 1e-9 ? length / width : 1;
   const rounds = group.filter((d) => d.kind === 'round');
-  const common = { position, normal, direction, sag, height, sources, size: Math.max(length, width) };
+  const common = { position, normal, direction, sag, height, sources, size: Math.max(length, width), extent: { length, width } };
   if (rounds.length === group.length) return null; // berries close together: each stays a berry of its own
   if (el < 1.4) {
     const bud = rounds.find((d) => Math.hypot(d.center[0] - position[0], d.center[1] - position[1], d.center[2] - position[2]) < 0.3 * length);

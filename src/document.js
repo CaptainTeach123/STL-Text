@@ -101,7 +101,7 @@ export function createItem(overrides = {}) {
   const { text, fontId, size, ...rest } = overrides;
   const item = { ...ITEM_DEFAULTS, ...rest, id: overrides.id ?? `t${nextId++}` };
   item.lines = item.kind === 'part' || item.kind === 'spot' ? [] : linesOf({ lines: rest.lines, text, fontId, size });
-  if (item.kind === 'part') item.conform = false; // a rigid part is never warped
+  if (item.kind === 'part' && rest.conform === undefined) item.conform = false; // a rigid part is never warped unless asked (a generated decoration draped over a curve)
   if (item.kind === 'spot') item.conform = true; // the spot's ring hugs the surface
   item.position = [...item.position];
   item.normal = [...item.normal];

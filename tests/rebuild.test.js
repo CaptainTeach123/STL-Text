@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { decoratedFixture } from './decorFixture.js';
-import { planRebuild, specForKind } from '../src/rebuild.js';
+import { planRebuild, removalSpotsFor, specForKind } from '../src/rebuild.js';
 import { decorPartId } from '../src/decor.js';
 import { manifold } from '../src/manifold.js';
 import { setup } from './helpers.js';
@@ -81,13 +81,13 @@ describe('the rebuild plan', () => {
     // as the app does it: a removing spot per detail plus the clean part
     const added = [];
     for (const item of items) {
-      const radius = Math.round(Math.max(1.5, 0.55 * item.size + 0.5) * 2) / 2;
-      added.push(createSpot({ radius, remove: true, position: item.position, normal: item.normal }));
+      for (const spot of removalSpotsFor(item)) added.push(createSpot({ radius: spot.radius, remove: true, position: spot.position, normal: spot.normal }));
       const partId = decorPartId(item.spec);
       await client.addGeneratedPart(partId, item.spec, item.kind);
-      added.push(createPart(partId, item.kind, { attach: 'bottom', sink: item.sink, spin: item.spin, fit: false, cover: false, join: 'fuse', position: item.position, normal: item.normal }));
+      added.push(createPart(partId, item.kind, { attach: 'bottom', sink: item.sink, spin: item.spin, fit: false, cover: false, join: 'fuse', conform: true, position: item.position, normal: item.normal }));
     }
     const spots = added.filter((i) => i.kind === 'spot');
+    expect(spots).toHaveLength(2); // compact details: one spot each
     const shown = await client.updateBase({ version: 2, transforms: [], simplify: null, enhance: null, spots: [], covers: spots });
     expect(shown.info.covered).toBe(2);
     const ex = await client.export(added, 2, 'rebuilt');
@@ -100,6 +100,50 @@ describe('the rebuild plan', () => {
     expect(slice.volume()).toBeLessThan(0.6 * probe.volume());
     expect(Math.abs(out.volume() - before) / before).toBeLessThan(0.02);
     [out, probe, slice].forEach((m) => m.delete());
+  });
+
+  it('drapes a star over a cane: rebuilt on the curved side, it is one solid that follows the surface', async () => {
+    const client = await engineClient();
+    const { writeBinarySTL, parseSTL } = await import('../src/stl.js');
+    const { manifoldToSoup, geometryToManifold } = await import('../src/mesh.js');
+    const { createPart, createSpot } = await import('../src/document.js');
+    const f = decoratedFixture({ body: 'cane', decorations: [{ kind: 'star', radius: 6, height: 1.6, at: [0, 40] }] });
+    await client.loadBase({ kind: 'stl', bytes: writeBinarySTL(manifoldToSoup(f.solid)), name: 'cane', version: 1 });
+    f.solid.delete();
+    const found = await client.findDetails(1, { featureSize: 16 });
+    const { items } = planRebuild(found.details, { featureSize: 16 });
+    const star = items.find((i) => i.kind === 'star');
+    expect(star).toBeTruthy();
+    expect(star.normal[0]).toBeGreaterThan(0.95); // facing out of the cane's side
+    const added = [];
+    for (const spot of removalSpotsFor(star)) added.push(createSpot({ radius: spot.radius, remove: true, position: spot.position, normal: spot.normal }));
+    const partId = decorPartId(star.spec);
+    await client.addGeneratedPart(partId, star.spec, 'star');
+    added.push(createPart(partId, 'star', { attach: 'bottom', sink: star.sink, spin: star.spin, fit: false, cover: false, join: 'fuse', conform: true, position: star.position, normal: star.normal }));
+    await client.updateBase({ version: 2, transforms: [], simplify: null, enhance: null, spots: [], covers: added.filter((i) => i.kind === 'spot') });
+    const out = geometryToManifold(parseSTL((await client.export(added, 2, 'cane-star')).stl));
+    expect(out.decompose().length).toBe(1);
+    // the star follows the cane: around its footprint the model reaches no further out than cane + star height
+    const m = out.getMesh();
+    let maxR = 0;
+    for (let v = 0; v < m.vertProperties.length / 3; v++) {
+      const x = m.vertProperties[v * 3], y = m.vertProperties[v * 3 + 1], z = m.vertProperties[v * 3 + 2];
+      if (Math.abs(z - 40) < 8 && Math.abs(y) < 8 && x > 0) maxR = Math.max(maxR, Math.hypot(x, y));
+    }
+    expect(maxR).toBeGreaterThan(12.8);
+    expect(maxR).toBeLessThan(12 + star.spec.height + 0.6);
+    out.delete();
+  });
+
+  it('cuts a long detail away with a row of spots along it', () => {
+    const item = { position: [0, 0, 3], normal: [0, 0, 1], direction: [1, 0, 0], size: 26, extent: { length: 26, width: 10 } };
+    const spots = removalSpotsFor(item);
+    expect(spots.length).toBeGreaterThanOrEqual(3);
+    for (const s of spots) expect(Math.abs(s.position[1])).toBeLessThan(1e-9); // along x
+    expect(Math.min(...spots.map((s) => s.position[0]))).toBeLessThan(-6);
+    expect(Math.max(...spots.map((s) => s.position[0]))).toBeGreaterThan(6);
+    expect(spots[0].radius).toBeLessThan(8); // sized to the width, not the length
+    expect(removalSpotsFor({ position: [0, 0, 3], normal: [0, 0, 1], direction: [1, 0, 0], size: 6, extent: { length: 6, width: 5.5 } })).toHaveLength(1);
   });
 
   it('sizes a detail read as another kind from what was measured', () => {

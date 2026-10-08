@@ -183,7 +183,7 @@ function describeModel() {
   if (info.covered) {
     notes.push({
       level: 'ok',
-      text: `${info.covered} ${info.covered === 1 ? 'item consumes' : 'items consume'} the details under ${info.covered === 1 ? 'it' : 'them'}: the model is shown and downloaded with them cut away.`,
+      text: `${info.covered} ${info.covered === 1 ? 'item cuts' : 'items cut'} the model, consuming or removing the details under ${info.covered === 1 ? 'it' : 'them'}: it is shown and downloaded that way.`,
     });
   }
   if (info.spots?.length) {
@@ -551,6 +551,78 @@ async function addPartFile(file) {
   }
 }
 
+/* --------------------------------------------------------------- details */
+
+let foundDetails = null; // the last "Find details" answer: { details, featureSize }
+let detailCount = 0;
+
+/** Look for the details standing on the model and show what was found with the actions for them. */
+async function findDetails() {
+  if (!modelInfo?.hasModel) return;
+  const card = $('detailsCard');
+  card.hidden = false;
+  $('detailsSummary').textContent = 'Looking for details…';
+  ['replaceRoundBtn', 'cleanOthersBtn', 'removeAllBtn'].forEach((id) => ($(id).disabled = true));
+  try {
+    if (!(await syncBase())) return;
+    const r = await client.findDetails(version(), { featureSize: Number.parseFloat($('detailScale').value) || 0 });
+    if (!r) return;
+    foundDetails = r;
+    const round = r.details.filter((d) => d.kind === 'round').length;
+    const other = r.details.length - round;
+    $('detailsSummary').textContent = r.details.length
+      ? `Found ${r.details.length} ${r.details.length === 1 ? 'detail' : 'details'}: ${round} round (berries, beads), ${other} other (leaves, stars, scrolls), looking at a detail size of about ${fmt(r.featureSize / 3)} mm.`
+      : `No details found at a detail size of about ${fmt(r.featureSize / 3)} mm. Try a different size.`;
+    $('replaceRoundBtn').disabled = !round;
+    $('cleanOthersBtn').disabled = !other;
+    $('removeAllBtn').disabled = !r.details.length;
+  } catch (err) {
+    $('detailsSummary').textContent = `Could not look for details: ${friendly(err)}`;
+  }
+}
+
+/** A clean sphere part for a round detail: consumes the smudgy one under it. */
+async function replaceRoundDetails() {
+  const round = foundDetails?.details.filter((d) => d.kind === 'round') ?? [];
+  if (!round.length) return;
+  for (const d of round) {
+    const radius = Math.round(d.radius * 20) / 20;
+    const partId = `sphere-${radius}`;
+    if (!partAssets.has(partId)) {
+      const { info } = await client.addGeneratedPart(partId, { kind: 'sphere', radius }, 'berry');
+      partAssets.set(partId, { name: 'berry', info });
+    }
+    const sink = Math.round(radius * 0.35 * 10) / 10;
+    // the sphere's centre goes where the fitted one is: the anchor sits that far below it along the base normal
+    const position = d.center.map((c, k) => c - d.normal[k] * (radius - sink));
+    doc.addItem({ ...createPart(partId, 'berry', { attach: 'bottom', sink, fit: false, cover: true, join: 'fuse' }), id: undefined, position, normal: d.normal });
+  }
+  setStatus(`Replaced ${round.length} round ${round.length === 1 ? 'detail' : 'details'} with clean spheres that consume the originals. Each is a part you can adjust or delete.`, 'ok');
+}
+
+/** A tuned clean-up spot on each detail that is not round. */
+function cleanOtherDetails() {
+  const others = foundDetails?.details.filter((d) => d.kind !== 'round') ?? [];
+  if (!others.length) return;
+  for (const d of others) {
+    const radius = Math.round(Math.max(1.5, d.size * 0.65) * 2) / 2;
+    doc.addItem({ ...createSpot(), id: undefined, radius, featureSize: Math.round((d.size / 3) * 10) / 10, deepen: 0.6, evenOut: 0.4, detail: 0.5, sharpen: 0.3, position: d.center, normal: d.normal });
+  }
+  setStatus(`Added ${others.length} clean-up ${others.length === 1 ? 'spot' : 'spots'} sized to the details found.`, 'ok');
+}
+
+/** A removing spot on every detail found: the model is cut back to the surface they stand on. */
+function removeFoundDetails() {
+  const all = foundDetails?.details ?? [];
+  if (!all.length) return;
+  for (const d of all) {
+    const radius = Math.round(Math.max(1.5, (d.kind === 'round' ? d.radius * 2 : d.size) * 0.65) * 2) / 2;
+    const position = d.kind === 'round' ? d.center.map((c, k) => c + d.normal[k] * d.radius * 0.5) : d.center;
+    doc.addItem({ ...createSpot(), id: undefined, radius, remove: true, position, normal: d.normal });
+  }
+  setStatus(`Removing ${all.length} ${all.length === 1 ? 'detail' : 'details'}: each is a spot you can resize or delete.`, 'ok');
+}
+
 /** Add a clean-up spot at the last click (or where the selected item is, or on top). */
 function addSpot() {
   if (!modelInfo?.hasModel) return;
@@ -853,6 +925,7 @@ function fillPanel(item) {
     $('textCard').hidden = part || spot;
     $('partCard').hidden = !part;
     $('spotCard').hidden = !spot;
+    $('spotCard').classList.toggle('removing', !!(spot && item?.remove));
     $('styleCard').hidden = spot;
     document.querySelectorAll('.text-only').forEach((el) => (el.hidden = part));
     document.querySelectorAll('.plate-only').forEach((el) => (el.hidden = part || !item || item.plate === 'none'));
@@ -1085,7 +1158,7 @@ function renderItems() {
         glyph.className = 'glyph spot';
         glyph.textContent = 'S';
         glyph.title = 'Clean-up spot';
-        meta.textContent = `${fmt(item.radius)} mm`;
+        meta.textContent = `${fmt(item.radius)} mm${item.remove ? ' · removes' : ''}`;
       } else if (part) {
         const joinLabel = { fuse: 'fused', fillet: 'fillet', pegs: 'pegs' }[item.join] ?? item.join;
         const loose = detached.get(item.id) && modelInfo?.hasModel;
@@ -1155,6 +1228,8 @@ function render() {
     ? 'Print the part separately and glue it into matching holes'
     : 'Pegs need a watertight model to make holes in';
   $('addSpotBtn').disabled = !modelInfo?.watertight;
+  $('findDetailsBtn').disabled = !modelInfo?.watertight;
+  if (!modelInfo?.hasModel) $('detailsCard').hidden = true;
   $('addSpotBtn').title = modelInfo?.watertight ? 'Clean up a clumped area of the model' : 'Clean-up spots need a watertight model';
   $('undoBtn').disabled = !doc.canUndo;
   $('redoBtn').disabled = !doc.canRedo;
@@ -1321,6 +1396,11 @@ function bindControls() {
 
   document.querySelectorAll('[data-side]').forEach((btn) => btn.addEventListener('click', () => snapToSide(btn.dataset.side, { look: true })));
   $('snapBtn').addEventListener('click', snapToModel);
+  $('findDetailsBtn').addEventListener('click', findDetails);
+  $('findAgainBtn').addEventListener('click', findDetails);
+  $('replaceRoundBtn').addEventListener('click', () => replaceRoundDetails().catch((err) => setStatus(friendly(err), 'error')));
+  $('cleanOthersBtn').addEventListener('click', cleanOtherDetails);
+  $('removeAllBtn').addEventListener('click', removeFoundDetails);
   $('addSpotBtn').addEventListener('click', addSpot);
   document.querySelectorAll('[data-turn]').forEach((btn) => btn.addEventListener('click', () => turnPart(btn.dataset.turn)));
   document.querySelectorAll('[data-nudge]').forEach((btn) =>

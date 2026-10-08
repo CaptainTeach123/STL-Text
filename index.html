@@ -109,6 +109,7 @@
               <input type="number" data-key="radius" min="0.5" max="200" step="0.5" value="8" />
               <input type="range" data-key="radius" min="1" max="40" step="0.5" value="8" aria-label="Radius" />
             </label>
+            <label class="check" title="Instead of cleaning up: cut the detail under the spot off the model, down to the surface it stands on"><input type="checkbox" data-key="remove" /> Remove this detail</label>
             <label class="field num" title="How much of the radius fades out gently so the clean-up blends into the rest of the model">
               <span>Soft edge <small>%</small></span>
               <input type="number" data-key="feather" min="0" max="100" step="5" value="50" />
@@ -156,6 +157,27 @@
           <ul class="notes" id="spotNotes" aria-live="polite"></ul>
         </section>
 
+        <!-- ============================================================ details -->
+        <section class="card" aria-labelledby="h-details" id="detailsCard" hidden>
+          <h2 id="h-details"><span class="step">3</span> Details found</h2>
+          <p class="hint" id="detailsSummary">Looking for details…</p>
+          <div class="grid2">
+            <label class="field num" title="About three times the size of the details you are after; 0 picks a size from the model">
+              <span>Detail size <small>mm</small></span>
+              <input type="number" id="detailScale" min="0" max="200" step="0.5" value="0" />
+            </label>
+            <div class="row">
+              <button type="button" id="findAgainBtn" class="btn small">Find again</button>
+            </div>
+          </div>
+          <div class="row">
+            <button type="button" id="replaceRoundBtn" class="btn" title="Each round detail becomes a clean sphere of the fitted size that consumes the smudgy one under it">Replace round ones with clean spheres</button>
+            <button type="button" id="cleanOthersBtn" class="btn" title="A clean-up spot sized to each remaining detail">Clean up the others</button>
+            <button type="button" id="removeAllBtn" class="btn ghost" title="A removing spot on each found detail: the model is cut back to the surface they stand on">Remove all found</button>
+          </div>
+          <p class="hint tiny">Each action adds items you can select, adjust or delete. Round ones you keep can also be removed one by one with a clean-up spot set to <em>Remove this detail</em>.</p>
+        </section>
+
         <!-- ============================================================ texts -->
         <section class="card" aria-labelledby="h-texts">
           <h2 id="h-texts"><span class="step">2</span> Texts &amp; parts</h2>
@@ -164,6 +186,7 @@
             <button type="button" id="addTextBtn" class="btn">+ Add text</button>
             <button type="button" id="openPartBtn" class="btn" title="Attach another STL file to the model">+ Add part (STL)…</button>
             <button type="button" id="addSpotBtn" class="btn" title="Clean up a clumped area of the model">+ Clean-up spot</button>
+            <button type="button" id="findDetailsBtn" class="btn" title="Find the details standing on the model – berries, leaves, stars – to replace, clean up or remove them">Find details…</button>
             <input id="partFile" type="file" accept=".stl,model/stl" hidden />
             <button type="button" id="duplicateBtn" class="btn">Duplicate</button>
             <button type="button" id="deleteBtn" class="btn ghost">Delete</button>

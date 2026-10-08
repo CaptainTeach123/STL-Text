@@ -784,3 +784,10 @@ body.deriving .deriving-note {
 label.check.muted {
   opacity: 0.5;
 }
+
+/* a spot set to remove the detail under it has no clean-up amounts to set */
+#spotCard.removing .grid2:not(:first-of-type),
+#spotCard.removing details {
+  opacity: 0.35;
+  pointer-events: none;
+}

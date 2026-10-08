@@ -173,6 +173,10 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
   async function rehydratePart(partId) {
     const part = parts.get(partId);
     if (!part) throw new EngineError({ code: 'PART_MISSING', message: `Part ${partId} is not loaded`, details: { partId } });
+    if (part.spec) {
+      await request(`part:${partId}`, 'part.generate', { partId, name: part.name, ...part.spec });
+      return;
+    }
     const bytes = copy(part.bytes);
     await request(`part:${partId}`, 'part.add', { partId, name: part.name, bytes }, [bytes]);
   }
@@ -211,6 +215,17 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
       parts.set(partId, { bytes, name });
       const sent = copy(bytes);
       return request(`part:${partId}`, 'part.add', { partId, name, bytes: sent }, [sent]);
+    },
+
+    /** Register a generated part (e.g. { kind: 'sphere', radius }); the spec is kept for restarts. */
+    addGeneratedPart(partId, spec, name) {
+      parts.set(partId, { spec, name });
+      return request(`part:${partId}`, 'part.generate', { partId, name, ...spec });
+    },
+
+    /** Find the details standing on the current model (berries, leaves, …); see details.js. */
+    findDetails(baseVersion, options = {}) {
+      return request('details', 'details.find', { baseVersion, ...options });
     },
 
     /**

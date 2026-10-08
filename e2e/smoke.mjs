@@ -589,6 +589,27 @@ try {
     await page.click('#deleteBtn');
     await idle();
     check(!/clean-up spot/.test(await page.locator('#modelNotes').innerText()), 'deleting the spot removes it from the model');
+    // find the details standing on the model and remove them (the bumps are big for this small plate: say so)
+    await page.click('#findDetailsBtn');
+    await page.waitForFunction(() => !document.querySelector('#detailsCard').hidden);
+    await page.fill('#detailScale', '8');
+    await page.click('#findAgainBtn');
+    await page.waitForFunction(() => /Found \d+ detail|No details|Could not/.test(document.querySelector('#detailsSummary').textContent), null, { timeout: 60000 });
+    await idle();
+    const summary = await page.locator('#detailsSummary').innerText();
+    check(/Found [1-9]\d* detail/.test(summary), '"Find details" finds the clumped bumps', summary.slice(0, 140));
+    const itemsBeforeRemove = await page.locator('#itemList li').count();
+    await page.click('#removeAllBtn');
+    await idle();
+    const itemsAfterRemove = await page.locator('#itemList li').count();
+    check(itemsAfterRemove > itemsBeforeRemove && /removes/.test(await page.locator('#itemList li[aria-selected="true"] .meta').innerText()), '"Remove all found" adds removing spots', `${itemsBeforeRemove} → ${itemsAfterRemove}`);
+    check(/cuts? the model/.test(await page.locator('#modelNotes').innerText()), 'the model notes say the details are being cut away', (await page.locator('#modelNotes').innerText()).replace(/\s+/g, ' ').slice(0, 160));
+    const removedStl = await download('clump-removed.stl');
+    check(removedStl.volume < clumpBefore.volume - 1 && removedStl.sizeOk, 'the download has the bumps cut away', `${removedStl.volume?.toFixed(0)} < ${clumpBefore.volume?.toFixed(0)}`);
+    while ((await page.locator('#itemList li').count()) > itemsBeforeRemove) {
+      await page.click('#deleteBtn');
+      await idle();
+    }
     await page.click('#itemList li:first-child');
     await idle();
   }

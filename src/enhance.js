@@ -895,7 +895,7 @@ function umbrella(x, out, topo, lam, stride) {
 }
 
 /** K umbrella passes (ping-pong buffers); returns a new array. */
-function smoothField(x, topo, lam, K, stride, progress) {
+export function smoothField(x, topo, lam, K, stride, progress) {
   let a = Float64Array.from(x);
   let b = new Float64Array(a.length);
   for (let k = 0; k < K; k++) {

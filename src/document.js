@@ -29,6 +29,7 @@ export const ITEM_DEFAULTS = Object.freeze({
   feather: 0.5, // 0..1: how much of the radius is a soft edge
   sharpen: 0, smooth: 0, detail: 0.5, deepen: 0.6, evenOut: 0.4, // amounts 0..1
   featureSize: 0, maxMove: 0, // mm, 0 = automatic
+  remove: false, // a spot that cuts the detail under it off the model, down to the surface it stands on
   sink: 0.4, // how deep the part sits into the surface
   fit: true, // push the part in until its body meets the surface, not just its nearest point
   cover: false, // cut away the model's details under the item (part or plate) so nothing pokes through it (final result only: not a shape key)
@@ -59,7 +60,7 @@ const SHAPE_KEYS = [
   'cornerRadius', 'mirror', 'quality', 'mode', 'depth', 'overlap',
   'plate', 'plateThickness', 'platePadding',
   'partId', 'scale', 'attach', 'tilt', 'roll', 'sink', 'fit', 'join', 'filletRadius', 'pegCount', 'pegDiameter', 'pegLength', 'pegClearance',
-  'radius', 'feather', 'sharpen', 'smooth', 'detail', 'deepen', 'evenOut', 'featureSize', 'maxMove',
+  'radius', 'feather', 'sharpen', 'smooth', 'detail', 'deepen', 'evenOut', 'featureSize', 'maxMove', 'remove',
 ];
 const PLACE_KEYS = ['position', 'normal', 'spin', 'conform'];
 
@@ -124,7 +125,7 @@ export const isSpot = (item) => item?.kind === 'spot';
 /** The spots as the engine needs them (everything that changes what they do to the model). */
 export const spotsOf = (items) =>
   items
-    .filter(isSpot)
+    .filter((i) => isSpot(i) && !i.remove)
     .map((s) => ({
       id: s.id, position: s.position, radius: s.radius, feather: s.feather,
       sharpen: s.sharpen, smooth: s.smooth, detail: s.detail, deepen: s.deepen, evenOut: s.evenOut, featureSize: s.featureSize, maxMove: s.maxMove,
@@ -132,13 +133,15 @@ export const spotsOf = (items) =>
 export const spotsKey = (items) => stableKey(spotsOf(items));
 
 /**
- * The items that consume what they cover (parts and text plates with the
- * cover option): they change the model itself, so the engine derives the
- * model with their cut applied. Everything that changes where and how such
+ * The items that cut the model: parts and text plates that consume what
+ * they cover, and spots that remove the detail under them. They change the
+ * model itself, so the engine derives the model with their cut applied. Everything that changes where and how such
  * an item sits is part of its key.
  */
 export const coversOf = (items) =>
-  items.filter((i) => i.cover && hasText(i) && !isSpot(i) && i.mode !== 'engrave' && (isPart(i) || i.plate !== 'none')).map((i) => ({ ...i }));
+  items
+    .filter((i) => (isSpot(i) ? !!i.remove : i.cover && hasText(i) && i.mode !== 'engrave' && (isPart(i) || i.plate !== 'none')))
+    .map((i) => ({ ...i }));
 export const coversKey = (items) => stableKey(coversOf(items).map((i) => ({ shape: shapeKey(i, ''), place: placeKey(i), sink: i.sink, fit: i.fit !== false })));
 
 /** True when the item would produce geometry (text with letters, a part) or affect the model (a spot). */

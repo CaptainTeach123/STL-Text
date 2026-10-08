@@ -1,4 +1,4 @@
-import { Matrix4, Vector3 } from 'three';
+import { BufferGeometry, Float32BufferAttribute, Matrix4, Uint32BufferAttribute, Vector3 } from 'three';
 import { describeRepair, repairToManifold } from './repair.js';
 import { conformNotes, conformSolid, createSurfaceSampler, createUndersideSampler, fitDepth, heightFieldSlab } from './conform.js';
 import { buildCrossSectionInfo, printLimits, textZRange, thinStrokeReport } from './textGeometry.js';
@@ -8,7 +8,8 @@ import { concatSoups, displayBuffers, manifoldToSoup } from './mesh.js';
 import { ViewCache, passthroughRangesOf } from './view.js';
 import { ATTACH_ROTATIONS, placementMatrix, toMat4 } from './placement.js';
 import { baseMode, fontIds, hasText, isPart, isSpot, itemLabel, placeKey, shapeKey } from './document.js';
-import { enhanceMesh, extractRegion, isEnhanceActive, regionWeights } from './enhance.js';
+import { enhanceMesh, extractRegion, isEnhanceActive, regionWeights, smoothField } from './enhance.js';
+import { baseSurface, findDetails } from './details.js';
 
 /**
  * The geometry engine: a pure request handler that owns Manifold objects,
@@ -623,7 +624,15 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const covers = [];
     const notes = [];
     for (const item of items) {
-      if (!item.cover || !hasText(item) || isSpot(item) || baseMode(item) === 'engrave' || !(isPart(item) || item.plate !== 'none')) continue;
+      if (isSpot(item)) {
+        if (!item.remove) continue;
+        const remover = removerSolidFor(item);
+        if (!remover) continue;
+        covers.push(temps.add(temps.add(remover).transform(toMat4(placementMatrix(item)))));
+        notes.push({ level: 'info', code: 'REMOVED', itemId: item.id, text: `${quote(item)} removes the detail under it, down to the surface it stands on.` });
+        continue;
+      }
+      if (!item.cover || !hasText(item) || baseMode(item) === 'engrave' || !(isPart(item) || item.plate !== 'none')) continue;
       const placed = solidFor(item);
       if (placed.stats && placed.stats.touches === false) continue; // not on the model: nothing to consume
       const pegged = isPart(item) && placed.flat.pegged;
@@ -637,6 +646,97 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       notes.push({ level: 'info', code: 'COVERED', itemId: item.id, text: `${quote(item)} covers what is under it: the model's details there were cut away so nothing pokes through.` });
     }
     return { covers, notes };
+  }
+
+  /**
+   * What a removing spot cuts: within its radius, everything from the base
+   * surface (the model smoothed at a scale larger than the detail, so the
+   * detail is gone while the shape it stands on remains) up to where the
+   * model is left again, within reach. Returns a solid in the spot's local
+   * frame, or null.
+   */
+  function removerSolidFor(spot) {
+    const stage = base.current?.stage;
+    if (!stage || !base.current.geometry) return null;
+    const radius = Math.max(0.5, spot.radius ?? 8);
+    const mesh = stage.view ?? stage.mesh;
+    const region = extractRegion(mesh.positions, mesh.index, spot.position, radius * 3);
+    if (region.index.length < 12) return null;
+    // the detail's vertices: those standing clearly above the region's smoothed base, within the spot. The base the cut
+    // goes down to is the surface spanned across them with everything else held in place (a membrane fill), so it
+    // follows the surrounding surface exactly and bridges the detail smoothly
+    const { height, topo } = baseSurface(region, { featureSize: 3 * radius, pinBorder: true });
+    const V = region.positions.length / 3;
+    let maxH = 0;
+    for (let v = 0; v < V; v++) if (height[v] > maxH) maxH = height[v];
+    const threshold = Math.max(0.05, 0.2 * maxH);
+    const lam = new Float64Array(V);
+    const reach2 = (1.2 * radius) ** 2;
+    let freed = 0;
+    for (let v = 0; v < V; v++) {
+      const d2 = (region.positions[v * 3] - spot.position[0]) ** 2 + (region.positions[v * 3 + 1] - spot.position[1]) ** 2 + (region.positions[v * 3 + 2] - spot.position[2]) ** 2;
+      if (height[v] > threshold && d2 <= reach2) {
+        lam[v] = 0.5;
+        freed++;
+      }
+    }
+    if (!freed) return null;
+    const basePositions = smoothField(Float64Array.from(region.positions), topo, lam, 400, 3);
+    const placement = placementMatrix(spot);
+    const baseGeometry = new BufferGeometry();
+    baseGeometry.setAttribute('position', new Float32BufferAttribute(Float32Array.from(basePositions), 3));
+    baseGeometry.setIndex(new Uint32BufferAttribute(region.index, 1));
+    const range = Math.max(50, 4 * radius + 10);
+    const baseSampler = createSurfaceSampler(baseGeometry, placement, { searchAbove: range, searchBelow: range });
+    const surface = sampler(placement, { searchAbove: range, searchBelow: range });
+    if (!surface) return null;
+    const cell = Math.min(1, Math.max(0.25, radius / 30));
+    const nx = Math.ceil((2 * radius) / cell) + 2;
+    const ny = nx;
+    const x0 = -radius - cell;
+    const y0 = -radius - cell;
+    const W = nx + 1;
+    const bottom = new Float64Array(W * (ny + 1)).fill(NaN);
+    const top = new Float64Array(W * (ny + 1)).fill(NaN);
+    const budget = 2 * radius + COVER_PROTRUDE;
+    let consumed = false;
+    for (let j = 0; j <= ny; j++) {
+      for (let i = 0; i <= nx; i++) {
+        const x = x0 + i * cell;
+        const y = y0 + j * cell;
+        if (x * x + y * y > radius * radius) continue;
+        const b0 = baseSampler.heightAt(x, y);
+        if (!Number.isFinite(b0)) continue;
+        const z0 = b0 + 0.15; // a hair above the spanned surface, so the cut floor is that surface
+        const k = j * W + i;
+        bottom[k] = z0;
+        top[k] = z0 + 0.01;
+        let cutTo = NaN;
+        for (const c of surface.crossingsAt(x, y)) {
+          if (c.z <= z0) continue;
+          if (c.z - z0 > budget) break;
+          if (c.exit) cutTo = c.z;
+        }
+        if (Number.isFinite(cutTo)) {
+          top[k] = cutTo + COVER_EPSILON;
+          consumed = true;
+        }
+      }
+    }
+    baseSampler.dispose();
+    if (!consumed) return null;
+    const slab = heightFieldSlab({ x0, y0, cell, nx, ny, bottom, top });
+    if (!slab) return null;
+    try {
+      const m = Manifold.ofMesh(new wasm.Mesh({ numProp: 3, vertProperties: slab.vertProperties, triVerts: slab.triVerts }));
+      if (m.status() !== 'NoError' || m.isEmpty()) {
+        m.delete();
+        return null;
+      }
+      return m;
+    } catch {
+      return null;
+    }
   }
 
   /** The model with the covering items' cuts applied, cached by what covers it: a stage for display. */
@@ -1249,6 +1349,14 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         notes.push({ level: 'info', code: 'SPOT', text: 'Load a model for the spot to work on.' });
         return notes;
       }
+      if (item.remove) {
+        notes.push(
+          base?.current?.watertight
+            ? { level: 'ok', code: 'SPOT', text: 'Removes the detail under it, down to the surface it stands on. The model is shown and downloaded without it.' }
+            : { level: 'warn', code: 'SPOT_UNAVAILABLE', text: "This model couldn't be made watertight, so nothing can be cut from it." },
+        );
+        return notes;
+      }
       if (!isEnhanceActive(item)) {
         notes.push({ level: 'info', code: 'SPOT', text: 'All amounts are 0, so this spot changes nothing yet.' });
         return notes;
@@ -1411,8 +1519,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const raised = []; // raised items and their world solids, to check that each really merged
     const temps = scope();
     try {
-      // what covering items consume is cut from the model before anything is added
-      const { covers, notes: coverNotes } = model ? coverSolidsFor(active, temps) : { covers: [], notes: [] };
+      // what covering items consume, and what removing spots cut, is taken from the model before anything is added
+      const cutting = items.filter((i) => (isSpot(i) ? !!i.remove : active.includes(i)));
+      const { covers, notes: coverNotes } = model ? coverSolidsFor(cutting, temps) : { covers: [], notes: [] };
       notes.push(...coverNotes);
       active.forEach((item, n) => {
         progress?.('Building text…', { done: n + 1, total: active.length });
@@ -1632,6 +1741,49 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     return { message: { partId, info }, transfer: [] };
   }
 
+  /** A generated part: a clean primitive to replace a smudgy detail with (a sphere for a berry). */
+  function generatePart({ partId, kind = 'sphere', radius = 2, name = 'berry' }) {
+    const r = Math.max(0.2, Math.min(100, Number(radius) || 2));
+    let m;
+    if (kind === 'sphere') m = Manifold.sphere(r, Math.max(24, Math.min(128, Math.round(r * 24))));
+    else fail('PART_INVALID', `Unknown generated part "${kind}"`);
+    parts.get(partId)?.manifold.delete();
+    const { min, max } = m.boundingBox();
+    const info = { name, triangles: m.numTri(), size: [max[0] - min[0], max[1] - min[1], max[2] - min[2]], watertight: true, repaired: false, summary: '', dropped: 0, generated: kind };
+    parts.set(partId, { manifold: m, info, key: `${partId}:${kind}:${r}` });
+    flat.clear();
+    clearDerived();
+    return { message: { partId, info }, transfer: [] };
+  }
+
+  /**
+   * The details standing on the current model (see details.js), found on a
+   * lighter copy of it: the base is smoothed at the feature scale, so edges
+   * a good deal shorter than that add nothing but time.
+   */
+  function findDetailsIn({ baseVersion, featureSize = 0, minHeight = 0 }, progress) {
+    const b = baseFor(baseVersion);
+    if (!b.current || b.kind === 'none') return { message: { details: [], featureSize: 0, threshold: 0 }, transfer: [] };
+    progress?.('Looking for details…');
+    const temps = scope();
+    try {
+      const stage = b.current.stage;
+      let mesh = stage.view ?? stage.mesh;
+      const bounds = b.current.bounds;
+      const diag = bounds ? Math.hypot(...[0, 1, 2].map((k) => bounds.max[k] - bounds.min[k])) : 100;
+      const F = featureSize > 0 ? featureSize : 0.05 * diag;
+      const solid = b.current.watertight ? stageManifold(stage) : null;
+      if (solid && mesh.index.length / 3 > 20_000) {
+        const lighter = temps.add(solid.simplify(F / 40));
+        if (lighter.numTri() >= 1000) mesh = meshOf(lighter);
+      }
+      const found = findDetails(mesh, { featureSize: F, minHeight });
+      return { message: { details: found.details, featureSize: found.featureSize, threshold: found.threshold, triangles: mesh.index.length / 3 }, transfer: [] };
+    } finally {
+      temps.dispose();
+    }
+  }
+
   /* ---------------------------------------------------------- dispatch */
 
   const handlers = {
@@ -1647,6 +1799,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     }),
     'font.add': addFont,
     'part.add': addPart,
+    'part.generate': generatePart,
+    'details.find': findDetailsIn,
     'base.load': loadBase,
     'base.update': updateBase,
     preview,

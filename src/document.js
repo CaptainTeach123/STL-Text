@@ -131,6 +131,16 @@ export const spotsOf = (items) =>
     }));
 export const spotsKey = (items) => stableKey(spotsOf(items));
 
+/**
+ * The items that consume what they cover (parts and text plates with the
+ * cover option): they change the model itself, so the engine derives the
+ * model with their cut applied. Everything that changes where and how such
+ * an item sits is part of its key.
+ */
+export const coversOf = (items) =>
+  items.filter((i) => i.cover && hasText(i) && !isSpot(i) && i.mode !== 'engrave' && (isPart(i) || i.plate !== 'none')).map((i) => ({ ...i }));
+export const coversKey = (items) => stableKey(coversOf(items).map((i) => ({ shape: shapeKey(i, ''), place: placeKey(i), sink: i.sink, fit: i.fit !== false })));
+
 /** True when the item would produce geometry (text with letters, a part) or affect the model (a spot). */
 export const hasText = (item) =>
   isSpot(item) ? true : isPart(item) ? !!item.partId : (item.lines ?? []).some((l) => String(l.text ?? '').trim().length > 0);
@@ -224,8 +234,8 @@ export class Document {
     this.coalesceKey = coalesce;
     const next = clone(this.state);
     mutate(next);
-    // clean-up spots change the model itself, so anything about them is a new model version
-    if (spotsKey(next.items) !== spotsKey(this.state.items)) next.baseVersion += 1;
+    // clean-up spots and covering items change the model itself, so anything about them is a new model version
+    if (spotsKey(next.items) !== spotsKey(this.state.items) || coversKey(next.items) !== coversKey(this.state.items)) next.baseVersion += 1;
     this.state = next;
     this.#notify();
   }

@@ -1,23 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Matrix4 } from 'three';
-import {
-  Document,
-  createItem,
-  createSpot,
-  fontIds,
-  frameOf,
-  hasText,
-  isSpot,
-  itemLabel,
-  itemText,
-  linesOf,
-  maxSize,
-  placeKey,
-  shapeKey,
-  spotsKey,
-  stableKey,
-  transformItems,
-} from '../src/document.js';
+import { Document, coversKey, coversOf, createItem, createPart, createSpot, fontIds, frameOf, hasText, isSpot, itemLabel, itemText, linesOf, maxSize, placeKey, shapeKey, spotsKey, stableKey, transformItems } from '../src/document.js';
 
 describe('keys', () => {
   it('stableKey ignores key order and slider jitter', () => {
@@ -265,5 +248,28 @@ describe('clean-up spots', () => {
     expect(doc.state.baseVersion).toBe(v0 + 2);
     expect(doc.undo()).toBe(true);
     expect(doc.items.some(isSpot)).toBe(true);
+  });
+});
+
+describe('covering items', () => {
+  it('a part that consumes what it covers is part of the model derivation: toggling or moving it is a new model version', () => {
+    const doc = new Document();
+    doc.setBase('sample', 'plaque');
+    const part = createPart('p', 'part', { position: [0, 0, 4], normal: [0, 0, 1] });
+    doc.addItem(part);
+    const v0 = doc.state.baseVersion;
+    expect(coversOf(doc.items)).toHaveLength(0);
+    doc.updateItem(part.id, { cover: true });
+    expect(coversOf(doc.items)).toHaveLength(1);
+    expect(doc.state.baseVersion).toBe(v0 + 1);
+    doc.updateItem(part.id, { position: [5, 0, 4] });
+    expect(doc.state.baseVersion).toBe(v0 + 2); // moving a covering part re-derives the model
+    const key = coversKey(doc.items);
+    doc.updateItem(part.id, { name: 'renamed' });
+    expect(coversKey(doc.items)).toBe(key); // but a name is not part of what it cuts
+    expect(doc.state.baseVersion).toBe(v0 + 2);
+    // a cutter part never covers
+    doc.updateItem(part.id, { mode: 'engrave' });
+    expect(coversOf(doc.items)).toHaveLength(0);
   });
 });

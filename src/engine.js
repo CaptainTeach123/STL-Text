@@ -276,7 +276,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   function trimCache(map, max) {
     while (map.size > max) {
       const key = map.keys().next().value;
-      map.get(key).dispose();
+      const e = map.get(key);
+      (e.dispose ? e : e.stage).dispose();
       map.delete(key);
     }
   }
@@ -493,7 +494,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     disposeCurrent();
     base.original?.stage?.dispose();
     base = null;
-    for (const cache of [movedCache, simplifyCache, enhanceCache, spotCache]) trimCache(cache, 0);
+    for (const cache of [movedCache, simplifyCache, enhanceCache, spotCache, coverCache]) trimCache(cache, 0);
   }
 
   /**
@@ -614,6 +615,54 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   }
 
   /**
+   * The cover solids (world frame) of the items that consume what they cover,
+   * placed on the current (uncovered) model, with a note per item. Shared by
+   * the displayed model and the final result so both cut the same thing.
+   */
+  function coverSolidsFor(items, temps) {
+    const covers = [];
+    const notes = [];
+    for (const item of items) {
+      if (!item.cover || !hasText(item) || isSpot(item) || baseMode(item) === 'engrave' || !(isPart(item) || item.plate !== 'none')) continue;
+      const placed = solidFor(item);
+      if (placed.stats && placed.stats.touches === false) continue; // not on the model: nothing to consume
+      const pegged = isPart(item) && placed.flat.pegged;
+      const covering = placed.flat.body ? temps.add(placed.flat.body.translate(0, 0, placed.settle)) : placed.solid;
+      const cbb = covering.boundingBox();
+      const range = Math.max(50, cbb.max[2] - cbb.min[2] + COVER_PROTRUDE + 10);
+      const surface = sampler(placed.placement, { searchAbove: range, searchBelow: range });
+      const cover = surface ? coverSolidFor(covering, surface, { pegged }) : null;
+      if (!cover) continue;
+      covers.push(temps.add(temps.add(cover).transform(toMat4(placed.placement))));
+      notes.push({ level: 'info', code: 'COVERED', itemId: item.id, text: `${quote(item)} covers what is under it: the model's details there were cut away so nothing pokes through.` });
+    }
+    return { covers, notes };
+  }
+
+  /** The model with the covering items' cuts applied, cached by what covers it: a stage for display. */
+  const coverCache = new Map();
+  function coveredFor(stage, covers, stageKey) {
+    const key = `${stageKey}|covers:${covers.map((i) => `${shapeKey(i, fontKeyOf(i))}|${placeKey(i)}|${i.sink}|${i.fit === false ? 0 : 1}`).sort().join(';')}`;
+    let entry = coverCache.get(key);
+    if (!entry) {
+      const temps = scope();
+      try {
+        const { covers: solids } = coverSolidsFor(covers, temps);
+        if (!solids.length) return null;
+        const model = stageManifold(stage);
+        if (!model) return null;
+        const carved = Manifold.difference(model, temps.add(Manifold.union(solids)));
+        entry = { stage: makeStage({ manifold: carved, input: stage }), count: solids.length };
+      } finally {
+        temps.dispose();
+      }
+      coverCache.set(key, entry);
+      trimCache(coverCache, 2);
+    }
+    return entry;
+  }
+
+  /**
    * (Re)build the displayed model from the original + transforms + simplify
    * + enhancement + clean-up spots. Every stage is cached by its settings
    * (see makeStage), so a change to one setting redoes only that stage, and
@@ -622,7 +671,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   function deriveCurrent(progress) {
     disposeCurrent();
     clearDerived();
-    const { original, transforms, simplify, enhance, spots } = base;
+    const { original, transforms, simplify, enhance, spots, covers } = base;
     const matrix = composeTransforms(transforms);
     const transformsKey = JSON.stringify(transforms);
     const watertight = !!original.manifold;
@@ -648,18 +697,30 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const passthrough = transformSoup(original.passthrough, matrix);
     progress?.('Preparing the view…');
     const view = stage.view;
-    const built = views.build(view ?? stage.mesh, { normals: stage.normals, passthrough });
+    let built = views.build(view ?? stage.mesh, { normals: stage.normals, passthrough });
     if (stage.keepNormals) stage.normals = built.normals;
-    const triangles = built.display.index.length / 3;
     base.current = {
-      stage,
+      stage, // what results and downloads build on; covering items cut it there as well
       watertight,
       passthrough,
-      geometry: built.geometry,
+      geometry: built.geometry, // the surface items are placed on: the model before any covering cut
       bounds: built.bounds,
       shellVolumes: null, // filled lazily: volumes of the model's own shells
       spotStats,
     };
+    // items that consume what they cover are shown doing so: the view is the model with their cuts applied
+    let covered = 0;
+    if (watertight && covers?.length) {
+      progress?.('Clearing under the parts…');
+      const shown = coveredFor(stage, covers, `${transformsKey}|${simplify}|${JSON.stringify(enhance)}|${JSON.stringify(spots)}`);
+      if (shown) {
+        covered = shown.count;
+        built = views.build(shown.stage.view ?? shown.stage.mesh, { normals: shown.stage.normals, passthrough });
+        shown.stage.normals = built.normals;
+        base.current.bounds = built.bounds;
+      }
+    }
+    const triangles = built.display.index.length / 3;
     const size = built.bounds ? [0, 1, 2].map((k) => built.bounds.max[k] - built.bounds.min[k]) : [0, 0, 0];
     const info = {
       name: base.name,
@@ -677,6 +738,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       hasModel: base.kind !== 'none',
       enhanced,
       spots: spotStats,
+      covered,
       suggestions: base.kind === 'stl' && transforms.length === 0 && !simplify && !enhanced ? modelSuggestions({ size, triangles: stage.mesh.index.length / 3 + passthrough.length / 9 }) : [],
     };
     return {
@@ -685,7 +747,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     };
   }
 
-  function loadBase({ kind, bytes, name = 'model', version, transforms = [], simplify = null, enhance = null, spots = [] }, progress) {
+  function loadBase({ kind, bytes, name = 'model', version, transforms = [], simplify = null, enhance = null, spots = [], covers = [] }, progress) {
     disposeBase();
     clearDerived();
     let original;
@@ -722,17 +784,18 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       fail('INTERNAL', `Unknown model kind "${kind}"`);
     }
     original.stage = makeStage({ manifold: original.manifold });
-    base = { version, kind, name, original, transforms, simplify, enhance, spots };
+    base = { version, kind, name, original, transforms, simplify, enhance, spots, covers };
     return deriveCurrent(progress);
   }
 
-  function updateBase({ version, transforms = [], simplify = null, enhance = null, spots = [] }, progress) {
+  function updateBase({ version, transforms = [], simplify = null, enhance = null, spots = [], covers = [] }, progress) {
     if (!base?.original) fail('BASE_MISSING', 'The model is not loaded in the engine', { version });
     base.version = version;
     base.transforms = transforms;
     base.simplify = simplify;
     base.enhance = enhance;
     base.spots = spots;
+    base.covers = covers;
     return deriveCurrent(progress);
   }
 
@@ -1346,9 +1409,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const engrave = [];
     const separate = []; // parts joined with pegs: printed on their own
     const raised = []; // raised items and their world solids, to check that each really merged
-    const covers = []; // what covering items consume: cut from the model before anything is added
     const temps = scope();
     try {
+      // what covering items consume is cut from the model before anything is added
+      const { covers, notes: coverNotes } = model ? coverSolidsFor(active, temps) : { covers: [], notes: [] };
+      notes.push(...coverNotes);
       active.forEach((item, n) => {
         progress?.('Building text…', { done: n + 1, total: active.length });
         const placed = solidFor(item);
@@ -1376,18 +1441,6 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           return;
         }
         const world = temps.add(placed.solid.transform(toMat4(placed.placement)));
-        if (item.cover && meets === 'emboss' && model && (isPart(item) || item.plate !== 'none')) {
-          // a pegged part covers with its body only (its pegs go into holes), lowered like the part itself
-          const covering = placed.flat.body ? temps.add(placed.flat.body.translate(0, 0, placed.settle)) : placed.solid;
-          const cbb = covering.boundingBox();
-          const range = Math.max(50, cbb.max[2] - cbb.min[2] + COVER_PROTRUDE + 10);
-          const surface = sampler(placed.placement, { searchAbove: range, searchBelow: range });
-          const cover = surface ? coverSolidFor(covering, surface, { pegged }) : null;
-          if (cover) {
-            covers.push(temps.add(temps.add(cover).transform(toMat4(placed.placement))));
-            notes.push({ level: 'info', code: 'COVERED', itemId: item.id, text: `${quote(item)} covers what is under it: the model's details there were cut away so nothing pokes through.` });
-          }
-        }
         if (pegged) {
           const holes = placed.settle ? temps.add(placed.flat.cutter.translate(0, 0, placed.settle)) : placed.flat.cutter;
           engrave.push(temps.add(holes.transform(toMat4(placed.placement))));

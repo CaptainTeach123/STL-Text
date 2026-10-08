@@ -439,6 +439,23 @@ describe('parts really merge with the model', () => {
     expect(covered.notes).toContain('COVERED');
     expect(covered.notes).not.toContain('NOT_MERGED');
     expect(covered.notes).not.toContain('FRAGMENTS_REMOVED'); // a clean cut leaves no slivers behind
+    // the editing view shows the cut too: the displayed model loses the berry's top under the plate
+    const shownPlain = await client.updateBase({ version: ++version, transforms: [], simplify: null, enhance: null, spots: [], covers: [] });
+    const topUnder = (display) => {
+      let top = -Infinity;
+      const p = display.positions;
+      for (let i = 0; i < p.length; i += 3) if (Math.abs(p[i] - 10) < 10 && Math.abs(p[i + 1]) < 5 && p[i + 2] > top) top = p[i + 2];
+      return top;
+    };
+    expect(topUnder(shownPlain.display)).toBeCloseTo(6.2, 1); // the berry's top
+    const shownCovered = await client.updateBase({ version: ++version, transforms: [], simplify: null, enhance: null, spots: [], covers: [{ ...over, cover: true }] });
+    expect(shownCovered.info.covered).toBe(1);
+    expect(topUnder(shownCovered.display)).toBeLessThan(3.5); // only the skin left under where the plate goes
+    expect(shownCovered.info.triangles).toBeGreaterThan(0);
+    // results and downloads still build on the uncovered model and cut it themselves
+    const again = await measure({ ...over, cover: true });
+    expect(again.poking).toBeLessThan(1e-6);
+    expect(again.shells).toBe(1);
   });
 
   it('a cover only consumes details: not a structure passing through the item, nor anything across a hollow', async () => {

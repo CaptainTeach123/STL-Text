@@ -1,5 +1,5 @@
 import { Matrix4, Vector3 } from 'three';
-import { Document, ITEM_DEFAULTS, createPart, createSpot, fontIds, frameOf, hasText, isPart, isSpot, itemLabel, maxSize, placeKey, shapeKey, spotsOf, stableKey } from './document.js';
+import { Document, ITEM_DEFAULTS, coversOf, createPart, createSpot, fontIds, frameOf, hasText, isPart, isSpot, itemLabel, maxSize, placeKey, shapeKey, spotsOf, stableKey } from './document.js';
 import { createEngineClient } from './engineClient.js';
 import { ENHANCE_DEFAULTS, isEnhanceActive } from './enhance.js';
 import { Viewer } from './viewer.js';
@@ -180,6 +180,12 @@ function describeModel() {
   } else if (isEnhanceActive(doc.base?.enhance) && compareOriginal) {
     notes.push({ level: 'info', text: 'Showing the original model; untick "Show original" to see it enhanced.' });
   }
+  if (info.covered) {
+    notes.push({
+      level: 'ok',
+      text: `${info.covered} ${info.covered === 1 ? 'item consumes' : 'items consume'} the details under ${info.covered === 1 ? 'it' : 'them'}: the model is shown and downloaded with them cut away.`,
+    });
+  }
   if (info.spots?.length) {
     const applied = info.spots.filter((s) => !s.empty && !s.failed);
     const moved = applied.reduce((n, s) => n + s.verticesMoved, 0);
@@ -270,7 +276,7 @@ async function loadModel(kind, { bytes = null, name = 'model' } = {}) {
     lastClick = null;
   }
   sentVersion = version();
-  const pending = client.loadBase({ kind, bytes, name, version: sentVersion, spots: spotsOf(doc.items) });
+  const pending = client.loadBase({ kind, bytes, name, version: sentVersion, spots: spotsOf(doc.items), covers: coversOf(doc.items) });
   basePending = pending;
   try {
     const result = await pending;
@@ -328,7 +334,7 @@ async function syncBase() {
     const v = version();
     sentVersion = v;
     const pending = doc.base
-      ? client.updateBase({ version: v, transforms: doc.base.transforms, simplify: doc.base.simplify, enhance: compareOriginal ? null : doc.base.enhance, spots: spotsOf(doc.items) })
+      ? client.updateBase({ version: v, transforms: doc.base.transforms, simplify: doc.base.simplify, enhance: compareOriginal ? null : doc.base.enhance, spots: spotsOf(doc.items), covers: coversOf(doc.items) })
       : client.loadBase({ kind: 'none', version: v });
     basePending = pending;
     setDeriving(true);
@@ -660,13 +666,13 @@ viewer.onDrag = ({ itemId, point, normal, done }) => {
   if (!item) return;
   if (!done && point) {
     // a spot changes the model itself (a costly recompute), so it only lands when dropped; its ring follows the pointer meanwhile
-    if (isSpot(item)) viewer.setOverlayMatrix(itemId, placementMatrix({ ...item, position: point, normal }));
+    if (isSpot(item) || item.cover) viewer.setOverlayMatrix(itemId, placementMatrix({ ...item, position: point, normal }));
     else doc.updateItem(itemId, { position: point, normal }, { coalesce: 'drag' });
   }
   if (done) {
-    if (isSpot(item)) {
+    if (isSpot(item) || item.cover) {
       if (point) doc.updateItem(itemId, { position: point, normal });
-      else viewer.setOverlayMatrix(itemId, placementMatrix(item)); // dropped off the model: the ring goes back where the spot is
+      else viewer.setOverlayMatrix(itemId, placementMatrix(item)); // dropped off the model: the shape goes back where the item is
     }
     doc.endCoalescing();
     if (point) lastClick = { position: point, normal };
@@ -1252,8 +1258,9 @@ function bindControls() {
       let sel = doc.selected;
       if (!sel) sel = addItem('', {}, { focus: false });
       mirror(readValue(el));
-      // a clean-up spot's amounts re-derive the whole model: apply them on release, not on every tick
-      if (event.type === 'input' && continuous && isSpot(sel) && HEAVY_SPOT_KEYS.has(key)) return;
+      // a clean-up spot's amounts, and anything about an item that consumes what it covers, re-derive the whole model:
+      // apply them on release, not on every tick
+      if (event.type === 'input' && continuous && ((isSpot(sel) && HEAVY_SPOT_KEYS.has(key)) || sel.cover)) return;
       // the value already in force (the browser's own change event when a typed field loses focus) is not a change:
       // re-committing it would re-render the panel under whatever the user is clicking on
       if (sel[key] === value) return;

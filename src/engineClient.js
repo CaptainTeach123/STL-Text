@@ -183,7 +183,7 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
     await request(
       'base',
       'base.load',
-      { kind: base.kind, name: base.name, bytes, version: base.version, transforms: base.transforms, simplify: base.simplify, enhance: base.enhance ?? null, spots: base.spots ?? [] },
+      { kind: base.kind, name: base.name, bytes, version: base.version, transforms: base.transforms, simplify: base.simplify, enhance: base.enhance ?? null, spots: base.spots ?? [], covers: base.covers ?? [] },
       bytes ? [bytes] : [],
     );
   }
@@ -217,17 +217,17 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
      * Load a model: kind 'stl' (with bytes), 'sample' or 'none'.
      * Returns the display payload + repair report.
      */
-    loadBase({ kind, bytes = null, name = 'model', version, spots = [] }) {
-      base = { kind, bytes, name, version, transforms: [], simplify: null, enhance: null, spots };
+    loadBase({ kind, bytes = null, name = 'model', version, spots = [], covers = [] }) {
+      base = { kind, bytes, name, version, transforms: [], simplify: null, enhance: null, spots, covers };
       const sent = bytes ? copy(bytes) : null;
-      return request('base', 'base.load', { kind, name, bytes: sent, version, transforms: [], simplify: null, enhance: null, spots }, sent ? [sent] : []);
+      return request('base', 'base.load', { kind, name, bytes: sent, version, transforms: [], simplify: null, enhance: null, spots, covers }, sent ? [sent] : []);
     },
 
     /** Re-derive the model with a new transform list / simplify tolerance / enhancement / clean-up spots. */
-    updateBase({ version, transforms, simplify, enhance = null, spots = [] }) {
+    updateBase({ version, transforms, simplify, enhance = null, spots = [], covers = [] }) {
       if (!base) return Promise.reject(new EngineError({ code: 'BASE_MISSING', message: 'No model is loaded' }));
-      base = { ...base, version, transforms, simplify, enhance, spots };
-      return request('base', 'base.update', { version, transforms, simplify, enhance, spots });
+      base = { ...base, version, transforms, simplify, enhance, spots, covers };
+      return request('base', 'base.update', { version, transforms, simplify, enhance, spots, covers });
     },
 
     /**

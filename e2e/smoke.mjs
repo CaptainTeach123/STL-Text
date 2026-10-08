@@ -598,6 +598,24 @@ try {
     await idle();
     const summary = await page.locator('#detailsSummary').innerText();
     check(/Found [1-9]\d* detail/.test(summary), '"Find details" finds the clumped bumps', summary.slice(0, 140));
+    // the plan: one row per detail with what it seems to be; rebuilding adds a removing spot and a clean part per row
+    const rows = await page.locator('#detailsList li').count();
+    check(rows >= 1 && (await page.locator('#detailsList li select').first().inputValue()).length > 0, 'the plan lists each detail with a kind to become', `${rows} rows`);
+    await page.locator('#detailsList li select').first().selectOption('dome');
+    await page.locator('#detailsList li input[type="checkbox"]').first().check();
+    const itemsBeforeRebuild = await page.locator('#itemList li').count();
+    check(!(await page.locator('#rebuildBtn').isDisabled()), 'the rebuild button is live with a ticked row');
+    await page.click('#rebuildBtn');
+    await page.waitForFunction((n) => document.querySelectorAll('#itemList li').length >= n + 2, itemsBeforeRebuild, { timeout: 60000 });
+    await idle();
+    const itemsAfterRebuild = await page.locator('#itemList li').count();
+    check(itemsAfterRebuild >= itemsBeforeRebuild + 2 && /dome/i.test(await page.locator('#itemList li[aria-selected="true"] .name, #itemList li[aria-selected="true"]').first().innerText()), 'rebuilding adds a removing spot and a clean dome part', `${itemsBeforeRebuild} → ${itemsAfterRebuild}`);
+    const rebuiltStl = await download('clump-rebuilt.stl');
+    check(rebuiltStl.volume !== null && rebuiltStl.sizeOk, 'the rebuilt model downloads as one watertight solid', `${rebuiltStl.volume?.toFixed(1)}`);
+    await page.click('#undoBtn');
+    await idle();
+    check((await page.locator('#itemList li').count()) === itemsBeforeRebuild, 'one undo takes the whole rebuild back');
+    check(!(await page.locator('#removeAllBtn').isDisabled()), 'the found details are still on offer after the undo');
     const itemsBeforeRemove = await page.locator('#itemList li').count();
     await page.click('#removeAllBtn');
     await idle();

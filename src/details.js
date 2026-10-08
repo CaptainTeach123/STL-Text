@@ -113,12 +113,16 @@ export function baseSurface(mesh, { featureSize = 0, pinBorder = true } = {}) {
  * @param {number} [options.minHeight]    details lower than this are ignored, mm (0: automatic)
  * @param {number} [options.maxCount]     at most this many details, the tallest first (default 400)
  * @returns {{ details: Detail[], featureSize: number, threshold: number }}
- *   Detail = { id, kind: 'round' | 'other', center, normal, radius, size, height, vertices, roundness }
+ *   Detail = { id, kind: 'round' | 'other', center, normal, radius, size, height, crest, sag, vertices, roundness, walls,
+ *     footLevel, direction, length, width, middle, lobes, lobeDirection, elongation }
  *   where `center` is the fitted sphere's centre (round) or the region's centroid (other), `normal` the
  *   base surface direction there, `radius` the fitted radius (round) or half the region's extent (other),
- *   `height` how far the detail stands above the base, all in the mesh's own frame.
+ *   `height` how far the detail stands above the smoothed base (an underestimate for low relief) and `crest` how
+ *   far its top stands above its foot, `sag` how far the surface under it falls away across its footprint, and
+ *   `direction`/`length`/`width`/`middle`/`lobes`/`lobeDirection`/`elongation` the shape of its footprint
+ *   (see describeShape), all in the mesh's own frame.
  */
-export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 400 } = {}) {
+export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 400, trace = null } = {}) {
   const pos = Float64Array.from(mesh.positions);
   const index = mesh.index;
   const V = pos.length / 3;
@@ -145,15 +149,65 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
     }
   }
 
-  // threshold: clearly above the noise of the surface, and a fair fraction of the feature scale
-  const sorted = Float64Array.from(r).sort();
-  const median = sorted[V >> 1];
-  const dev = Float64Array.from(r, (x) => Math.abs(x - median)).sort();
-  const mad = dev[V >> 1] * 1.4826;
-  const high = Math.max(minHeight, 0.06 * F, median + 3 * mad);
-  const low = median + 0.35 * (high - median);
+  // concave vertices: where the surface turns up around them (the mean of the neighbours lies above the tangent
+  // plane) by more than a slight angle per edge, smoothed a little so vertex noise counts less – the foot of a
+  // detail, where its flank meets the surface it stands on, is such a ring
+  const concave = new Uint8Array(V);
+  {
+    const conc = new Float64Array(V);
+    for (let v = 0; v < V; v++) {
+      const s0 = adjStart[v], e0 = adjStart[v + 1];
+      if (e0 === s0) continue;
+      let mx = 0, my = 0, mz = 0;
+      for (let i = s0; i < e0; i++) {
+        const j = adj[i] * 3;
+        mx += pos[j];
+        my += pos[j + 1];
+        mz += pos[j + 2];
+      }
+      const n0 = e0 - s0;
+      conc[v] = (mx / n0 - pos[v * 3]) * vn[v * 3] + (my / n0 - pos[v * 3 + 1]) * vn[v * 3 + 1] + (mz / n0 - pos[v * 3 + 2]) * vn[v * 3 + 2];
+    }
+    const half = new Float64Array(V).fill(0.5);
+    const smooth = smoothField(conc, topo, half, 1, 1);
+    const limit = 0.03 * topo.hMean;
+    for (let v = 0; v < V; v++) if (smooth[v] > limit) concave[v] = 1;
+  }
 
-  // regions: grow from the clearly-raised vertices over everything moderately raised
+  // threshold: clearly above the noise of the surface, and a fair fraction of the feature scale. The noise is
+  // measured away from creases: the smoothing rounds every edge of the body off, and the heights that leaves
+  // along them are not the surface's noise
+  const nearCrease = new Uint8Array(V);
+  {
+    const rings = Math.max(1, Math.min(40, Math.ceil((0.5 * F) / topo.hMean)));
+    let front = [];
+    for (let v = 0; v < V; v++) if (sharp[v]) { nearCrease[v] = 1; front.push(v); }
+    for (let ring = 0; ring < rings && front.length; ring++) {
+      const next = [];
+      for (const v of front) {
+        for (let i = adjStart[v]; i < adjStart[v + 1]; i++) {
+          const o = adj[i];
+          if (nearCrease[o]) continue;
+          nearCrease[o] = 1;
+          next.push(o);
+        }
+      }
+      front = next;
+    }
+  }
+  let plain = [];
+  for (let v = 0; v < V; v++) if (!nearCrease[v]) plain.push(r[v]);
+  if (plain.length < 0.2 * V) plain = Array.from(r);
+  const sorted = Float64Array.from(plain).sort();
+  const median = sorted[sorted.length >> 1];
+  const dev = Float64Array.from(plain, (x) => Math.abs(x - median)).sort();
+  const mad = dev[dev.length >> 1] * 1.4826;
+  const high = Math.max(minHeight, 0.025 * F, median + 4 * mad);
+  const low = median + 0.25 * (high - median);
+
+  // regions: grow from the clearly-raised vertices over everything moderately raised, then on down each detail's
+  // flanks while the height keeps falling, to the foot where the surrounding surface begins (the smoothed base
+  // lifts under a detail, so its lower flanks read as low or even sunken, yet they are the detail's)
   const label = new Int32Array(V).fill(-1);
   const regions = [];
   const stack = new Int32Array(V);
@@ -174,19 +228,65 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
         stack[top++] = o;
       }
     }
+    // down the flanks, by geometric height above the core's foot (the smoothed height is unreliable there: the
+    // base lifts under a detail): a breadth-first growth to neighbours lower than where it came from, not below the
+    // foot, so the detail is taken whole down to where the surrounding surface begins and no further
+    let nx = 0, ny = 0, nz = 0, sx = 0, sy = 0, sz = 0;
+    for (const v of members) {
+      nx += vn[v * 3] * va[v];
+      ny += vn[v * 3 + 1] * va[v];
+      nz += vn[v * 3 + 2] * va[v];
+      sx += pos[v * 3];
+      sy += pos[v * 3 + 1];
+      sz += pos[v * 3 + 2];
+    }
+    const nl = Math.hypot(nx, ny, nz) || 1;
+    const N = [nx / nl, ny / nl, nz / nl];
+    sx /= members.length; sy /= members.length; sz /= members.length;
+    const g = (v) => pos[v * 3] * N[0] + pos[v * 3 + 1] * N[1] + pos[v * 3 + 2] * N[2];
+    const bases = Float64Array.from(members, (v) => base[v * 3] * N[0] + base[v * 3 + 1] * N[1] + base[v * 3 + 2] * N[2]).sort();
+    const foot = bases[Math.floor(0.1 * (bases.length - 1))];
+    let crest = 0;
+    for (const v of members) crest = Math.max(crest, g(v) - foot);
+    const floor = foot - 0.5 * crest;
+    // how far the flanks can run: a little beyond the core, and out by a fair part of the height they come down
+    let coreFar = 0;
+    for (const v of members) coreFar = Math.max(coreFar, (pos[v * 3] - sx) ** 2 + (pos[v * 3 + 1] - sy) ** 2 + (pos[v * 3 + 2] - sz) ** 2);
+    const reach2 = Math.min(0.75 * F, 1.25 * Math.sqrt(coreFar) + 0.6 * crest) ** 2;
+    const coreCount = members.length;
+    const coreSize = 2 * Math.sqrt(coreFar);
+    const step = Math.max(1e-6, 0.002 * crest);
+    const flat = Math.cos((12 * Math.PI) / 180); // a flank slopes; the surface around (plate or gently curved) does not
+    for (let i = 0; i < members.length; i++) {
+      const v = members[i];
+      const gv = g(v);
+      for (let k = adjStart[v]; k < adjStart[v + 1]; k++) {
+        const o = adj[k];
+        if (label[o] >= 0 || concave[o]) continue; // the foot ring is where the detail ends
+        const go = g(o);
+        if (go >= gv - step || go < floor) continue;
+        if (vn[o * 3] * N[0] + vn[o * 3 + 1] * N[1] + vn[o * 3 + 2] * N[2] > flat) continue;
+        if ((pos[o * 3] - sx) ** 2 + (pos[o * 3 + 1] - sy) ** 2 + (pos[o * 3 + 2] - sz) ** 2 > reach2) continue;
+        label[o] = id;
+        members.push(o);
+      }
+    }
+    members.coreCount = coreCount;
+    members.coreSize = coreSize;
     regions.push(members);
   }
 
   // a region that rings a hollow – the rim around a dent or a hole, which stands above the sunken base too – is not a
   // detail: what a detail's region encloses is raised as well. The flood beyond a region's neighbour stops at the
   // region; one that stays small is what the region encloses, and the region goes if that lies, on average, below
-  // the level of the region's own base along the region's direction (judging each vertex along its own normal would
+  // the level of the region's own foot along the region's direction (judging each vertex along its own normal would
   // not do: a thin fin's flanks read as sunken that way, and a bowl's steep walls as hardly sunken at all)
   const sunken = median - (high - median);
   const mark = new Int32Array(V).fill(-1);
   const queue = new Int32Array(V);
-  const enclosesHollow = (members, id, N, C) => {
+  const enclosesHollow = (members, id, N, level) => {
     const cap = 4 * members.length + 50;
+    const patch = Math.max(6, 0.03 * members.length);
     for (const m of members) {
       for (let i = adjStart[m]; i < adjStart[m + 1]; i++) {
         const u = adj[i];
@@ -196,7 +296,7 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
         mark[u] = id;
         while (head < tail) {
           const v = queue[head++];
-          depth += (pos[v * 3] - C[0]) * N[0] + (pos[v * 3 + 1] - C[1]) * N[1] + (pos[v * 3 + 2] - C[2]) * N[2];
+          depth += pos[v * 3] * N[0] + pos[v * 3 + 1] * N[1] + pos[v * 3 + 2] * N[2] - level;
           if (tail > cap) {
             outside = true;
             break;
@@ -208,7 +308,10 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
             queue[tail++] = w;
           }
         }
-        if (!outside && depth / head < sunken) return true;
+        if (!outside && head >= patch && depth / head < sunken) {
+          trace?.({ reason: 'hollow', flood: head, depth: depth / head, sunken, start: [pos[u * 3], pos[u * 3 + 1], pos[u * 3 + 2]], level });
+          return true;
+        }
       }
     }
     return false;
@@ -217,43 +320,105 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
   const details = [];
   for (let id = 0; id < regions.length; id++) {
     const members = regions[id];
-    if (members.length < 6) continue;
-    let cx = 0, cy = 0, cz = 0, nx = 0, ny = 0, nz = 0, area = 0, height = 0, creased = 0;
-    let bx = 0, by = 0, bz = 0; // the region's base: where the surface it stands on runs under it
+    if (members.length < 6) continue; // vertex-scale noise
+    // the region's direction: its area-weighted mean normal
+    let nx = 0, ny = 0, nz = 0;
     for (const v of members) {
+      nx += vn[v * 3] * va[v];
+      ny += vn[v * 3 + 1] * va[v];
+      nz += vn[v * 3 + 2] * va[v];
+    }
+    const nl = Math.hypot(nx, ny, nz) || 1;
+    const normal = [nx / nl, ny / nl, nz / nl];
+    const alongN = (arr, v) => arr[v * 3] * normal[0] + arr[v * 3 + 1] * normal[1] + arr[v * 3 + 2] * normal[2];
+    // the foot level: where the surface the region stands on runs, along the region's direction (a low percentile
+    // of the members' base points, since the base under a detail's flanks lies off to the side)
+    const rim = [];
+    const rimVerts = [];
+    for (const v of members) {
+      for (let i = adjStart[v]; i < adjStart[v + 1]; i++) if (label[adj[i]] !== id) { rim.push(alongN(pos, v)); rimVerts.push(v); break; }
+    }
+    rim.sort((a, b) => a - b);
+    const along = Float64Array.from(members, (v) => alongN(base, v)).sort();
+    // the foot level: where the region's rim runs (the growth stopped at the foot), or failing a rim, the low end of
+    // the members' base points
+    const footLevel = rim.length >= 3 ? rim[rim.length >> 1] : along[Math.floor(0.1 * (along.length - 1))];
+    // how far the surface under the detail falls away across its footprint (a curved body): from how far the
+    // surface's normals at the lower half of the rim lean away from the region's direction (on a body of radius R,
+    // a rim point `a` from the middle leans by a/R and lies a·sin(lean)/2 below the tangent plane)
+    let sag = 0;
+    const sagSize = 1; // scaled by the real size once that is known
+    if (rimVerts.length >= 3) {
+      const cut = rim[rim.length >> 1];
+      const leans = [];
+      for (const v of rimVerts) {
+        if (alongN(pos, v) > cut) continue;
+        leans.push(Math.acos(Math.max(-1, Math.min(1, vn[v * 3] * normal[0] + vn[v * 3 + 1] * normal[1] + vn[v * 3 + 2] * normal[2]))));
+      }
+      leans.sort((a, b) => a - b);
+      const lean = leans.length ? Math.min(Math.PI / 3, leans[Math.floor(0.9 * (leans.length - 1))]) : 0;
+      sag = 0.5 * (sagSize / 2) * Math.sin(lean);
+    }
+    // the detail's body: what stands above the foot, leaving out any surrounding surface the growth ran onto; a
+    // growth that ran away (far beyond the clearly raised core, down a coarse or noisy surface) is dropped back to
+    // the core
+    let crest = 0;
+    for (const v of members) crest = Math.max(crest, alongN(pos, v) - footLevel);
+    let body = members.filter((v) => alongN(pos, v) - footLevel > 0.03 * crest);
+    {
+      let bx = 0, by = 0, bz = 0;
+      for (const v of body) { bx += pos[v * 3]; by += pos[v * 3 + 1]; bz += pos[v * 3 + 2]; }
+      bx /= body.length || 1; by /= body.length || 1; bz /= body.length || 1;
+      let bodyFar = 0;
+      for (const v of body) bodyFar = Math.max(bodyFar, (pos[v * 3] - bx) ** 2 + (pos[v * 3 + 1] - by) ** 2 + (pos[v * 3 + 2] - bz) ** 2);
+      if (2 * Math.sqrt(bodyFar) > 1.6 * members.coreSize) body = members.slice(0, members.coreCount);
+    }
+    if (body.length < 6) continue;
+    let cx = 0, cy = 0, cz = 0, area = 0, height = 0, walls = 0, creased = 0;
+    for (const v of body) {
       creased += sharp[v];
       cx += pos[v * 3];
       cy += pos[v * 3 + 1];
       cz += pos[v * 3 + 2];
-      bx += base[v * 3];
-      by += base[v * 3 + 1];
-      bz += base[v * 3 + 2];
-      nx += vn[v * 3] * va[v];
-      ny += vn[v * 3 + 1] * va[v];
-      nz += vn[v * 3 + 2] * va[v];
       area += va[v];
       if (r[v] > height) height = r[v];
+      // a region that turns the corner of the body (the end of a cylinder, the edge of a block, rounded off by the
+      // smoothing) has walls in it; a detail standing on the surface does not, round ones excepted (see below)
+      if (vn[v * 3] * normal[0] + vn[v * 3 + 1] * normal[1] + vn[v * 3 + 2] * normal[2] < 0.34) walls++;
     }
-    const n = members.length;
+    const n = body.length;
     cx /= n;
     cy /= n;
     cz /= n;
-    const nl = Math.hypot(nx, ny, nz) || 1;
-    const normal = [nx / nl, ny / nl, nz / nl];
-
     let far = 0;
-    for (const v of members) {
+    for (const v of body) {
       const d = (pos[v * 3] - cx) ** 2 + (pos[v * 3 + 1] - cy) ** 2 + (pos[v * 3 + 2] - cz) ** 2;
       if (d > far) far = d;
     }
     const size = 2 * Math.sqrt(far);
-    if (size < 0.15 * F || size > 1.5 * F) continue; // vertex-scale noise, or larger than what the feature scale looks for
-    if (area < 0.3 * Math.PI * far) continue; // long and thin: the rim of an edge, not a detail
-    if (height < 0.06 * size) continue; // broad and very low: not something standing on the surface
-    // a large region with a sharp crease running most of the way round it is the end of the body, not a detail
-    if (size > 0.8 * F && creased > 0.3 * ((Math.PI * size) / topo.hMean)) continue;
-    if (enclosesHollow(members, id, normal, [bx / n, by / n, bz / n])) continue;
-    const fit = fitSphere(pos, members);
+    if (rimVerts.length >= 3) sag *= size / 2 / Math.max(1e-9, sagSize / 2);
+    const drop = (reason) => trace?.({ reason, size, height, n, area, far, walls: walls / n, center: [cx, cy, cz] });
+    if (size < 0.15 * F || size > 1.5 * F) { drop(size < 0.15 * F ? 'tiny' : 'too large'); continue; }
+    if (area < 0.12 * Math.PI * far) { drop('thin'); continue; } // long and thin: the rim of an edge, not a detail (a star covers 0.4 of its circle)
+    if (height < 0.04 * size) { drop('low'); continue; } // broad and very low: not something standing on the surface
+    if (height < 1.25 * high) { drop('faint'); continue; } // barely over the threshold: noise, the edge of a dent
+    if (enclosesHollow(members, id, normal, footLevel)) { drop('rings a hollow'); continue; }
+    // the rim of a dent need not ring it whole to stand above the sunken base: a region with a fair share of its
+    // neighbours well below its foot (deeper than half its own height, and below the noise) is beside a hollow
+    {
+      let beside = 0, around = 0;
+      const deep = Math.min(sunken, -0.5 * height);
+      for (const v of members) {
+        for (let i = adjStart[v]; i < adjStart[v + 1]; i++) {
+          const o = adj[i];
+          if (label[o] === id) continue;
+          around++;
+          if (alongN(pos, o) - footLevel < deep) beside++;
+        }
+      }
+      if (around && beside > 0.2 * around) { drop('beside a hollow'); continue; }
+    }
+    const fit = fitSphere(pos, body);
     let kind = 'other';
     let center = [cx, cy, cz];
     let radius = size / 2;
@@ -269,10 +434,104 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
         radius = fit.radius;
       }
     }
-    details.push({ id, kind, center, normal, radius, size, height, vertices: n, roundness });
+    // the end of the body – a cylinder's cap, the edge of a block, rounded off by the smoothing – is large, has a
+    // sharp crease running most of the way round it and turns the corner into the body's walls; a detail with walls
+    // of its own (an upright fin) is small, a creased leaf has no walls
+    if (kind !== 'round' && size > 0.8 * F && creased > 0.3 * ((Math.PI * size) / topo.hMean) && walls > 0.25 * n) { drop('end of the body'); continue; }
+    const shape = describeShape(pos, body, normal, [cx, cy, cz]);
+    // the footprint at the foot: the whole region's extent along the body's direction (the body stops short of it)
+    const foot = describeShape(pos, members, normal, [cx, cy, cz], shape.direction);
+    details.push({ id, kind, center, normal, radius, size, height, crest, sag, vertices: n, roundness, walls: walls / n, footLevel, ...shape, footLength: foot.length, footWidth: foot.width, footMiddle: foot.middle });
   }
   details.sort((a, b) => b.height - a.height);
   return { details: details.slice(0, maxCount), featureSize: F, threshold: high };
+}
+
+/**
+ * The shape of a region's body in the plane of its base: the principal
+ * direction (a unit vector in the mesh's frame, along the base), the extent
+ * along it (`length`) and across it (`width`), the mid-point of those
+ * extents (`middle`, where a clean part of that length and width sits), and
+ * the lobes of its outline: the number of peaks of the radial profile around
+ * the middle, each at least a fifth of the mean radius proud of its dips – a
+ * five-point star has 5, a rosette its petals, a leaf 2 (its tips), a berry
+ * or dome 0 or 1.
+ */
+function describeShape(pos, body, N, centroid, fixedDirection = null) {
+  // a frame in the base plane
+  const a = Math.abs(N[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+  let ux = a[1] * N[2] - a[2] * N[1], uy = a[2] * N[0] - a[0] * N[2], uz = a[0] * N[1] - a[1] * N[0];
+  const ul = Math.hypot(ux, uy, uz) || 1;
+  ux /= ul; uy /= ul; uz /= ul;
+  const vx = N[1] * uz - N[2] * uy, vy = N[2] * ux - N[0] * uz, vz = N[0] * uy - N[1] * ux;
+  const n = body.length;
+  const px = new Float64Array(n), py = new Float64Array(n);
+  let sxx = 0, sxy = 0, syy = 0;
+  for (let i = 0; i < n; i++) {
+    const v = body[i];
+    const dx = pos[v * 3] - centroid[0], dy = pos[v * 3 + 1] - centroid[1], dz = pos[v * 3 + 2] - centroid[2];
+    px[i] = dx * ux + dy * uy + dz * uz;
+    py[i] = dx * vx + dy * vy + dz * vz;
+    sxx += px[i] * px[i];
+    sxy += px[i] * py[i];
+    syy += py[i] * py[i];
+  }
+  // principal direction of the in-plane covariance (or the direction given)
+  let theta = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+  if (fixedDirection) theta = Math.atan2(fixedDirection[0] * vx + fixedDirection[1] * vy + fixedDirection[2] * vz, fixedDirection[0] * ux + fixedDirection[1] * uy + fixedDirection[2] * uz);
+  const c = Math.cos(theta), s = Math.sin(theta);
+  let minA = Infinity, maxA = -Infinity, minB = Infinity, maxB = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const along = px[i] * c + py[i] * s;
+    const across = -px[i] * s + py[i] * c;
+    if (along < minA) minA = along;
+    if (along > maxA) maxA = along;
+    if (across < minB) minB = across;
+    if (across > maxB) maxB = across;
+  }
+  const length = maxA - minA, width = maxB - minB;
+  const midA = (minA + maxA) / 2, midB = (minB + maxB) / 2;
+  // back to the mesh frame
+  const dir = [c * ux + s * vx, c * uy + s * vy, c * uz + s * vz];
+  const mx = midA * c - midB * s, my = midA * s + midB * c; // the middle in the (u, v) frame
+  const middle = [centroid[0] + mx * ux + my * vx, centroid[1] + mx * uy + my * vy, centroid[2] + mx * uz + my * vz];
+  // the radial profile around the middle: the outline's farthest reach per angular bin
+  const BINS = 36;
+  const profile = new Float64Array(BINS);
+  for (let i = 0; i < n; i++) {
+    const x = px[i] - mx, y = py[i] - my;
+    const bin = (Math.floor(((Math.atan2(y, x) + Math.PI) / (2 * Math.PI)) * BINS) + BINS) % BINS;
+    const rr = Math.hypot(x, y);
+    if (rr > profile[bin]) profile[bin] = rr;
+  }
+  // smooth once, then count peaks a fifth of the mean radius proud of the dips either side
+  const sm = new Float64Array(BINS);
+  let mean = 0;
+  for (let b = 0; b < BINS; b++) {
+    sm[b] = 0.25 * profile[(b + BINS - 1) % BINS] + 0.5 * profile[b] + 0.25 * profile[(b + 1) % BINS];
+    mean += sm[b] / BINS;
+  }
+  let lobes = 0;
+  for (let b = 0; b < BINS; b++) {
+    const here = sm[b];
+    if (here <= sm[(b + BINS - 1) % BINS] || here < sm[(b + 1) % BINS]) continue; // not a peak
+    // the dips: the lowest value before the next peak either way
+    let dipL = here, dipR = here;
+    for (let k = 1; k < BINS / 2; k++) {
+      const l = sm[(b + BINS - k) % BINS], rgt = sm[(b + k) % BINS];
+      if (l < dipL) dipL = l;
+      if (rgt < dipR) dipR = rgt;
+      if (l > here || rgt > here) break;
+    }
+    if (here - Math.max(dipL, dipR) > 0.2 * mean) lobes++;
+  }
+  const lobeAngle = (() => {
+    let best = 0, bb = -1;
+    for (let b = 0; b < BINS; b++) if (sm[b] > best) { best = sm[b]; bb = b; }
+    return bb < 0 ? 0 : ((bb + 0.5) / BINS) * 2 * Math.PI - Math.PI; // where the outline reaches farthest, in the (u, v) frame
+  })();
+  const lobeDir = [Math.cos(lobeAngle) * ux + Math.sin(lobeAngle) * vx, Math.cos(lobeAngle) * uy + Math.sin(lobeAngle) * vy, Math.cos(lobeAngle) * uz + Math.sin(lobeAngle) * vz];
+  return { direction: dir, length, width, middle, lobes, lobeDirection: lobeDir, elongation: width > 1e-9 ? length / width : 1 };
 }
 
 /**

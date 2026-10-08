@@ -789,3 +789,40 @@ label.check.muted {
 #spotCard.removing .cleanup {
   opacity: 0.35;
 }
+
+/* the rebuild plan: one row per detail found */
+ul.plan {
+  list-style: none;
+  margin: 0.5rem 0;
+  padding: 0;
+  max-height: 14rem;
+  overflow: auto;
+  border: 1px solid var(--line, #d8dde6);
+  border-radius: 6px;
+}
+ul.plan:empty {
+  display: none;
+}
+ul.plan li {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  gap: 0.4rem;
+  align-items: center;
+  padding: 0.3rem 0.5rem;
+  border-bottom: 1px solid var(--line, #d8dde6);
+  font-size: 0.85rem;
+}
+ul.plan li:last-child {
+  border-bottom: 0;
+}
+ul.plan li .meta {
+  color: var(--muted, #667);
+  font-size: 0.78rem;
+}
+ul.plan li.skipped .meta {
+  opacity: 0.5;
+}
+ul.plan li select {
+  font: inherit;
+  font-size: 0.82rem;
+}

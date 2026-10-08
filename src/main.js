@@ -1,5 +1,7 @@
 import { Matrix4, Vector3 } from 'three';
 import { Document, ITEM_DEFAULTS, coversOf, createPart, createSpot, fontIds, frameOf, hasText, isPart, isSpot, itemLabel, maxSize, placeKey, shapeKey, spotsOf, stableKey, modelPlacementKey } from './document.js';
+import { planRebuild, specForKind } from './rebuild.js';
+import { DECOR_KINDS, decorPartId, normaliseDecorSpec } from './decor.js';
 import { createEngineClient } from './engineClient.js';
 import { ENHANCE_DEFAULTS, isEnhanceActive } from './enhance.js';
 import { Viewer } from './viewer.js';
@@ -554,14 +556,95 @@ async function addPartFile(file) {
 /* --------------------------------------------------------------- details */
 
 let foundDetails = null; // the last "Find details" answer: { details, featureSize, placement } – placement: the model it was found on
-const DETAIL_ACTIONS = ['replaceRoundBtn', 'cleanOthersBtn', 'removeAllBtn'];
+let rebuildPlan = null; // what each found detail seems to be and what to put in its place: { items } (see rebuild.js)
+const DETAIL_ACTIONS = ['rebuildBtn', 'removeAllBtn'];
 
 /** The found details are for the model as it lay: a new model or a transformed one puts them out of place. */
 function dropStaleDetails() {
   if (!foundDetails || foundDetails.placement === modelPlacementKey(doc.base)) return;
   foundDetails = null;
+  rebuildPlan = null;
+  $('detailsList').replaceChildren();
   if (!$('detailsCard').hidden) $('detailsSummary').textContent = 'The model changed – click Find again to look for details on it as it is now.';
   DETAIL_ACTIONS.forEach((id) => ($(id).disabled = true));
+}
+
+const KIND_CHOICES = [...Object.entries(DECOR_KINDS).map(([kind, k]) => [kind, k.label]), ['remove', 'Remove only']];
+
+/** The rows of the rebuild plan: a tick, what the detail should become, and what was measured. */
+function renderPlan() {
+  const list = $('detailsList');
+  list.replaceChildren();
+  if (!rebuildPlan) return;
+  for (const item of rebuildPlan.items) {
+    const li = document.createElement('li');
+    li.classList.toggle('skipped', !item.include);
+    const tick = document.createElement('input');
+    tick.type = 'checkbox';
+    tick.checked = item.include;
+    tick.title = 'Rebuild this detail';
+    tick.addEventListener('change', () => {
+      item.include = tick.checked;
+      li.classList.toggle('skipped', !item.include);
+      syncRebuildButton();
+    });
+    const select = document.createElement('select');
+    select.title = 'What this detail should become';
+    for (const [kind, label] of KIND_CHOICES) {
+      const option = document.createElement('option');
+      option.value = kind;
+      option.textContent = label;
+      select.append(option);
+    }
+    select.value = item.kind;
+    select.addEventListener('change', () => {
+      item.kind = select.value;
+      if (item.kind !== 'remove') item.spec = specForKind(item.kind, item);
+    });
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    meta.textContent = `${fmt(item.size, 0)} mm, ${fmt(item.height, 1)} mm high · ${Math.round(item.confidence * 100)} % sure · ${item.note}`;
+    li.append(tick, select, meta);
+    list.append(li);
+  }
+  syncRebuildButton();
+}
+
+function syncRebuildButton() {
+  const ticked = rebuildPlan?.items.filter((i) => i.include).length ?? 0;
+  $('rebuildBtn').disabled = !ticked;
+  $('rebuildBtn').textContent = ticked ? `Rebuild ${ticked} ${ticked === 1 ? 'detail' : 'details'}` : 'Rebuild the ticked details';
+}
+
+/** Cut each ticked detail off and fuse a clean version of what it should be in its place, as one undo step. */
+async function rebuildDetails() {
+  const picked = rebuildPlan?.items.filter((i) => i.include) ?? [];
+  if (!picked.length) return;
+  const placement = foundDetails?.placement;
+  const items = [];
+  try {
+    for (const item of picked) {
+      // the smudgy original goes: a removing spot the size of what was found cuts it back to the surface
+      const radius = Math.round(Math.max(1.5, 0.55 * item.size + 0.5) * 2) / 2;
+      items.push({ ...createSpot(), id: undefined, radius, remove: true, position: item.position, normal: item.normal });
+      if (item.kind === 'remove') continue;
+      const spec = normaliseDecorSpec(item.spec);
+      const partId = decorPartId(spec);
+      const label = DECOR_KINDS[spec.kind].label.toLowerCase();
+      if (!partAssets.has(partId)) {
+        const { info } = await client.addGeneratedPart(partId, spec, label);
+        partAssets.set(partId, { name: label, info });
+      }
+      items.push({ ...createPart(partId, label, { attach: 'bottom', sink: item.sink, spin: item.spin, fit: false, cover: false, join: 'fuse' }), id: undefined, position: item.position, normal: item.normal });
+    }
+  } catch (err) {
+    setStatus(friendly(err), 'error');
+    return;
+  }
+  if (!foundDetails || foundDetails.placement !== placement) return; // the model changed meanwhile
+  doc.addItems(items);
+  const rebuilt = picked.filter((i) => i.kind !== 'remove').length;
+  setStatus(`Rebuilt ${rebuilt} ${rebuilt === 1 ? 'detail' : 'details'}${picked.length > rebuilt ? ` and removed ${picked.length - rebuilt}` : ''}: each is a removing spot and a clean part you can adjust or delete.`, 'ok');
 }
 
 /** Look for the details standing on the model and show what was found with the actions for them. */
@@ -580,52 +663,19 @@ async function findDetails() {
       return;
     }
     foundDetails = { ...r, placement: modelPlacementKey(doc.base) };
-    const round = r.details.filter((d) => d.kind === 'round').length;
-    const other = r.details.length - round;
+    rebuildPlan = planRebuild(r.details, { featureSize: r.featureSize });
+    for (const item of rebuildPlan.items) item.include = item.confidence >= 0.4;
+    const counts = new Map();
+    for (const item of rebuildPlan.items) counts.set(item.label, (counts.get(item.label) ?? 0) + 1);
+    const kinds = [...counts.entries()].map(([label, n]) => `${n} ${n === 1 ? label.toLowerCase() : `${label.toLowerCase()}s`}`).join(', ');
     $('detailsSummary').textContent = r.details.length
-      ? `Found ${r.details.length} ${r.details.length === 1 ? 'detail' : 'details'}: ${round} round (berries, beads), ${other} other (leaves, stars, scrolls), looking at a detail size of about ${fmt(r.featureSize / 3)} mm.`
+      ? `Found ${r.details.length} ${r.details.length === 1 ? 'detail' : 'details'} (looking at a detail size of about ${fmt(r.featureSize / 3)} mm), read as ${kinds}. Unsure ones are unticked.`
       : `No details found at a detail size of about ${fmt(r.featureSize / 3)} mm. Try a different size.`;
-    $('replaceRoundBtn').disabled = !round;
-    $('cleanOthersBtn').disabled = !other;
+    renderPlan();
     $('removeAllBtn').disabled = !r.details.length;
   } catch (err) {
     $('detailsSummary').textContent = `Could not look for details: ${friendly(err)}`;
   }
-}
-
-/** A clean sphere part for a round detail: consumes the smudgy one under it. */
-async function replaceRoundDetails() {
-  const round = foundDetails?.details.filter((d) => d.kind === 'round') ?? [];
-  if (!round.length) return;
-  const items = [];
-  for (const d of round) {
-    const radius = Math.round(d.radius * 20) / 20;
-    const partId = `sphere-${radius}`;
-    if (!partAssets.has(partId)) {
-      const { info } = await client.addGeneratedPart(partId, { kind: 'sphere', radius }, 'berry');
-      partAssets.set(partId, { name: 'berry', info });
-    }
-    const sink = Math.round(radius * 0.35 * 10) / 10;
-    // the sphere's centre goes where the fitted one is: the anchor sits that far below it along the base normal
-    const position = d.center.map((c, k) => c - d.normal[k] * (radius - sink));
-    items.push({ ...createPart(partId, 'berry', { attach: 'bottom', sink, fit: false, cover: true, join: 'fuse' }), id: undefined, position, normal: d.normal });
-  }
-  if (!foundDetails) return; // the model changed meanwhile
-  doc.addItems(items); // one undo step for the lot
-  setStatus(`Replaced ${round.length} round ${round.length === 1 ? 'detail' : 'details'} with clean spheres that consume the originals. Each is a part you can adjust or delete.`, 'ok');
-}
-
-/** A tuned clean-up spot on each detail that is not round. */
-function cleanOtherDetails() {
-  const others = foundDetails?.details.filter((d) => d.kind !== 'round') ?? [];
-  if (!others.length) return;
-  doc.addItems(
-    others.map((d) => {
-      const radius = Math.round(Math.max(1.5, d.size * 0.65) * 2) / 2;
-      return { ...createSpot(), id: undefined, radius, featureSize: Math.round((d.size / 3) * 10) / 10, deepen: 0.6, evenOut: 0.4, detail: 0.5, sharpen: 0.3, position: d.center, normal: d.normal };
-    }),
-  );
-  setStatus(`Added ${others.length} clean-up ${others.length === 1 ? 'spot' : 'spots'} sized to the details found.`, 'ok');
 }
 
 /** A removing spot on every detail found: the model is cut back to the surface they stand on. */
@@ -1420,8 +1470,7 @@ function bindControls() {
   $('snapBtn').addEventListener('click', snapToModel);
   $('findDetailsBtn').addEventListener('click', findDetails);
   $('findAgainBtn').addEventListener('click', findDetails);
-  $('replaceRoundBtn').addEventListener('click', () => replaceRoundDetails().catch((err) => setStatus(friendly(err), 'error')));
-  $('cleanOthersBtn').addEventListener('click', cleanOtherDetails);
+  $('rebuildBtn').addEventListener('click', () => rebuildDetails().catch((err) => setStatus(friendly(err), 'error')));
   $('removeAllBtn').addEventListener('click', removeFoundDetails);
   $('addSpotBtn').addEventListener('click', addSpot);
   document.querySelectorAll('[data-turn]').forEach((btn) => btn.addEventListener('click', () => turnPart(btn.dataset.turn)));

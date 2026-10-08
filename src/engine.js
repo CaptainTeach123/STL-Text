@@ -10,6 +10,7 @@ import { ATTACH_ROTATIONS, placementMatrix, toMat4 } from './placement.js';
 import { baseMode, fontIds, hasText, isPart, isSpot, itemLabel, placeKey, shapeKey } from './document.js';
 import { enhanceMesh, extractRegion, isEnhanceActive, regionWeights } from './enhance.js';
 import { baseSurface, findDetails, refitSpheres } from './details.js';
+import { DECOR_KINDS, buildDecor, decorPartId, normaliseDecorSpec } from './decor.js';
 
 /**
  * The geometry engine: a pure request handler that owns Manifold objects,
@@ -1906,15 +1907,22 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   }
 
   /** A generated part: a clean primitive to replace a smudgy detail with (a sphere for a berry). */
-  function generatePart({ partId, kind = 'sphere', radius = 2, name = 'berry' }) {
-    const r = Math.max(0.2, Math.min(100, Number(radius) || 2));
-    let m;
-    if (kind === 'sphere') m = Manifold.sphere(r, Math.max(24, Math.min(128, Math.round(r * 24))));
-    else fail('PART_INVALID', `Unknown generated part "${kind}"`);
+  function generatePart({ partId, kind = 'sphere', radius = 2, name = 'berry', ...spec }) {
+    let m, key;
+    if (kind === 'sphere') {
+      const r = Math.max(0.2, Math.min(100, Number(radius) || 2));
+      m = Manifold.sphere(r, Math.max(24, Math.min(128, Math.round(r * 24))));
+      key = `${partId}:${kind}:${r}`;
+    } else if (DECOR_KINDS[kind]) {
+      // a clean decoration (see decor.js), standing on z = 0 with its skirt below
+      const s = normaliseDecorSpec({ ...spec, kind, radius });
+      m = buildDecor(wasm, s);
+      key = decorPartId(s);
+    } else fail('PART_INVALID', `Unknown generated part "${kind}"`);
     parts.get(partId)?.manifold.delete();
     const { min, max } = m.boundingBox();
     const info = { name, triangles: m.numTri(), size: [max[0] - min[0], max[1] - min[1], max[2] - min[2]], watertight: true, repaired: false, summary: '', dropped: 0, generated: kind };
-    parts.set(partId, { manifold: m, info, key: `${partId}:${kind}:${r}` });
+    parts.set(partId, { manifold: m, info, key });
     flat.clear();
     clearDerived();
     return { message: { partId, info }, transfer: [] };
@@ -1925,7 +1933,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * lighter copy of it: the base is smoothed at the feature scale, so edges
    * a good deal shorter than that add nothing but time.
    */
-  function findDetailsIn({ baseVersion, featureSize = 0, minHeight = 0 }, progress) {
+  function findDetailsIn({ baseVersion, featureSize = 0, minHeight = 0, debug = false }, progress) {
     const b = baseFor(baseVersion);
     if (!b.current || b.kind === 'none') return { message: { details: [], featureSize: 0, threshold: 0 }, transfer: [] };
     progress?.('Looking for details…');
@@ -1939,18 +1947,19 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const solid = b.current.watertight ? stageManifold(stage) : null;
       if (solid) {
         // the smoothing works per edge, so the copy it runs on has evenly sized edges: a dense model is first
-        // lightened, a coarse one (long thin triangles) refined, both to about a twelfth of the feature scale
-        const edge = F / 12;
-        let lighter = mesh.index.length / 3 > 20_000 ? temps.add(solid.simplify(F / 40)) : solid;
+        // lightened, a coarse one (long thin triangles) refined, both to about a sixteenth of the feature scale
+        const edge = F / 16;
+        let lighter = mesh.index.length / 3 > 20_000 ? temps.add(solid.simplify(F / 120)) : solid;
         const area = lighter.surfaceArea();
         if (area / (0.43 * edge * edge) < 600_000) lighter = temps.add(lighter.refineToLength(edge));
         if (lighter.numTri() >= 100) mesh = meshOf(lighter);
       }
-      const found = findDetails(mesh, { featureSize: F, minHeight });
+      const dropped = [];
+      const found = findDetails(mesh, { featureSize: F, minHeight, trace: debug ? (t) => dropped.push(t) : null });
       // the copy's vertices lie a little off the surface, so round details take their sphere from the model itself
       const own = stage.view ?? stage.mesh;
       if (mesh !== own) refitSpheres(found.details, own.positions);
-      return { message: { details: found.details, featureSize: found.featureSize, threshold: found.threshold, triangles: mesh.index.length / 3 }, transfer: [] };
+      return { message: { details: found.details, featureSize: found.featureSize, threshold: found.threshold, triangles: mesh.index.length / 3, ...(debug && { dropped }) }, transfer: [] };
     } finally {
       temps.dispose();
     }

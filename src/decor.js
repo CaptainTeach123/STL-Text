@@ -59,16 +59,64 @@ function ccw(points) {
   return area < 0 ? points.slice().reverse() : points;
 }
 
-function leafOutline(length, width, { spikes = 0, n = 36 } = {}) {
-  const half = (t) => {
-    let v = Math.sin(Math.PI * t) ** 0.85;
-    if (spikes) v *= 0.78 + 0.22 * Math.cos(2 * Math.PI * spikes * t + Math.PI); // dips between the spikes
-    return (v * width) / 2;
-  };
+/**
+ * Half the width of a leaf at `t` (0 at the base, 1 at the tip): a pointed oval. A holly leaf has `spikes` sharp
+ * spines along each side, the edge sweeping in between them: each spine is a narrow point on an edge that
+ * otherwise follows a narrower oval.
+ */
+function leafHalfWidth(width, t, spikes) {
+  const tt = Math.min(1, Math.max(0, t));
+  const oval = Math.sin(Math.PI * tt) ** 0.8;
+  if (!spikes) return (oval * width) / 2;
+  // the spines sit at the oval's full width; between them the edge dips to 0.62 of it, in a smooth curve that
+  // rises to each spine in a straight-sided point
+  const phase = spikes * tt + 0.5;
+  const near = Math.abs(phase - Math.floor(phase) - 0.5) * 2; // 0 at a spine, 1 midway between two
+  const spine = Math.max(0, 1 - near / 0.28); // a straight-sided point 0.28 of the spacing wide at its base
+  const sweep = 0.62 + 0.1 * Math.cos(Math.PI * near); // the gentle curve of the edge between spines
+  return (oval * Math.max(sweep, 0.62 + 0.38 * spine) * width) / 2;
+}
+
+function leafOutline(length, width, { spikes = 0, n = 48 } = {}) {
   const pts = [];
-  for (let i = 0; i <= n; i++) pts.push([(i / n - 0.5) * length, half(i / n)]);
-  for (let i = n - 1; i > 0; i--) pts.push([(i / n - 0.5) * length, -half(i / n)]);
+  for (let i = 0; i <= n; i++) pts.push([(i / n - 0.5) * length, leafHalfWidth(width, i / n, spikes)]);
+  for (let i = n - 1; i > 0; i--) pts.push([(i / n - 0.5) * length, -leafHalfWidth(width, i / n, spikes)]);
   return ccw(pts);
+}
+
+/**
+ * A smooth mound on an outline: the outline extruded to `height`, meshed finely, and its top shaped by `profile`
+ * (a function of x, y returning 0..1 – 1 at the full height, 0 at the foot). A little of the height is kept all
+ * round (the rim) so the flanks never collapse to nothing.
+ */
+function mound(wasm, keep, outline, height, profile, { rim = 0.1, edge } = {}) {
+  const { CrossSection } = wasm;
+  const cs = new CrossSection([ccw(outline)]);
+  const block = keep(cs.extrude(height, 1, 0, [1, 1]));
+  cs.delete();
+  const fine = keep(block.refineToLength(edge));
+  return keep(fine.warpBatch((v, count) => {
+    for (let i = 0; i < count; i++) {
+      const g = Math.min(1, Math.max(0, profile(v[i * 3], v[i * 3 + 1])));
+      v[i * 3 + 2] *= rim + (1 - rim) * g;
+    }
+  }));
+}
+
+/** A leaf as a smooth sheet: a rounded cross-section fullest at the middle, a raised midrib, thinning to the tip and base. */
+function leafSolid(wasm, keep, length, width, height, spikes) {
+  const edge = Math.max(0.2, Math.min(length, width) / 26);
+  const profile = (x, y) => {
+    const t = x / length + 0.5;
+    const half = leafHalfWidth(width, t, spikes);
+    const v = half > 1e-6 ? Math.min(1, Math.abs(y) / half) : 1;
+    const u = (2 * x) / length; // -1 at the base, 1 at the tip
+    const dome = (1 - v * v) ** 0.7;
+    const fullness = 0.55 + 0.45 * Math.sqrt(Math.max(0, 1 - u * u));
+    const rib = 0.3 * Math.exp(-((v / 0.16) ** 2)) * (1 - Math.abs(u) ** 3);
+    return (dome * fullness + rib) / 1.3;
+  };
+  return mound(wasm, keep, leafOutline(length, width, { spikes }), height, profile, { edge });
 }
 
 /**
@@ -101,31 +149,38 @@ export function buildDecor(wasm, spec) {
         const r = i % 2 === 0 ? s.radius : s.radius * 0.42;
         pts.push([r * Math.cos(a), r * Math.sin(a)]);
       }
-      m = extrude(pts, s.height, [0.1, 0.1]); // pyramidal facets meeting at a small top
+      m = extrude(pts, s.height, [0.04, 0.04]); // pyramidal facets meeting at the apex
       break;
     }
     case 'leaf':
     case 'holly': {
-      // a roof-shaped leaf: the top narrows to a ridge along the midrib
-      m = extrude(leafOutline(s.length, s.width, { spikes: s.kind === 'holly' ? 3 : 0 }), s.height, [0.6, 0.12]);
+      m = leafSolid(wasm, keep, s.length, s.width, s.height, s.kind === 'holly' ? 4 : 0);
       break;
     }
     case 'rosette': {
-      const n = 96;
+      // rounded petals round a domed bud: a wavy disc whose top is a dome on every petal, grooved between them
+      const n = Math.max(96, s.petals * 16);
       const pts = [];
+      const rim = (a) => s.radius * (0.8 + 0.2 * Math.cos(s.petals * a));
       for (let i = 0; i < n; i++) {
         const a = (2 * Math.PI * i) / n;
-        const r = s.radius * (0.78 + 0.22 * Math.cos(s.petals * a));
-        pts.push([r * Math.cos(a), r * Math.sin(a)]);
+        pts.push([rim(a) * Math.cos(a), rim(a) * Math.sin(a)]);
       }
-      const petals = extrude(pts, s.height, [0.4, 0.4]);
+      const profile = (x, y) => {
+        const a = Math.atan2(y, x);
+        const rho = Math.min(1, Math.hypot(x, y) / rim(a));
+        const petal = (1 - rho * rho) ** 0.6;
+        const groove = 0.82 + 0.18 * Math.cos(s.petals * a) * rho;
+        return petal * groove;
+      };
+      const petals = mound(wasm, keep, pts, s.height, profile, { edge: Math.max(0.2, s.radius / 24) });
       const bud = Math.max(0.2, s.radius * 0.3);
       const centre = keep(Manifold.sphere(bud, segments(bud)).translate(0, 0, s.height * 0.6 + bud * 0.35));
       m = keep(petals.add(centre));
       break;
     }
     case 'dome': {
-      const ball = keep(Manifold.sphere(1, 48).scale([s.length / 2, s.width / 2, s.height]));
+      const ball = keep(Manifold.sphere(1, segments(Math.max(s.length, s.width) / 2)).scale([s.length / 2, s.width / 2, s.height]));
       m = keep(ball.trimByPlane([0, 0, 1], 0));
       break;
     }
@@ -142,12 +197,12 @@ export function buildDecor(wasm, spec) {
       const reach = 0.95 * leafLen * Math.cos(rad);
       const first = -L / 2 + Math.max(stemR * 2, L * 0.1);
       const last = Math.max(first, L / 2 - reach);
-      m = keep(keep(keep(Manifold.cylinder(last + stemR - -L / 2, stemR * 1.15, stemR * 0.85, 24)).rotate([0, 90, 0])).translate(-L / 2, 0, stemR * 0.8));
+      m = keep(keep(keep(Manifold.cylinder(last + stemR - -L / 2, stemR * 1.15, stemR * 0.85, segments(stemR * 1.5))).rotate([0, 90, 0])).translate(-L / 2, 0, stemR * 0.8));
       const count = Math.max(2, Math.min(12, Math.round((last - first) / (leafLen * 0.5)) + 1));
       for (let i = 0; i < count; i++) {
         const x = count === 1 ? first : first + ((last - first) * i) / (count - 1);
         const side = i % 2 === 0 ? 1 : -1;
-        const leaf = extrude(leafOutline(leafLen, leafW, { spikes: 3 }), H * 0.75, [0.6, 0.12]);
+        const leaf = leafSolid(wasm, keep, leafLen, leafW, H * 0.75, 4);
         const placed = keep(keep(keep(leaf.translate(leafLen * 0.45, 0, 0)).rotate([0, -6, side * angle])).translate(x, 0, 0));
         m = keep(m.add(placed));
       }

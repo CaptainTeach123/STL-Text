@@ -217,7 +217,7 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
   const roughSorted = Float64Array.from(rough).sort();
   const mad = roughSorted[roughSorted.length >> 1] * 1.4826 * 2; // the roughness of a height over a few vertices
   const high = Math.max(minHeight, 0.025 * F, median + 4 * mad);
-  const low = median + 0.25 * (high - median);
+  const low = median + 0.4 * (high - median); // the core of a detail: well on the way up to the threshold
 
   // regions: grow from the clearly-raised vertices over everything moderately raised, then on down each detail's
   // flanks while the height keeps falling, to the foot where the surrounding surface begins (the smoothed base
@@ -270,11 +270,12 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
     const gl = Math.hypot(gx, gy, gz);
     return { normal: gl > 1e-12 ? [gx / gl, gy / gl, gz / gl] : null, count, coherence: ga > 0 ? gl / ga : 0 };
   };
-  // the direction a core stands on, the surest way available: the ground round it, when there is enough and it
-  // agrees (the surface a detail stands on faces one way round its foot); else the axis of the plane through the
-  // core's boundary ring, turned the way the ground or the core's own normals say; else the core's own normals
-  // averaged (a star's facets lean every way round its axis and average to it, a berry's top to its direction –
-  // though a tall spiky detail's flanks cancel out and say little)
+  // the direction a core stands on, the surest way available: the axis of the plane through the core's boundary
+  // ring when that ring is flat enough (the detail's own footprint), turned the way the ground round it or the
+  // core's own normals say; else the ground round it, when there is enough (the surface a detail stands on faces
+  // one way round its foot); else the core's own normals averaged (a star's facets lean every way round its axis
+  // and average to it, a berry's top to its direction – though a tall spiky detail's flanks cancel out and say
+  // little)
   const directionOf = (core, inCore) => {
     const ring = [];
     let sx = 0, sy = 0, sz = 0, nx = 0, ny = 0, nz = 0, area = 0;
@@ -291,7 +292,8 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
     const ground = groundAround(ring, inCore);
     const plane = planeOf(ring);
     if (trace && core.length > 300) trace({ reason: 'direction', n: core.length, ring: ring.length, centroid: [+sx.toFixed(1), +sy.toFixed(1), +sz.toFixed(1)], facets: facets?.map((x) => +x.toFixed(2)), facetAgreement: +facetAgreement.toFixed(2), ground: { count: ground.count, coherence: +ground.coherence.toFixed(2), normal: ground.normal?.map((x) => +x.toFixed(2)) }, plane: plane && { axis: plane.normal.map((x) => +x.toFixed(2)), centroid: plane.centroid.map((x) => +x.toFixed(1)), spread: +plane.spread.toFixed(1) } });
-    if (ground.count >= 12 && ground.coherence >= 0.6) return { normal: ground.normal, source: 'ground', ground };
+    // the plane through the core's own ring first: it is the detail's footprint and symmetric about it, where the
+    // ground round it may have been sampled more on one side
     if (plane) {
       const axis = plane.normal;
       const onGround = ground.normal ? axis[0] * ground.normal[0] + axis[1] * ground.normal[1] + axis[2] * ground.normal[2] : 0;
@@ -369,7 +371,10 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
         const go = g(o);
         if (go < floor) continue;
         const d2 = (pos[o * 3] - sx) ** 2 + (pos[o * 3 + 1] - sy) ** 2 + (pos[o * 3 + 2] - sz) ** 2;
-        if (go >= gv - step && !(d2 < inside2 && go > gv + 0.15 * topo.hMean)) continue;
+        // down a real slope (a few degrees at least, so a slight lean of the direction cannot send the growth
+        // creeping along a straight body), or up within the core's footprint
+        const hop = Math.hypot(pos[o * 3] - pos[v * 3], pos[o * 3 + 1] - pos[v * 3 + 1], pos[o * 3 + 2] - pos[v * 3 + 2]);
+        if (go >= gv - Math.max(step, 0.07 * hop) && !(d2 < inside2 && go > gv + 0.15 * topo.hMean)) continue;
         const facing = vn[o * 3] * N[0] + vn[o * 3 + 1] * N[1] + vn[o * 3 + 2] * N[2];
         if (facing > flat && go < gv) continue;
         if (facing < -0.5) continue; // the far side of an edge or ridge of the body the detail stands near: never its flank
@@ -394,16 +399,21 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
   const enclosesHollow = (members, id, N, level) => {
     const cap = 4 * members.length + 50;
     const patch = Math.max(6, 0.03 * members.length);
+    // how high the region itself rises above its foot: what it encloses is judged against that
+    let crest = 0;
+    for (const v of members) crest = Math.max(crest, pos[v * 3] * N[0] + pos[v * 3 + 1] * N[1] + pos[v * 3 + 2] * N[2] - level);
     for (const m of members) {
       for (let i = adjStart[m]; i < adjStart[m + 1]; i++) {
         const u = adj[i];
         if (label[u] === id || mark[u] === id) continue;
-        let head = 0, tail = 0, depth = 0, outside = false;
+        let head = 0, tail = 0, depth = 0, top = -Infinity, outside = false;
         queue[tail++] = u;
         mark[u] = id;
         while (head < tail) {
           const v = queue[head++];
-          depth += pos[v * 3] * N[0] + pos[v * 3 + 1] * N[1] + pos[v * 3 + 2] * N[2] - level;
+          const above = pos[v * 3] * N[0] + pos[v * 3 + 1] * N[1] + pos[v * 3 + 2] * N[2] - level;
+          depth += above;
+          if (above > top) top = above;
           if (tail > cap) {
             outside = true;
             break;
@@ -416,17 +426,18 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
           }
         }
         if (!outside && head >= patch) {
-          // sunken: the rim around a dent or a hole; level or raised and large: the rim of a plateau (the sharp edge
-          // of a cap or a block, rounded off by the smoothing) – a detail never surrounds a patch of the surface
-          const verdict = depth / head < sunken ? 'rings a hollow' : head >= 0.3 * members.length ? 'rims a plateau' : null;
+          // sunken: the rim around a dent or a hole; no higher than the rim itself: the rim of a plateau (the sharp
+          // edge of a cap or a block, rounded off by the smoothing, or a moulding round a disc) – a detail never
+          // surrounds a patch of the surface; rising above the rim: the middle of the detail (a big star's, which
+          // the smoothing hardly raises), which the region takes in
+          const verdict = depth / head < sunken ? 'rings a hollow' : top <= crest + 0.03 * F ? 'rims a plateau' : null;
           if (verdict) {
-            trace?.({ reason: 'hollow', flood: head, depth: depth / head, sunken, verdict, start: [pos[u * 3], pos[u * 3 + 1], pos[u * 3 + 2]], level });
+            trace?.({ reason: 'hollow', flood: head, depth: depth / head, sunken, top, crest, verdict, start: [pos[u * 3], pos[u * 3 + 1], pos[u * 3 + 2]], level });
             return verdict;
           }
-          // a smaller patch at the region's level or above is part of the detail (the middle of a big star, which
-          // the smoothing hardly raises): the region takes it in
           for (let i = 0; i < head; i++) { label[queue[i]] = id; members.push(queue[i]); }
         } else if (!outside) {
+          // a few vertices the region surrounds (a missed facet) are its own
           for (let i = 0; i < head; i++) { label[queue[i]] = id; members.push(queue[i]); }
         }
       }
@@ -779,7 +790,7 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
     // is a stretch of the body (the rim of an end, a moulding)
     if (size > 1.5 * F && shape.elongation > 1.6) return drop('too large');
     if (area < 0.12 * Math.PI * far) return drop('thin'); // long and thin: the rim of an edge, not a detail (a star covers 0.4 of its circle)
-    if (crest < 0.07 * size) return drop('low'); // broad and very low: not something standing on the surface
+    if (crest < 0.05 * size) return drop('low'); // broad and very low: not something standing on the surface
     if (height < 1.25 * high || crest < 0.05 * F) return drop('faint'); // barely over the threshold, or hardly standing up at this scale: noise, the edge of a dent
     if (members.verdict) return drop(members.verdict); // rings or borders a hollow (judged on the whole region)
     const fit = fitSphere(pos, body);
@@ -799,7 +810,7 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
       }
     }
     // a flat round disc with a worked top (radial petals, a wheel) that no sphere fits: a rosette
-    if (kind === 'other' && shape.elongation < 1.3 && (shape.lobes < 4 || (shape.lobes < 5 && crest < 0.12 * size)) && crest < 0.2 * size && !(fit && roundness < 0.08 && fit.radius < 1.1 * size)) kind = 'rosette';
+    if (kind === 'other' && shape.elongation < 1.4 && (shape.lobes < 4 || (shape.lobes < 5 && crest < 0.12 * size)) && crest < 0.2 * size && !(fit && roundness < 0.08 && fit.radius < 1.1 * size)) kind = 'rosette';
     // the footprint at the foot: the whole region's extent along the body's direction (the body stops short of it)
     const foot = describeShape(pos, members, normal, [cx, cy, cz], shape.direction);
     return { id, kind, center, normal, radius, size, height, crest, sag, vertices: n, roundness, walls: walls / n, source, footLevel, ...shape, footLength: foot.length, footWidth: foot.width, footMiddle: foot.middle };
@@ -836,7 +847,7 @@ export function findDetails(mesh, { featureSize = 0, minHeight = 0, maxCount = 4
       const m = regions[id];
       const p = new Float32Array(m.length * 3);
       m.forEach((v, i) => { p[i * 3] = pos[v * 3]; p[i * 3 + 1] = pos[v * 3 + 1]; p[i * 3 + 2] = pos[v * 3 + 2]; });
-      trace({ reason: 'region', id, parent: m.parent ?? -1, n: m.length, coreCount: m.coreCount ?? m.length, verdict: kept.has(id) ? `kept ${kept.get(id)}` : m.structure ? 'structure' : m.lastDrop ?? 'none', pos: Array.from(p, (x) => +x.toFixed(2)) });
+      trace({ reason: 'region', id, parent: m.parent ?? -1, n: m.length, coreCount: m.coreCount ?? m.length, verdict: kept.has(id) ? `kept ${kept.get(id)}` : m.structure ? 'structure' : m.lastDrop ?? 'none', pos: Array.from(p, (x) => +x.toFixed(2)), r: m.map((v) => +r[v].toFixed(3)) });
     }
   }
   details.sort((a, b) => b.height - a.height);

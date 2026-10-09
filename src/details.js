@@ -1079,8 +1079,9 @@ export function crumpleOf(details, mesh) {
   // a grid of the details by position, so each face is tested against the few near it
   const cell = Math.max(1e-6, 2 * Math.max(...frames.map((f) => f.reach)));
   const grid = new Map();
+  const keyOf = (i, j, k) => (i * 73856093) ^ (j * 19349663) ^ (k * 83492791); // one integer per cell
   frames.forEach((f, i) => {
-    const k = `${Math.floor(f.mid[0] / cell)},${Math.floor(f.mid[1] / cell)},${Math.floor(f.mid[2] / cell)}`;
+    const k = keyOf(Math.floor(f.mid[0] / cell), Math.floor(f.mid[1] / cell), Math.floor(f.mid[2] / cell));
     let list = grid.get(k);
     if (!list) grid.set(k, (list = []));
     list.push(i);
@@ -1092,7 +1093,7 @@ export function crumpleOf(details, mesh) {
     for (let i = i0 - 1; i <= i0 + 1; i++) {
       for (let j = j0 - 1; j <= j0 + 1; j++) {
         for (let k = k0 - 1; k <= k0 + 1; k++) {
-          const list = grid.get(`${i},${j},${k}`);
+          const list = grid.get(keyOf(i, j, k));
           if (!list) continue;
           for (const di of list) {
             const f = frames[di];

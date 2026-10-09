@@ -668,10 +668,10 @@ async function findDetails() {
     const counts = new Map();
     for (const item of rebuildPlan.items) counts.set(item.label, (counts.get(item.label) ?? 0) + 1);
     const kinds = [...counts.entries()].map(([label, n]) => `${n} ${n === 1 ? label.toLowerCase() : `${label.toLowerCase()}s`}`).join(', ');
-    const roughCount = rebuildPlan.items.filter((i) => i.include).length;
-    const rough = roughCount === 1 ? 'one' : roughCount || 'none';
+    const ticked = rebuildPlan.items.filter((i) => i.include).length;
+    const ticks = ticked === 0 ? 'None look messed up with a sure enough reading, so nothing is ticked yet.' : ticked === 1 ? 'The one that looks messed up is ticked; the rest look clean or are unsure.' : `The ${ticked} that look messed up are ticked; the rest look clean or are unsure.`;
     $('detailsSummary').textContent = r.details.length
-      ? `Found ${r.details.length} ${r.details.length === 1 ? 'detail' : 'details'} (looking at a detail size of about ${fmt(r.featureSize / 3)} mm), read as ${kinds}. The ${rough} that look messed up are ticked; the rest look clean or are unsure.`
+      ? `Found ${r.details.length} ${r.details.length === 1 ? 'detail' : 'details'} (looking at a detail size of about ${fmt(r.featureSize / 3)} mm), read as ${kinds}. ${ticks}`
       : `No details found at a detail size of about ${fmt(r.featureSize / 3)} mm. Try a different size.`;
     renderPlan();
     $('removeAllBtn').disabled = !r.details.length;

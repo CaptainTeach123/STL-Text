@@ -62,7 +62,23 @@ describe('the rebuild plan', () => {
       expect(i.sink).toBeLessThan(3.5);
       expect(i.confidence).toBeGreaterThan(0);
       expect(i.confidence).toBeLessThanOrEqual(1);
+      expect(['rough', 'clean']).toContain(i.looks);
+      expect(i.roughness).toBeGreaterThanOrEqual(0);
     }
+  });
+
+  it('judges how each detail looks on the model\'s own mesh: clean generated decorations read as clean', async () => {
+    const client = await engineClient();
+    const { writeBinarySTL } = await import('../src/stl.js');
+    const { manifoldToSoup } = await import('../src/mesh.js');
+    const f = decoratedFixture({ decorations: [{ kind: 'berry', radius: 2.5, at: [-20, -15] }, { kind: 'star', radius: 6, height: 1.6, at: [0, 20] }] });
+    await client.loadBase({ kind: 'stl', bytes: writeBinarySTL(manifoldToSoup(f.solid)), name: 'clean', version: 1 });
+    f.solid.delete();
+    const found = await client.findDetails(1, { featureSize: 14 });
+    for (const d of found.details) expect(d.crumple).toBeLessThan(0.14);
+    const { items } = planRebuild(found.details, { featureSize: 14 });
+    expect(items.length).toBeGreaterThanOrEqual(2);
+    for (const i of items) expect(i.looks).toBe('clean');
   });
 
   it('rebuilds: removing spots cut the smudgy originals away and clean parts fuse in their place as one solid', async () => {

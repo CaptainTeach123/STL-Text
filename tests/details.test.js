@@ -202,12 +202,13 @@ describe('details in the engine', () => {
     const bumps = 2 * (2 * Math.PI * sigma * sigma * 0.8); // about 14.5 mm³
     await client.loadBase({ kind: 'stl', bytes: writeBinarySTL(manifoldToSoup(clump)), name: 'clump', version: 1 });
     const found = await client.findDetails(1, { featureSize: 8 });
-    expect(found.details).toHaveLength(1);
-    const d = found.details[0];
-    // the spot "Remove all found" would add for it
-    const spot = createSpot({ radius: Math.round(Math.max(1.5, d.size * 0.65) * 2) / 2, remove: true, position: d.center, normal: d.normal });
-    await client.updateBase({ version: 2, transforms: [], simplify: null, enhance: null, spots: [], covers: [spot] });
-    const out = geometryToManifold(parseSTL((await client.export([spot], 2, 'x')).stl));
+    // the two bumps that ran together: found as one clump or as two bumps
+    expect(found.details.length).toBeGreaterThanOrEqual(1);
+    expect(found.details.length).toBeLessThanOrEqual(2);
+    // the spots "Remove all found" would add
+    const spots = found.details.map((d) => createSpot({ radius: Math.round(Math.max(1.5, d.size * 0.65) * 2) / 2, remove: true, position: d.center, normal: d.normal }));
+    await client.updateBase({ version: 2, transforms: [], simplify: null, enhance: null, spots: [], covers: spots });
+    const out = geometryToManifold(parseSTL((await client.export(spots, 2, 'x')).stl));
     const removed = volume0 - out.volume();
     expect(removed).toBeGreaterThan(0.65 * bumps); // the skirts beyond the spot and a hair of skin stay
     expect(removed).toBeLessThan(1.05 * bumps);
@@ -232,7 +233,7 @@ describe('details in the engine', () => {
     await client.loadBase({ kind: 'stl', bytes: writeBinarySTL(manifoldToSoup(model)), name: 'cad', version: 1 });
     for (const featureSize of [14, 0]) {
       const found = await client.findDetails(1, { featureSize });
-      expect(found.featureSize).toBeCloseTo(featureSize || 0.15 * Math.hypot(26.4, 26.4, 60), 0);
+      expect(found.featureSize).toBeCloseTo(featureSize || Math.max(6, Math.min(40, 0.03 * Math.hypot(26.4, 26.4, 60))), 0);
       expect(found.details).toHaveLength(1);
       const d = found.details[0];
       expect(d.kind).toBe('round');

@@ -27,9 +27,9 @@ export function planRebuild(details, { featureSize = 0 } = {}) {
   const groups = groupDetails(details, F);
   const items = [];
   for (const group of groups) {
-    const item = group.length === 1 ? readOne(group[0]) : readGroup(group, F);
+    const item = group.length === 1 ? readOne(group[0], F) : readGroup(group, F);
     if (item) items.push({ id: items.length + 1, ...item });
-    else for (const d of group) items.push({ id: items.length + 1, ...readOne(d) }); // a group that is no one thing: each piece on its own
+    else for (const d of group) items.push({ id: items.length + 1, ...readOne(d, F) }); // a group that is no one thing: each piece on its own
   }
   return { items };
 }
@@ -40,9 +40,13 @@ function groupDetails(details, F) {
   const parent = Array.from({ length: n }, (_, i) => i);
   const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
   const gap = 0.25 * F;
+  // a berry or a star is a thing of its own; only pieces without a clear shape of their own group into a sprig or
+  // rosette
+  const single = (d) => d.kind === 'round' || d.kind === 'rosette' || ((d.lobes ?? 0) >= 4 && (d.elongation ?? 1) < 1.5);
   for (let i = 0; i < n; i++) {
     for (let j = i + 1; j < n; j++) {
       const a = details[i], b = details[j];
+      if (single(a) || single(b)) continue;
       const dist = Math.hypot(a.center[0] - b.center[0], a.center[1] - b.center[1], a.center[2] - b.center[2]);
       const facing = a.normal[0] * b.normal[0] + a.normal[1] * b.normal[1] + a.normal[2] * b.normal[2];
       if (dist - (a.size + b.size) / 2 < gap && facing > 0.3) parent[find(i)] = find(j);
@@ -79,7 +83,11 @@ function footPoint(d) {
   return [middle[0] - d.normal[0] * above, middle[1] - d.normal[1] * above, middle[2] - d.normal[2] * above];
 }
 
-function place(kind, spec, { position, normal, direction, sag, height, confidence, sources, size, note, extent }) {
+/** How rough a detail or group looks: the share of its surface that is crumpled (see crumpleOf), 0 when unknown. */
+const roughnessOf = (details) => Math.max(0, ...details.map((d) => d.crumple ?? 0));
+export const ROUGH = 0.14; // crumpled over this share of its surface, a detail looks messed up rather than merely low-poly
+
+function place(kind, spec, { position, normal, direction, sag, height, confidence, sources, size, note, extent, roughness = 0 }) {
   // the decoration is draped over the surface it stands on (it follows a curve), so its skirt only has to reach a
   // little into the surface; the sag across the footprint adds some, within reason
   const skirt = Math.round((Math.min(Math.max(0, sag), 0.5 * height + 0.3, 1.5) * 0.5 + 0.3) * 10) / 10;
@@ -89,6 +97,8 @@ function place(kind, spec, { position, normal, direction, sag, height, confidenc
     kind,
     label: DECOR_KINDS[kind].label,
     confidence,
+    roughness,
+    looks: roughness >= ROUGH ? 'rough' : 'clean',
     spec: full,
     position,
     normal: unit(normal),
@@ -131,9 +141,9 @@ export function removalSpotsFor(item) {
 const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 
 /** What one detail was meant to be. */
-function readOne(d) {
+function readOne(d, F) {
   const height = Math.max(0.1, d.crest ?? d.height);
-  const common = { position: footPoint(d), normal: d.normal, sag: d.sag ?? 0, height, sources: [d.id], size: d.size, direction: d.direction, extent: { length: 1.05 * (d.footLength ?? d.length ?? d.size), width: 1.05 * (d.footWidth ?? d.width ?? d.size) } };
+  const common = { position: footPoint(d), normal: d.normal, sag: d.sag ?? 0, height, sources: [d.id], size: d.size, direction: d.direction, roughness: roughnessOf([d]), extent: { length: 1.05 * (d.footLength ?? d.length ?? d.size), width: 1.05 * (d.footWidth ?? d.width ?? d.size) } };
   if (d.kind === 'round') {
     const radius = d.radius;
     // the sphere's centre stays where the fitted one is: the berry's base lies 0.65 radius below its centre
@@ -143,16 +153,22 @@ function readOne(d) {
   }
   const el = d.elongation ?? 1;
   const lobes = d.lobes ?? 0;
+  if (d.kind === 'rosette') {
+    return place('rosette', { radius: Math.max(d.footLength ?? d.length, d.footWidth ?? d.width) / 2, height, petals: 8 }, { ...common, confidence: 0.5, note: 'a flat round disc with a worked top' });
+  }
   // the region stops a ring short of the foot and the thin tips of a star or leaf read low: the footprint is a
   // little larger than measured
   const L = 1.05 * (d.footLength ?? d.length), W = 1.05 * (d.footWidth ?? d.width);
   const across = Math.max(L, W);
-  if (lobes >= 7 && el < 1.4) {
+  // (a star or rosette is a thing of some size with some relief: a few lobes on a speck or on a hair of relief are
+  // noise)
+  const substantial = d.size >= 0.4 * F && height >= 0.06 * d.size;
+  if (lobes >= 7 && el < 1.4 && substantial) {
     return place('rosette', { radius: across / 2, height, petals: Math.min(16, lobes) }, { ...common, confidence: 0.6, note: `${lobes} lobes around a round footprint` });
   }
-  if (lobes >= 4 && el < 1.35) {
-    // four to six lobes read on a smudgy outline: a five-point star, the usual one
-    return place('star', { radius: across / 2, height, points: 5 }, { ...common, direction: d.lobeDirection, confidence: lobes === 5 ? 0.85 : 0.6, note: `${lobes} points around a round footprint` });
+  if (lobes >= 4 && el < 1.5 && substantial) {
+    // five points is a star; four or six read on a smudgy outline may be one, with little confidence
+    return place('star', { radius: across / 2, height, points: 5 }, { ...common, direction: d.lobeDirection, confidence: lobes === 5 ? 0.85 : 0.35, note: `${lobes} points around a round footprint` });
   }
   if (el >= 1.7) {
     const spiky = lobes >= 4;
@@ -211,16 +227,30 @@ function readGroup(group, F) {
   const sources = group.map((d) => d.id);
   const el = width > 1e-9 ? length / width : 1;
   const rounds = group.filter((d) => d.kind === 'round');
-  const common = { position, normal, direction, sag, height, sources, size: Math.max(length, width), extent: { length, width } };
+  const common = { position, normal, direction, sag, height, sources, size: Math.max(length, width), roughness: roughnessOf(group), extent: { length, width } };
   if (rounds.length === group.length) return null; // berries close together: each stays a berry of its own
+  // berries among leaves are a cluster (a holly sprig, berries on a scroll), never one round decoration: read as
+  // a sprig when it runs along a line, else each piece on its own
+  if (rounds.length >= 2 && el < 1.6) return null;
+  // a group far larger than the scale being looked at is more likely a stretch of ornament (a corner's scrollwork)
+  // than one decoration: whatever it reads as, the reading is unsure
+  const unsure = Math.max(length, width) > 2.5 * F ? 0.25 : 1;
   if (el < 1.4) {
     const bud = rounds.find((d) => Math.hypot(d.center[0] - position[0], d.center[1] - position[1], d.center[2] - position[2]) < 0.3 * length);
-    if (bud || group.length >= 4) {
-      return place('rosette', { radius: Math.max(length, width) / 2, height, petals: Math.max(5, Math.min(16, group.length - (bud ? 1 : 0))) }, { ...common, confidence: bud ? 0.7 : 0.45, note: `${group.length} pieces around a round footprint${bud ? ', with a round bud in the middle' : ''}` });
+    // a rosette's pieces are petals: they point at its middle; a cluster of leaves point every way
+    const radial = group.filter((d) => {
+      if (d === bud || !d.direction) return false;
+      const m = footPoint(d);
+      const to = unit([position[0] - m[0], position[1] - m[1], position[2] - m[2]]);
+      return Math.abs(dot(to, unit(d.direction))) > 0.6;
+    }).length;
+    const petals = group.length - (bud ? 1 : 0);
+    if ((bud && rounds.length === 1 && radial >= 0.6 * petals && petals >= 3) || (!rounds.length && petals >= 5 && radial >= 0.6 * petals)) {
+      return place('rosette', { radius: Math.max(length, width) / 2, height, petals: Math.max(5, Math.min(16, group.length - (bud ? 1 : 0))) }, { ...common, confidence: Math.min(unsure, bud ? 0.7 : 0.45), note: `${group.length} pieces around a round footprint${bud ? ', with a round bud in the middle' : ''}${unsure < 1 ? ', far larger than the detail size' : ''}` });
     }
   }
   if (el >= 1.6) {
-    return place('sprig', { length, width, height }, { ...common, confidence: group.length >= 3 ? 0.7 : 0.5, note: `${group.length} pieces along a line, ${el.toFixed(1)} times as long as wide` });
+    return place('sprig', { length, width, height }, { ...common, confidence: Math.min(unsure, group.length >= 3 ? 0.7 : 0.5), note: `${group.length} pieces along a line, ${el.toFixed(1)} times as long as wide${unsure < 1 ? ', far larger than the detail size' : ''}` });
   }
   return place('dome', { length: Math.max(length, width), width: Math.min(length, width), height }, { ...common, confidence: 0.25, note: `${group.length} pieces close together with no clear shape` });
 }

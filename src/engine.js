@@ -9,7 +9,7 @@ import { ViewCache, passthroughRangesOf } from './view.js';
 import { ATTACH_ROTATIONS, placementMatrix, toMat4 } from './placement.js';
 import { baseMode, fontIds, hasText, isPart, isSpot, itemLabel, placeKey, shapeKey } from './document.js';
 import { enhanceMesh, extractRegion, isEnhanceActive, regionWeights } from './enhance.js';
-import { baseSurface, findDetails, refitSpheres } from './details.js';
+import { baseSurface, crumpleOf, findDetails, refitSpheres } from './details.js';
 import { DECOR_KINDS, buildDecor, decorPartId, normaliseDecorSpec } from './decor.js';
 
 /**
@@ -1953,15 +1953,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       let mesh = stage.view ?? stage.mesh;
       const bounds = b.current.bounds;
       const diag = bounds ? Math.hypot(...[0, 1, 2].map((k) => bounds.max[k] - bounds.min[k])) : 100;
-      const F = featureSize > 0 ? featureSize : 0.15 * diag; // the same automatic scale as details.js
+      // the automatic scale: decorations are a few per cent of a model's extent, within a sensible range in mm
+      const F = featureSize > 0 ? featureSize : Math.max(6, Math.min(40, 0.03 * diag));
       const solid = b.current.watertight ? stageManifold(stage) : null;
       if (solid) {
-        // the smoothing works per edge, so the copy it runs on has evenly sized edges: a dense model is first
-        // lightened, a coarse one (long thin triangles) refined, both to about a sixteenth of the feature scale
-        const edge = F / 16;
-        let lighter = mesh.index.length / 3 > 20_000 ? temps.add(solid.simplify(F / 120)) : solid;
-        const area = lighter.surfaceArea();
-        if (area / (0.43 * edge * edge) < 600_000) lighter = temps.add(lighter.refineToLength(edge));
+        // the smoothing works per edge, so the copy it runs on has evenly sized edges: the model is lightened, then
+        // refined to an even edge length – a sixteenth of the feature scale, or longer on a huge model so the copy
+        // stays within a budget of triangles (it is always refined: a simplified mesh alone is long thin triangles)
+        const area = solid.surfaceArea();
+        const edge = Math.max(F / 16, Math.sqrt(area / (0.43 * 350_000)));
+        const lighter = temps.add(temps.add(solid.simplify(Math.min(F / 120, edge / 8))).refineToLength(edge));
         if (lighter.numTri() >= 100) mesh = meshOf(lighter);
       }
       const dropped = [];
@@ -1969,6 +1970,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       // the copy's vertices lie a little off the surface, so round details take their sphere from the model itself
       const own = stage.view ?? stage.mesh;
       if (mesh !== own) refitSpheres(found.details, own.positions);
+      // how crumpled each one is, judged on the model's own mesh (the copy has the fine crumples smoothed away)
+      crumpleOf(found.details, stage.mesh ?? own);
       return { message: { details: found.details, featureSize: found.featureSize, threshold: found.threshold, triangles: mesh.index.length / 3, ...(debug && { dropped }) }, transfer: [] };
     } finally {
       temps.dispose();

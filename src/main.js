@@ -603,7 +603,7 @@ function renderPlan() {
     });
     const meta = document.createElement('span');
     meta.className = 'meta';
-    meta.textContent = `${fmt(item.size, 0)} mm, ${fmt(item.height, 1)} mm high · ${Math.round(item.confidence * 100)} % sure · ${item.note}`;
+    meta.textContent = `${fmt(item.size, 0)} mm, ${fmt(item.height, 1)} mm high · looks ${item.looks === 'rough' ? 'messed up' : 'clean'} · ${Math.round(item.confidence * 100)} % sure · ${item.note}`;
     li.append(tick, select, meta);
     list.append(li);
   }
@@ -663,12 +663,15 @@ async function findDetails() {
     }
     foundDetails = { ...r, placement: modelPlacementKey(doc.base) };
     rebuildPlan = planRebuild(r.details, { featureSize: r.featureSize });
-    for (const item of rebuildPlan.items) item.include = item.confidence >= 0.4;
+    // the rough-looking ones are ticked, when the reading is a fair bet; clean ones are left as they are
+    for (const item of rebuildPlan.items) item.include = item.looks === 'rough' && item.confidence >= 0.4;
     const counts = new Map();
     for (const item of rebuildPlan.items) counts.set(item.label, (counts.get(item.label) ?? 0) + 1);
     const kinds = [...counts.entries()].map(([label, n]) => `${n} ${n === 1 ? label.toLowerCase() : `${label.toLowerCase()}s`}`).join(', ');
+    const roughCount = rebuildPlan.items.filter((i) => i.include).length;
+    const rough = roughCount === 1 ? 'one' : roughCount || 'none';
     $('detailsSummary').textContent = r.details.length
-      ? `Found ${r.details.length} ${r.details.length === 1 ? 'detail' : 'details'} (looking at a detail size of about ${fmt(r.featureSize / 3)} mm), read as ${kinds}. Unsure ones are unticked.`
+      ? `Found ${r.details.length} ${r.details.length === 1 ? 'detail' : 'details'} (looking at a detail size of about ${fmt(r.featureSize / 3)} mm), read as ${kinds}. The ${rough} that look messed up are ticked; the rest look clean or are unsure.`
       : `No details found at a detail size of about ${fmt(r.featureSize / 3)} mm. Try a different size.`;
     renderPlan();
     $('removeAllBtn').disabled = !r.details.length;

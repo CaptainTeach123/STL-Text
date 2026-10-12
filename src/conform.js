@@ -8,8 +8,10 @@ import { manifoldToGeometry } from './mesh.js';
  * Text is built as a flat extrusion in a local frame (X/Y in the text plane,
  * +Z = outward surface normal, origin = the clicked point). On a curved model a
  * flat slab cuts too deep in the middle or floats at the ends, so we sample the
- * model surface height h(x, y) above the text plane on a grid and shift every
- * vertex of the (refined) slab along local Z by that height.
+ * model surface height h(x, y) above the text plane on a grid and move every
+ * vertex of the (refined) slab onto the surface there and out along the
+ * surface's own normal by the vertex's height: the letters stand square on
+ * the surface everywhere, at the same height or depth, however it slopes.
  */
 
 /** Grid nodes per axis above which the sample spacing is enlarged. */
@@ -60,9 +62,10 @@ const toVector = (v) => (v?.isVector3 ? v.clone() : new Vector3(...v));
  *   how far (model units) above / below the text plane a surface may be to
  *   count; default 50 each, Infinity for unlimited.
  * @returns {{ heightAt(x: number, y: number): number, dispose(): void }}
- *   heightAt gives the local-Z height of the model surface at (x, y): the hit
- *   of a ray cast along -normal that is closest to the text plane (the clicked
- *   surface, z = 0), or NaN when nothing is hit within the search range.
+ *   heightAt gives the local-Z height of the model surface at (x, y): of the
+ *   hits of a ray cast along -normal whose face looks the text's way, the one
+ *   closest to the text plane (the clicked surface, z = 0), or NaN when
+ *   nothing is hit within the search range.
  */
 export function createSurfaceSampler(geometry, placement, options = {}) {
   let bvh = bvhFor(geometry);
@@ -83,17 +86,29 @@ export function createSurfaceSampler(geometry, placement, options = {}) {
     if (!bvh) return { z: NaN, wall: Infinity };
     ray.origin.set(x, y, above).applyMatrix4(placement);
     const hits = bvh.raycast(ray, DoubleSide, 0, above + below);
+    // the surface an item sits on faces its way: of the hits whose face points along the item's normal (the outside
+    // of the model as seen from the item) the one closest to the item's plane; a thin sheet bending towards the item
+    // would otherwise offer its back, and letters there would sink into it. Only when no hit faces the item (the
+    // ray enters a solid from inside) the closest hit of any kind counts
     let best = NaN;
     let bestAbs = Infinity;
+    let any = NaN;
+    let anyAbs = Infinity;
     const zs = [];
     for (const hit of hits) {
       const z = local.copy(hit.point).applyMatrix4(inverse).z;
       zs.push(z);
-      if (Math.abs(z) < bestAbs) {
-        bestAbs = Math.abs(z);
+      const abs = Math.abs(z);
+      if (hit.face.normal.dot(normal) > 0 && abs < bestAbs) {
+        bestAbs = abs;
         best = z;
       }
+      if (abs < anyAbs) {
+        anyAbs = abs;
+        any = z;
+      }
     }
+    if (Number.isNaN(best)) best = any;
     // the next surface crossing behind the chosen one = the wall thickness there
     let wall = Infinity;
     for (const z of zs) if (z < best - 1e-6) wall = Math.min(wall, best - z);
@@ -321,23 +336,65 @@ export function conformSolid(flatSolid, sampler, options = {}) {
   }
   stats.maxEdge = maxEdge;
 
+  // the surface normal at every grid node (from central differences of the height, one-sided at the border), so the
+  // slab is extruded along the surface's own normal rather than the text's: constant height on a slope, and the
+  // letters' sides stand square on the surface. A step (a sudden slope change) is left out of the slope on its
+  // side, so the surface next to it keeps its own normal and the step's wall is not smeared into a lean
+  const gn = new Float64Array(nx * ny * 3);
+  const slopeAcross = (k, kLo, kHi, stepLo, stepHi) => {
+    // central difference, or the gentler one-sided difference where the other side steps or is missing
+    const lo = kLo < 0 ? NaN : (h[k] - h[kLo]) / stepLo;
+    const hi = kHi < 0 ? NaN : (h[kHi] - h[k]) / stepHi;
+    if (Number.isFinite(lo) && Number.isFinite(hi)) {
+      if (Math.abs(hi - lo) > tanMax) return Math.abs(lo) < Math.abs(hi) ? lo : hi;
+      return (lo + hi) / 2;
+    }
+    return Number.isFinite(lo) ? lo : Number.isFinite(hi) ? hi : 0;
+  };
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const k = j * nx + i;
+      const gx = slopeAcross(k, i > 0 ? k - 1 : -1, i < nx - 1 ? k + 1 : -1, cell, cell);
+      const gy = slopeAcross(k, j > 0 ? k - nx : -1, j < ny - 1 ? k + nx : -1, cell, cell);
+      const l = Math.sqrt(gx * gx + gy * gy + 1);
+      gn[k * 3] = -gx / l;
+      gn[k * 3 + 1] = -gy / l;
+      gn[k * 3 + 2] = 1 / l;
+    }
+  }
+
   // bilinear interpolation of the grid, clamped to its edges
-  const heightAt = (x, y) => {
+  const cellOf = (x, y) => {
     const u = Math.min(Math.max((x - x0) / cell, 0), nx - 1);
     const v = Math.min(Math.max((y - y0) / cell, 0), ny - 1);
     const i = Math.min(Math.floor(u), nx - 2);
     const j = Math.min(Math.floor(v), ny - 2);
-    const fx = u - i;
-    const fy = v - j;
-    const k = j * nx + i;
-    const bottom = h[k] * (1 - fx) + h[k + 1] * fx;
-    const top = h[k + nx] * (1 - fx) + h[k + nx + 1] * fx;
+    return { k: j * nx + i, fx: u - i, fy: v - j };
+  };
+  const lerp2 = (a, k, fx, fy, stride, c) => {
+    const bottom = a[k * stride + c] * (1 - fx) + a[(k + 1) * stride + c] * fx;
+    const top = a[(k + nx) * stride + c] * (1 - fx) + a[(k + nx + 1) * stride + c] * fx;
     return bottom * (1 - fy) + top * fy;
+  };
+  const heightAt = (x, y) => {
+    const { k, fx, fy } = cellOf(x, y);
+    return lerp2(h, k, fx, fy, 1, 0);
   };
 
   const refined = flatSolid.refineToLength(maxEdge);
   const solid = refined.warpBatch((verts, count) => {
-    for (let i = 0; i < count; i++) verts[i * 3 + 2] += heightAt(verts[i * 3], verts[i * 3 + 1]);
+    for (let i = 0; i < count; i++) {
+      const x = verts[i * 3], y = verts[i * 3 + 1], z = verts[i * 3 + 2];
+      const { k, fx, fy } = cellOf(x, y);
+      let nxv = lerp2(gn, k, fx, fy, 3, 0), nyv = lerp2(gn, k, fx, fy, 3, 1), nzv = lerp2(gn, k, fx, fy, 3, 2);
+      const l = Math.sqrt(nxv * nxv + nyv * nyv + nzv * nzv) || 1;
+      nxv /= l;
+      nyv /= l;
+      nzv /= l;
+      verts[i * 3] = x + z * nxv;
+      verts[i * 3 + 1] = y + z * nyv;
+      verts[i * 3 + 2] = lerp2(h, k, fx, fy, 1, 0) + z * nzv;
+    }
   });
   refined.delete();
   return result(solid, true, stats);

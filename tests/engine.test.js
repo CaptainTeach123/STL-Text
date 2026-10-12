@@ -207,6 +207,32 @@ describe('preview', () => {
     await expect(client.preview(missing, version)).rejects.toMatchObject({ code: 'FONT_MISSING', details: { fontId: 'nope', fontIds: ['nope', 'nada'] } });
   });
 
+  it('lays wide text over a sheet that bends up towards its ends, on its front', async () => {
+    // a wavy banner: 2 mm thick, rising 42 mm at the ends (z = x² / 240); a flat text plane tangent at its middle
+    // runs inside the sheet towards the ends, and the underside is then the surface nearest the plane
+    const flat = wasm.Manifold.cube([200, 40, 2], true).refineToLength(2);
+    const sheet = flat.warpBatch((verts, count) => {
+      for (let i = 0; i < count; i++) verts[i * 3 + 2] += (verts[i * 3] * verts[i * 3]) / 240;
+    });
+    await client.loadBase({ kind: 'stl', bytes: stlOf(sheet), name: 'banner', version: ++version });
+    const r = await client.preview(topItem('Candy Cane Lane', { size: 12, position: [0, 0, 1] }), version); // 140 mm wide: the ends rise 20 mm
+    expect(r.stats.conformed).toBe(true);
+    expect(r.notes.map((n) => n.code)).not.toContain('NOT_TOUCHING');
+    expect(r.notes.map((n) => n.code)).not.toContain('OVERHANG');
+    const p = r.geometry.positions;
+    let deepest = Infinity;
+    let highest = -Infinity;
+    for (let i = 0; i < p.length; i += 3) {
+      const above = p[i + 2] - (p[i] * p[i]) / 240; // height over the sheet's top at that x (text-local = model frame here, 1 mm up)
+      deepest = Math.min(deepest, above);
+      highest = Math.max(highest, above);
+    }
+    expect(deepest).toBeGreaterThan(-0.7); // sunk by no more than the overlap
+    expect(highest).toBeGreaterThan(0.9); // and the letters stand their full height above the sheet
+    flat.delete();
+    sheet.delete();
+  });
+
   it('follows a curved surface', async () => {
     const cyl = wasm.Manifold.cylinder(60, 20, 20, 128, true).rotate([90, 0, 0]);
     await client.loadBase({ kind: 'stl', bytes: stlOf(cyl), name: 'cyl', version: ++version });

@@ -1433,8 +1433,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     let stats = null;
     let settle = 0; // how far a rigid part was lowered to meet the surface (local z, ≤ 0)
     const wantsStats = base.kind !== 'none';
-    // a part may be pulled down by as much as its own height, so the surface search reaches at least that far
-    const partReach = isPart(item) ? Math.max(50, flatEntry.solid.boundingBox().max[2] - flatEntry.solid.boundingBox().min[2] + 1) : 50;
+    // a part may be pulled down by as much as its own height, so the surface search reaches at least that far; under
+    // a wide text or plate the surface may bend away by as much as the item is wide
+    const fbb = flatEntry.solid.boundingBox();
+    const partReach = isPart(item) ? Math.max(50, fbb.max[2] - fbb.min[2] + 1) : Math.max(50, fbb.max[0] - fbb.min[0], fbb.max[1] - fbb.min[1]);
     const covering = isPart(item) ? !!item.cover : item.cover && item.mode !== 'engrave' && item.plate !== 'none';
     const s = wantsStats && (item.conform || isPart(item)) ? sampler(placement, { searchAbove: partReach, searchBelow: partReach }, { cut: !covering }) : null;
     // text follows curved surfaces when asked; so does a generated decoration (a leaf or sprig draped over a horn),

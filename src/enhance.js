@@ -864,12 +864,17 @@ function fitToNormals(topo, index, pos0, pos, nTarget, n0, iterations, cap, stat
 
 /* ------------------------------------------------------------------ detail */
 
-/** One umbrella step out = x + λ·(mean of neighbours − x) on a field of `stride` values per vertex. */
-function umbrella(x, out, topo, lam, stride) {
+/**
+ * One umbrella step out = x + λ·(mean of neighbours − x) on a field of `stride` values per vertex. With `weights`
+ * (one per adjacency entry, rows summing to `weights.sum`) the mean is weighted.
+ */
+function umbrella(x, out, topo, lam, stride, weights = null) {
   const { adjStart: start, adj, V } = topo;
+  const w = weights?.w ?? null;
+  const W = weights?.sum ?? null;
   for (let v = 0; v < V; v++) {
     const s = start[v], e = start[v + 1];
-    const n = e - s;
+    const n = w ? W[v] : e - s;
     const l = lam[v];
     if (n === 0 || l === 0) {
       for (let k = 0; k < stride; k++) out[v * stride + k] = x[v * stride + k];
@@ -877,29 +882,121 @@ function umbrella(x, out, topo, lam, stride) {
     }
     if (stride === 3) {
       let mx = 0, my = 0, mz = 0;
-      for (let i = s; i < e; i++) {
-        const j = adj[i] * 3;
-        mx += x[j];
-        my += x[j + 1];
-        mz += x[j + 2];
+      if (w) {
+        for (let i = s; i < e; i++) {
+          const j = adj[i] * 3;
+          const wi = w[i];
+          mx += wi * x[j];
+          my += wi * x[j + 1];
+          mz += wi * x[j + 2];
+        }
+      } else {
+        for (let i = s; i < e; i++) {
+          const j = adj[i] * 3;
+          mx += x[j];
+          my += x[j + 1];
+          mz += x[j + 2];
+        }
       }
       out[v * 3] = x[v * 3] + l * (mx / n - x[v * 3]);
       out[v * 3 + 1] = x[v * 3 + 1] + l * (my / n - x[v * 3 + 1]);
       out[v * 3 + 2] = x[v * 3 + 2] + l * (mz / n - x[v * 3 + 2]);
     } else {
       let m = 0;
-      for (let i = s; i < e; i++) m += x[adj[i]];
+      if (w) for (let i = s; i < e; i++) m += w[i] * x[adj[i]];
+      else for (let i = s; i < e; i++) m += x[adj[i]];
       out[v] = x[v] + l * (m / n - x[v]);
     }
   }
 }
 
+/**
+ * Cotangent weights of the edges (one per adjacency entry, in the order of `topo.adj`, negative ones from obtuse
+ * angles clamped to zero) with their row sums, and the mixed area around each vertex. With these the umbrella is a
+ * consistent discretisation of mean-curvature flow: a vertex on a smooth surface moves inward by the same amount
+ * however regular or irregular its neighbourhood, so the base of a surface that is smooth already has no bumps.
+ * `unit[v]` = area / weight sum is the step a free vertex takes per pass, in mm², before any normalisation.
+ */
+function cotanWeights(pos, index, topo) {
+  const { V, adjStart, adj } = topo;
+  const w = new Float64Array(adj.length);
+  const area = new Float64Array(V);
+  const slot = (a, b) => {
+    // the adjacency rows are sorted: binary search b in row a
+    let lo = adjStart[a], hi = adjStart[a + 1] - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (adj[mid] === b) return mid;
+      if (adj[mid] < b) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    return -1;
+  };
+  const vx = [0, 0, 0], ex = new Float64Array(9), l2 = [0, 0, 0], cot = [0, 0, 0];
+  for (let t = 0; t < index.length; t += 3) {
+    vx[0] = index[t];
+    vx[1] = index[t + 1];
+    vx[2] = index[t + 2];
+    // edge k runs from vertex k+1 to vertex k+2 (opposite vertex k)
+    for (let k = 0; k < 3; k++) {
+      const a = vx[(k + 1) % 3] * 3, b = vx[(k + 2) % 3] * 3;
+      ex[k * 3] = pos[b] - pos[a];
+      ex[k * 3 + 1] = pos[b + 1] - pos[a + 1];
+      ex[k * 3 + 2] = pos[b + 2] - pos[a + 2];
+      l2[k] = ex[k * 3] ** 2 + ex[k * 3 + 1] ** 2 + ex[k * 3 + 2] ** 2;
+    }
+    const cx = ex[1] * ex[5] - ex[2] * ex[4], cy = ex[2] * ex[3] - ex[0] * ex[5], cz = ex[0] * ex[4] - ex[1] * ex[3];
+    const twice = Math.sqrt(cx * cx + cy * cy + cz * cz); // twice the area
+    if (!(twice > 1e-30)) continue;
+    // cot of the angle at vertex k = (e_{k+1} · e_{k+2}) / (2 area), with the edges pointing away from vertex k
+    let obtuse = -1;
+    for (let k = 0; k < 3; k++) {
+      const i = ((k + 1) % 3) * 3, j = ((k + 2) % 3) * 3;
+      // edge k+1 runs k+2 -> k, edge k+2 runs k -> k+1: both away from k after flipping the first
+      const d = -(ex[i] * ex[j] + ex[i + 1] * ex[j + 1] + ex[i + 2] * ex[j + 2]);
+      cot[k] = d / twice;
+      if (d < 0) obtuse = k;
+    }
+    for (let k = 0; k < 3; k++) {
+      const a = vx[(k + 1) % 3], b = vx[(k + 2) % 3];
+      const c = Math.max(0, 0.5 * cot[k]);
+      const ab = slot(a, b), ba = slot(b, a);
+      if (ab >= 0) w[ab] += c;
+      if (ba >= 0) w[ba] += c;
+    }
+    // mixed area: Voronoi for a non-obtuse triangle, else half of it at the obtuse vertex and a quarter at the others
+    if (obtuse < 0) {
+      for (let k = 0; k < 3; k++) {
+        // the two edges at vertex k are edges i and j (opposite vertices i and j), each weighted by its opposite angle
+        const i = (k + 1) % 3, j = (k + 2) % 3;
+        area[vx[k]] += (l2[i] * cot[i] + l2[j] * cot[j]) / 8;
+      }
+    } else {
+      for (let k = 0; k < 3; k++) area[vx[k]] += k === obtuse ? twice / 4 : twice / 8;
+    }
+  }
+  const sum = new Float64Array(V);
+  const unit = new Float64Array(V);
+  for (let v = 0; v < V; v++) {
+    let s = 0;
+    for (let i = adjStart[v]; i < adjStart[v + 1]; i++) s += w[i];
+    if (!(s > 1e-30)) {
+      // every angle obtuse or degenerate: fall back to the plain mean for this vertex
+      for (let i = adjStart[v]; i < adjStart[v + 1]; i++) w[i] = 1;
+      s = adjStart[v + 1] - adjStart[v];
+    }
+    sum[v] = s;
+    unit[v] = s > 0 ? area[v] / s : 0;
+  }
+  return { w, sum, unit };
+}
+
 /** K umbrella passes (ping-pong buffers); returns a new array. */
-export function smoothField(x, topo, lam, K, stride, progress) {
+export function smoothField(x, topo, lam, K, stride, progress, weights = null) {
   let a = Float64Array.from(x);
   let b = new Float64Array(a.length);
   for (let k = 0; k < K; k++) {
-    umbrella(a, b, topo, lam, stride);
+    umbrella(a, b, topo, lam, stride, weights);
     [a, b] = [b, a];
     progress?.(k + 1, K);
   }
@@ -907,14 +1004,10 @@ export function smoothField(x, topo, lam, K, stride, progress) {
 }
 
 /**
- * Mesh unsharp masking along vertex normals. `pos` is Float64 (current
- * positions); returns the signed displacement per vertex (mm, along `vn`)
- * before the flip guard, plus the vertex normals.
+ * Unit vertex normals (area weighted) of the faces `fd` describes, and the
+ * freedom of each vertex: its pin, or 0 where the normal is undefined.
  */
-function reliefDisplacement(pos, index, topo, { gain = 0, deepen = 0, evenOut = 0, featureSize, edgeAngle, cap, pin, weights = null }, progress) {
-  const { V, hv, hMean, diag, adjStart, adj } = topo;
-  // vertex normals (area weighted) from the current positions
-  const fd = faceData(pos, index);
+function vertexNormals(fd, index, V, pin) {
   const vn = new Float64Array(V * 3);
   for (let t = 0; t < index.length / 3; t++) {
     const a2 = fd.area[t] * 2;
@@ -938,14 +1031,32 @@ function reliefDisplacement(pos, index, topo, { gain = 0, deepen = 0, evenOut = 
       f[v] = 0;
     }
   }
-  // kernel size: featureSize in mm -> number of umbrella passes
-  const F = featureSize > 0 ? featureSize : Math.max(5 * hMean, 0.01 * diag);
-  const K = Math.max(2, Math.min(64, Math.round(0.5 * (F / hMean) ** 2)));
-  const K0 = Math.max(1, Math.min(4, Math.round(K / 16)));
-  const K2 = 2 * K;
-  const Ke = Math.max(1, K >> 1);
-  // ring size and its smoothed version normalise the step so the kernel is uniform in millimetres, not in edge counts
-  const ring = new Float64Array(V);
+  return { vn, f };
+}
+
+/**
+ * The umbrella step per vertex: half way to the mean of the neighbours for a
+ * free vertex, nothing for a pinned one. The size of a step in mm² (the ring
+ * size, or the cotangent unit) normalises it so the kernel is uniform in
+ * millimetres, not in edge counts: with the plain mean, against the smoothed
+ * ring size nearby; with cotangent weights, against the unit of a regular
+ * mesh with the model's mean edge length (hMean²/4), so a vertex of a
+ * smooth surface sinks by the same amount wherever it sits, whatever the
+ * local mesh density (finer areas diffuse a little slower than meant,
+ * coarser ones take smaller steps).
+ */
+function umbrellaSteps(pos, topo, f, K2, weights = null) {
+  const { V, adjStart, adj, hMean } = topo;
+  const lam = new Float64Array(V);
+  if (weights) {
+    const ref = 0.5 * (hMean * hMean) / 4;
+    for (let v = 0; v < V; v++) {
+      const u = weights.unit[v];
+      lam[v] = u > 0 ? f[v] * Math.max(0.02, Math.min(1, ref / u)) : 0;
+    }
+    return lam;
+  }
+  const size = new Float64Array(V);
   for (let v = 0; v < V; v++) {
     const s = adjStart[v], e = adjStart[v + 1];
     if (e === s) continue;
@@ -954,16 +1065,173 @@ function reliefDisplacement(pos, index, topo, { gain = 0, deepen = 0, evenOut = 
       const j = adj[i] * 3;
       sum += (pos[j] - pos[v * 3]) ** 2 + (pos[j + 1] - pos[v * 3 + 1]) ** 2 + (pos[j + 2] - pos[v * 3 + 2]) ** 2;
     }
-    ring[v] = sum / (e - s);
+    size[v] = sum / (e - s);
   }
   const lamU = new Float64Array(V);
   for (let v = 0; v < V; v++) lamU[v] = 0.5 * f[v];
-  const ringBar = smoothField(ring, topo, lamU, K2, 1);
-  const lam = new Float64Array(V);
+  const sizeBar = smoothField(size, topo, lamU, K2, 1);
   for (let v = 0; v < V; v++) {
-    const rho = ring[v] > 0 ? Math.max(0.5, Math.min(1.5, ringBar[v] / ring[v])) : 1;
+    const rho = size[v] > 0 ? Math.max(0.5, Math.min(1.5, sizeBar[v] / size[v])) : 1;
     lam[v] = 0.5 * rho * f[v];
   }
+  return lam;
+}
+
+/** The relief size in mm when none is given: five edges, or a hundredth of the model, whichever is larger. */
+const autoFeatureSize = (featureSize, topo) => (featureSize > 0 ? featureSize : Math.max(5 * topo.hMean, 0.01 * topo.diag));
+
+/** Umbrella passes for a kernel of `F` millimetres (the kernel widens with the square root of the pass count). */
+const passesFor = (F, hMean, most) => Math.max(2, Math.min(most, Math.round(0.5 * (F / hMean) ** 2)));
+
+/** Smoothing moves a vertex at most this far, in relief sizes (bumps are never that high). */
+const SMOOTH_REACH = 0.5;
+/** The most umbrella passes smoothing runs (a relief size of about 28 edges; wider ones are kernel-limited). */
+const SMOOTH_PASSES = 400;
+/** Coring for smoothing: the band-passed bump height, in local edge lengths, below which a surface counts as smooth already. */
+const SMOOTH_CORING = [0.02, 0.08];
+
+/**
+ * Smoothing at the relief size. The base shape is the surface diffused with
+ * a kernel about the relief size wide, each vertex moving only along its own
+ * normal (a height field over the surface): `s` is how far the base sits
+ * below a vertex. Of that height, the local mean is the curvature shrink of
+ * the base (a sphere's base is a smaller sphere), which is kept; the rest is
+ * the bumps, which are removed. The diffusion uses cotangent weights with
+ * the mixed areas, a consistent discretisation of mean-curvature flow, so a
+ * vertex of a surface that is smooth already sinks by the same amount as its
+ * neighbours however irregular the mesh, and such a surface has no bumps;
+ * surfaces whose bump height is tiny next to their edges (flat panels,
+ * coarse facets of a curved surface) stay exactly put. Creases are pinned
+ * and bound the base: each level of a stepped surface is smoothed within
+ * its own edges, and the steps stay sharp.
+ *
+ * `pos` is Float64 (current positions); returns the signed displacement per
+ * vertex (mm, along `vn`) before the flip guard, plus the normals.
+ */
+function smoothDisplacement(pos, index, topo, { amount, featureSize, edgeAngle, pin }, progress) {
+  const { V, hv, hMean, adjStart, adj } = topo;
+  const F = autoFeatureSize(featureSize, topo);
+  const K = passesFor(F, hMean, SMOOTH_PASSES);
+  const K2 = 2 * K;
+  const Ke = Math.max(1, K >> 1);
+  const { vn, f } = vertexNormals(faceData(pos, index), index, V, pin);
+  const weights = cotanWeights(pos, index, topo);
+  const lam = umbrellaSteps(pos, topo, f, K2, weights);
+  const total = K + K2 + Ke;
+  let done = 0;
+  const tick = (k, n) => {
+    if (k === n || k % 8 === 0) progress?.((done + k) / total);
+  };
+  // the diffusion along the normals: a step takes a vertex towards the weighted mean of its neighbours' base points,
+  // measured along its own normal: source[v] is the fixed part (the sag of the neighbours' own positions) and
+  // cos[i] the share of a neighbour's height that counts along this normal
+  const { w, sum: W } = weights;
+  const source = new Float64Array(V);
+  const cos = new Float64Array(adj.length);
+  for (let v = 0; v < V; v++) {
+    const nx = vn[v * 3], ny = vn[v * 3 + 1], nz = vn[v * 3 + 2];
+    let a = 0;
+    for (let i = adjStart[v]; i < adjStart[v + 1]; i++) {
+      const j = adj[i];
+      a += w[i] * ((pos[j * 3] - pos[v * 3]) * nx + (pos[j * 3 + 1] - pos[v * 3 + 1]) * ny + (pos[j * 3 + 2] - pos[v * 3 + 2]) * nz);
+      cos[i] = w[i] * (vn[j * 3] * nx + vn[j * 3 + 1] * ny + vn[j * 3 + 2] * nz);
+    }
+    source[v] = a;
+  }
+  let s = new Float64Array(V);
+  let next = new Float64Array(V);
+  for (let k = 0; k < K; k++) {
+    for (let v = 0; v < V; v++) {
+      const l = lam[v];
+      if (l === 0 || W[v] === 0) {
+        next[v] = s[v];
+        continue;
+      }
+      let m = source[v];
+      for (let i = adjStart[v]; i < adjStart[v + 1]; i++) m += cos[i] * s[adj[i]];
+      next[v] = s[v] + l * (m / W[v] - s[v]);
+    }
+    [s, next] = [next, s];
+    tick(k + 1, K);
+  }
+  done += K;
+  // the height above the base, its local mean (the shrink) and the bumps. The mean is taken over the free vertices
+  // only (a pinned one sits at height zero, which is no measure of the shrink next to it), so a curved surface meets
+  // its crease without a ridge or a dip
+  const h = new Float64Array(V);
+  for (let v = 0; v < V; v++) h[v] = -s[v];
+  const hm = smoothField(h, topo, lam, K2, 1, tick, weights);
+  const fm = smoothField(f, topo, lam, K2, 1, null, weights);
+  done += K2;
+  const bumps = new Float64Array(V);
+  for (let v = 0; v < V; v++) {
+    hm[v] = fm[v] > 1e-6 ? hm[v] / fm[v] : h[v];
+    bumps[v] = h[v] - hm[v];
+  }
+  // coring: the bump height squared and averaged over the kernel
+  const band = new Float64Array(V);
+  for (let v = 0; v < V; v++) band[v] = bumps[v] * bumps[v];
+  const em = smoothField(band, topo, lam, Ke, 1, tick, weights);
+  // next to a crease the move tapers off: no vertex moves further than its distance from the nearest pinned vertex
+  // times the slope of the edge angle, so the triangles along a crease are never sheared into a fold (the moves on
+  // either side of a step differ, and the step's own vertices stay put). The distance runs along the edges, out to
+  // where the taper no longer binds
+  const slope = Math.tan((edgeAngle * Math.PI) / 180);
+  const reach = SMOOTH_REACH * F;
+  const far = reach / slope;
+  const dist = new Float64Array(V).fill(far);
+  for (let v = 0; v < V; v++) if (f[v] < 0.5) dist[v] = 0;
+  for (let round = 0; round < 4 * Math.ceil(far / hMean); round++) {
+    let changed = false;
+    for (let v = 0; v < V; v++) {
+      let d = dist[v];
+      if (d === 0) continue;
+      for (let i = adjStart[v]; i < adjStart[v + 1]; i++) {
+        const j = adj[i];
+        if (dist[j] >= d) continue;
+        const e = dist[j] + Math.sqrt((pos[j * 3] - pos[v * 3]) ** 2 + (pos[j * 3 + 1] - pos[v * 3 + 1]) ** 2 + (pos[j * 3 + 2] - pos[v * 3 + 2]) ** 2);
+        if (e < d) d = e;
+      }
+      if (d < dist[v]) {
+        dist[v] = d;
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+  const disp = new Float64Array(V);
+  let maxA = 0, maxBump = 0, masked = 0, pinned = 0;
+  for (let v = 0; v < V; v++) {
+    const A = Math.sqrt(Math.max(0, em[v])) / (hv[v] || 1);
+    const mask = f[v] * smoothstep(SMOOTH_CORING[0], SMOOTH_CORING[1], A);
+    const raw = -amount * mask * bumps[v];
+    const c = Math.min(reach, dist[v] * slope);
+    disp[v] = Number.isFinite(raw) && c > 0 ? c * Math.tanh(raw / c) : 0;
+    if (A > maxA) maxA = A;
+    if (Math.abs(bumps[v]) > maxBump) maxBump = Math.abs(bumps[v]);
+    if (mask > 0.5) masked++;
+    if (f[v] < 0.5) pinned++;
+  }
+  const src = new Float64Array(V); for (let v = 0; v < V; v++) src[v] = W[v] ? lam[v] * source[v] / W[v] : 0;
+  return { disp, vn, passes: total, debug: { K, F, maxA, maxBump, pinned, unmasked: masked, fields: { h, hm, bumps, em, src, lam, unit: weights.unit } } };
+}
+
+/**
+ * Mesh unsharp masking along vertex normals. `pos` is Float64 (current
+ * positions); returns the signed displacement per vertex (mm, along `vn`)
+ * before the flip guard, plus the vertex normals.
+ */
+function reliefDisplacement(pos, index, topo, { gain = 0, deepen = 0, evenOut = 0, featureSize, edgeAngle, cap, pin, weights = null }, progress) {
+  const { V, hv, hMean } = topo;
+  // vertex normals (area weighted) from the current positions
+  const { vn, f } = vertexNormals(faceData(pos, index), index, V, pin);
+  // kernel size: featureSize in mm -> number of umbrella passes
+  const F = autoFeatureSize(featureSize, topo);
+  const K = passesFor(F, hMean, 64);
+  const K0 = Math.max(1, Math.min(4, Math.round(K / 16)));
+  const K2 = 2 * K;
+  const Ke = Math.max(1, K >> 1);
+  const lam = umbrellaSteps(pos, topo, f, K2);
   const total = 2 * K + 2 * (K0 + K2) + K2 + Ke;
   let done = 0;
   const tick = (k, n) => {
@@ -1134,11 +1402,13 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
   const n0 = fd0.n.slice(); // the flip reference: input face normals
   const edges = pairEdges(index, V);
   const h = topo.hMean;
-  // the budget every vertex may move, shared by all operations
+  // the budget every vertex may move, shared by all operations but the smoothing, whose move (the height of the bump
+  // it takes away) comes on top of it
   const cap = new Float64Array(V);
   for (let v = 0; v < V; v++) cap[v] = maxMove > 0 ? maxMove : capFactor * (topo.hv[v] || h);
   // vertices on boundary or non-manifold edges never move
   for (let v = 0; v < V; v++) if (edges.open[v]) cap[v] = 0;
+  const smoothMove = new Float64Array(V);
   report('Analysing the surface', 0.08);
 
   let pos = pos0.slice();
@@ -1168,14 +1438,47 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
     pos = out;
   };
 
+  let smoothed = null; // the positions after smoothing only, for a partial sharpen amount
+  if (smooth > 0) {
+    // creases are judged on the raw normals and on denoised ones (a few bilateral passes: never across an edge
+    // sharper than the edge angle) and must be sharp in both: a real edge is, a noise spike is not (its faces meet
+    // steeply, but the denoised normals agree), nor is a coarse facet the denoising happens to tilt
+    const cut = chord(edgeAngle);
+    let cur = fd0.n.slice();
+    let nxt = new Float64Array(T * 3);
+    for (let k = 0; k < 4; k++) {
+      bilateral(topo, fd0, cur, cur, nxt, 1.5 * h, cut / 2, cut, null, false);
+      [cur, nxt] = [nxt, cur];
+    }
+    const raw = dihedrals(edges, index, fd0.n, edgeAngle, V, pos).maxDih;
+    const denoised = dihedrals(edges, index, cur, edgeAngle, V, pos).maxDih;
+    const pin = new Float64Array(V);
+    for (let v = 0; v < V; v++) pin[v] = edges.open[v] ? 0 : 1 - smoothstep(0.75 * edgeAngle, edgeAngle, Math.min(raw[v], denoised[v]));
+    // bumps at the relief size are removed with creases pinned; the move is the bump's own height, which is the
+    // smoothing's own budget on top of the shared one (the other operations keep theirs, measured from the smoothed
+    // surface)
+    const relief = smoothDisplacement(pos, index, topo, { amount: smooth, featureSize, edgeAngle, pin }, (f) => report('Smoothing bumps', 0.1 + 0.15 * f));
+    stats.iterations += relief.passes;
+    stats.smoothRelief = relief.debug;
+    applyRelief(fd0, relief, 0.05);
+    for (let v = 0; v < V; v++) {
+      const v3 = v * 3;
+      smoothMove[v] = Math.sqrt((pos[v3] - pos0[v3]) ** 2 + (pos[v3 + 1] - pos0[v3 + 1]) ** 2 + (pos[v3 + 2] - pos0[v3 + 2]) ** 2);
+    }
+  }
+  const smoothedRef = smooth > 0 ? pos.slice() : pos0; // the surface the sharpening's budget is measured from
+
   if (smooth > 0 || sharpen > 0) {
-    const fdS = fd0;
+    // normal filtering on the (lump-free) surface, then the vertices are moved to fit the filtered normals: the
+    // smoothing's bilateral filter takes out triangle-scale noise, the sharpening's guided filter makes rounded edges
+    // crisp; only groups of faces whose filtered normals agree are fitted as planes
+    const fdS = smooth > 0 ? faceData(pos, index) : fd0;
     const tmp = new Float64Array(T * 3);
     const cut = chord(edgeAngle);
     const sigmaR = cut / 2;
     const sigmaS = featureSize > 0 ? featureSize : 1.5 * h;
     const stopCos = Math.cos((0.5 * Math.PI) / 180);
-    let cur = fd0.n.slice();
+    let cur = fdS.n.slice();
     let nxt = tmp;
     let nSmooth = null; // the normals after smoothing only, for a partial sharpen amount
     const turned = () => {
@@ -1183,19 +1486,20 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
       return false;
     };
     if (smooth > 0) {
-      // more iterations for a wider feature size: iterating a 1-ring filter approximates a wider kernel
-      const extra = featureSize > 2 * h ? Math.min(6, Math.round(featureSize / h) - 2) : 0;
-      const K = Math.round(2 + 4 * smooth) + extra;
+      const K = Math.round(2 + 4 * smooth);
       const sigmaRs = sigmaR * (0.3 + 0.7 * smooth);
       for (let k = 0; k < K; k++) {
-        bilateral(topo, fd0, cur, cur, nxt, sigmaS, sigmaRs, cut, null, false);
+        bilateral(topo, fdS, cur, cur, nxt, 1.5 * h, sigmaRs, cut, null, false);
         const more = turned();
         [cur, nxt] = [nxt, cur];
         stats.iterations++;
-        report('Smoothing bumps', 0.1 + (0.2 * (k + 1)) / K);
+        report('Smoothing bumps', 0.25 + (0.05 * (k + 1)) / K);
         if (!more) break;
       }
-      if (sharpen > 0 && sharpen < 1) nSmooth = cur.slice();
+      if (sharpen > 0 && sharpen < 1) {
+        nSmooth = cur.slice();
+        smoothed = pos.slice();
+      }
     }
     if (sharpen > 0) {
       const g = new Float64Array(T * 3);
@@ -1226,13 +1530,13 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
       }
     }
     report('Fitting the surface', 0.5);
-    fitToNormals(topo, index, pos0, pos, cur, n0, 10, cap, stats);
+    fitToNormals(topo, index, smoothedRef, pos, cur, n0, 10, cap, stats);
     if (sharpen > 0 && sharpen < 1) {
       // a partial amount is a fraction of the way from the smoothed-only result to the fully sharpened one, re-checked for flips
       let from = pos0;
       if (nSmooth) {
-        from = pos0.slice();
-        fitToNormals(topo, index, pos0, from, nSmooth, n0, 10, cap, stats);
+        from = smoothed;
+        fitToNormals(topo, index, smoothedRef, from, nSmooth, n0, 10, cap, stats);
       }
       const disp = new Float64Array(V * 3);
       for (let i = 0; i < V * 3; i++) disp[i] = from[i] - pos0[i] + sharpen * (pos[i] - from[i]);
@@ -1269,7 +1573,8 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
     applyRelief(fdNow, relief, 0.05);
   }
 
-  // shared budget: the total movement of a vertex never exceeds its cap, and the result has no flipped triangle
+  // shared budget: the total movement of a vertex never exceeds its cap plus its smoothing move, and the result has
+  // no flipped triangle
   report('Checking triangles', 0.92);
   const total = new Float64Array(V * 3);
   for (let v = 0; v < V; v++) {
@@ -1277,7 +1582,7 @@ export function enhanceMesh(mesh, options = {}, onProgress) {
     const w = weights ? Math.min(1, Math.max(0, weights[v])) : 1;
     let dx = w * (pos[v3] - pos0[v3]), dy = w * (pos[v3 + 1] - pos0[v3 + 1]), dz = w * (pos[v3 + 2] - pos0[v3 + 2]);
     const l = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    const c = cap[v];
+    const c = cap[v] > 0 ? cap[v] + smoothMove[v] : 0;
     if (l > c) {
       const s = c > 0 ? c / l : 0;
       dx *= s;

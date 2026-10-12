@@ -109,7 +109,9 @@ describe('conformSolid stats', () => {
     expect(adaptive.stats.triangles).toBeLessThan(fixed.stats.triangles);
     expect(adaptive.stats.rMin).toBeGreaterThan(15);
     expect(adaptive.stats.rMin).toBeLessThan(25);
-    expect(Math.abs(adaptive.solid.volume() - 30 * 6 * 2.4) / (30 * 6 * 2.4)).toBeLessThan(0.03);
-    expect(adaptive.solid.boundingBox().min[2]).toBeCloseTo(Math.sqrt(400 - 225) - 20 - 0.4, 0);
+    // standing square on the cylinder: a sector of the ring between R - 0.4 and R + 2
+    const volume = 6 * 2 * Math.asin(15 / 20) * (22 ** 2 - 19.6 ** 2) / 2;
+    expect(Math.abs(adaptive.solid.volume() - volume) / volume).toBeLessThan(0.03);
+    expect(adaptive.solid.boundingBox().min[2]).toBeCloseTo(Math.sqrt(400 - 225) - 20 - 0.4 * Math.cos(Math.asin(15 / 20)), 0);
   });
 });

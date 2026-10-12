@@ -468,6 +468,10 @@ describe('enhanceMesh: contract', () => {
 
   it('is independent of the model orientation', () => {
     const cube = build((M) => M.cube([20, 20, 20], true).refineToLength(1));
+    // a hair of jitter: on an exactly symmetric shape the sharpening's choice between two equally flat patches is a
+    // tie, which rotation rounding would break differently; a real model has no such ties
+    const rnd = mulberry32(3);
+    for (let i = 0; i < cube.positions.length; i++) cube.positions[i] += (rnd() - 0.5) * 2e-3;
     const soft = soften(cube, 0.5, 2);
     const out = enhanceMesh(soft, { sharpen: 1, smooth: 0.4, detail: 0.6 }).positions;
     // rotate by an awkward angle about a skew axis, enhance, rotate back

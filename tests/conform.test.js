@@ -26,6 +26,31 @@ const cylinderY = () => manifold().Manifold.cylinder(60, 20, 20, 128, true).rota
 /** Height of the cylinder's top surface above the text plane at local x. */
 const cylinderHeight = (x) => Math.sqrt(400 - x * x) - 20;
 
+/**
+ * Volume of a slab z0..z1 of width 2·half (as placed, i.e. projected onto the cylinder) and depth `d` along the axis
+ * once it stands square on the cylinder of radius R: a sector of the ring between R + z0 and R + z1.
+ */
+const shellVolume = (R, half, d, z0, z1) => d * 2 * Math.asin(half / R) * ((R + z1) ** 2 - (R + z0) ** 2) / 2;
+
+/** Distance of every vertex of a text-local solid from the axis of cylinderY() placed under top(20). */
+function radii(solid) {
+  const v = solid.getMesh().vertProperties;
+  const out = [];
+  for (let i = 0; i < v.length; i += 3) out.push(Math.hypot(v[i], v[i + 2] + 20));
+  return out;
+}
+
+/** A thin sheet 120 wide that bends up towards its ends (z = x² / 200), 2 thick. */
+function bentSheet() {
+  const { Manifold } = manifold();
+  const flat = Manifold.cube([120, 40, 2], true).refineToLength(2);
+  const bent = flat.warpBatch((verts, count) => {
+    for (let i = 0; i < count; i++) verts[i * 3 + 2] += (verts[i * 3] * verts[i * 3]) / 200;
+  });
+  flat.delete();
+  return bent;
+}
+
 /** Slab spanning local z0..z1 with a `w` x `d` footprint. */
 function slab(w, d, z0, z1) {
   return manifold().Manifold.cube([w, d, z1 - z0], true).translate(0, 0, (z0 + z1) / 2);
@@ -60,6 +85,18 @@ describe('createSurfaceSampler', () => {
     sphere.delete();
   });
 
+  it('reads the front of a thin sheet that bends towards the text, not its back', () => {
+    const sheet = bentSheet();
+    const sampler = samplerFor(sheet, placementMatrix({ position: [0, 0, 1], normal: [0, 0, 1] }));
+    expect(sampler.heightAt(0, 0)).toBeCloseTo(0, 2);
+    // at x = 50 the top is 12.5 above the plane and the underside 10.5: the underside is nearer the plane, but it faces away
+    expect(Math.abs(sampler.heightAt(50, 0) - 12.5)).toBeLessThan(0.1);
+    expect(Math.abs(sampler.heightAt(-55, 10) - 15.125)).toBeLessThan(0.1);
+    expect(sampler.sample(50, 0).wall).toBeCloseTo(2, 1);
+    sampler.dispose();
+    sheet.delete();
+  });
+
   it('accepts an unlimited search range and goes blind after dispose()', () => {
     const box = manifold().Manifold.cube([40, 40, 10], true);
     const sampler = samplerFor(box, top(5), { searchAbove: Infinity, searchBelow: Infinity });
@@ -90,17 +127,19 @@ describe('conformSolid', () => {
   it('wraps an embossed slab around a cylinder', () => {
     const cyl = cylinderY();
     const sampler = samplerFor(cyl, top(20));
-    const flat = slab(30, 6, -0.4, 2); // 30 x 6 x 2.4 = 432
+    const flat = slab(30, 6, -0.4, 2);
     const { solid, conformed, stats } = conformSolid(flat, sampler);
     expect(solid.status()).toBe('NoError');
     expect(conformed).toBe(true);
     expect(stats.triangles).toBeGreaterThan(flat.numTri());
-    expect(Math.abs(solid.volume() - 432) / 432).toBeLessThan(0.03);
-    // the slab bottom (z = -0.4) sinks to the surface height at the ends
-    expect(Math.abs(bounds(solid).min[2] - (cylinderHeight(15) - 0.4))).toBeLessThan(0.15);
+    // the slab stands square on the cylinder: a sector of the ring between R - 0.4 and R + 2
+    const volume = shellVolume(20, 15, 6, -0.4, 2);
+    expect(Math.abs(solid.volume() - volume) / volume).toBeLessThan(0.03);
+    // the slab bottom (z = -0.4) sinks to the surface at the ends, measured along the surface normal there
+    expect(Math.abs(bounds(solid).min[2] - (cylinderHeight(15) - 0.4 * Math.cos(Math.asin(15 / 20))))).toBeLessThan(0.15);
     expect(isClosed(manifoldToGeometry(solid))).toBe(true);
 
-    const expected = 30 * 6 * 2; // footprint x height above the surface
+    const expected = shellVolume(20, 15, 6, 0, 2); // the ring sector above the surface
     const placed = place(solid, top(20));
     const placedFlat = place(flat, top(20));
     const conformedUnion = cyl.add(placed);
@@ -122,9 +161,55 @@ describe('conformSolid', () => {
     const placed = place(solid, top(20));
     const cut = cyl.subtract(placed);
     const removed = cyl.volume() - cut.volume();
-    const expected = 30 * 6 * 1.5;
+    const expected = shellVolume(20, 15, 6, -1.5, 0); // the ring sector below the surface
     expect(Math.abs(removed - expected) / expected).toBeLessThan(0.05);
     [cut, placed, solid, flat, cyl].forEach((s) => s.delete());
+    sampler.dispose();
+  });
+
+  it('keeps a constant height on a cylinder: every point of the slab sits between R - 0.4 and R + 2 from the axis', () => {
+    const cyl = cylinderY();
+    const sampler = samplerFor(cyl, top(20));
+    const flat = slab(30, 6, -0.4, 2);
+    const { solid } = conformSolid(flat, sampler);
+    const r = radii(solid);
+    expect(Math.min(...r)).toBeGreaterThan(19.6 - 0.05);
+    expect(Math.max(...r)).toBeLessThan(22 + 0.05);
+    // ... at the ends too, where the surface slopes 49°: standing square on the surface, not along the text's normal
+    const v = solid.getMesh().vertProperties;
+    let endTop = 0;
+    for (let i = 0; i < v.length; i += 3) if (Math.abs(v[i]) > 14) endTop = Math.max(endTop, Math.hypot(v[i], v[i + 2] + 20));
+    expect(endTop).toBeGreaterThan(22 - 0.05);
+    [solid, flat, cyl].forEach((s) => s.delete());
+    sampler.dispose();
+  });
+
+  it('lays a slab over a sheet that bends up at its ends without burying the ends', () => {
+    const sheet = bentSheet();
+    const placement = placementMatrix({ position: [0, 0, 1], normal: [0, 0, 1] });
+    const sampler = samplerFor(sheet, placement);
+    const flat = slab(110, 10, -0.4, 2);
+    const { solid, conformed, stats } = conformSolid(flat, sampler);
+    expect(conformed).toBe(true);
+    expect(stats.misses).toBe(0);
+    expect(solid.status()).toBe('NoError');
+    // nothing sinks deeper than the overlap below the top surface, and the slab stands its full height above it
+    const v = solid.getMesh().vertProperties;
+    let deepest = Infinity;
+    let highest = -Infinity;
+    for (let i = 0; i < v.length; i += 3) {
+      const above = v[i + 2] - (v[i] * v[i]) / 200;
+      deepest = Math.min(deepest, above);
+      highest = Math.max(highest, above);
+    }
+    expect(deepest).toBeGreaterThan(-0.6);
+    expect(highest).toBeGreaterThan(1.9);
+    // the raised part really sits on the sheet: the union grows by about the slab's height over its footprint
+    const placed = place(solid, placement);
+    const union = sheet.add(placed);
+    const added = union.volume() - sheet.volume();
+    expect(added).toBeGreaterThan(110 * 10 * 2 * 0.9);
+    [union, placed, solid, flat, sheet].forEach((s) => s.delete());
     sampler.dispose();
   });
 

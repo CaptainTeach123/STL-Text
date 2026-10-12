@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { BufferGeometry } from 'three';
-import { conformSolid, createSurfaceSampler, wallThicknessAt } from '../src/conform.js';
+import { conformNotes, conformSolid, createSurfaceSampler, wallThicknessAt } from '../src/conform.js';
 import { manifold } from '../src/manifold.js';
 import { manifoldToGeometry } from '../src/mesh.js';
 import { placementMatrix, toMat4 } from '../src/placement.js';
@@ -27,10 +27,10 @@ const cylinderY = () => manifold().Manifold.cylinder(60, 20, 20, 128, true).rota
 const cylinderHeight = (x) => Math.sqrt(400 - x * x) - 20;
 
 /**
- * Volume of a slab z0..z1 of width 2·half (as placed, i.e. projected onto the cylinder) and depth `d` along the axis
- * once it stands square on the cylinder of radius R: a sector of the ring between R + z0 and R + z1.
+ * Volume of a slab z0..z1 of width 2·half and depth `d` along the axis once it is wrapped round the cylinder of
+ * radius R (its width measured along the surface): a sector of the ring between R + z0 and R + z1.
  */
-const shellVolume = (R, half, d, z0, z1) => d * 2 * Math.asin(half / R) * ((R + z1) ** 2 - (R + z0) ** 2) / 2;
+const shellVolume = (R, half, d, z0, z1) => d * ((2 * half) / R) * ((R + z1) ** 2 - (R + z0) ** 2) / 2;
 
 /** Distance of every vertex of a text-local solid from the axis of cylinderY() placed under top(20). */
 function radii(solid) {
@@ -132,11 +132,11 @@ describe('conformSolid', () => {
     expect(solid.status()).toBe('NoError');
     expect(conformed).toBe(true);
     expect(stats.triangles).toBeGreaterThan(flat.numTri());
-    // the slab stands square on the cylinder: a sector of the ring between R - 0.4 and R + 2
+    // the slab is wrapped round the cylinder: 30 mm along the surface, a sector of the ring between R - 0.4 and R + 2
     const volume = shellVolume(20, 15, 6, -0.4, 2);
     expect(Math.abs(solid.volume() - volume) / volume).toBeLessThan(0.03);
-    // the slab bottom (z = -0.4) sinks to the surface at the ends, measured along the surface normal there
-    expect(Math.abs(bounds(solid).min[2] - (cylinderHeight(15) - 0.4 * Math.cos(Math.asin(15 / 20))))).toBeLessThan(0.15);
+    // its ends sit 15 mm round the surface (0.75 rad) from the middle, the bottom corner 0.4 inside the surface
+    expect(Math.abs(bounds(solid).min[2] - (19.6 * Math.cos(0.75) - 20))).toBeLessThan(0.15);
     expect(isClosed(manifoldToGeometry(solid))).toBe(true);
 
     const expected = shellVolume(20, 15, 6, 0, 2); // the ring sector above the surface
@@ -281,6 +281,26 @@ describe('conformSolid', () => {
     expect(hi).toBeGreaterThan(0.9);
     [solid, slotted, slot, domed, block].forEach((m) => m.delete());
     sampler.dispose();
+  });
+
+  it('warns when the text runs under a part of the model hanging over the surface, with no room for its letters', () => {
+    const { Manifold } = manifold();
+    // a block with a shelf 1 mm over its top, covering the right half of the text
+    const block = Manifold.cube([60, 30, 10], true);
+    const post = Manifold.cube([4, 30, 1], true).translate(28, 0, 5.5);
+    const shelf = Manifold.cube([34, 30, 2], true).translate(13, 0, 7);
+    const model = block.add(post).add(shelf);
+    const sampler = samplerFor(model, top(5));
+    const { stats } = conformSolid(slab(40, 8, -0.4, 1.5), sampler);
+    expect(stats.squeezedFraction).toBeGreaterThan(0.2);
+    expect(conformNotes(stats).map((n) => n.code)).toContain('UNDER_OVERHANG');
+    // with room to spare (the shelf 10 mm up) there is nothing to say
+    const high = block.add(Manifold.cube([4, 30, 10], true).translate(28, 0, 10)).add(Manifold.cube([34, 30, 2], true).translate(13, 0, 16));
+    const roomy = samplerFor(high, top(5));
+    expect(conformSolid(slab(40, 8, -0.4, 1.5), roomy).stats.squeezedFraction).toBe(0);
+    [model, block, post, shelf, high].forEach((m) => m.delete());
+    sampler.dispose();
+    roomy.dispose();
   });
 
   it('fills sample misses where the text overhangs the model', () => {

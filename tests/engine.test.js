@@ -233,6 +233,55 @@ describe('preview', () => {
     sheet.delete();
   });
 
+  it('wraps text round a mug as far as it is long: every letter on the surface, none lost from the export', async () => {
+    // a mug R 30: 'Candy Cane Lane' at 8 mm is about 93 mm long, so it wraps nearly half way round (about 180°);
+    // projected from the click it would reach past the mug's silhouette and its end letters would float off
+    const outer = wasm.Manifold.cylinder(90, 30, 30, 256, false);
+    const inner = wasm.Manifold.cylinder(90, 26, 26, 256, false).translate([0, 0, 6]);
+    const mug = outer.subtract(inner);
+    await client.loadBase({ kind: 'stl', bytes: stlOf(mug), name: 'mug', version: ++version });
+    const item = createItem({ text: 'Candy Cane Lane', fontId: 'inter', size: 8, depth: 1.5, position: [0, -30, 45], normal: [0, -1, 0] });
+    const r = await client.preview(item, version);
+    const codes = r.notes.map((n) => n.code);
+    expect(codes).not.toContain('OVERHANG');
+    expect(codes).not.toContain('TOO_CURVED');
+    expect(r.stats.wrapDeg).toBeGreaterThan(150);
+    const ex = await client.export([item], version, 'mug');
+    expect(ex.notes?.map((n) => n.code) ?? []).not.toContain('FRAGMENTS_REMOVED');
+    const m = geometryToManifold(parseSTL(ex.stl));
+    expect(m.decompose().length).toBe(1);
+    // the letters add what they add on a flat face of the same size, within the shell factor of the curve
+    const flatBox = wasm.Manifold.cube([200, 40, 20], true);
+    await client.loadBase({ kind: 'stl', bytes: stlOf(flatBox), name: 'flat', version: ++version });
+    const onFlat = await client.export([createItem({ text: 'Candy Cane Lane', fontId: 'inter', size: 8, depth: 1.5, position: [0, 0, 10], normal: [0, 0, 1] })], version, 'flat');
+    const addedFlat = volumeOfStl(onFlat.stl) - flatBox.volume();
+    const added = m.volume() - mug.volume();
+    expect(added / addedFlat).toBeGreaterThan(0.95);
+    expect(added / addedFlat).toBeLessThan(1.1);
+    [m, mug, outer, inner, flatBox].forEach((x) => x.delete());
+  });
+
+  it('leaves out, and names, the letters that hang past the edge of the model', async () => {
+    const box = wasm.Manifold.cube([40, 40, 10], true);
+    await client.loadBase({ kind: 'stl', bytes: stlOf(box), name: 'box', version: ++version });
+    // about 70 mm of text whose middle is 10 mm right of the box's centre: the last letters lie wholly past its edge
+    const item = topItem('HELLO WORLD', { size: 8, position: [10, 0, 5], depth: 1.5 });
+    const r = await client.result([item], version);
+    const off = r.notes.find((n) => n.code === 'LETTERS_OFF_MODEL');
+    expect(off).toBeDefined();
+    expect(off.count).toBeGreaterThanOrEqual(2);
+    expect(off.level).toBe('warn');
+    expect(r.notes.map((n) => n.code)).not.toContain('FRAGMENTS_REMOVED');
+    const ex = await client.export([item], version, 'box');
+    const m = geometryToManifold(parseSTL(ex.stl));
+    expect(m.decompose().length).toBe(1); // nothing loose in the download
+    m.delete();
+    // cut in, the letters off the model cut nothing, and say so
+    const cut = await client.result([topItem('HELLO WORLD', { size: 8, position: [10, 0, 5], mode: 'engrave', depth: 1 })], version);
+    expect(cut.notes.find((n) => n.code === 'LETTERS_OFF_MODEL')?.text).toMatch(/cut nothing/);
+    box.delete();
+  });
+
   it('follows a curved surface', async () => {
     const cyl = wasm.Manifold.cylinder(60, 20, 20, 128, true).rotate([90, 0, 0]);
     await client.loadBase({ kind: 'stl', bytes: stlOf(cyl), name: 'cyl', version: ++version });

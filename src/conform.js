@@ -1,4 +1,4 @@
-import { BufferGeometry, DoubleSide, Ray, Vector3 } from 'three';
+import { BufferGeometry, DoubleSide, Ray, Triangle, Vector3 } from 'three';
 import { MeshBVH } from 'three-mesh-bvh';
 import { manifoldToGeometry } from './mesh.js';
 
@@ -7,11 +7,19 @@ import { manifoldToGeometry } from './mesh.js';
  *
  * Text is built as a flat extrusion in a local frame (X/Y in the text plane,
  * +Z = outward surface normal, origin = the clicked point). On a curved model a
- * flat slab cuts too deep in the middle or floats at the ends, so we sample the
- * model surface height h(x, y) above the text plane on a grid and move every
- * vertex of the (refined) slab onto the surface there and out along the
- * surface's own normal by the vertex's height: the letters stand square on
- * the surface everywhere, at the same height or depth, however it slopes.
+ * flat slab cuts too deep in the middle or floats at the ends, so the slab is
+ * laid onto the surface like a sticker: a grid is walked over the surface from
+ * the clicked point – along the reading direction, then up and down from each
+ * node – in steps of a fixed length along the surface, and every vertex of the
+ * (refined) slab goes to the surface point its flat (x, y) reaches and out
+ * along the surface normal there by its height. The letters keep their size
+ * and spacing measured along the surface, wrap round a mug, a cane or the
+ * inside of a ring as far as the text is long, and stand square on the
+ * surface at the same height or depth everywhere.
+ *
+ * Rigid parts (and samplers that cannot walk) use a projection instead: the
+ * surface height h(x, y) under the text plane, sampled along the text's
+ * normal and followed outward from the clicked point.
  */
 
 /** Grid nodes per axis above which the sample spacing is enlarged. */
@@ -132,9 +140,52 @@ export function createSurfaceSampler(geometry, placement, options = {}) {
     return { z: best, wall: wallBelow(hits, best) };
   };
 
+  // walking primitives, all in the item's local frame
+  const q = new Vector3();
+  const dir = new Vector3();
+  const tri = new Triangle();
+  const faceNormal = (faceIndex, out) => {
+    const g = bvh.geometry;
+    const idx = g.index;
+    const pos = g.attributes.position;
+    tri.setFromAttributeAndIndices(pos, idx.getX(faceIndex * 3), idx.getX(faceIndex * 3 + 1), idx.getX(faceIndex * 3 + 2));
+    return tri.getNormal(out);
+  };
+  const toLocal = (point, n) => {
+    const p = point.clone().applyMatrix4(inverse);
+    const m = n.clone().transformDirection(inverse);
+    return { p: [p.x, p.y, p.z], n: [m.x, m.y, m.z] };
+  };
+  const closestTarget = { point: new Vector3(), distance: 0, faceIndex: 0 };
+
   return {
     /** Local-Z height of the surface at (x, y) and the wall thickness behind it. */
     sample,
+    /**
+     * The point of the surface nearest the local point p within `maxDistance`, with its face's normal (local), or
+     * null.
+     */
+    closest(p, maxDistance = Infinity) {
+      if (!bvh) return null;
+      q.set(p[0], p[1], p[2]).applyMatrix4(placement);
+      const found = bvh.closestPointToPoint(q, closestTarget, 0, maxDistance);
+      if (!found) return null;
+      return { ...toLocal(found.point, faceNormal(found.faceIndex, new Vector3())), distance: found.distance };
+    },
+    /** Every surface crossed going from the local point p along the local direction d within `length`: { p, n, distance }. */
+    castAll(p, d, length) {
+      if (!bvh) return [];
+      const r = new Ray(q.set(p[0], p[1], p[2]).applyMatrix4(placement), dir.set(d[0], d[1], d[2]).transformDirection(placement));
+      return bvh.raycast(r, DoubleSide, 0, length).map((hit) => ({ ...toLocal(hit.point, faceNormal(hit.faceIndex, new Vector3())), distance: hit.distance }));
+    },
+    /** The first surface crossed going from the local point p along the local direction d, within `length`, or null. */
+    cast(p, d, length) {
+      if (!bvh) return null;
+      const r = new Ray(q.set(p[0], p[1], p[2]).applyMatrix4(placement), dir.set(d[0], d[1], d[2]).transformDirection(placement));
+      const hit = bvh.raycastFirst(r, DoubleSide, 0, length);
+      if (!hit) return null;
+      return { ...toLocal(hit.point, faceNormal(hit.faceIndex, new Vector3())), distance: hit.distance };
+    },
     /** Every crossing of the surface along the column at (x, y), unsorted: { z, front }. */
     hitsAt,
     heightAt(x, y) {
@@ -167,6 +218,23 @@ export function createSurfaceSampler(geometry, placement, options = {}) {
       if (bvh && bvhCache.get(geometry) === bvh) bvhCache.delete(geometry);
       bvh = null;
     },
+  };
+}
+
+/**
+ * A test of whether a point (model space) lies inside the closed model: the parity of the surface crossings along a
+ * ray from it. Null when the geometry is empty.
+ * @param {BufferGeometry} geometry
+ * @returns {((point: number[]) => boolean) | null}
+ */
+export function createInsideTest(geometry) {
+  const bvh = bvhFor(geometry);
+  if (!bvh) return null;
+  // an awkward direction, so the ray does not run along an edge or a face of a box-like model
+  const ray = new Ray(new Vector3(), new Vector3(0.3192, 0.5377, 0.7803).normalize());
+  return (point) => {
+    ray.origin.set(point[0], point[1], point[2]);
+    return bvh.raycast(ray, DoubleSide).length % 2 === 1;
   };
 }
 
@@ -321,6 +389,358 @@ function trackSurface(sampler, { nx, ny, x0, y0, cell, jump }) {
   };
 }
 
+/* --------------------------------------------------------------- walking */
+
+const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross3 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const along = (p, d, t) => [p[0] + d[0] * t, p[1] + d[1] * t, p[2] + d[2] * t];
+const unit3 = (a) => {
+  const l = Math.hypot(a[0], a[1], a[2]);
+  return l > 1e-12 ? [a[0] / l, a[1] / l, a[2] / l] : null;
+};
+const angleOf = (a, b) => Math.acos(Math.max(-1, Math.min(1, dot3(a, b))));
+
+/** A turn of the surface sharper than this within one step is an edge, not a curve to wrap round. */
+const SHARP = Math.cos((50 * Math.PI) / 180);
+/** Text never wraps on to surface facing more than this away from the text's own direction (the back of a sheet). */
+const AWAY = Math.cos((120 * Math.PI) / 180);
+
+/** The heading d carried from a surface with normal n on to one with normal m (turned as n turns into m). */
+function transport(d, n, m) {
+  const axis = cross3(n, m);
+  const s = Math.hypot(axis[0], axis[1], axis[2]);
+  let out = d;
+  if (s > 1e-9) {
+    const k = [axis[0] / s, axis[1] / s, axis[2] / s];
+    const c = dot3(n, m);
+    const kd = cross3(k, d);
+    const kk = dot3(k, d) * (1 - c);
+    out = [d[0] * c + kd[0] * s + k[0] * kk, d[1] * c + kd[1] * s + k[1] * kk, d[2] * c + kd[2] * s + k[2] * kk];
+  }
+  const t = dot3(out, m);
+  return unit3([out[0] - t * m[0], out[1] - t * m[1], out[2] - t * m[2]]) ?? d;
+}
+
+/**
+ * One step of length ds over the surface from p (normal n) heading d: the surface point nearest the point ds ahead.
+ * Null where the surface ends within the step, turns sharply (an edge, a ledge, the rim of a sheet), would face away
+ * from the text, or gives no headway (a wall right ahead).
+ */
+function stepOver(sampler, p, n, d, ds) {
+  const c = sampler.closest(along(p, d, ds), ds);
+  if (!c) return null;
+  if (dot3(c.n, n) < SHARP) return null;
+  if (c.n[2] < AWAY) return AWAY_FROM_TEXT;
+  if (dot3([c.p[0] - p[0], c.p[1] - p[1], c.p[2] - p[2]], d) < 0.3 * ds) return null;
+  return c;
+}
+
+/** stepOver's answer where the surface curves on round the back, past what the text may wrap. */
+const AWAY_FROM_TEXT = Object.freeze({ away: true });
+
+/**
+ * The surface under a point carried past an edge: of the surfaces crossed along -n within `jump` either side of the
+ * point, the one facing the text's way nearest it (the far side of a slot, the top of a ledge, the floor below a step).
+ */
+function landAt(sampler, c, n, jump) {
+  let best = null;
+  let bestD = Infinity;
+  for (const h of sampler.castAll(along(c, n, jump), [-n[0], -n[1], -n[2]], 2 * jump)) {
+    if (dot3(h.n, n) < SHARP || h.n[2] < AWAY) continue;
+    const d = Math.abs(h.distance - jump);
+    if (d < bestD) {
+      bestD = d;
+      best = h;
+    }
+  }
+  return best;
+}
+
+/**
+ * Walk `count` steps of length ds over the surface from `start` ({ p, n, on, lost }) heading d, calling
+ * emit(k, p, n, d, on, sharp, lost) after each. Smooth curvature is wrapped round; at a sharp turn the walk carries
+ * on straight and lands on the surface it finds there (`sharp` is then set), or carries on in the air (`on` false)
+ * where there is none, trying to land again at every step. `lost` says why the walk left the surface: EDGE (the
+ * text hangs over an edge) or ROUND_THE_BACK (the surface curves on round the back, further than text may wrap).
+ */
+function walk(sampler, start, d, count, ds, jump, emit) {
+  let { p, n, on, lost = 0 } = start;
+  for (let k = 1; k <= count; k++) {
+    let next = on ? stepOver(sampler, p, n, d, ds) : null;
+    if (next?.away) {
+      next = null;
+      lost = ROUND_THE_BACK;
+    } else if (on && !next) {
+      lost = EDGE;
+    }
+    const sharp = on && !next;
+    if (!next) {
+      const carried = along(p, d, ds);
+      next = landAt(sampler, carried, n, jump);
+      if (!next) {
+        p = carried;
+        on = false;
+        emit(k, p, n, d, false, sharp, lost);
+        continue;
+      }
+    }
+    d = transport(d, n, next.n);
+    p = next.p;
+    n = next.n;
+    on = true;
+    lost = 0;
+    emit(k, p, n, d, true, sharp, 0);
+  }
+}
+
+/** Why a walk left the surface. */
+const EDGE = 1;
+const ROUND_THE_BACK = 2;
+
+/**
+ * A grid walked over the surface: node (i, j) is the surface point reached from the seed by walking (i - i0)·cell
+ * along the reading direction and then (j - j0)·cell along the up direction, both measured along the surface.
+ * Returns the points, the walked (face) normals, whether each node is on the surface, and where a sharp turn was
+ * crossed.
+ */
+function walkChart(sampler, { nx, ny, i0, j0, cell, jump, seed }) {
+  const N = nx * ny;
+  const P = new Float64Array(N * 3);
+  const W = new Float64Array(N * 3);
+  const on = new Uint8Array(N);
+  const sharp = new Uint8Array(N);
+  const lost = new Uint8Array(N);
+  const set = (k, p, n, onSurface, isSharp, why = 0) => {
+    P[k * 3] = p[0];
+    P[k * 3 + 1] = p[1];
+    P[k * 3 + 2] = p[2];
+    W[k * 3] = n[0];
+    W[k * 3 + 1] = n[1];
+    W[k * 3 + 2] = n[2];
+    on[k] = onSurface ? 1 : 0;
+    sharp[k] = isSharp ? 1 : 0;
+    lost[k] = onSurface ? 0 : why;
+  };
+  const heading = new Array(nx);
+  set(j0 * nx + i0, seed.p, seed.n, true, false);
+  const x = unit3([1 - seed.n[0] * seed.n[0], -seed.n[0] * seed.n[1], -seed.n[0] * seed.n[2]]) ?? [1, 0, 0];
+  heading[i0] = x;
+  const start = { p: seed.p, n: seed.n, on: true };
+  walk(sampler, start, x, nx - 1 - i0, cell, jump, (k, p, n, d, o, sh, why) => {
+    set(j0 * nx + i0 + k, p, n, o, sh, why);
+    heading[i0 + k] = d;
+  });
+  walk(sampler, start, [-x[0], -x[1], -x[2]], i0, cell, jump, (k, p, n, d, o, sh, why) => {
+    set(j0 * nx + i0 - k, p, n, o, sh, why);
+    heading[i0 - k] = [-d[0], -d[1], -d[2]];
+  });
+  for (let i = 0; i < nx; i++) {
+    const k = j0 * nx + i;
+    const p = [P[k * 3], P[k * 3 + 1], P[k * 3 + 2]];
+    const n = [W[k * 3], W[k * 3 + 1], W[k * 3 + 2]];
+    const up = unit3(cross3(n, heading[i])) ?? [0, 1, 0];
+    const from = { p, n, on: !!on[k], lost: lost[k] };
+    walk(sampler, from, up, ny - 1 - j0, cell, jump, (m, q, nn, d, o, sh, why) => set((j0 + m) * nx + i, q, nn, o, sh, why));
+    walk(sampler, from, [-up[0], -up[1], -up[2]], j0, cell, jump, (m, q, nn, d, o, sh, why) => set((j0 - m) * nx + i, q, nn, o, sh, why));
+  }
+  return { P, W, on, sharp, lost };
+}
+
+/**
+ * conformSolid's wrapping path: the slab laid on to a grid walked over the surface (see walkChart). Null when the
+ * clicked point is not on the surface (the projection path then reports the text as not touching).
+ */
+function wrapSolid(flatSolid, sampler, { min, max, width, height, flatTolerance, reach, wallLimit, options, result }) {
+  const z0 = nearestHit(sampler.hitsAt(0, 0), 0);
+  if (!Number.isFinite(z0) || Math.abs(z0) > reach) return null;
+  // a grid with a node at the origin, covering the footprint and a margin
+  let cell = options.cell ?? Math.max(0.4, Math.min(width, height) / 12);
+  const margin = options.margin ?? cell;
+  const xLo = Math.min(min[0] - margin, 0);
+  const xHi = Math.max(max[0] + margin, 0);
+  const yLo = Math.min(min[1] - margin, 0);
+  const yHi = Math.max(max[1] + margin, 0);
+  cell = Math.max(cell, (xHi - xLo) / (MAX_GRID - 1), (yHi - yLo) / (MAX_GRID - 1));
+  const i0 = Math.ceil(-xLo / cell);
+  const j0 = Math.ceil(-yLo / cell);
+  const nx = i0 + Math.ceil(xHi / cell) + 1;
+  const ny = j0 + Math.ceil(yHi / cell) + 1;
+  const x0 = -i0 * cell;
+  const y0 = -j0 * cell;
+  const N = nx * ny;
+  const jump = Math.max(3, 0.6 * Math.min(width, height), 6 * cell);
+  const { P, W, on, sharp, lost } = walkChart(sampler, { nx, ny, i0, j0, cell, jump, seed: { p: [0, 0, z0], n: [0, 0, 1] } });
+  const pt = (k) => [P[k * 3], P[k * 3 + 1], P[k * 3 + 2]];
+  const wn = (k) => [W[k * 3], W[k * 3 + 1], W[k * 3 + 2]];
+
+  // smooth normals from the grid itself (central differences over a few nodes, more for a taller slab so its top
+  // layer does not fold on a tight concave bend), never across a sharp turn: there the side that agrees is used
+  const zr = Math.max(Math.abs(min[2]), Math.abs(max[2]));
+  const span = Math.max(1, Math.min(3, Math.round((1.5 * zr) / cell)));
+  const agree = (a, b) => on[a] === on[b] && dot3(wn(a), wn(b)) > Math.cos(Math.PI / 6);
+  const G = new Float64Array(N * 3);
+  const diff = (kc, kLo, kHi) => {
+    const a = kLo !== kc && agree(kLo, kc) ? kLo : kc;
+    const b = kHi !== kc && agree(kHi, kc) ? kHi : kc;
+    if (a === b) return null;
+    return [P[b * 3] - P[a * 3], P[b * 3 + 1] - P[a * 3 + 1], P[b * 3 + 2] - P[a * 3 + 2]];
+  };
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const k = j * nx + i;
+      const dx = diff(k, j * nx + Math.max(0, i - span), j * nx + Math.min(nx - 1, i + span));
+      const dy = diff(k, Math.max(0, j - span) * nx + i, Math.min(ny - 1, j + span) * nx + i);
+      let n = dx && dy ? unit3(cross3(dx, dy)) : null;
+      const w = wn(k);
+      if (!n) n = unit3(w) ?? [0, 0, 1];
+      else if (dot3(n, w) < 0) n = [-n[0], -n[1], -n[2]];
+      G[k * 3] = n[0];
+      G[k * 3 + 1] = n[1];
+      G[k * 3 + 2] = n[2];
+    }
+  }
+  const gn = (k) => [G[k * 3], G[k * 3 + 1], G[k * 3 + 2]];
+
+  // statistics behind the notes, over the nodes under the slab's footprint
+  const inside = (i, j) => {
+    const x = x0 + i * cell, y = y0 + j * cell;
+    return x >= min[0] && x <= max[0] && y >= min[1] && y <= max[1];
+  };
+  const buriedAt = (p) => sampler.castAll(p, [0, 0, 1], 1e4).length % 2 === 1; // an odd number of crossings above: inside
+  let misses = 0;
+  let buried = 0;
+  let roundTheBack = 0;
+  let squeezed = 0;
+  let footprint = 0;
+  let sum = 0;
+  let count = 0;
+  let lo = Infinity;
+  let hi = -Infinity;
+  let maxSlope = 0;
+  let crossesEdge = false;
+  let rMin = Infinity;
+  let steep = false;
+  let minWall = Infinity;
+  let thinCells = 0;
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const k = j * nx + i;
+      const under = inside(i, j);
+      if (under) footprint++;
+      if (!on[k]) {
+        misses++;
+        if (lost[k] === ROUND_THE_BACK) roundTheBack++;
+        else if (under && buriedAt(pt(k))) buried++;
+        continue;
+      }
+      const z = P[k * 3 + 2];
+      sum += z;
+      count++;
+      if (z < lo) lo = z;
+      if (z > hi) hi = z;
+      if (!under) continue;
+      maxSlope = Math.max(maxSlope, angleOf(gn(k), [0, 0, 1]));
+      if (sharp[k]) crossesEdge = true;
+      for (const [di, dj] of [[1, 0], [0, 1]]) {
+        if (i + di >= nx || j + dj >= ny) continue;
+        const n = (j + dj) * nx + i + di;
+        if (!on[n]) continue;
+        const turn = angleOf(gn(k), gn(n));
+        if (turn > Math.PI / 4) {
+          crossesEdge = true;
+          continue;
+        }
+        const step = [P[n * 3] - P[k * 3], P[n * 3 + 1] - P[k * 3 + 1], P[n * 3 + 2] - P[k * 3 + 2]];
+        if (sharp[n] || Math.abs(dot3(step, gn(k))) > 0.5 * cell) {
+          crossesEdge = true; // the walk landed past a ledge or a slot between these nodes
+          continue;
+        }
+        if (turn > 1e-6) rMin = Math.min(rMin, cell / turn);
+        if (turn > Math.PI / 6) continue;
+        const stretch = Math.hypot(step[0], step[1], step[2]) / cell;
+        if (stretch > 1.3 || stretch < 0.75) steep = true;
+      }
+      // the wall behind the surface, along its own normal
+      const g = gn(k);
+      const behind = sampler.cast(along(pt(k), g, -0.01), [-g[0], -g[1], -g[2]], 1e4);
+      const wall = behind ? behind.distance + 0.01 : Infinity;
+      if (wall < minWall) minWall = wall;
+      if (wall < wallLimit) thinCells++;
+      // and the room in front of it: a part of the model hanging over the surface (a scroll curling over a banner's
+      // face) closer than the letters are tall leaves no room for them
+      if (max[2] > 0 && sampler.cast(along(pt(k), g, 0.01), g, max[2] + 0.5)) squeezed++;
+    }
+  }
+  // how far the reading line turns from end to end
+  let wrapDeg = 0;
+  for (let i = 1; i < nx; i++) {
+    const a = j0 * nx + i - 1;
+    const b = a + 1;
+    if (on[a] && on[b] && !sharp[b]) wrapDeg += (angleOf(gn(a), gn(b)) * 180) / Math.PI;
+  }
+  const stats = {
+    samples: N,
+    misses,
+    buried,
+    missFraction: (misses - buried - roundTheBack) / N,
+    buriedFraction: footprint ? buried / footprint : 0,
+    squeezedFraction: footprint ? squeezed / footprint : 0,
+    touches: true,
+    minHeight: lo,
+    maxHeight: hi,
+    meanHeight: count ? sum / count : NaN,
+    minWall,
+    thinCells,
+    cell,
+    grid: [nx, ny],
+    maxSlopeDeg: (maxSlope * 180) / Math.PI,
+    steep,
+    wrapDeg,
+    wrapsAround: roundTheBack > 0.02 * N,
+    crossesEdge,
+    rMin,
+    wrapped: true,
+  };
+  if (hi - lo <= flatTolerance && stats.maxSlopeDeg < 0.5 && !crossesEdge) {
+    return result(flatSolid.translate(0, 0, stats.meanHeight), false, stats);
+  }
+
+  // refine just finely enough that the warped facets stay within the chord error
+  const chordError = options.chordError ?? 0.02;
+  let maxEdge = options.maxEdge;
+  if (!(maxEdge > 0)) {
+    maxEdge = Number.isFinite(rMin) ? Math.sqrt(8 * rMin * chordError) : 2;
+    maxEdge = Math.min(Math.max(maxEdge, 0.25), 2, Math.min(width, height) / 3);
+  }
+  stats.maxEdge = maxEdge;
+
+  const refined = flatSolid.refineToLength(maxEdge);
+  const solid = refined.warpBatch((verts, n) => {
+    for (let v = 0; v < n; v++) {
+      const x = verts[v * 3], y = verts[v * 3 + 1], z = verts[v * 3 + 2];
+      const u = Math.min(Math.max((x - x0) / cell, 0), nx - 1);
+      const w = Math.min(Math.max((y - y0) / cell, 0), ny - 1);
+      const i = Math.min(Math.floor(u), nx - 2);
+      const j = Math.min(Math.floor(w), ny - 2);
+      const fx = u - i;
+      const fy = w - j;
+      const k = j * nx + i;
+      const c00 = (1 - fx) * (1 - fy), c10 = fx * (1 - fy), c01 = (1 - fx) * fy, c11 = fx * fy;
+      const at = (a, c) => c00 * a[k * 3 + c] + c10 * a[(k + 1) * 3 + c] + c01 * a[(k + nx) * 3 + c] + c11 * a[(k + nx + 1) * 3 + c];
+      let gx = at(G, 0), gy = at(G, 1), gz = at(G, 2);
+      const l = Math.hypot(gx, gy, gz) || 1;
+      gx /= l;
+      gy /= l;
+      gz /= l;
+      verts[v * 3] = at(P, 0) + z * gx;
+      verts[v * 3 + 1] = at(P, 1) + z * gy;
+      verts[v * 3 + 2] = at(P, 2) + z * gz;
+    }
+  });
+  refined.delete();
+  return result(solid, true, stats);
+}
+
 /**
  * Deform a flat text solid so it follows the sampled surface.
  * @param {import('manifold-3d').Manifold} flatSolid  flat extrusion in text-local space (caller keeps ownership)
@@ -353,6 +773,10 @@ export function conformSolid(flatSolid, sampler, options = {}) {
     stats: { ...emptyStats, ...stats, conformed, triangles: solid.numTri() },
   });
   if (!(width > 0 && height > 0)) return result(flatSolid.translate(0, 0, 0), false, {});
+  if (options.wrap !== false && sampler.closest && sampler.castAll && sampler.hitsAt) {
+    const wrapped = wrapSolid(flatSolid, sampler, { min, max, width, height, flatTolerance, reach, wallLimit, options, result });
+    if (wrapped) return wrapped;
+  }
 
   let cell = options.cell ?? Math.max(0.4, Math.min(width, height) / 12);
   const margin = options.margin ?? cell;
@@ -541,11 +965,33 @@ export function conformNotes(stats, { mode = 'emboss', depth = 1, overlap = 0.4,
   if (stats.missFraction > 0.02) {
     notes.push({ level: 'warn', code: 'OVERHANG', text: 'Part of the text hangs over the edge of the surface.' });
   }
-  if (stats.steep) {
+  if (stats.buriedFraction > 0.02) {
+    notes.push({
+      level: 'warn',
+      code: 'RUNS_INTO_MODEL',
+      text: 'Part of the text runs into the model here – a floor, a ledge or a wall in its way – and is buried in it. Move it or make it smaller.',
+    });
+  }
+  if (stats.squeezedFraction > 0.02) {
+    notes.push({
+      level: 'warn',
+      code: 'UNDER_OVERHANG',
+      text: 'Part of the text runs under a part of the model that hangs over the surface, where there is no room for the letters. Move it out from under it.',
+    });
+  }
+  if (stats.wrapsAround) {
+    notes.push({
+      level: 'warn',
+      code: 'WRAPS_AROUND',
+      text: 'The text is longer than this curve lets it wrap: its ends would run round the back. Make it shorter or smaller, or use two lines.',
+    });
+  } else if (stats.steep) {
     notes.push({
       level: 'warn',
       code: 'TOO_CURVED',
-      text: 'The text is wider than this curve can hold; letters near the ends stretch. Try shorter text, smaller letters or two lines.',
+      text: stats.wrapped
+        ? 'The surface curves two ways here, so the letters near the ends of the text are stretched or squeezed. Try shorter text, smaller letters or two lines.'
+        : 'The text is wider than this curve can hold; letters near the ends stretch. Try shorter text, smaller letters or two lines.',
     });
   }
   if (stats.crossesEdge) {

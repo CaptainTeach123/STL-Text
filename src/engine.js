@@ -1,6 +1,6 @@
 import { BufferGeometry, Float32BufferAttribute, Matrix4, Uint32BufferAttribute, Vector3 } from 'three';
 import { describeRepair, repairToManifold } from './repair.js';
-import { conformNotes, conformSolid, createSurfaceSampler, createUndersideSampler, fitDepth, heightFieldSlab } from './conform.js';
+import { conformNotes, conformSolid, createInsideTest, createSurfaceSampler, createUndersideSampler, fitDepth, heightFieldSlab } from './conform.js';
 import { buildCrossSectionInfo, printLimits, textZRange, thinStrokeReport } from './textGeometry.js';
 import { labelFor, parseFont } from './fontParse.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from './stl.js';
@@ -1455,7 +1455,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         if (foot !== atPlane) atPlane.delete();
         if (!foot.isEmpty()) {
           const slab = Manifold.extrude(foot, 0.2);
-          const out = conformSolid(slab, s);
+          const out = conformSolid(slab, s, { wrap: false }); // a rigid part rests on the surface straight below it
           stats = { ...out.stats, conformed: false };
           out.solid.delete();
           slab.delete();
@@ -1671,6 +1671,53 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
 
   /* ------------------------------------------------------------ result */
 
+  /** Inside tests per model geometry (the surface after the cuts, or the model). */
+  const insideTests = new WeakMap();
+
+  /**
+   * The pieces of an item's solid (its letters) that reach into the model: { solid, off } with `off` the number that
+   * do not, or null when the item is one piece or none of it reaches the model (the item as a whole is then judged).
+   * A letter reaches the model when any of its vertices – its base sinks in by the overlap – lies inside it.
+   */
+  function lettersOnModel(world, temps) {
+    const pieces = world.decompose();
+    if (pieces.length < 2) {
+      pieces.forEach((p) => p.delete());
+      return null;
+    }
+    const geometry = base.current.cutGeometry ?? base.current.geometry;
+    let inside = insideTests.get(geometry);
+    if (!inside) {
+      inside = createInsideTest(geometry);
+      insideTests.set(geometry, inside);
+    }
+    if (!inside) {
+      pieces.forEach((p) => p.delete());
+      return null;
+    }
+    const on = [];
+    let off = 0;
+    for (const piece of pieces) {
+      const v = piece.getMesh().vertProperties;
+      const count = v.length / 3;
+      const stride = Math.max(1, Math.floor(count / 64));
+      let reaches = false;
+      for (let i = 0; i < count && !reaches; i += stride) reaches = inside([v[i * 3], v[i * 3 + 1], v[i * 3 + 2]]);
+      if (reaches) on.push(piece);
+      else {
+        off++;
+        piece.delete();
+      }
+    }
+    if (!off || !on.length) {
+      on.forEach((p) => p.delete());
+      return null;
+    }
+    const solid = temps.add(Manifold.compose(on));
+    on.forEach((p) => p.delete());
+    return { solid, off };
+  }
+
   /** union(base, raised) − union(cut); cached for the same inputs. */
   function finalFor(items, baseVersion, printing, progress) {
     const b = baseFor(baseVersion);
@@ -1726,7 +1773,26 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           });
           return;
         }
-        const world = temps.add(placed.solid.transform(toMat4(placed.placement)));
+        let world = temps.add(placed.solid.transform(toMat4(placed.placement)));
+        // text whose letters run past the edge of the model: the letters that do not reach into it would print as loose
+        // pieces (raised) or cut nothing (cut in); they are left out, and the note says how many
+        if (!isPart(item) && model && b.current.geometry) {
+          const kept = lettersOnModel(world, temps);
+          if (kept && kept.off > 0 && kept.solid) {
+            world = kept.solid;
+            const n = kept.off;
+            notes.push({
+              level: 'warn',
+              code: 'LETTERS_OFF_MODEL',
+              itemId: item.id,
+              count: n,
+              text:
+                meets === 'engrave'
+                  ? `${n} ${n === 1 ? 'letter' : 'letters'} of ${quote(item)} ${n === 1 ? 'lies' : 'lie'} past the edge of the model and ${n === 1 ? 'cuts' : 'cut'} nothing. Move the text or make it shorter.`
+                  : `${n} ${n === 1 ? 'letter' : 'letters'} of ${quote(item)} ${n === 1 ? 'hangs' : 'hang'} past the edge of the model and ${n === 1 ? 'was' : 'were'} left out, as ${n === 1 ? 'it' : 'they'} would print loose. Move the text or make it shorter.`,
+            });
+          }
+        }
         if (pegged) {
           const holes = placed.settle ? temps.add(placed.flat.cutter.translate(0, 0, placed.settle)) : placed.flat.cutter;
           engrave.push(temps.add(holes.transform(toMat4(placed.placement))));

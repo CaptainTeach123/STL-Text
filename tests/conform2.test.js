@@ -72,22 +72,29 @@ describe('conformSolid stats', () => {
     expect(conformNotes(floating.stats)[0].code).toBe('NOT_TOUCHING');
   });
 
-  it('slope: a 30 mm slab on R=20 is fine, a 38 mm one is too curved', () => {
+  it('wraps round a cylinder as far as the text is long, without stretching; a sphere stretches big text', () => {
     const cyl = M.cylinder(60, 20, 20, 128, true).rotate([90, 0, 0]);
-    const fine = run(cyl, top(20), slab(30, 6, -0.4, 2));
-    expect(fine.stats.maxSlopeDeg).toBeGreaterThan(44);
-    expect(fine.stats.maxSlopeDeg).toBeLessThan(54);
-    expect(fine.stats.steep).toBe(false);
-    expect(fine.stats.crossesEdge).toBe(false);
-    expect(conformNotes(fine.stats).map((n) => n.code)).toEqual(['FOLLOWS_CURVE']);
-    const wide = run(cyl, top(20), slab(38, 6, -0.4, 2));
-    expect(wide.stats.steep).toBe(true);
-    expect(wide.stats.crossesEdge).toBe(false); // a smooth silhouette is not a step
-    expect(conformNotes(wide.stats).some((n) => n.code === 'TOO_CURVED')).toBe(true);
-    // wider than the cylinder itself: still "too curved", still no false step
-    const over = run(cyl, top(20), slab(48, 6, -0.4, 2));
-    expect(over.stats.steep).toBe(true);
-    expect(over.stats.crossesEdge).toBe(false);
+    // 30, 38 and 48 mm along a R = 20 surface: 43°, 54° and 69° either side of the middle, all wrapped evenly
+    for (const [w, deg] of [[30, 43], [38, 54], [48, 69]]) {
+      const out = run(cyl, top(20), slab(w, 6, -0.4, 2));
+      expect(out.stats.maxSlopeDeg).toBeGreaterThan(deg - 4);
+      expect(out.stats.maxSlopeDeg).toBeLessThan(deg + 4);
+      expect(out.stats.steep).toBe(false);
+      expect(out.stats.crossesEdge).toBe(false); // a smooth curve is not a step
+      expect(out.stats.missFraction).toBe(0);
+      expect(conformNotes(out.stats).map((n) => n.code)).toEqual(['FOLLOWS_CURVE']);
+    }
+    // longer than the way round: it meets itself
+    const round = run(cyl, top(20), slab(140, 6, -0.4, 2));
+    expect(round.stats.wrapsAround).toBe(true);
+    expect(conformNotes(round.stats).map((n) => n.code)).toContain('WRAPS_AROUND');
+    // a sphere curves two ways: a block of text as tall as the sphere's radius cannot lie on it unstretched
+    const ball = M.sphere(15, 128);
+    const big = run(ball, top(15), slab(30, 30, -0.4, 1));
+    expect(big.stats.steep).toBe(true);
+    expect(conformNotes(big.stats).map((n) => n.code)).toContain('TOO_CURVED');
+    const small = run(ball, top(15), slab(10, 4, -0.4, 1));
+    expect(small.stats.steep).toBe(false);
   });
 
   it('detects a step inside the footprint and still returns a valid solid', () => {
@@ -109,9 +116,9 @@ describe('conformSolid stats', () => {
     expect(adaptive.stats.triangles).toBeLessThan(fixed.stats.triangles);
     expect(adaptive.stats.rMin).toBeGreaterThan(15);
     expect(adaptive.stats.rMin).toBeLessThan(25);
-    // standing square on the cylinder: a sector of the ring between R - 0.4 and R + 2
-    const volume = 6 * 2 * Math.asin(15 / 20) * (22 ** 2 - 19.6 ** 2) / 2;
+    // wrapped round the cylinder, 30 mm along its surface: a sector of the ring between R - 0.4 and R + 2
+    const volume = 6 * (30 / 20) * (22 ** 2 - 19.6 ** 2) / 2;
     expect(Math.abs(adaptive.solid.volume() - volume) / volume).toBeLessThan(0.03);
-    expect(adaptive.solid.boundingBox().min[2]).toBeCloseTo(Math.sqrt(400 - 225) - 20 - 0.4 * Math.cos(Math.asin(15 / 20)), 0);
+    expect(adaptive.solid.boundingBox().min[2]).toBeCloseTo(19.6 * Math.cos(0.75) - 20, 0);
   });
 });

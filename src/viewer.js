@@ -26,6 +26,7 @@ import {
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { MeshBVH, acceleratedRaycast } from 'three-mesh-bvh';
 import { geometryFromBuffers } from './mesh.js';
+import { clickRadius, surfaceNormalAt } from './surfaceNormal.js';
 
 Mesh.prototype.raycast = acceleratedRaycast;
 
@@ -339,7 +340,7 @@ export class Viewer {
     tri.c.fromBufferAttribute(pos, index.getX(found.faceIndex * 3 + 2));
     const normal = tri.getNormal(new Vector3());
     if (!normal.lengthSq()) return null;
-    return { point: found.point.toArray(), normal: normal.toArray() };
+    return { point: found.point.toArray(), normal: this.#surfaceNormal(this.baseMesh, found.point, normal, found.faceIndex) };
   }
 
   /** First model surface hit by a ray from `origin` along `direction`, or null. */
@@ -379,7 +380,24 @@ export class Viewer {
     if (!h?.face) return null;
     const normal = h.face.normal.clone();
     if (h.object.matrixWorld) normal.transformDirection(h.object.matrixWorld);
-    return { point: h.point.toArray(), normal: normal.normalize().toArray(), object: h.object };
+    normal.normalize();
+    return { point: h.point.toArray(), normal: this.#surfaceNormal(h.object, h.point, normal, h.faceIndex), object: h.object };
+  }
+
+  /**
+   * The direction the model's surface faces at a hit: the mean over a small disc rather than the one triangle under
+   * the cursor, so text clicked onto a lumpy, sculpted surface faces the way the surface does (see surfaceNormalAt).
+   */
+  #surfaceNormal(object, point, normal, faceIndex) {
+    const geometry = object === this.baseMesh ? object.geometry : null;
+    if (!geometry?.boundsTree || !Number.isInteger(faceIndex)) return normal.toArray();
+    const index = geometry.index;
+    const pos = geometry.attributes.position;
+    const a = new Vector3().fromBufferAttribute(pos, index.getX(faceIndex * 3));
+    const b = new Vector3().fromBufferAttribute(pos, index.getX(faceIndex * 3 + 1));
+    const c = new Vector3().fromBufferAttribute(pos, index.getX(faceIndex * 3 + 2));
+    const edge = Math.max(a.distanceTo(b), b.distanceTo(c), c.distanceTo(a));
+    return surfaceNormalAt(geometry.boundsTree, point.toArray(), normal.toArray(), clickRadius(edge));
   }
 
   #ndc(event) {

@@ -213,6 +213,76 @@ describe('conformSolid', () => {
     sampler.dispose();
   });
 
+  it('stays on the clicked layer of a doubled ribbon: the layer behind faces the text too, and is nearer its plane', () => {
+    // two sheets 2 thick, 3 apart, both bending towards the text at their ends (a banner whose tail folds behind it)
+    const { Manifold } = manifold();
+    const bent = (dz) => {
+      const flat = Manifold.cube([120, 30, 2], true).refineToLength(2);
+      const out = flat.warpBatch((verts, count) => {
+        for (let i = 0; i < count; i++) verts[i * 3 + 2] += dz + (verts[i * 3] * verts[i * 3]) / 200;
+      });
+      flat.delete();
+      return out;
+    };
+    const front = bent(0);
+    const back = bent(-5);
+    const both = front.add(back);
+    const placement = placementMatrix({ position: [0, 0, 1], normal: [0, 0, 1] });
+    const sampler = samplerFor(both, placement);
+    // at x = 50 the front sheet's top is at 12.5, its underside at 10.5 and the back sheet's top at 7.5: the nearest
+    // surface facing the text is the wrong one
+    const { solid, stats } = conformSolid(slab(110, 8, -0.4, 1), sampler);
+    expect(stats.misses).toBe(0);
+    const v = solid.getMesh().vertProperties;
+    let deepest = Infinity;
+    for (let i = 0; i < v.length; i += 3) deepest = Math.min(deepest, v[i + 2] - (v[i] * v[i]) / 200);
+    expect(deepest).toBeGreaterThan(-0.6); // nothing sinks below the front sheet's top by more than the overlap
+    [solid, both, front, back].forEach((m) => m.delete());
+    sampler.dispose();
+  });
+
+  it('does not drop the ends of the text onto a surface far below an edge it hangs over', () => {
+    const { Manifold } = manifold();
+    const plate = Manifold.cube([40, 40, 4], true);
+    const floor = Manifold.cube([120, 60, 2], true).translate(0, 0, -30);
+    const both = plate.add(floor);
+    const sampler = samplerFor(both, top(2));
+    const { solid, stats } = conformSolid(slab(60, 6, -0.4, 1), sampler);
+    expect(stats.missFraction).toBeGreaterThan(0.2); // the overhang is reported as such ...
+    expect(bounds(solid).min[2]).toBeGreaterThan(-1); // ... and the ends carry on level instead of falling 30 mm
+    [solid, both, plate, floor].forEach((m) => m.delete());
+    sampler.dispose();
+  });
+
+  it('carries on across a slot in the surface: the letters beyond it follow the surface again', () => {
+    // a dome-topped block with a 3 mm slot across it, under the middle of the text
+    const { Manifold } = manifold();
+    const block = Manifold.cube([80, 30, 10], true).refineToLength(1);
+    const domed = block.warpBatch((v, n) => {
+      for (let i = 0; i < n; i++) if (v[i * 3 + 2] > 4.99) v[i * 3 + 2] -= (v[i * 3] * v[i * 3]) / 400;
+    });
+    const slot = Manifold.cube([3, 40, 20], true).translate(-8, 0, 0);
+    const slotted = domed.subtract(slot);
+    const sampler = samplerFor(slotted, top(5));
+    const { solid } = conformSolid(slab(70, 8, -0.4, 1), sampler);
+    // beyond the slot (x < -12) the text still sits on the dome (z = -x² / 400 there, 2.25 mm lower at the end than at
+    // the slot), not level with the near side: every vertex lies between the letters' bottom and top above the dome
+    const v = solid.getMesh().vertProperties;
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let i = 0; i < v.length; i += 3) {
+      if (v[i] > -12) continue;
+      const above = v[i + 2] + (v[i] * v[i]) / 400;
+      lo = Math.min(lo, above);
+      hi = Math.max(hi, above);
+    }
+    expect(lo).toBeGreaterThan(-0.5);
+    expect(hi).toBeLessThan(1.1);
+    expect(hi).toBeGreaterThan(0.9);
+    [solid, slotted, slot, domed, block].forEach((m) => m.delete());
+    sampler.dispose();
+  });
+
   it('fills sample misses where the text overhangs the model', () => {
     const box = manifold().Manifold.cube([40, 40, 10], true);
     const sampler = samplerFor(box, top(5));

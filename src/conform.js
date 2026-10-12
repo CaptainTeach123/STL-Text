@@ -55,6 +55,36 @@ function reachFrom(bvh, origin) {
 const toVector = (v) => (v?.isVector3 ? v.clone() : new Vector3(...v));
 
 /**
+ * Of a column's hits, the front-facing one (the outside of the model as seen from the item) nearest `target`, or
+ * the nearest of any kind when none faces the item (the column starts inside a solid); NaN when there is none.
+ */
+function nearestHit(hits, target) {
+  let best = NaN;
+  let bestD = Infinity;
+  let any = NaN;
+  let anyD = Infinity;
+  for (const { z, front } of hits) {
+    const d = Math.abs(z - target);
+    if (front && d < bestD) {
+      bestD = d;
+      best = z;
+    }
+    if (d < anyD) {
+      anyD = d;
+      any = z;
+    }
+  }
+  return Number.isNaN(best) ? any : best;
+}
+
+/** The distance from height `z` down to the next crossing of the column: the wall thickness there. */
+function wallBelow(hits, z) {
+  let wall = Infinity;
+  if (Number.isFinite(z)) for (const h of hits) if (h.z < z - 1e-6) wall = Math.min(wall, z - h.z);
+  return wall;
+}
+
+/**
  * Build a sampler of the model surface in the text's local frame.
  * @param {BufferGeometry} geometry  the model (indexed or not); it is not modified
  * @param {import('three').Matrix4} placement  text-local -> model space (see placementMatrix())
@@ -82,42 +112,31 @@ export function createSurfaceSampler(geometry, placement, options = {}) {
     below = Math.min(below, reach);
   }
 
-  const sample = (x, y) => {
-    if (!bvh) return { z: NaN, wall: Infinity };
+  /** Every crossing of the column at (x, y): local-Z height and whether the face looks the item's way. */
+  const hitsAt = (x, y) => {
+    if (!bvh) return [];
     ray.origin.set(x, y, above).applyMatrix4(placement);
-    const hits = bvh.raycast(ray, DoubleSide, 0, above + below);
+    return bvh.raycast(ray, DoubleSide, 0, above + below).map((hit) => ({
+      z: local.copy(hit.point).applyMatrix4(inverse).z,
+      front: hit.face.normal.dot(normal) > 0,
+    }));
+  };
+
+  const sample = (x, y) => {
+    const hits = hitsAt(x, y);
     // the surface an item sits on faces its way: of the hits whose face points along the item's normal (the outside
     // of the model as seen from the item) the one closest to the item's plane; a thin sheet bending towards the item
     // would otherwise offer its back, and letters there would sink into it. Only when no hit faces the item (the
     // ray enters a solid from inside) the closest hit of any kind counts
-    let best = NaN;
-    let bestAbs = Infinity;
-    let any = NaN;
-    let anyAbs = Infinity;
-    const zs = [];
-    for (const hit of hits) {
-      const z = local.copy(hit.point).applyMatrix4(inverse).z;
-      zs.push(z);
-      const abs = Math.abs(z);
-      if (hit.face.normal.dot(normal) > 0 && abs < bestAbs) {
-        bestAbs = abs;
-        best = z;
-      }
-      if (abs < anyAbs) {
-        anyAbs = abs;
-        any = z;
-      }
-    }
-    if (Number.isNaN(best)) best = any;
-    // the next surface crossing behind the chosen one = the wall thickness there
-    let wall = Infinity;
-    for (const z of zs) if (z < best - 1e-6) wall = Math.min(wall, best - z);
-    return { z: best, wall };
+    const best = nearestHit(hits, 0);
+    return { z: best, wall: wallBelow(hits, best) };
   };
 
   return {
     /** Local-Z height of the surface at (x, y) and the wall thickness behind it. */
     sample,
+    /** Every crossing of the surface along the column at (x, y), unsorted: { z, front }. */
+    hitsAt,
     heightAt(x, y) {
       return sample(x, y).z;
     },
@@ -196,6 +215,113 @@ function fillMisses(h, nx, ny) {
 }
 
 /**
+ * The surface under a grid, followed outward from the node nearest the item's origin (the clicked point): every
+ * node takes the front-facing hit nearest the height its resolved neighbours predict (their height carried on by
+ * their slope), so the grid stays on the clicked surface where the column also crosses another one – the back of a
+ * thin sheet, a scroll curling behind or over the face, a part of the model far below an edge. A node whose nearest
+ * front-facing hit is further than `jump` from the prediction is a miss: the surface ended there (the text hangs
+ * over an edge), it did not move to another layer. Returns a probe (x, y, i, j) => { z, wall } for the grid loop.
+ */
+function trackSurface(sampler, { nx, ny, x0, y0, cell, jump }) {
+  const N = nx * ny;
+  const hits = new Array(N);
+  const fronts = new Array(N);
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const k = j * nx + i;
+      hits[k] = sampler.hitsAt(x0 + i * cell, y0 + j * cell);
+      const f = hits[k].filter((h) => h.front);
+      fronts[k] = f.length ? f : hits[k];
+    }
+  }
+  const z = new Float64Array(N).fill(NaN);
+  const done = new Uint8Array(N); // visited: resolved (z finite) or judged a miss from the neighbours seen then
+  const steps = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  const resolved = (i, j) => i >= 0 && j >= 0 && i < nx && j < ny && Number.isFinite(z[j * nx + i]);
+  const grow = (queue) => {
+    for (let q = 0; q < queue.length; q++) {
+      const k = queue[q];
+      const i = k % nx;
+      const j = (k - i) / nx;
+      for (const [di, dj] of steps) {
+        const a = i + di, b = j + dj;
+        if (a < 0 || b < 0 || a >= nx || b >= ny) continue;
+        const n = b * nx + a;
+        if (done[n]) continue;
+        done[n] = 1;
+        // the prediction: each resolved neighbour's height, carried on by its slope where the node behind it is known too
+        let sum = 0;
+        let count = 0;
+        for (const [ei, ej] of steps) {
+          const p = a + ei, r = b + ej;
+          if (!resolved(p, r)) continue;
+          const zp = z[r * nx + p];
+          sum += resolved(p + ei, r + ej) ? 2 * zp - z[(r + ej) * nx + p + ei] : zp;
+          count++;
+        }
+        const predicted = sum / count;
+        const best = nearestHit(fronts[n], predicted);
+        if (Number.isFinite(best) && Math.abs(best - predicted) <= jump) {
+          z[n] = best;
+          queue.push(n);
+        }
+      }
+    }
+  };
+  // the seed: the node nearest the origin that has a hit, on the surface nearest the item's plane
+  let seed = -1;
+  let seedD = Infinity;
+  for (let k = 0; k < N; k++) {
+    if (!hits[k].length) continue;
+    const d = (x0 + (k % nx) * cell) ** 2 + (y0 + Math.floor(k / nx) * cell) ** 2;
+    if (d < seedD) {
+      seedD = d;
+      seed = k;
+    }
+  }
+  if (seed < 0) return () => ({ z: NaN, wall: Infinity });
+  z[seed] = nearestHit(hits[seed], 0);
+  done[seed] = 1;
+  grow([seed]);
+  // across a gap (a slot, a hole, a cut-out letter of the model) the surface carries on: the nodes beyond it that lie
+  // where the surface before the gap leads (its height carried across, nearest node first) seed the growth again
+  for (let round = 0; round < 8; round++) {
+    const carried = Float64Array.from(z);
+    const queue = [];
+    for (let k = 0; k < N; k++) if (Number.isFinite(carried[k])) queue.push(k);
+    for (let q = 0; q < queue.length; q++) {
+      const k = queue[q];
+      const i = k % nx;
+      const j = (k - i) / nx;
+      for (const [di, dj] of steps) {
+        const a = i + di, b = j + dj;
+        if (a < 0 || b < 0 || a >= nx || b >= ny) continue;
+        const n = b * nx + a;
+        if (Number.isFinite(carried[n])) continue;
+        carried[n] = carried[k];
+        queue.push(n);
+      }
+    }
+    const seeds = [];
+    for (let k = 0; k < N; k++) {
+      if (Number.isFinite(z[k]) || !hits[k].length) continue;
+      const best = nearestHit(fronts[k], carried[k]);
+      if (Number.isFinite(best) && Math.abs(best - carried[k]) <= jump) {
+        z[k] = best;
+        done[k] = 1;
+        seeds.push(k);
+      }
+    }
+    if (!seeds.length) break;
+    grow(seeds);
+  }
+  return (x, y, i, j) => {
+    const k = j * nx + i;
+    return { z: z[k], wall: wallBelow(hits[k], z[k]) };
+  };
+}
+
+/**
  * Deform a flat text solid so it follows the sampled surface.
  * @param {import('manifold-3d').Manifold} flatSolid  flat extrusion in text-local space (caller keeps ownership)
  * @param {{ heightAt(x: number, y: number): number }} sampler  from createSurfaceSampler()
@@ -247,10 +373,12 @@ export function conformSolid(flatSolid, sampler, options = {}) {
   let minWall = Infinity;
   let thinCells = 0;
   let touches = false;
-  const probe = sampler.sample ?? ((x, y) => ({ z: sampler.heightAt(x, y), wall: Infinity }));
+  const probe = sampler.hitsAt
+    ? trackSurface(sampler, { nx, ny, x0, y0, cell, jump: Math.max(3, 0.6 * Math.min(width, height), 6 * cell) })
+    : sampler.sample ?? ((x, y) => ({ z: sampler.heightAt(x, y), wall: Infinity }));
   for (let j = 0; j < ny; j++) {
     for (let i = 0; i < nx; i++) {
-      const { z, wall } = probe(x0 + i * cell, y0 + j * cell);
+      const { z, wall } = probe(x0 + i * cell, y0 + j * cell, i, j);
       const k = j * nx + i;
       if (Number.isFinite(z)) {
         h[k] = z;

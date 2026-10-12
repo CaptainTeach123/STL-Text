@@ -529,7 +529,7 @@ describe('enhanceMesh: contract', () => {
     const t0 = performance.now();
     const out = enhanceMesh(soft, { sharpen: 1, smooth: 1, detail: 1 }, (stage, fraction) => calls.push({ stage, fraction }));
     const ms = performance.now() - t0;
-    expect(ms).toBeLessThan(3000);
+    expect(ms).toBeLessThan(4000); // a guard against anything quadratic: about 2 s here, slower on a CI runner
     expect(flips(soft.positions, out.positions, soft.index)).toBe(0);
     expect(calls.length).toBeGreaterThan(5);
     expect(calls.length).toBeLessThan(80);

@@ -1129,11 +1129,14 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       if (item.curve) {
         const ob = outline ? outline.bounds() : null;
         const half = ob ? Math.max(-ob.min[1], ob.max[1]) : Math.max(-min[1], max[1]);
-        const bend = arcBend(item.curve, size[0], half, ob ? ob.max[0] - ob.min[0] : size[0]);
+        const middles = info.lineMiddles?.length ? info.lineMiddles : [0];
+        // the line on the inside of the curve: the lowest of an arch, the highest of a ∪
+        const inner = item.curve > 0 ? Math.min(...middles) : Math.max(...middles);
+        const bend = arcBend(item.curve, size[0], half, { extent: ob ? ob.max[0] - ob.min[0] : size[0], inner });
         if (bend) {
           const edge = Math.min(bendEdgeFor(bend.radius), Math.max(0.05, size[1] / 20));
-          cs = temps.add(bendCrossSection(cs, bend, edge));
-          if (outline) outline = temps.add(bendCrossSection(outline, bend, edge));
+          cs = temps.add(bendCrossSection(cs, bend, edge, middles));
+          if (outline) outline = temps.add(bendCrossSection(outline, bend, edge, inner));
           const b = (outline ?? cs).bounds();
           const dx = -(b.min[0] + b.max[0]) / 2;
           const dy = -(b.min[1] + b.max[1]) / 2;

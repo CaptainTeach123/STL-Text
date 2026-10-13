@@ -341,8 +341,42 @@ describe('curved text', () => {
     expect(long.limited).toBe(true);
     expect(Math.abs(long.degrees)).toBeLessThanOrEqual(330);
     // a plate wider than the text (its tails) limits the text so the plate's ends do not meet either
-    const plated = arcBend(330, 100, 5, 150);
+    const plated = arcBend(330, 100, 5, { extent: 150 });
     expect(Math.abs(plated.degrees)).toBeCloseTo(220, 6);
+  });
+
+  it('bends stacked lines round one centre, each keeping its own size along its own arc', () => {
+    const lines = [
+      { font, text: 'HELLO', size: 10 },
+      { font, text: 'WORLD', size: 10 },
+    ];
+    const info = buildCrossSectionInfo(lines, { lineSpacing: 1.7 });
+    expect(info.lineMiddles).toHaveLength(2);
+    const [top, bottom] = info.lineMiddles;
+    expect(top - bottom).toBeCloseTo(17, 6); // 1.7 × 10 mm apart
+    const [w] = size(info.cs);
+    for (const degrees of [120, -120]) {
+      const bend = arcBend(degrees, w, 13.5, { inner: degrees > 0 ? bottom : top });
+      // each line's middle, walked along its own arc, keeps the length it had straight
+      for (const middle of [top, bottom]) {
+        let length = 0;
+        let prev = bend.map(-20, middle, middle);
+        for (let x = -19.5; x <= 20; x += 0.5) {
+          const next = bend.map(x, middle, middle);
+          length += Math.hypot(next[0] - prev[0], next[1] - prev[1]);
+          prev = next;
+        }
+        expect(length).toBeCloseTo(40, 1);
+      }
+      // and both lines' middles are circles round the same centre
+      const centre = [0, degrees > 0 ? -bend.radius : bend.radius];
+      for (const middle of [top, bottom]) {
+        const d = (x) => Math.hypot(bend.map(x, middle, middle)[0] - centre[0], bend.map(x, middle, middle)[1] - centre[1]);
+        expect(d(-15)).toBeCloseTo(d(15), 6);
+        expect(d(0)).toBeCloseTo(d(15), 6);
+      }
+    }
+    info.cs.delete();
   });
 
   it('bends the outlines of real text into a sound arc of the same area', () => {

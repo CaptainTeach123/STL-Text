@@ -204,6 +204,16 @@ try {
   check(embossed.volume > base.volume, 'raised text adds volume and the result is watertight', `${embossed.volume?.toFixed(0)} > ${base.volume.toFixed(0)}`);
   await page.screenshot({ path: path.join(out, '2-raised.png') });
 
+  console.log('\ncurved line');
+  const straightWidth = Number.parseFloat(await page.inputValue('#widthInput'));
+  await setNumber('curve', 120);
+  await page.waitForFunction((w) => Math.abs(Number.parseFloat(document.querySelector('#widthInput').value) - w) > 1, straightWidth, { timeout: 30000 }).catch(() => {});
+  const curvedWidth = Number.parseFloat(await page.inputValue('#widthInput'));
+  check(Math.abs(curvedWidth - straightWidth) > 1, 'Curve bends the lines into arcs: the block changes shape', `${straightWidth} → ${curvedWidth} mm wide`);
+  check((await page.inputValue('input[type="range"][data-key="curve"]')) === '120', 'the curve slider follows the number');
+  await page.screenshot({ path: path.join(out, '2b-curved.png') });
+  await setNumber('curve', 0);
+
   console.log('\ntexts list: add, select, delete, undo');
   await page.click('#addTextBtn');
   await setText('Second');

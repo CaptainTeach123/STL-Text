@@ -123,6 +123,18 @@ function flatten(out, pts, tol) {
  * The distance between two baselines is lineSpacing × the mean of the two
  * lines' sizes, so a small line under a big one sits where you'd expect.
  */
+/** The baseline of each stacked line (mm, the first line's at 0, the others below it). */
+export function lineBaselines(lines, options = {}) {
+  const spacing = options.lineSpacing ?? DEFAULT_TEXT_OPTIONS.lineSpacing;
+  const baselines = [];
+  let baseline = 0;
+  lines.forEach((line, i) => {
+    baselines.push(baseline);
+    if (i < lines.length - 1) baseline -= spacing * ((line.size || 0) + (lines[i + 1].size || 0)) / 2;
+  });
+  return baselines;
+}
+
 export function layoutLines(lines, options = {}) {
   const o = { ...DEFAULT_TEXT_OPTIONS, ...options };
   const tol = QUALITY[o.quality] ?? QUALITY.normal;
@@ -143,12 +155,7 @@ export function layoutLines(lines, options = {}) {
     return { font, upem, scale, glyphs, xs, widthUnits: pen };
   });
 
-  const baselines = [];
-  let baseline = 0;
-  lines.forEach((line, i) => {
-    baselines.push(baseline);
-    if (i < lines.length - 1) baseline -= o.lineSpacing * ((line.size || 0) + (lines[i + 1].size || 0)) / 2;
-  });
+  const baselines = lineBaselines(lines, o);
 
   const polygons = [];
   laid.forEach((line, li) => {
@@ -250,8 +257,12 @@ export function buildCrossSectionInfo(linesOrFont, textOrOptions, maybeOptions) 
     return info;
   }
   const { min, max } = cs.bounds();
-  step(cs.translate(-(min[0] + max[0]) / 2, -(min[1] + max[1]) / 2));
+  const cy = (min[1] + max[1]) / 2;
+  step(cs.translate(-(min[0] + max[0]) / 2, -cy));
   info.cs = cs;
+  // the middle of each line's capitals, in the centred frame (for curving each line round its own arc)
+  const baselines = lineBaselines(lines, o);
+  info.lineMiddles = lines.flatMap((l, i) => (l.size > 0 && String(l.text ?? '').trim() ? [baselines[i] + l.size / 2 - cy] : []));
   return info;
 }
 
@@ -260,57 +271,68 @@ export const MAX_CURVE = 330;
 
 /**
  * Bending text into an arc. `degrees` is how far round a circle the text's
- * own width reaches: positive arches it (∩, the ends lower than the middle),
- * negative curves it the other way (∪, the ends higher). The text's middle
- * line (y = 0, the block centred on the origin) keeps its length along the
- * arc, so letters keep their size and spacing; letters stand square on the
- * arc, their tops outward on an arch and inward on a ∪. `halfHeight` is how
- * far the shape reaches above and below the middle line (its plate included)
- * and `extent` its full width (a plate's tails reach further than the text):
- * the curve is limited so the inside of the bend never folds and the shape's
- * two ends never meet. Returns null for no curve.
- * @returns {{ degrees: number, requested: number, limited: boolean, radius: number, map(x: number, y: number): number[] } | null}
+ * widest line reaches: positive arches it (∩, the ends lower than the
+ * middle), negative curves it the other way (∪, the ends higher). Every line
+ * bends round the same centre, each keeping its own size along its own arc
+ * (the middle of its capitals keeps its length), so stacked lines sit on
+ * concentric arcs as on a badge; letters stand square on their arc, tops
+ * outward on an arch and inward on a ∪.
+ *
+ * `width` is the widest line's width, `halfHeight` how far the shape reaches
+ * above and below its centre (its plate included), `extent` its full width
+ * (a plate's tails reach further than the text) and `inner` the middle of the
+ * line on the inside of the curve (the lowest for an arch, the highest for a
+ * ∪; a plate is bent with that line's arc, so it holds every line). The curve
+ * is limited so the inside of the bend never folds and the shape's two ends
+ * never meet. map(x, y, middle) bends a point of a line whose middle is at
+ * `middle`. Returns null for no curve.
+ * @returns {{ degrees: number, requested: number, limited: boolean, radius: number, map(x: number, y: number, middle?: number): number[] } | null}
  */
-export function arcBend(degrees, width, halfHeight, extent = width) {
+export function arcBend(degrees, width, halfHeight, { extent = width, inner = 0 } = {}) {
   const requested = Number(degrees) || 0;
   if (!requested || !(width > 0)) return null;
-  // the inside of the bend must stay outside the centre: radius ≥ 1.25 × the half height
-  const byFold = ((width / (1.25 * Math.max(halfHeight, 1e-6))) * 180) / Math.PI;
-  const byEnds = (MAX_CURVE * width) / Math.max(extent, width);
-  const most = Math.min(byFold, byEnds);
-  const applied = Math.sign(requested) * Math.min(Math.abs(requested), most);
-  const radius = width / ((Math.abs(applied) * Math.PI) / 180);
-  const arch = applied > 0;
+  const arch = requested > 0;
+  const s = arch ? 1 : -1; // a line's radius is radius + s·middle; a point's, radius + s·y
+  const most = (MAX_CURVE * Math.PI) / 180;
+  // the radius at the shape's centre: as asked, but never so small that the inside of the bend passes the centre,
+  // nor that the line on the inside (or the plate bent with it) reaches round further than MAX_CURVE
+  const asked = width / ((Math.abs(requested) * Math.PI) / 180);
+  const radius = Math.max(asked, 1.25 * Math.max(halfHeight, 1e-6), Math.max(extent, width) / most - s * inner);
+  const applied = Math.sign(requested) * ((width / radius) * 180) / Math.PI;
   return {
     degrees: applied,
     requested,
-    limited: Math.abs(applied) < Math.abs(requested) - 1e-9,
+    limited: radius > asked * (1 + 1e-9),
     radius,
-    map(x, y) {
-      const t = x / radius;
-      if (arch) {
-        const r = radius + y;
-        return [r * Math.sin(t), r * Math.cos(t) - radius];
-      }
-      const r = radius - y;
-      return [r * Math.sin(t), radius - r * Math.cos(t)];
+    inner,
+    map(x, y, middle = 0) {
+      const t = x / Math.max(1e-9, radius + s * middle);
+      const r = radius + s * y;
+      return [r * Math.sin(t), s * (r * Math.cos(t) - radius) + 0]; // + 0: no -0 at the centre
     },
   };
 }
 
 /**
  * A cross-section bent by `bend` (see arcBend): its outlines split into edges no longer than `maxEdge` so straight
- * strokes follow the curve, then mapped. The caller owns the result.
+ * strokes follow the curve, then mapped, each outline with the arc of the line it belongs to (the middle in `middles`
+ * nearest its own; a single number for all). The caller owns the result.
  */
-export function bendCrossSection(cs, bend, maxEdge = 0.5) {
+export function bendCrossSection(cs, bend, maxEdge = 0.5, middles = [0]) {
   const { CrossSection } = manifold();
+  const list = Array.isArray(middles) && middles.length ? middles : [Number(middles) || 0];
   const polygons = cs.toPolygons().map((poly) => {
+    let cy = 0;
+    for (const p of poly) cy += p[1];
+    cy /= poly.length;
+    let middle = list[0];
+    for (const m of list) if (Math.abs(m - cy) < Math.abs(middle - cy)) middle = m;
     const out = [];
     for (let i = 0; i < poly.length; i++) {
       const [x0, y0] = poly[i];
       const [x1, y1] = poly[(i + 1) % poly.length];
       const n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / maxEdge));
-      for (let k = 0; k < n; k++) out.push(bend.map(x0 + ((x1 - x0) * k) / n, y0 + ((y1 - y0) * k) / n));
+      for (let k = 0; k < n; k++) out.push(bend.map(x0 + ((x1 - x0) * k) / n, y0 + ((y1 - y0) * k) / n, middle));
     }
     return out;
   });

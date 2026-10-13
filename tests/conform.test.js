@@ -303,6 +303,41 @@ describe('conformSolid', () => {
     roomy.dispose();
   });
 
+  it('keeps a long line straight and its length on lumpy, sculpted surfaces, without false warnings', () => {
+    const { Manifold } = manifold();
+    for (const [amp, wave, noise] of [[0.3, 4, 0], [1, 6, 0], [0.5, 3, 0.15]]) {
+      let seed = 3;
+      const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+      const plate = Manifold.cube([200, 60, 10], true).refineToLength(0.6);
+      const lumpy = plate.warpBatch((v, n) => {
+        for (let i = 0; i < n; i++) {
+          if (v[i * 3 + 2] < 4.99) continue;
+          const x = v[i * 3], y = v[i * 3 + 1];
+          v[i * 3 + 2] += amp * Math.sin((2 * Math.PI * x) / wave + 1.3 * Math.sin(y / 5)) * Math.cos((2 * Math.PI * y) / (wave * 1.3) + (0.7 * x) / wave) + noise * (rnd() * 2 - 1);
+        }
+      });
+      const sampler = samplerFor(lumpy, top(5));
+      const { solid, stats } = conformSolid(slab(140, 10, -0.4, 1.5), sampler);
+      const v = solid.getMesh().vertProperties;
+      let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+      for (let i = 0; i < v.length; i += 3) {
+        x0 = Math.min(x0, v[i]);
+        x1 = Math.max(x1, v[i]);
+        y0 = Math.min(y0, v[i + 1]);
+        y1 = Math.max(y1, v[i + 1]);
+      }
+      // seen from above the line neither wanders sideways nor shrinks or grows: bumps are lain over, not followed
+      expect(Math.abs(x0 + 70)).toBeLessThan(1.5);
+      expect(Math.abs(x1 - 70)).toBeLessThan(1.5);
+      expect(y0).toBeGreaterThan(-6);
+      expect(y1).toBeLessThan(6);
+      expect(stats.misses).toBe(0);
+      expect(conformNotes(stats).filter((n) => n.level === 'warn').map((n) => n.code)).toEqual([]);
+      [solid, lumpy, plate].forEach((m) => m.delete());
+      sampler.dispose();
+    }
+  });
+
   it('fills sample misses where the text overhangs the model', () => {
     const box = manifold().Manifold.cube([40, 40, 10], true);
     const sampler = samplerFor(box, top(5));

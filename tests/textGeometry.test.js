@@ -1,5 +1,7 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import {
+  arcBend,
+  bendCrossSection,
   buildCrossSection,
   buildTextSolid,
   capHeightUnits,
@@ -301,6 +303,61 @@ describe('stacked lines with different fonts and sizes', () => {
     expect(Math.abs(l.min2 - l.min1)).toBeLessThan(1.5);
     const r = edges('right');
     expect(Math.abs(r.max2 - r.max1)).toBeLessThan(1.5);
+  });
+});
+
+describe('curved text', () => {
+  it('arches with a positive curve and curves the other way with a negative one, the middle line keeping its length', () => {
+    for (const degrees of [60, -60, 180, -180]) {
+      const bend = arcBend(degrees, 100, 5);
+      expect(bend.limited).toBe(false);
+      expect(bend.map(0, 0)).toEqual([0, 0]);
+      const [, yEnd] = bend.map(50, 0);
+      if (degrees > 0) expect(yEnd).toBeLessThan(-1); // the ends lower: ∩
+      else expect(yEnd).toBeGreaterThan(1); // the ends higher: ∪
+      // the middle line, walked in small steps, is as long on the arc as it was straight
+      let length = 0;
+      let prev = bend.map(-50, 0);
+      for (let x = -49; x <= 50; x++) {
+        const next = bend.map(x, 0);
+        length += Math.hypot(next[0] - prev[0], next[1] - prev[1]);
+        prev = next;
+      }
+      expect(length).toBeCloseTo(100, 1);
+      // it reaches round the asked part of a circle: the end's direction from the centre turns by half the angle
+      const r = bend.radius;
+      expect(r).toBeCloseTo(100 / ((Math.abs(degrees) * Math.PI) / 180), 6);
+    }
+    expect(arcBend(0, 100, 5)).toBeNull();
+  });
+
+  it('never folds the inside of the bend, and never lets the ends meet', () => {
+    // 20 mm of text 10 mm tall cannot go 300° round: its inside would pass the centre
+    const short = arcBend(300, 20, 5);
+    expect(short.limited).toBe(true);
+    expect(short.radius).toBeGreaterThanOrEqual(1.25 * 5 - 1e-9);
+    // long text may go most of the way round, but not all of it
+    const long = arcBend(400, 300, 5);
+    expect(long.limited).toBe(true);
+    expect(Math.abs(long.degrees)).toBeLessThanOrEqual(330);
+    // a plate wider than the text (its tails) limits the text so the plate's ends do not meet either
+    const plated = arcBend(330, 100, 5, 150);
+    expect(Math.abs(plated.degrees)).toBeCloseTo(220, 6);
+  });
+
+  it('bends the outlines of real text into a sound arc of the same area', () => {
+    const cs = buildCrossSection(font, 'Candy Cane Lane', { size: 10 });
+    const [w] = size(cs);
+    const bend = arcBend(90, w, 6.5);
+    const bent = bendCrossSection(cs, bend, 0.3);
+    expect(bent.isEmpty()).toBe(false);
+    // the letters keep their size along the arc: the area changes only by the bend's stretch above and below the middle
+    expect(Math.abs(bent.area() / cs.area() - 1)).toBeLessThan(0.03);
+    const [bw, bh] = size(bent);
+    expect(bw).toBeLessThan(w); // an arch spans less than the straight text ...
+    expect(bh).toBeGreaterThan(size(cs)[1] + 5); // ... and rises in the middle
+    cs.delete();
+    bent.delete();
   });
 });
 

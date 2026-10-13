@@ -1,7 +1,7 @@
 import { BufferGeometry, Float32BufferAttribute, Matrix4, Uint32BufferAttribute, Vector3 } from 'three';
 import { describeRepair, repairToManifold } from './repair.js';
 import { conformNotes, conformSolid, createInsideTest, createSurfaceSampler, createUndersideSampler, fitDepth, heightFieldSlab } from './conform.js';
-import { buildCrossSectionInfo, printLimits, textZRange, thinStrokeReport } from './textGeometry.js';
+import { arcBend, bendCrossSection, bendEdgeFor, buildCrossSectionInfo, printLimits, textZRange, thinStrokeReport } from './textGeometry.js';
 import { labelFor, parseFont } from './fontParse.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from './stl.js';
 import { concatSoups, displayBuffers, manifoldToSoup } from './mesh.js';
@@ -1117,15 +1117,36 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     if (!info.cs) fail('FONT_NO_OUTLINES', 'The font has no outlines for those characters.');
     const temps = scope();
     try {
-      const cs = info.cs;
+      let cs = info.cs;
       const { min, max } = cs.bounds();
       let solid;
       let size = [max[0] - min[0], max[1] - min[1]];
-      if (item.plate && item.plate !== 'none') {
+      const plated = item.plate && item.plate !== 'none';
+      const pad = Math.max(0, item.platePadding ?? 3);
+      let outline = plated ? temps.add(plateShape(wasm, item.plate, size[0] + 2 * pad, size[1] + 2 * pad)) : null;
+      // a curved line of text: the text (and its plate with it) bent round an arc, then centred again
+      let curve = null;
+      if (item.curve) {
+        const ob = outline ? outline.bounds() : null;
+        const half = ob ? Math.max(-ob.min[1], ob.max[1]) : Math.max(-min[1], max[1]);
+        const bend = arcBend(item.curve, size[0], half, ob ? ob.max[0] - ob.min[0] : size[0]);
+        if (bend) {
+          const edge = Math.min(bendEdgeFor(bend.radius), Math.max(0.05, size[1] / 20));
+          cs = temps.add(bendCrossSection(cs, bend, edge));
+          if (outline) outline = temps.add(bendCrossSection(outline, bend, edge));
+          const b = (outline ?? cs).bounds();
+          const dx = -(b.min[0] + b.max[0]) / 2;
+          const dy = -(b.min[1] + b.max[1]) / 2;
+          cs = temps.add(cs.translate(dx, dy));
+          if (outline) outline = temps.add(outline.translate(dx, dy));
+          const tb = cs.bounds();
+          size = [tb.max[0] - tb.min[0], tb.max[1] - tb.min[1]];
+          curve = { requested: bend.requested, applied: bend.degrees, limited: bend.limited };
+        }
+      }
+      if (plated) {
         // text on a plaque or banner: the plate is what meets the model
-        const pad = Math.max(0, item.platePadding ?? 3);
         const thickness = Math.max(0.2, item.plateThickness ?? 2);
-        const outline = temps.add(plateShape(wasm, item.plate, size[0] + 2 * pad, size[1] + 2 * pad));
         const plateRaw = temps.add(Manifold.extrude(outline, thickness + item.overlap));
         const plate = temps.add(plateRaw.translate(0, 0, -item.overlap));
         if (item.mode === 'engrave') {
@@ -1146,7 +1167,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         const extruded = temps.add(Manifold.extrude(cs, z1 - z0));
         solid = extruded.translate(0, 0, z0);
       }
-      return { solid, size, rounding: info.rounding, cutter: null };
+      return { solid, size, rounding: info.rounding, curve, cutter: null };
     } finally {
       info.cs.delete();
       temps.dispose();
@@ -1628,6 +1649,14 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         level: 'info',
         code: 'ROUNDING_LIMITED',
         text: `Corner rounding was limited to ${rounding.applied.toFixed(2)} mm by the thinnest strokes.`,
+      });
+    }
+    if (flatEntry.curve?.limited) {
+      notes.push({
+        level: 'info',
+        code: 'CURVE_LIMITED',
+        text: `This text is too short for ${Math.abs(flatEntry.curve.requested)}° of curve – the inside of the bend would fold – so it is curved ${Math.abs(Math.round(flatEntry.curve.applied))}°. Make the text longer or the letters smaller to curve it further.`,
+        applied: Math.round(flatEntry.curve.applied),
       });
     }
     if (item.depth < 2 * layer && !(item.plate !== 'none' && item.mode === 'engrave')) {

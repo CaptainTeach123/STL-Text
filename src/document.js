@@ -41,6 +41,7 @@ export const ITEM_DEFAULTS = Object.freeze({
   pegClearance: 0.15,
   letterSpacing: 0,
   lineSpacing: 1.7,
+  curve: 0, // degrees of arc the text's width bends round: + arches it (∩), − curves it the other way (∪)
   align: 'center',
   weight: 0,
   cornerRadius: 0,
@@ -56,7 +57,7 @@ export const ITEM_DEFAULTS = Object.freeze({
 });
 
 const SHAPE_KEYS = [
-  'kind', 'lines', 'letterSpacing', 'lineSpacing', 'align', 'weight',
+  'kind', 'lines', 'letterSpacing', 'lineSpacing', 'curve', 'align', 'weight',
   'cornerRadius', 'mirror', 'quality', 'mode', 'depth', 'overlap',
   'plate', 'plateThickness', 'platePadding',
   'partId', 'scale', 'attach', 'tilt', 'roll', 'sink', 'fit', 'join', 'filletRadius', 'pegCount', 'pegDiameter', 'pegLength', 'pegClearance',

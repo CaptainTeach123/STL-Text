@@ -255,6 +255,71 @@ export function buildCrossSectionInfo(linesOrFont, textOrOptions, maybeOptions) 
   return info;
 }
 
+/** The most a line of text can be curved: short of a full circle, so its two ends never meet. */
+export const MAX_CURVE = 330;
+
+/**
+ * Bending text into an arc. `degrees` is how far round a circle the text's
+ * own width reaches: positive arches it (∩, the ends lower than the middle),
+ * negative curves it the other way (∪, the ends higher). The text's middle
+ * line (y = 0, the block centred on the origin) keeps its length along the
+ * arc, so letters keep their size and spacing; letters stand square on the
+ * arc, their tops outward on an arch and inward on a ∪. `halfHeight` is how
+ * far the shape reaches above and below the middle line (its plate included)
+ * and `extent` its full width (a plate's tails reach further than the text):
+ * the curve is limited so the inside of the bend never folds and the shape's
+ * two ends never meet. Returns null for no curve.
+ * @returns {{ degrees: number, requested: number, limited: boolean, radius: number, map(x: number, y: number): number[] } | null}
+ */
+export function arcBend(degrees, width, halfHeight, extent = width) {
+  const requested = Number(degrees) || 0;
+  if (!requested || !(width > 0)) return null;
+  // the inside of the bend must stay outside the centre: radius ≥ 1.25 × the half height
+  const byFold = ((width / (1.25 * Math.max(halfHeight, 1e-6))) * 180) / Math.PI;
+  const byEnds = (MAX_CURVE * width) / Math.max(extent, width);
+  const most = Math.min(byFold, byEnds);
+  const applied = Math.sign(requested) * Math.min(Math.abs(requested), most);
+  const radius = width / ((Math.abs(applied) * Math.PI) / 180);
+  const arch = applied > 0;
+  return {
+    degrees: applied,
+    requested,
+    limited: Math.abs(applied) < Math.abs(requested) - 1e-9,
+    radius,
+    map(x, y) {
+      const t = x / radius;
+      if (arch) {
+        const r = radius + y;
+        return [r * Math.sin(t), r * Math.cos(t) - radius];
+      }
+      const r = radius - y;
+      return [r * Math.sin(t), radius - r * Math.cos(t)];
+    },
+  };
+}
+
+/**
+ * A cross-section bent by `bend` (see arcBend): its outlines split into edges no longer than `maxEdge` so straight
+ * strokes follow the curve, then mapped. The caller owns the result.
+ */
+export function bendCrossSection(cs, bend, maxEdge = 0.5) {
+  const { CrossSection } = manifold();
+  const polygons = cs.toPolygons().map((poly) => {
+    const out = [];
+    for (let i = 0; i < poly.length; i++) {
+      const [x0, y0] = poly[i];
+      const [x1, y1] = poly[(i + 1) % poly.length];
+      const n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / maxEdge));
+      for (let k = 0; k < n; k++) out.push(bend.map(x0 + ((x1 - x0) * k) / n, y0 + ((y1 - y0) * k) / n));
+    }
+    return out;
+  });
+  return CrossSection.ofPolygons(polygons, 'Positive');
+}
+
+/** The longest straight edge that, bent round `radius`, strays less than about 0.01 mm from the arc. */
+export const bendEdgeFor = (radius) => Math.min(2, Math.max(0.1, Math.sqrt(0.08 * radius)));
+
 /**
  * Build the 2D shape of the text as a Manifold CrossSection centred on the
  * origin. Returns null when the text has no visible outline.

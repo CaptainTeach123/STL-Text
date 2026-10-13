@@ -282,6 +282,38 @@ describe('preview', () => {
     box.delete();
   });
 
+  it('curves a line of text either way, its plate with it, and says when it is too short to curve that far', async () => {
+    await client.loadBase({ kind: 'sample', version: ++version });
+    const shape = async (extra) => {
+      const r = await client.preview(topItem('Candy Cane Lane', { size: 10, position: [0, 0, 60], conform: false, ...extra }), version);
+      const p = r.geometry.positions;
+      let maxX = 0;
+      for (let i = 0; i < p.length; i += 3) maxX = Math.max(maxX, Math.abs(p[i]));
+      let mid = 0, nMid = 0, end = 0, nEnd = 0;
+      for (let i = 0; i < p.length; i += 3) {
+        if (Math.abs(p[i]) < 0.1 * maxX) (mid += p[i + 1]), nMid++;
+        else if (Math.abs(p[i]) > 0.8 * maxX) (end += p[i + 1]), nEnd++;
+      }
+      return { r, rise: mid / nMid - end / nEnd };
+    };
+    const straight = await shape({});
+    const arch = await shape({ curve: 90 });
+    const smile = await shape({ curve: -90 });
+    expect(Math.abs(straight.rise)).toBeLessThan(1);
+    expect(arch.rise).toBeGreaterThan(8); // the middle above the ends
+    expect(smile.rise).toBeLessThan(-8); // the middle below the ends
+    expect(arch.r.size[0]).toBeLessThan(straight.r.size[0]);
+    expect(arch.r.notes.map((n) => n.code)).not.toContain('CURVE_LIMITED');
+    // with a banner plate the plate bends too: it is as tall as the bend makes it, not a flat strip
+    const plated = await shape({ curve: 90, plate: 'banner' });
+    expect(plated.r.size[1]).toBeGreaterThan(straight.r.size[1] + 15);
+    // a short word cannot go most of the way round a circle: it is curved as far as it can be, and the note says so
+    const short = await client.preview(topItem('Hi', { size: 10, position: [0, 0, 60], conform: false, curve: 300 }), version);
+    const note = short.notes.find((n) => n.code === 'CURVE_LIMITED');
+    expect(note).toBeDefined();
+    expect(note.applied).toBeLessThan(300);
+  });
+
   it('follows a curved surface', async () => {
     const cyl = wasm.Manifold.cylinder(60, 20, 20, 128, true).rotate([90, 0, 0]);
     await client.loadBase({ kind: 'stl', bytes: stlOf(cyl), name: 'cyl', version: ++version });

@@ -294,6 +294,11 @@
               <input type="number" data-key="lineSpacing" min="0.8" max="4" step="0.05" value="1.7" />
               <input type="range" data-key="lineSpacing" min="1" max="3" step="0.05" value="1.7" aria-label="Line spacing" />
             </label>
+            <label class="field num" title="Bends the line of text into an arc: positive arches it (∩, the ends lower), negative curves it the other way (∪, the ends higher). The value is how far round a circle the text reaches.">
+              <span>Curve <small>° · + ∩ · − ∪</small></span>
+              <input type="number" data-key="curve" min="-330" max="330" step="1" value="0" />
+              <input type="range" data-key="curve" min="-180" max="180" step="1" value="0" aria-label="Curve" />
+            </label>
             <label class="field num">
               <span>Boldness <small>mm</small></span>
               <input type="number" data-key="weight" min="-2" max="4" step="0.05" value="0" />

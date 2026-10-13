@@ -25,6 +25,53 @@ import { manifoldToGeometry } from './mesh.js';
 /** Grid nodes per axis above which the sample spacing is enlarged. */
 const MAX_GRID = 400;
 
+/**
+ * Squared distance from the point (px, py, pz) to the triangle whose corners start at a, b and c in `pos` (the
+ * nearest point by its region: a corner, an edge or the inside; Ericson, Real-Time Collision Detection, 5.1.5).
+ */
+function pointTriangleDistance2(px, py, pz, pos, a, b, c) {
+  const ax = pos[a], ay = pos[a + 1], az = pos[a + 2];
+  const abx = pos[b] - ax, aby = pos[b + 1] - ay, abz = pos[b + 2] - az;
+  const acx = pos[c] - ax, acy = pos[c + 1] - ay, acz = pos[c + 2] - az;
+  const apx = px - ax, apy = py - ay, apz = pz - az;
+  const d1 = abx * apx + aby * apy + abz * apz;
+  const d2 = acx * apx + acy * apy + acz * apz;
+  let qx, qy, qz;
+  if (d1 <= 0 && d2 <= 0) {
+    qx = ax; qy = ay; qz = az;
+  } else {
+    const bpx = px - pos[b], bpy = py - pos[b + 1], bpz = pz - pos[b + 2];
+    const d3 = abx * bpx + aby * bpy + abz * bpz;
+    const d4 = acx * bpx + acy * bpy + acz * bpz;
+    const cpx = px - pos[c], cpy = py - pos[c + 1], cpz = pz - pos[c + 2];
+    const d5 = abx * cpx + aby * cpy + abz * cpz;
+    const d6 = acx * cpx + acy * cpy + acz * cpz;
+    const vc = d1 * d4 - d3 * d2;
+    const vb = d5 * d2 - d1 * d6;
+    const va = d3 * d6 - d5 * d4;
+    if (d3 >= 0 && d4 <= d3) {
+      qx = pos[b]; qy = pos[b + 1]; qz = pos[b + 2];
+    } else if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+      const v = d1 / (d1 - d3);
+      qx = ax + v * abx; qy = ay + v * aby; qz = az + v * abz;
+    } else if (d6 >= 0 && d5 <= d6) {
+      qx = pos[c]; qy = pos[c + 1]; qz = pos[c + 2];
+    } else if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+      const w = d2 / (d2 - d6);
+      qx = ax + w * acx; qy = ay + w * acy; qz = az + w * acz;
+    } else if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) {
+      const w = (d4 - d3) / (d4 - d3 + (d5 - d6));
+      qx = pos[b] + w * (pos[c] - pos[b]); qy = pos[b + 1] + w * (pos[c + 1] - pos[b + 1]); qz = pos[b + 2] + w * (pos[c + 2] - pos[b + 2]);
+    } else {
+      const denom = 1 / (va + vb + vc);
+      const v = vb * denom;
+      const w = vc * denom;
+      qx = ax + abx * v + acx * w; qy = ay + aby * v + acy * w; qz = az + abz * v + acz * w;
+    }
+  }
+  return (px - qx) ** 2 + (py - qy) ** 2 + (pz - qz) ** 2;
+}
+
 /** Triangles facing within this of the walk's own normal count towards the surface's mean facing around a point ... */
 const WIDE_AROUND = Math.cos((75 * Math.PI) / 180);
 /** ... and then those within this of that mean. */
@@ -182,24 +229,48 @@ export function createSurfaceSampler(geometry, placement, options = {}) {
      * triangles within `radius` that face within 37° of `ref` – bumps smaller than the disc average out, a crease
      * (the edge of a top, the other side of a sheet) never counts. Null when no triangle qualifies.
      */
-    normalAround(p, ref, radius) {
+    normalAround(p, ref, radius, budget = 384) {
       if (!bvh) return null;
       const c = q.set(p[0], p[1], p[2]).applyMatrix4(placement);
       const r = dir.set(ref[0], ref[1], ref[2]).transformDirection(placement);
-      const r2 = radius * radius;
-      const near = []; // [nx, ny, nz, area] of the triangles reaching into the disc
-      const nn = new Vector3();
-      const closest = new Vector3();
+      const cx = c.x, cy = c.y, cz = c.z;
+      // the leaves near the point, then at most `budget` of their triangles (every k-th, in the tree's order, which
+      // scatters them over the disc): a dense scan has thousands of triangles in a few millimetres, and their mean
+      // facing needs only a few hundred
+      const ranges = [];
+      let total = 0;
       bvh.shapecast({
         intersectsBounds: (box) => box.distanceToPoint(c) <= radius,
-        intersectsTriangle: (t) => {
-          t.closestPointToPoint(c, closest);
-          if (closest.distanceToSquared(c) > r2) return false;
-          t.getNormal(nn);
-          near.push(nn.x, nn.y, nn.z, t.getArea());
+        intersectsRange: (offset, count) => {
+          ranges.push(offset, count);
+          total += count;
           return false;
         },
       });
+      if (!total) return null;
+      const g = bvh.geometry;
+      const pos = g.attributes.position.array;
+      const idx = g.index.array;
+      const step = Math.max(1, Math.floor(total / budget));
+      const r2 = radius * radius;
+      const quarter = (Math.PI * r2) / 4;
+      const near = [];
+      let skip = 0;
+      for (let k = 0; k < ranges.length; k += 2) {
+        const end = ranges[k] + ranges[k + 1];
+        for (let t = ranges[k] + skip; t < end; t += step) {
+          const a = idx[t * 3] * 3, b = idx[t * 3 + 1] * 3, e = idx[t * 3 + 2] * 3;
+          const ux = pos[b] - pos[a], uy = pos[b + 1] - pos[a + 1], uz = pos[b + 2] - pos[a + 2];
+          const vx = pos[e] - pos[a], vy = pos[e + 1] - pos[a + 1], vz = pos[e + 2] - pos[a + 2];
+          // a triangle counts when its nearest point lies in the disc; by its area, but a large triangle of a coarse
+          // model (a CAD face) as at most a quarter of the disc, so it cannot outweigh a fillet next to it
+          if (pointTriangleDistance2(cx, cy, cz, pos, a, b, e) > r2) continue;
+          const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+          const l = Math.sqrt(nx * nx + ny * ny + nz * nz);
+          if (l > 0) near.push(nx / l, ny / l, nz / l, Math.min(l / 2, quarter));
+        }
+        skip = (skip + step - (ranges[k + 1] % step)) % step;
+      }
       // two passes: the mean of everything facing roughly the walk's way (only walls and the far side of a sheet left
       // out), then the mean of what faces within 37° of that – a reference taken from the walk itself would carry
       // any lean from one step to the next
@@ -476,23 +547,29 @@ const inPlane = (v, k) => {
 };
 
 /**
- * One step of length ds from p heading d, within the walk's plane (normal `plane`): the surface is met straight
- * under the point ds ahead along the way it faces around p (its normal averaged over `smooth` mm, so bumps smaller
- * than that neither steer the walk nor lengthen it). Returns { p, n } with n the surface's averaged normal there; null
- * where the surface ends within the step or turns sharply (an edge, a ledge, the rim of a sheet); AWAY_FROM_TEXT where
- * it curves on round the back further than text may wrap.
+ * One step of length ds from p heading d. The heading is kept along the surface as it faces around p (its normal n
+ * averaged over `smooth` mm, so bumps smaller than that neither steer the walk nor lengthen it) – and, when `plane`
+ * is given, within that plane. The surface is met along the way it faces at the point ahead (a lump between the two
+ * points then moves the new one up or down, not along the line); where that misses – the walk is going over a
+ * small rounded edge the averaged normal has not yet turned for – the surface point nearest the point ahead is taken
+ * instead, as long as the surface turns there no more sharply than 50° from `raw` (the face last stepped on).
+ * Returns { p, n, raw, d } with n the averaged normal there and d the heading that arrived; null where the surface
+ * ends within the step or turns sharply (an edge, a ledge, the rim of a sheet); AWAY_FROM_TEXT where it curves on
+ * round the back further than text may wrap.
  */
-function stepOver(sampler, p, n, d, ds, plane, smooth) {
-  const m = inPlane(n, plane);
-  if (!m) return null;
-  let ahead = unit3(cross3(plane, m));
+function stepOver(sampler, p, n, raw, d, ds, plane, smooth, lateral = null) {
+  let ahead = plane ? unit3(cross3(plane, inPlane(n, plane) ?? n)) : d;
   if (!ahead) return null;
   if (dot3(ahead, d) < 0) ahead = [-ahead[0], -ahead[1], -ahead[2]];
   const target = along(p, ahead, ds);
-  // the surface is met along the way it faces at the point ahead, not at p: a lump between them then moves the point
-  // up or down, not along the line, and the steps stay even
-  const there = inPlane(sampler.normalAround(target, n, smooth) ?? n, plane);
-  const mt = there && dot3(there, m) > SHARP ? there : m;
+  const aroundTarget = sampler.normalAround(target, n, smooth);
+  let mt = aroundTarget ?? n;
+  // the surface is met within the plane of the heading (the walk's plane, or the plane through the heading and the
+  // surface's wider facing): a lump leaning sideways then moves the point up or down, never sideways, so a walk over
+  // lumps does not drift off its line step by step
+  const side = plane ?? lateral;
+  if (side) mt = inPlane(mt, side) ?? mt;
+  if (dot3(mt, n) < SHARP) mt = n;
   const reach = Math.max(1.5 * ds, 1.5);
   let best = null;
   let bestD = Infinity;
@@ -504,11 +581,19 @@ function stepOver(sampler, p, n, d, ds, plane, smooth) {
       best = h;
     }
   }
-  if (!best) return null;
-  const around = sampler.normalAround(best.p, n, smooth) ?? best.n;
+  if (!best) {
+    // round a small rounded edge: the nearest surface point, if the surface turns there gently enough
+    const c = sampler.closest(target, ds);
+    if (!c || dot3(c.n, raw) < SHARP || dot3(c.n, n) < 0.2) return null;
+    if (dot3([c.p[0] - p[0], c.p[1] - p[1], c.p[2] - p[2]], ahead) < 0.3 * ds) return null;
+    best = c;
+  }
+  // the averaged normal at the landed point: the one at the point ahead serves when the two are close
+  const near = Math.hypot(best.p[0] - target[0], best.p[1] - target[1], best.p[2] - target[2]) < 0.25 * smooth;
+  const around = (near && aroundTarget) || sampler.normalAround(best.p, mt, smooth) || best.n;
   if (dot3(around, n) < SHARP) return null;
   if (around[2] < AWAY) return AWAY_FROM_TEXT;
-  return { p: best.p, n: around, d: ahead };
+  return { p: best.p, n: around, raw: best.n, d: ahead };
 }
 
 /** stepOver's answer where the surface curves on round the back, past what the text may wrap. */
@@ -520,7 +605,7 @@ const AWAY_FROM_TEXT = Object.freeze({ away: true });
  * ledge, the floor below a step), with its averaged normal.
  */
 function landAt(sampler, c, n, jump, plane, smooth) {
-  const m = inPlane(n, plane) ?? n;
+  const m = (plane && inPlane(n, plane)) || n;
   let best = null;
   let bestD = Infinity;
   for (const h of sampler.castAll(along(c, m, jump), [-m[0], -m[1], -m[2]], 2 * jump)) {
@@ -534,22 +619,28 @@ function landAt(sampler, c, n, jump, plane, smooth) {
   if (!best) return null;
   const around = sampler.normalAround(best.p, m, smooth) ?? best.n;
   if (dot3(around, m) < 0.2 || around[2] < AWAY) return null;
-  return { p: best.p, n: around };
+  return { p: best.p, n: around, raw: best.n };
 }
 
 /**
- * Walk `count` steps of length ds over the surface from `start` ({ p, n, on, lost }) heading d, within the plane
- * through the start with normal `plane`, calling emit(k, p, n, d, on, sharp, lost) after each. Smooth curvature is
- * wrapped round; at a sharp turn the walk carries on straight and lands on the surface it finds there (`sharp` is
- * then set), or carries on in the air (`on` false) where there is none, trying to land again at every step. `lost`
- * says why the walk left the surface: EDGE (the text hangs over an edge) or ROUND_THE_BACK (the surface curves on
- * round the back, further than text may wrap).
+ * Walk `count` steps of length ds over the surface from `start` ({ p, n, raw, on, lost }) heading d, calling
+ * emit(k, p, n, d, on, sharp, lost) after each. Without `plane` the walk goes straight on along the (averaged)
+ * surface – a geodesic, the way a strip of tape lies, which on a cylinder is a helix at any angle; with `plane` it
+ * stays in the plane through the start with that normal. Smooth curvature is wrapped round; at a sharp turn the walk
+ * carries on straight and lands on the surface it finds there (`sharp` is then set), or carries on in the air (`on`
+ * false) where there is none, trying to land again at every step. `lost` says why the walk left the surface: EDGE
+ * (the text hangs over an edge) or ROUND_THE_BACK (the surface curves on round the back, further than text may wrap).
  */
-function walk(sampler, start, d, count, ds, jump, emit, plane, smooth) {
-  let { p, n, on, lost = 0 } = start;
-  d = inPlane(d, plane) ?? d;
+function walk(sampler, start, d, count, ds, jump, emit, plane, smooth, steer = smooth) {
+  let { p, n, raw = start.n, on, lost = 0 } = start;
+  // the heading is carried along the surface as it faces over a wider disc (`steer` mm): lumps the size of letters
+  // then do not turn it, while a cane or a mug, whose mean facing over any disc centred on it is its own normal, still
+  // does – so on a cylinder the line is a helix, as tape would lie
+  let ns = (!plane && steer > smooth && sampler.normalAround(p, n, steer, 256)) || n;
+  d = (plane ? inPlane(d, plane) : inPlane(d, ns)) ?? d;
   for (let k = 1; k <= count; k++) {
-    let next = on ? stepOver(sampler, p, n, d, ds, plane, smooth) : null;
+    const lateral = plane ? null : unit3(cross3(ns, d));
+    let next = on ? stepOver(sampler, p, n, raw, d, ds, plane, smooth, lateral) : null;
     if (next?.away) {
       next = null;
       lost = ROUND_THE_BACK;
@@ -568,19 +659,22 @@ function walk(sampler, start, d, count, ds, jump, emit, plane, smooth) {
       }
       next = landed;
     }
-    // the heading: along the surface within the plane, onward
-    let ahead = next.d ?? (inPlane(next.n, plane) && unit3(cross3(plane, inPlane(next.n, plane))));
-    if (!ahead) ahead = d;
-    else if (dot3(ahead, d) < 0) ahead = [-ahead[0], -ahead[1], -ahead[2]];
-    // the heading for the next step follows the surface at the new point
-    const m = inPlane(next.n, plane);
-    if (m) {
-      const t = unit3(cross3(plane, m));
+    // the heading for the next step: carried on to the new point's surface (turned as the normal turns), or kept in
+    // the plane
+    let ahead = next.d ?? d;
+    if (plane) {
+      const m = inPlane(next.n, plane);
+      const t = m && unit3(cross3(plane, m));
       if (t) ahead = dot3(t, ahead) < 0 ? [-t[0], -t[1], -t[2]] : t;
+    } else {
+      const nsNext = (steer > smooth && sampler.normalAround(next.p, next.n, steer, 256)) || next.n;
+      ahead = transport(ahead, ns, nsNext);
+      ns = nsNext;
     }
     d = ahead;
     p = next.p;
     n = next.n;
+    raw = next.raw ?? next.n;
     on = true;
     lost = 0;
     emit(k, p, n, d, true, sharp, 0);
@@ -597,7 +691,7 @@ const ROUND_THE_BACK = 2;
  * Returns the points, the walked (face) normals, whether each node is on the surface, and where a sharp turn was
  * crossed.
  */
-function walkChart(sampler, { nx, ny, i0, j0, cell, jump, seed, smooth, chord = smooth }) {
+function walkChart(sampler, { nx, ny, i0, j0, cell, jump, seed, smooth, chord = smooth, steer = chord, planar = 'auto' }) {
   const N = nx * ny;
   const P = new Float64Array(N * 3);
   const W = new Float64Array(N * 3);
@@ -616,26 +710,55 @@ function walkChart(sampler, { nx, ny, i0, j0, cell, jump, seed, smooth, chord = 
     lost[k] = onSurface ? 0 : why;
   };
   const heading = new Array(nx);
-  // the reading line stays in the plane through the clicked point spanned by the reading direction and the normal:
-  // seen from where the text was placed it runs straight, however the surface undulates under it
-  const spine = [0, 1, 0];
   const n0 = sampler.normalAround(seed.p, seed.n, smooth) ?? seed.n;
-  set(j0 * nx + i0, seed.p, n0, true, false);
   const x = inPlane([1, 0, 0], unit3(n0) ?? [0, 0, 1]) ?? [1, 0, 0];
-  heading[i0] = x;
   const start = { p: seed.p, n: n0, on: true };
-  walk(sampler, start, x, nx - 1 - i0, cell, jump, (k, p, n, d, o, sh, why) => {
-    set(j0 * nx + i0 + k, p, n, o, sh, why);
-    heading[i0 + k] = d;
-  }, spine, smooth);
-  walk(sampler, start, [-x[0], -x[1], -x[2]], i0, cell, jump, (k, p, n, d, o, sh, why) => {
-    set(j0 * nx + i0 - k, p, n, o, sh, why);
-    heading[i0 - k] = [-d[0], -d[1], -d[2]];
-  }, spine, smooth);
+  const walkSpine = (plane) => {
+    set(j0 * nx + i0, seed.p, n0, true, false);
+    heading[i0] = x;
+    walk(sampler, start, x, nx - 1 - i0, cell, jump, (k, p, n, d, o, sh, why) => {
+      set(j0 * nx + i0 + k, p, n, o, sh, why);
+      heading[i0 + k] = d;
+    }, plane, smooth, steer);
+    walk(sampler, start, [-x[0], -x[1], -x[2]], i0, cell, jump, (k, p, n, d, o, sh, why) => {
+      set(j0 * nx + i0 - k, p, n, o, sh, why);
+      heading[i0 - k] = [-d[0], -d[1], -d[2]];
+    }, plane, smooth, steer);
+  };
+  // the reading line first stays in the plane through the clicked point spanned by the reading direction and the
+  // normal: seen from where the text was placed it runs straight, however the surface undulates under it. Where the
+  // surface under it turns steadily about one axis tilted from that plane – a cane or a mug with the text set at an
+  // angle – a straight line in that plane would fan the letters out, and the text is laid on like tape instead (a
+  // helix round a cylinder)
+  const spine = [0, 1, 0];
+  walkSpine(spine);
+  const span = Math.max(1, Math.round(chord / cell));
+  let planarWalk = planar !== false;
+  if (planar === 'auto') {
+    let ax = 0, ay = 0, az = 0, turn = 0;
+    for (let i = 0; i + span < nx; i += span) {
+      const a = j0 * nx + i;
+      const b = a + span;
+      if (!on[a] || !on[b]) continue;
+      const c = cross3([W[a * 3], W[a * 3 + 1], W[a * 3 + 2]], [W[b * 3], W[b * 3 + 1], W[b * 3 + 2]]);
+      ax += c[0];
+      ay += c[1];
+      az += c[2];
+      turn += Math.hypot(c[0], c[1], c[2]);
+    }
+    const total = Math.hypot(ax, ay, az);
+    const coherent = turn > 0.35 && total > 0.85 * turn; // turns by more than 20°, nearly all of it about one axis
+    const tilted = total > 0 && Math.abs(ay) / total < Math.cos((10 * Math.PI) / 180); // that axis is not the plane's
+    if (coherent && tilted) {
+      planarWalk = false;
+      walkSpine(null);
+    }
+  }
+  planar = planarWalk;
   // each column stays in the plane across the reading line there, its direction taken as the chord over `chord` mm
   // either side: on a circle that chord is exactly the tangent at its middle, while the tilt of lumps shorter than it
-  // averages out, so a lump under one node does not lean its column into its neighbours
-  const span = Math.max(1, Math.round(chord / cell));
+  // averages out, so a lump under one node does not lean its column into its neighbours (laid like tape, it goes
+  // straight on along the surface across the line)
   for (let i = 0; i < nx; i++) {
     const k = j0 * nx + i;
     const p = [P[k * 3], P[k * 3 + 1], P[k * 3 + 2]];
@@ -651,8 +774,9 @@ function walkChart(sampler, { nx, ny, i0, j0, cell, jump, seed, smooth, chord = 
     const across = along3;
     const up = unit3(cross3(n, across)) ?? [0, 1, 0];
     const from = { p, n, on: !!on[k], lost: lost[k] };
-    walk(sampler, from, up, ny - 1 - j0, cell, jump, (m, q, nn, d, o, sh, why) => set((j0 + m) * nx + i, q, nn, o, sh, why), across, smooth);
-    walk(sampler, from, [-up[0], -up[1], -up[2]], j0, cell, jump, (m, q, nn, d, o, sh, why) => set((j0 - m) * nx + i, q, nn, o, sh, why), across, smooth);
+    const plane = planar ? across : null;
+    walk(sampler, from, up, ny - 1 - j0, cell, jump, (m, q, nn, d, o, sh, why) => set((j0 + m) * nx + i, q, nn, o, sh, why), plane, smooth, steer);
+    walk(sampler, from, [-up[0], -up[1], -up[2]], j0, cell, jump, (m, q, nn, d, o, sh, why) => set((j0 - m) * nx + i, q, nn, o, sh, why), plane, smooth, steer);
   }
   return { P, W, on, sharp, lost };
 }
@@ -683,7 +807,7 @@ function wrapSolid(flatSolid, sampler, { min, max, width, height, flatTolerance,
   // bumps smaller than about a quarter of the letters' height are texture the text lies over, not a shape it follows
   const smooth = Math.min(4, Math.max(1, 0.25 * Math.min(width, height)));
   const chord = Math.max(smooth, 0.5 * Math.min(width, height));
-  const { P, W, on, sharp, lost } = walkChart(sampler, { nx, ny, i0, j0, cell, jump, smooth, chord, seed: { p: [0, 0, z0], n: [0, 0, 1] } });
+  const { P, W, on, sharp, lost } = walkChart(sampler, { nx, ny, i0, j0, cell, jump, smooth, chord, planar: 'auto', seed: { p: [0, 0, z0], n: [0, 0, 1] } });
   const pt = (k) => [P[k * 3], P[k * 3 + 1], P[k * 3 + 2]];
   const wn = (k) => [W[k * 3], W[k * 3 + 1], W[k * 3 + 2]];
 
@@ -734,7 +858,6 @@ function wrapSolid(flatSolid, sampler, { min, max, width, height, flatTolerance,
   let rMin = Infinity;
   let pairs = 0; // neighbouring nodes under the slab, both on the surface
   let edgePairs = 0; // ... with a ledge, a slot or a sharp turn between them
-  let steepPairs = 0; // ... stretched or squeezed apart along the surface
   const rowsUnder = new Set();
   let minWall = Infinity;
   let thinCells = 0;
@@ -776,9 +899,6 @@ function wrapSolid(flatSolid, sampler, { min, max, width, height, flatTolerance,
           continue;
         }
         if (turn > 1e-6) rMin = Math.min(rMin, cell / turn);
-        if (turn > Math.PI / 6) continue;
-        const stretch = run / cell; // along the surface: bumps between the nodes are not stretch
-        if (stretch > 1.3 || stretch < 0.75) steepPairs++;
       }
       // the wall behind the surface, along its own normal
       const g = gn(k);
@@ -791,10 +911,66 @@ function wrapSolid(flatSolid, sampler, { min, max, width, height, flatTolerance,
       if (max[2] > 0 && sampler.cast(along(pt(k), g, 0.01), g, max[2] + 0.5)) squeezed++;
     }
   }
-  // an edge runs across the text: a line of jumps, not a stray one where the surface is rough; stretching shows over
-  // more than a few nodes
+  // how the letters' shape survives: each grid cell under the slab, its sides along the surface, compared with the
+  // flat square – stretched, squeezed or sheared (a line running obliquely round a cane fans its letters out). The
+  // cells' shapes are averaged over a few cells around each first: a lump distorts a cell or two one way and the next
+  // ones the other, a fan distorts them all alike
+  const CX = new Float64Array(N).fill(NaN);
+  const CY = new Float64Array(N).fill(NaN);
+  const CA = new Float64Array(N).fill(NaN);
+  const CS = new Float64Array(N).fill(NaN);
+  for (let j = 0; j + 1 < ny; j++) {
+    for (let i = 0; i + 1 < nx; i++) {
+      const k = j * nx + i;
+      if (!inside(i, j) || !on[k] || !on[k + 1] || !on[k + nx] || sharp[k + 1] || sharp[k + nx]) continue;
+      const g = gn(k);
+      const tangential = (a, b) => {
+        const v = [P[b * 3] - P[a * 3], P[b * 3 + 1] - P[a * 3 + 1], P[b * 3 + 2] - P[a * 3 + 2]];
+        const t = dot3(v, g);
+        return [v[0] - t * g[0], v[1] - t * g[1], v[2] - t * g[2]];
+      };
+      const ex = tangential(k, k + 1);
+      const ey = tangential(k, k + nx);
+      const lx = Math.hypot(ex[0], ex[1], ex[2]) / cell;
+      const ly = Math.hypot(ey[0], ey[1], ey[2]) / cell;
+      if (lx > 2 || ly > 2) continue; // a jump (a ledge, a slot), not a stretch
+      const c = cross3(ex, ey);
+      CX[k] = lx;
+      CY[k] = ly;
+      CA[k] = Math.hypot(c[0], c[1], c[2]) / (cell * cell);
+      CS[k] = dot3(ex, ey) / Math.max(1e-12, lx * ly * cell * cell); // cos of the cell's corner angle (signed)
+    }
+  }
+  const around = Math.max(1, Math.round(smooth / cell));
+  let cells = 0;
+  let distorted = 0;
+  for (let j = 0; j + 1 < ny; j++) {
+    for (let i = 0; i + 1 < nx; i++) {
+      if (Number.isNaN(CX[j * nx + i])) continue;
+      let sx = 0, sy = 0, sa = 0, ss = 0, n = 0;
+      for (let b = Math.max(0, j - around); b <= Math.min(ny - 2, j + around); b++) {
+        for (let a = Math.max(0, i - around); a <= Math.min(nx - 2, i + around); a++) {
+          const m = b * nx + a;
+          if (Number.isNaN(CX[m])) continue;
+          sx += CX[m];
+          sy += CY[m];
+          sa += CA[m];
+          ss += CS[m];
+          n++;
+        }
+      }
+      sx /= n;
+      sy /= n;
+      sa /= n;
+      ss /= n;
+      cells++;
+      if (sx > 1.2 || sx < 0.83 || sy > 1.2 || sy < 0.83 || sa > 1.3 || sa < 0.75 || Math.abs(ss) > 0.25) distorted++;
+    }
+  }
+  // an edge runs across the text: a line of jumps, not a stray one where the surface is rough; distortion shows
+  // over more than a few cells
   const crossesEdge = edgePairs >= Math.max(3, 0.3 * rowsUnder.size);
-  const steep = steepPairs > 0.02 * Math.max(1, pairs);
+  const steep = distorted > 0.03 * Math.max(1, cells);
   // how far the reading line turns from end to end
   let wrapDeg = 0;
   for (let i = 1; i < nx; i++) {
@@ -818,6 +994,7 @@ function wrapSolid(flatSolid, sampler, { min, max, width, height, flatTolerance,
     cell,
     grid: [nx, ny],
     maxSlopeDeg: (maxSlope * 180) / Math.PI,
+    distortedFraction: cells ? distorted / cells : 0,
     steep,
     wrapDeg,
     wrapsAround: roundTheBack > 0.02 * N,

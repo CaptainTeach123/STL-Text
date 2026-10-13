@@ -1,7 +1,7 @@
 import { BufferGeometry, Float32BufferAttribute, Matrix4, Uint32BufferAttribute, Vector3 } from 'three';
 import { describeRepair, repairToManifold } from './repair.js';
 import { conformNotes, conformSolid, createInsideTest, createSurfaceSampler, createUndersideSampler, fitDepth, heightFieldSlab } from './conform.js';
-import { arcBend, bendCrossSection, bendEdgeFor, buildCrossSectionInfo, printLimits, textZRange, thinStrokeReport } from './textGeometry.js';
+import { buildCrossSectionInfo, curveText, printLimits, textZRange, thinStrokeReport } from './textGeometry.js';
 import { labelFor, parseFont } from './fontParse.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from './stl.js';
 import { concatSoups, displayBuffers, manifoldToSoup } from './mesh.js';
@@ -1112,41 +1112,40 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     }
   }
 
+  /**
+   * The outline of a text item and of its plate (null without one), curved as asked, and the size of the shape
+   * before it was curved. Everything returned is owned by `temps`.
+   */
+  function textOutlineFor(item, temps) {
+    const info = buildCrossSectionInfo(linesWithFonts(item), { ...item, perLine: !!item.curve });
+    for (const l of info.lines ?? []) temps.add(l.cs);
+    if (!info.cs) return { cs: null, outline: null, curve: null, rounding: info.rounding };
+    let cs = temps.add(info.cs);
+    const { min, max } = cs.bounds();
+    const pad = Math.max(0, item.platePadding ?? 3);
+    let outline = item.plate && item.plate !== 'none' ? temps.add(plateShape(wasm, item.plate, max[0] - min[0] + 2 * pad, max[1] - min[1] + 2 * pad)) : null;
+    const ub = (outline ?? cs).bounds();
+    const unbent = [ub.max[0] - ub.min[0], ub.max[1] - ub.min[1]];
+    // a curved line of text: every line bent round its own arc, the plate with them, then centred again
+    let curve = null;
+    const bent = item.curve ? curveText(info, item.curve, { plate: outline }) : null;
+    if (bent) {
+      cs = temps.add(bent.cs);
+      if (bent.plate) outline = temps.add(bent.plate);
+      curve = { requested: bent.bend.requested, applied: bent.bend.degrees, limited: bent.bend.limited, plated: !!outline };
+    }
+    return { cs, outline, curve, unbent, rounding: info.rounding };
+  }
+
   function textSolidFor(item) {
-    const info = buildCrossSectionInfo(linesWithFonts(item), item);
-    if (!info.cs) fail('FONT_NO_OUTLINES', 'The font has no outlines for those characters.');
     const temps = scope();
     try {
-      let cs = info.cs;
-      const { min, max } = cs.bounds();
+      const { cs, outline, curve, unbent, rounding } = textOutlineFor(item, temps);
+      if (!cs) fail('FONT_NO_OUTLINES', 'The font has no outlines for those characters.');
+      const tb = cs.bounds();
+      let size = [tb.max[0] - tb.min[0], tb.max[1] - tb.min[1]];
       let solid;
-      let size = [max[0] - min[0], max[1] - min[1]];
-      const plated = item.plate && item.plate !== 'none';
-      const pad = Math.max(0, item.platePadding ?? 3);
-      let outline = plated ? temps.add(plateShape(wasm, item.plate, size[0] + 2 * pad, size[1] + 2 * pad)) : null;
-      // a curved line of text: the text (and its plate with it) bent round an arc, then centred again
-      let curve = null;
-      if (item.curve) {
-        const ob = outline ? outline.bounds() : null;
-        const half = ob ? Math.max(-ob.min[1], ob.max[1]) : Math.max(-min[1], max[1]);
-        const middles = info.lineMiddles?.length ? info.lineMiddles : [0];
-        // the line on the inside of the curve: the lowest of an arch, the highest of a ∪
-        const inner = item.curve > 0 ? Math.min(...middles) : Math.max(...middles);
-        const bend = arcBend(item.curve, size[0], half, { extent: ob ? ob.max[0] - ob.min[0] : size[0], inner });
-        if (bend) {
-          const edge = Math.min(bendEdgeFor(bend.radius), Math.max(0.05, size[1] / 20));
-          cs = temps.add(bendCrossSection(cs, bend, edge, middles));
-          if (outline) outline = temps.add(bendCrossSection(outline, bend, edge, inner));
-          const b = (outline ?? cs).bounds();
-          const dx = -(b.min[0] + b.max[0]) / 2;
-          const dy = -(b.min[1] + b.max[1]) / 2;
-          cs = temps.add(cs.translate(dx, dy));
-          if (outline) outline = temps.add(outline.translate(dx, dy));
-          const tb = cs.bounds();
-          size = [tb.max[0] - tb.min[0], tb.max[1] - tb.min[1]];
-          curve = { requested: bend.requested, applied: bend.degrees, limited: bend.limited };
-        }
-      }
+      const plated = !!outline;
       if (plated) {
         // text on a plaque or banner: the plate is what meets the model
         const thickness = Math.max(0.2, item.plateThickness ?? 2);
@@ -1170,9 +1169,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         const extruded = temps.add(Manifold.extrude(cs, z1 - z0));
         solid = extruded.translate(0, 0, z0);
       }
-      return { solid, size, rounding: info.rounding, curve, cutter: null };
+      // a curved shape is conformed at the scale of its letters (or plate), not of the arc's box
+      return { solid, size, rounding, curve, scale: curve ? Math.min(...unbent) : undefined, cutter: null };
     } finally {
-      info.cs.delete();
       temps.dispose();
     }
   }
@@ -1421,11 +1420,14 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const limits = printLimits({ nozzle: printing?.nozzle ?? 0.4, mode: item.mode });
     const key = `${shapeKey(item, fontKeyOf(item))}|${limits.minStroke}|${limits.minGap}`;
     if (strokeCache.has(key)) return strokeCache.get(key);
-    const info = buildCrossSectionInfo(linesWithFonts(item), item);
+    // judged on the outline as built: a curve squeezes the inside of the bend
     let stroke = null;
-    if (info.cs) {
-      stroke = thinStrokeReport(info.cs, limits);
-      info.cs.delete();
+    const temps = scope();
+    try {
+      const { cs } = textOutlineFor(item, temps);
+      if (cs) stroke = thinStrokeReport(cs, limits);
+    } finally {
+      temps.dispose();
     }
     const report = { stroke, limits };
     strokeCache.set(key, report);
@@ -1466,7 +1468,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     // text follows curved surfaces when asked; so does a generated decoration (a leaf or sprig draped over a horn),
     // never a rigid imported part
     if (s && item.conform && (!isPart(item) || parts.get(item.partId)?.info?.generated)) {
-      const out = conformSolid(flatEntry.solid, s);
+      const out = conformSolid(flatEntry.solid, s, { scale: flatEntry.scale });
       solid = out.solid;
       stats = { ...out.stats, conformed: out.conformed };
     } else {
@@ -1655,11 +1657,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       });
     }
     if (flatEntry.curve?.limited) {
+      const { requested, applied, limited, plated } = flatEntry.curve;
+      const built = Math.abs(Math.round(applied));
       notes.push({
         level: 'info',
         code: 'CURVE_LIMITED',
-        text: `This text is too short for ${Math.abs(flatEntry.curve.requested)}° of curve – the inside of the bend would fold – so it is curved ${Math.abs(Math.round(flatEntry.curve.applied))}°. Make the text longer or the letters smaller to curve it further.`,
-        applied: Math.round(flatEntry.curve.applied),
+        text:
+          limited === 'ends'
+            ? `${Math.abs(requested)}° of curve would bring the ends of the ${plated ? 'plate' : 'text'} round to meet, so it is curved ${built}°.`
+            : `This text is too short for ${Math.abs(requested)}° of curve – the inside of the bend would fold – so it is curved ${built}°. More letters, wider letter spacing${plated ? ', less plate padding' : ''} or fewer lines let it curve further.`,
+        applied: Math.round(applied),
       });
     }
     if (item.depth < 2 * layer && !(item.plate !== 'none' && item.mode === 'engrave')) {

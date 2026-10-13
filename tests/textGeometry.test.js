@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import {
   arcBend,
   bendCrossSection,
+  curveText,
   buildCrossSection,
   buildTextSolid,
   capHeightUnits,
@@ -307,10 +308,15 @@ describe('stacked lines with different fonts and sizes', () => {
 });
 
 describe('curved text', () => {
+  const oneLine = (width, half) => ({ lines: [{ middle: 0, left: -width / 2, right: width / 2 }], bottom: -half, top: half });
+  // the angle of a point round the bend's centre, for a bend centred again by `shift`
+  const angleRound = (bend, shift, s, [x, y]) => Math.atan2(x - shift[0], s * (y - shift[1]) + bend.radius);
+
   it('arches with a positive curve and curves the other way with a negative one, the middle line keeping its length', () => {
     for (const degrees of [60, -60, 180, -180]) {
-      const bend = arcBend(degrees, 100, 5);
+      const bend = arcBend(degrees, oneLine(100, 5));
       expect(bend.limited).toBe(false);
+      expect(bend.degrees).toBeCloseTo(degrees, 6);
       expect(bend.map(0, 0)).toEqual([0, 0]);
       const [, yEnd] = bend.map(50, 0);
       if (degrees > 0) expect(yEnd).toBeLessThan(-1); // the ends lower: ∩
@@ -324,74 +330,175 @@ describe('curved text', () => {
         prev = next;
       }
       expect(length).toBeCloseTo(100, 1);
-      // it reaches round the asked part of a circle: the end's direction from the centre turns by half the angle
-      const r = bend.radius;
-      expect(r).toBeCloseTo(100 / ((Math.abs(degrees) * Math.PI) / 180), 6);
+      expect(bend.radius).toBeCloseTo(100 / ((Math.abs(degrees) * Math.PI) / 180), 6);
     }
-    expect(arcBend(0, 100, 5)).toBeNull();
+    expect(arcBend(0, oneLine(100, 5))).toBeNull();
   });
 
-  it('never folds the inside of the bend, and never lets the ends meet', () => {
+  it('never folds the inside of the bend, and never lets the ends meet, and says which', () => {
     // 20 mm of text 10 mm tall cannot go 300° round: its inside would pass the centre
-    const short = arcBend(300, 20, 5);
-    expect(short.limited).toBe(true);
+    const short = arcBend(300, oneLine(20, 5));
+    expect(short.limited).toBe('fold');
     expect(short.radius).toBeGreaterThanOrEqual(1.25 * 5 - 1e-9);
     // long text may go most of the way round, but not all of it
-    const long = arcBend(400, 300, 5);
-    expect(long.limited).toBe(true);
-    expect(Math.abs(long.degrees)).toBeLessThanOrEqual(330);
+    const long = arcBend(400, oneLine(300, 5));
+    expect(long.limited).toBe('ends');
+    expect(Math.abs(long.degrees)).toBeCloseTo(330, 6);
     // a plate wider than the text (its tails) limits the text so the plate's ends do not meet either
-    const plated = arcBend(330, 100, 5, { extent: 150 });
+    const plated = arcBend(330, { ...oneLine(100, 5), plate: { left: -75, right: 75 } });
+    expect(plated.limited).toBe('ends');
     expect(Math.abs(plated.degrees)).toBeCloseTo(220, 6);
+    expect(plated.mapPlate(-75, 0)[0]).toBeCloseTo(-plated.mapPlate(75, 0)[0], 6);
   });
 
-  it('bends stacked lines round one centre, each keeping its own size along its own arc', () => {
+  it('bends stacked lines round one centre, each keeping its own size along its own arc, the widest by the angle asked', () => {
     const lines = [
       { font, text: 'HELLO', size: 10 },
-      { font, text: 'WORLD', size: 10 },
+      { font, text: 'WIDE WORLD', size: 10 },
     ];
-    const info = buildCrossSectionInfo(lines, { lineSpacing: 1.7 });
-    expect(info.lineMiddles).toHaveLength(2);
-    const [top, bottom] = info.lineMiddles;
+    const info = buildCrossSectionInfo(lines, { lineSpacing: 1.7, perLine: true });
+    expect(info.lines).toHaveLength(2);
+    const [top, bottom] = info.lines.map((l) => l.middle);
     expect(top - bottom).toBeCloseTo(17, 6); // 1.7 × 10 mm apart
-    const [w] = size(info.cs);
     for (const degrees of [120, -120]) {
-      const bend = arcBend(degrees, w, 13.5, { inner: degrees > 0 ? bottom : top });
+      const { cs, bend, shift } = curveText(info, degrees);
+      const s = Math.sign(degrees);
+      // the widest line (the second) reaches round exactly the angle asked
+      const b = info.lines[1].cs.bounds();
+      const ends = [b.min[0], b.max[0]].map((x) => bend.map(x, bottom, 1));
+      const sweep = Math.atan2(ends[1][0], s * ends[1][1] + bend.radius) - Math.atan2(ends[0][0], s * ends[0][1] + bend.radius);
+      expect((sweep * 180) / Math.PI).toBeCloseTo(Math.abs(degrees), 4);
+      expect(bend.degrees).toBeCloseTo(degrees, 6);
       // each line's middle, walked along its own arc, keeps the length it had straight
-      for (const middle of [top, bottom]) {
+      [top, bottom].forEach((middle, i) => {
         let length = 0;
-        let prev = bend.map(-20, middle, middle);
+        let prev = bend.map(-20, middle, i);
         for (let x = -19.5; x <= 20; x += 0.5) {
-          const next = bend.map(x, middle, middle);
+          const next = bend.map(x, middle, i);
           length += Math.hypot(next[0] - prev[0], next[1] - prev[1]);
           prev = next;
         }
         expect(length).toBeCloseTo(40, 1);
-      }
-      // and both lines' middles are circles round the same centre
-      const centre = [0, degrees > 0 ? -bend.radius : bend.radius];
-      for (const middle of [top, bottom]) {
-        const d = (x) => Math.hypot(bend.map(x, middle, middle)[0] - centre[0], bend.map(x, middle, middle)[1] - centre[1]);
+        // on a circle round the shared centre
+        const d = (x) => Math.hypot(bend.map(x, middle, i)[0], bend.map(x, middle, i)[1] + s * bend.radius);
         expect(d(-15)).toBeCloseTo(d(15), 6);
-        expect(d(0)).toBeCloseTo(d(15), 6);
-      }
+        expect(d(0)).toBeCloseTo(bend.lineRadius(i), 6);
+      });
+      expect(Math.abs(angleRound(bend, shift, s, [shift[0], shift[1]]))).toBeLessThan(1e-9);
+      cs.delete();
     }
     info.cs.delete();
+    for (const l of info.lines) l.cs.delete();
+  });
+
+  it('keeps left- and right-aligned lines aligned along the arc', () => {
+    const lines = [
+      { font, text: 'BEST', size: 10 },
+      { font, text: 'GRANDPA EVER', size: 10 },
+    ];
+    for (const align of ['left', 'right']) {
+      const info = buildCrossSectionInfo(lines, { align, perLine: true });
+      for (const degrees of [120, -120]) {
+        const { cs, bend } = curveText(info, degrees);
+        const s = Math.sign(degrees);
+        const at = (x, i) => {
+          const [px, py] = bend.map(x, info.lines[i].middle, i);
+          return (Math.atan2(px, s * py + bend.radius) * 180) / Math.PI;
+        };
+        const edge = (i) => {
+          const b = info.lines[i].cs.bounds();
+          return align === 'left' ? b.min[0] : b.max[0];
+        };
+        // the lines' starts (or ends) on one radius, as far as the letters' side bearings allow
+        expect(Math.abs(at(edge(0), 0) - at(edge(1), 1))).toBeLessThan(2);
+        cs.delete();
+      }
+      info.cs.delete();
+      for (const l of info.lines) l.cs.delete();
+    }
+  });
+
+  it('keeps every counter, dot and accent with its own letter when a small line sits over a big one', () => {
+    const lines = [
+      { font, text: 'hi', size: 5 },
+      { font, text: 'Mini Jiji ÉÖ obo', size: 20 },
+    ];
+    const info = buildCrossSectionInfo(lines, { perLine: true });
+    const holes = (cs) => cs.toPolygons().filter((p) => {
+      let a = 0;
+      for (let i = 0; i < p.length; i++) a += p[i][0] * p[(i + 1) % p.length][1] - p[(i + 1) % p.length][0] * p[i][1];
+      return a < 0;
+    }).length;
+    const flatHoles = holes(info.cs);
+    // each piece's area and centroid
+    const pieces = (cs) =>
+      cs.decompose().map((p) => {
+        let a = 0, cx = 0, cy = 0;
+        for (const poly of p.toPolygons()) {
+          for (let i = 0; i < poly.length; i++) {
+            const [x0, y0] = poly[i];
+            const [x1, y1] = poly[(i + 1) % poly.length];
+            const c = x0 * y1 - x1 * y0;
+            a += c;
+            cx += (x0 + x1) * c;
+            cy += (y0 + y1) * c;
+          }
+        }
+        p.delete();
+        return { area: a / 2, c: [cx / (3 * a), cy / (3 * a)] };
+      });
+    // the marks (pieces under 20 mm²) in order along the line, each as an offset from the nearest letter body
+    const offsets = (list) => {
+      const big = list.filter((p) => p.area > 20);
+      return list
+        .filter((p) => p.area <= 20)
+        .sort((a, b) => a.x - b.x)
+        .map((m) => big.map((b) => m.x - b.x).reduce((best, d) => (Math.abs(d) < Math.abs(best) ? d : best), Infinity));
+    };
+    const flatOffsets = offsets(pieces(info.lines[1].cs).map((p) => ({ area: p.area, x: p.c[0] })));
+    expect(flatOffsets.length).toBeGreaterThanOrEqual(6);
+    for (const degrees of [90, -90, 180]) {
+      const { cs, bend, shift } = curveText(info, degrees);
+      const s = Math.sign(degrees);
+      // no counter filled in or cut elsewhere
+      expect(holes(cs)).toBe(flatHoles);
+      // the big line's marks (dots, accents) keep their offset along the line from the nearest letter body: the same
+      // distance round the arc as they had straight
+      const bent = pieces(cs).map((p) => ({ ...p, at: angleRound(bend, shift, s, p.c) * bend.lineRadius(1), r: Math.hypot(p.c[0] - shift[0], p.c[1] - shift[1] + s * bend.radius) }));
+      // (the small line's letters are left out: those in its span, past the big line's dots)
+      const b0 = info.lines[0].cs.bounds();
+      const span = [b0.min[0], b0.max[0]].map((x) => {
+        const [px, py] = bend.map(x, info.lines[0].middle, 0);
+        return Math.atan2(px, s * py + bend.radius) * bend.lineRadius(1);
+      });
+      const ofLine = bent.filter((p) => !(Math.abs(p.r - bend.lineRadius(1)) > 10 && p.at > Math.min(...span) - 1 && p.at < Math.max(...span) + 1));
+      const bentOffsets = offsets(ofLine.map((p) => ({ area: p.area, x: p.at })));
+      expect(bentOffsets).toHaveLength(flatOffsets.length);
+      bentOffsets.forEach((o, i) => expect(Math.abs(o - flatOffsets[i])).toBeLessThan(0.3));
+      cs.delete();
+    }
+    info.cs.delete();
+    for (const l of info.lines) l.cs.delete();
   });
 
   it('bends the outlines of real text into a sound arc of the same area', () => {
-    const cs = buildCrossSection(font, 'Candy Cane Lane', { size: 10 });
-    const [w] = size(cs);
-    const bend = arcBend(90, w, 6.5);
-    const bent = bendCrossSection(cs, bend, 0.3);
+    const info = buildCrossSectionInfo([{ font, text: 'Candy Cane Lane', size: 10 }], { perLine: true });
+    const [w, h] = size(info.cs);
+    const { cs: bent } = curveText(info, 90);
     expect(bent.isEmpty()).toBe(false);
     // the letters keep their size along the arc: the area changes only by the bend's stretch above and below the middle
-    expect(Math.abs(bent.area() / cs.area() - 1)).toBeLessThan(0.03);
+    expect(Math.abs(bent.area() / info.cs.area() - 1)).toBeLessThan(0.03);
     const [bw, bh] = size(bent);
     expect(bw).toBeLessThan(w); // an arch spans less than the straight text ...
-    expect(bh).toBeGreaterThan(size(cs)[1] + 5); // ... and rises in the middle
-    cs.delete();
+    expect(bh).toBeGreaterThan(h + 5); // ... and rises in the middle
+    // and it is the same shape as a straight bend of the same outline
+    const bend = arcBend(90, { lines: [{ middle: info.lines[0].middle, left: -w / 2, right: w / 2 }], bottom: -h / 2, top: h / 2 });
+    const plain = bendCrossSection(info.cs, (x, y) => bend.map(x, y), 0.3);
+    expect(Math.abs(plain.area() - bent.area()) / bent.area()).toBeLessThan(0.01);
+    plain.delete();
     bent.delete();
+    info.cs.delete();
+    for (const l of info.lines) l.cs.delete();
   });
 });
 

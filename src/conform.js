@@ -381,6 +381,40 @@ export function wallThicknessAt(geometry, position, normal, maxDistance = 1000) 
 }
 
 /** Fill NaN cells with the value of the nearest valid cell (multi-source BFS). */
+/**
+ * Which nodes of a grid (nx × ny nodes `cell` apart from [x0, y0]) lie within `grow` of the solid's footprint (its
+ * shadow on the XY plane): 1 for those, 0 for the rest.
+ */
+function footprintMask(solid, { nx, ny, x0, y0, cell, grow }) {
+  const mask = new Uint8Array(nx * ny);
+  const shadow = solid.project();
+  const grown = shadow.offset(grow, 'Round', 2, 8);
+  const polygons = grown.toPolygons();
+  shadow.delete();
+  grown.delete();
+  // each row: where it crosses the outlines, filled between alternate crossings
+  const xs = [];
+  for (let j = 0; j < ny; j++) {
+    const y = y0 + j * cell;
+    xs.length = 0;
+    for (const poly of polygons) {
+      for (let a = 0; a < poly.length; a++) {
+        const p = poly[a];
+        const q = poly[(a + 1) % poly.length];
+        if (p[1] <= y === q[1] <= y) continue;
+        xs.push(p[0] + ((y - p[1]) * (q[0] - p[0])) / (q[1] - p[1]));
+      }
+    }
+    xs.sort((a, b) => a - b);
+    for (let c = 0; c + 1 < xs.length; c += 2) {
+      const from = Math.max(0, Math.ceil((xs[c] - x0) / cell));
+      const to = Math.min(nx - 1, Math.floor((xs[c + 1] - x0) / cell));
+      for (let i = from; i <= to; i++) mask[j * nx + i] = 1;
+    }
+  }
+  return mask;
+}
+
 function fillMisses(h, nx, ny) {
   const queue = [];
   for (let k = 0; k < h.length; k++) if (!Number.isNaN(h[k])) queue.push(k);
@@ -586,6 +620,12 @@ function stepOver(sampler, p, n, raw, d, ds, plane, smooth, lateral = null) {
     const c = sampler.closest(target, ds);
     if (!c || dot3(c.n, raw) < SHARP || dot3(c.n, n) < 0.2) return null;
     if (dot3([c.p[0] - p[0], c.p[1] - p[1], c.p[2] - p[2]], ahead) < 0.3 * ds) return null;
+    // on a rounded edge the nearest point lies under the point ahead, along the surface's normal; past a sharp edge
+    // (the rim of a disc) it is the edge itself, off to the side: the text does not crawl along the rim
+    const v = [target[0] - c.p[0], target[1] - c.p[1], target[2] - c.p[2]];
+    const off = Math.hypot(v[0], v[1], v[2]);
+    const square = Math.abs(dot3(v, c.n));
+    if (off > 0.05 * ds && square < 0.8 * off) return null;
     best = c;
   }
   // the averaged normal at the landed point: the one at the point ahead serves when the two are close
@@ -788,8 +828,11 @@ function walkChart(sampler, { nx, ny, i0, j0, cell, jump, seed, smooth, chord = 
 function wrapSolid(flatSolid, sampler, { min, max, width, height, flatTolerance, reach, wallLimit, options, result }) {
   const z0 = nearestHit(sampler.hitsAt(0, 0), 0);
   if (!Number.isFinite(z0) || Math.abs(z0) > reach) return null;
+  // the size of the letters (or plate): what the grid, the smoothing and the jumps are scaled to – a curved line of
+  // text spans a box much taller than its letters
+  const scale = options.scale ?? Math.min(width, height);
   // a grid with a node at the origin, covering the footprint and a margin
-  let cell = options.cell ?? Math.max(0.4, Math.min(width, height) / 12);
+  let cell = options.cell ?? Math.max(0.4, scale / 12);
   const margin = options.margin ?? cell;
   const xLo = Math.min(min[0] - margin, 0);
   const xHi = Math.max(max[0] + margin, 0);
@@ -803,10 +846,10 @@ function wrapSolid(flatSolid, sampler, { min, max, width, height, flatTolerance,
   const x0 = -i0 * cell;
   const y0 = -j0 * cell;
   const N = nx * ny;
-  const jump = Math.max(3, 0.6 * Math.min(width, height), 6 * cell);
+  const jump = Math.max(3, 0.6 * scale, 6 * cell);
   // bumps smaller than about a quarter of the letters' height are texture the text lies over, not a shape it follows
-  const smooth = Math.min(4, Math.max(1, 0.25 * Math.min(width, height)));
-  const chord = Math.max(smooth, 0.5 * Math.min(width, height));
+  const smooth = Math.min(4, Math.max(1, 0.25 * scale));
+  const chord = Math.max(smooth, 0.5 * scale);
   const { P, W, on, sharp, lost } = walkChart(sampler, { nx, ny, i0, j0, cell, jump, smooth, chord, planar: 'auto', seed: { p: [0, 0, z0], n: [0, 0, 1] } });
   const pt = (k) => [P[k * 3], P[k * 3 + 1], P[k * 3 + 2]];
   const wn = (k) => [W[k * 3], W[k * 3 + 1], W[k * 3 + 2]];
@@ -839,17 +882,23 @@ function wrapSolid(flatSolid, sampler, { min, max, width, height, flatTolerance,
   }
   const gn = (k) => [G[k * 3], G[k * 3 + 1], G[k * 3 + 2]];
 
-  // statistics behind the notes, over the nodes under the slab's footprint
-  const inside = (i, j) => {
+  // statistics behind the notes, over the nodes under the slab: within its box and within half a letter of its
+  // footprint – a straight line or a plate covers its box, but an arc of text leaves most of it empty, and what lies
+  // there (the inside of the arch, past the rim of a medal) is no part of the text
+  const near = footprintMask(flatSolid, { nx, ny, x0, y0, cell, grow: Math.max(cell, 0.5 * scale) });
+  const inBox = (i, j) => {
     const x = x0 + i * cell, y = y0 + j * cell;
     return x >= min[0] && x <= max[0] && y >= min[1] && y <= max[1];
   };
+  const any = near.includes(1);
+  const inside = (i, j) => inBox(i, j) && (!any || near[j * nx + i] === 1);
   const buriedAt = (p) => sampler.castAll(p, [0, 0, 1], 1e4).length % 2 === 1; // an odd number of crossings above: inside
   let misses = 0;
   let buried = 0;
   let roundTheBack = 0;
   let squeezed = 0;
-  let footprint = 0;
+  let footprint = 0; // nodes under the footprint
+  let missesUnder = 0; // ... missing the surface
   let sum = 0;
   let count = 0;
   let lo = Infinity;
@@ -868,8 +917,10 @@ function wrapSolid(flatSolid, sampler, { min, max, width, height, flatTolerance,
       if (under) footprint++;
       if (!on[k]) {
         misses++;
+        if (!under) continue;
+        missesUnder++;
         if (lost[k] === ROUND_THE_BACK) roundTheBack++;
-        else if (under && buriedAt(pt(k))) buried++;
+        else if (buriedAt(pt(k))) buried++;
         continue;
       }
       const z = P[k * 3 + 2];
@@ -982,7 +1033,7 @@ function wrapSolid(flatSolid, sampler, { min, max, width, height, flatTolerance,
     samples: N,
     misses,
     buried,
-    missFraction: (misses - buried - roundTheBack) / N,
+    missFraction: footprint ? (missesUnder - buried - roundTheBack) / footprint : 0,
     buriedFraction: footprint ? buried / footprint : 0,
     squeezedFraction: footprint ? squeezed / footprint : 0,
     touches: true,
@@ -997,7 +1048,7 @@ function wrapSolid(flatSolid, sampler, { min, max, width, height, flatTolerance,
     distortedFraction: cells ? distorted / cells : 0,
     steep,
     wrapDeg,
-    wrapsAround: roundTheBack > 0.02 * N,
+    wrapsAround: roundTheBack > 0.02 * footprint,
     crossesEdge,
     rMin,
     wrapped: true,
@@ -1047,7 +1098,9 @@ function wrapSolid(flatSolid, sampler, { min, max, width, height, flatTolerance,
  * @param {import('manifold-3d').Manifold} flatSolid  flat extrusion in text-local space (caller keeps ownership)
  * @param {{ heightAt(x: number, y: number): number }} sampler  from createSurfaceSampler()
  * @param {object} [options]
- * @param {number} [options.cell]           sample spacing, model units (default max(0.4, min(w, h) / 12))
+ * @param {number} [options.scale]          the size of the letters or plate (default min(w, h)): a curved line spans a
+ *                                          box taller than its letters, and the grid and smoothing follow the letters
+ * @param {number} [options.cell]           sample spacing, model units (default max(0.4, scale / 12))
  * @param {number} [options.maxEdge]        refineToLength() edge length (default: cell)
  * @param {number} [options.flatTolerance]  height range treated as flat (default 0.02); flat text is only translated
  * @param {number} [options.margin]         grid margin around the footprint (default: one cell)
@@ -1079,7 +1132,7 @@ export function conformSolid(flatSolid, sampler, options = {}) {
     if (wrapped) return wrapped;
   }
 
-  let cell = options.cell ?? Math.max(0.4, Math.min(width, height) / 12);
+  let cell = options.cell ?? Math.max(0.4, (options.scale ?? Math.min(width, height)) / 12);
   const margin = options.margin ?? cell;
   const spanX = width + 2 * margin;
   const spanY = height + 2 * margin;

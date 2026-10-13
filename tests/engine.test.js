@@ -314,6 +314,30 @@ describe('preview', () => {
     expect(note.applied).toBeLessThan(300);
   });
 
+  it('says what held a curve back, judges gaps as bent, and sees no overhang in the empty middle of an arch', async () => {
+    await client.loadBase({ kind: 'sample', version: ++version });
+    const notesOf = async (text, extra) => (await client.preview(topItem(text, { size: 10, position: [0, 0, 60], conform: false, ...extra }), version)).notes;
+    // a banner bent most of the way round: its tails would meet, not its inside fold
+    const banner = (await notesOf('Candy Cane Lane', { curve: 330, plate: 'banner' })).find((n) => n.code === 'CURVE_LIMITED');
+    expect(banner.text).toMatch(/ends of the plate/);
+    expect(banner.applied).toBeLessThan(330);
+    const short = (await notesOf('Hi', { curve: 300 })).find((n) => n.code === 'CURVE_LIMITED');
+    expect(short.text).toMatch(/fold/);
+    // a long line goes as far round as asked
+    expect((await notesOf('Candy Cane Lane', { curve: 330 })).map((n) => n.code)).not.toContain('CURVE_LIMITED');
+    // the gaps between letters on the inside of a tight arch are squeezed below what the nozzle can print
+    expect((await notesOf('HELLO', { size: 8, curve: 0 })).map((n) => n.code)).not.toContain('NARROW_GAPS');
+    expect((await notesOf('HELLO', { size: 8, curve: 330 })).map((n) => n.code)).toContain('NARROW_GAPS');
+
+    // text arched along the rim of a medal: every letter on it, the corners of the arch's box past the rim
+    const disc = wasm.Manifold.cylinder(4, 40, 40, 256, true);
+    await client.loadBase({ kind: 'stl', bytes: stlOf(disc), name: 'medal', version: ++version });
+    const arch = await client.preview(topItem('CANDY CANE LANE', { size: 6, curve: 150, position: [0, 20, 2] }), version);
+    expect(arch.stats.missFraction).toBeLessThan(0.02);
+    expect(arch.notes.map((n) => n.code)).not.toContain('OVERHANG');
+    disc.delete();
+  });
+
   it('follows a curved surface', async () => {
     const cyl = wasm.Manifold.cylinder(60, 20, 20, 128, true).rotate([90, 0, 0]);
     await client.loadBase({ kind: 'stl', bytes: stlOf(cyl), name: 'cyl', version: ++version });

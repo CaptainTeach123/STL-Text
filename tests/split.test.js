@@ -769,6 +769,110 @@ describe('planning pieces that really print', () => {
     }
   });
 
+  it('a table is cut through its legs, not just inside its apron, which would leave slivers of it as pieces of their own', async () => {
+    // 600 × 350 × 300: a 20 mm top, 35 mm legs, a 60 × 15 mm apron under the top. Cut 3.5 mm inside the apron, the
+    // boxes between the legs each held a 3.5 mm sliver of it: twelve pieces, two of them glued flat with no pins
+    const table = (stretcher) => {
+      const parts = [cube([600, 350, 20], [300, 175, 290])];
+      for (const x of [37.5, 562.5]) for (const y of [37.5, 312.5]) parts.push(cube([35, 35, 280], [x, y, 140]));
+      parts.push(cube([490, 15, 60], [300, 27.5, 250]), cube([490, 15, 60], [300, 322.5, 250]), cube([15, 240, 60], [27.5, 175, 250]), cube([15, 240, 60], [572.5, 175, 250]));
+      // an H stretcher 50–70 mm up: cut through it, its rail left a strip held loose over the rest of a piece
+      if (stretcher) parts.push(cube([520, 20, 20], [300, 175, 60]), cube([25, 242, 20], [37.5, 175, 60]), cube([25, 242, 20], [562.5, 175, 60]));
+      return own(wasm.Manifold.union(parts));
+    };
+    for (const [name, count] of [['coffee table', 10], ['stretcher table', 11]]) {
+      await load(table(name === 'stretcher table'), name);
+      const p = await plan();
+      expect(p.counts, name).toEqual([2, 1, 1]);
+      expect(p.pieces, name).toHaveLength(count);
+      const z = p.cuts.find((c) => c.normal[2] === 1).position[2];
+      expect(z, name).toBeLessThan(220);
+      const ex = await exportSplit(planned(p, { labels: false }), { name });
+      expect(ex.pieces, name).toHaveLength(count);
+      expect(ex.notes.filter((n) => n.level === 'warn'), name).toEqual([]);
+      expect(ex.seams.every((s) => s.dowels.length > 0), name).toBe(true);
+      for (const f of piecesOf(ex)) for (const shell of pieceSolid(f).decompose().map(own)) expect(shell.boundingBox().min[2], f.name).toBeCloseTo(0, 3);
+    }
+  });
+
+  it('a gear with a hub is cut into quarters that all lie flat, none stood on its cut edge with its teeth over supports', async () => {
+    // a 10 mm gear Ø300 with five lightening holes and a hub 40 mm tall: on its cut edge a quarter would put one mating
+    // face down, but stand 138 mm tall and need ten times the support
+    const { CrossSection } = wasm;
+    const teeth = [];
+    for (let i = 0; i < 40; i++) {
+      const a = (2 * Math.PI * i) / 40;
+      teeth.push([[138, -6], [150, -3], [150, 3], [138, 6]].map(([x, y]) => [x * Math.cos(a) - y * Math.sin(a), x * Math.sin(a) + y * Math.cos(a)]));
+    }
+    const rim = own(new CrossSection(teeth, 'NonZero'));
+    const disc = own(rim.add(own(CrossSection.circle(140, 180))));
+    let gear = own(wasm.Manifold.extrude(disc, 10));
+    const bore = (r, at, h) => own(own(wasm.Manifold.cylinder(h + 2, r, r, 64)).translate([at[0], at[1], -1]));
+    for (let i = 0; i < 5; i++) gear = own(gear.subtract(bore(25, [80 * Math.cos((2 * i + 1) * Math.PI / 5), 80 * Math.sin((2 * i + 1) * Math.PI / 5)], 10)));
+    const hub = own(own(wasm.Manifold.cylinder(40, 30, 30, 64)).subtract(bore(10, [0, 0], 40)));
+    await load(own(own(gear.add(hub)).subtract(bore(10, [0, 0], 40))), 'gear');
+    const p = await plan();
+    expect(p.counts).toEqual([1, 1, 0]);
+    const r = await resultSplit(planned(p, { labels: false }));
+    expect(r.pieces.map((x) => [x.down, x.lies, x.fits])).toEqual(Array(4).fill(['-z', 'flat as modelled', true]));
+    expect(r.pieces.every((x) => x.size[2] === 40)).toBe(true);
+  });
+
+  it('only a piece whose material meets a dovetail cut is held flat by it: the top of a T\'s stem lies on its side', async () => {
+    // the arm's cut is a dovetail 3.5 mm from the stem, closer than its tab reaches; the stem's top never meets it
+    const T = (stem) => own(wasm.Manifold.union([cube([300, 40, 8], [0, 20, 4]), cube([8, 40, stem], [0, 20, stem / 2])]));
+    await load(T(260), 'T');
+    const p = await plan();
+    expect(p.cuts.map((c) => [c.normal.indexOf(1), c.position[c.normal.indexOf(1)]])).toEqual([[0, -7.5], [2, 130]]);
+    // planned without the tab's length, as the cut makes it
+    expect(p.pieces[2].size).toEqual([157.5, 40, 130]);
+    const r = await resultSplit(planned(p, { labels: false }));
+    expect(r.seams.map((x) => [x.letter, x.pieces, x.joint])).toEqual([['A', [1, 2], 'dovetail'], ['B', [2, 3], 'dowels']]);
+    expect(r.pieces[2]).toMatchObject({ lies: 'on its side', fits: true });
+    // cut by hand, a 250 mm stem top fits lying across the bed's diagonal: it is not stood on its end, too tall to print
+    await load(T(400), 'T');
+    const tall = await resultSplit(S({ cuts: [cutAt(0, -7.5, 'c1'), cutAt(2, 150, 'c2')], labels: false }));
+    expect(tall.pieces[2]).toMatchObject({ lies: 'on its side', fits: true });
+    expect(codes(tall)).not.toContain('PIECE_TOO_BIG');
+  });
+
+  it('a file holds only what rests on the bed: the shelves a bookcase\'s middle box holds loose are pieces of their own', async () => {
+    // on the default printer the middle box can only lie as modelled: its bottom shelf rests on the bed, and the other
+    // two would be held 110 and 225 mm over it. They are pieces of their own, numbered, labelled and glued as such
+    const board = (z) => cube([600, 200, 15], [300, 100, z + 7.5]);
+    const bookcase = own(wasm.Manifold.union([board(0), board(110), board(225), cube([15, 200, 240], [7.5, 100, 120]), cube([15, 200, 240], [592.5, 100, 120])]));
+    await load(bookcase, 'bookcase');
+    const p = await plan();
+    expect(p.counts).toEqual([2, 0, 0]);
+    const ex = await exportSplit(planned(p), { name: 'bookcase' });
+    const files = piecesOf(ex);
+    expect(files).toHaveLength(4);
+    expect(ex.pieces.map((x) => [x.cell[0], x.shells, x.fits])).toEqual([[0, 1, true], [1, 1, true], [1, 2, true], [2, 1, true]]);
+    for (const f of files) {
+      // every shell of every file starts on the bed (a sealed hollow would come back inside out, with no volume of its own)
+      for (const shell of pieceSolid(f).decompose().map(own)) expect(shell.boundingBox().min[2], f.name).toBeCloseTo(0, 3);
+    }
+    // put back where they were, the pieces make the model: nothing lost, nothing twice
+    const parts = files.map(assembled);
+    for (let i = 0; i < parts.length; i++) for (let j = i + 1; j < parts.length; j++) expect(overlap(parts[i], parts[j])).toBeLessThan(1e-3);
+    const glued = piecesOf(await exportSplit(planned(p, { joint: 'none', labels: false }), { name: 'bookcase' })).map(assembled);
+    expect(glued.reduce((v, m) => v + m.volume(), 0)).toBeCloseTo(bookcase.volume(), 0);
+    // each loose shelf is joined to the ends with its own pins and labels, and the glue sheet and the view count it
+    const seams = ex.seams.map((s) => [s.letter, s.pieces, s.labels, s.dowels.length > 0]);
+    expect(seams.map(([letter, pieces]) => [letter, pieces])).toEqual([['A', [1, 2]], ['A', [1, 3]], ['B', [2, 4]], ['B', [3, 4]]]);
+    for (const [letter, pieces, labels, pinned] of seams) {
+      expect(pinned).toBe(true);
+      expect(labels).toEqual(pieces.map((k) => `${k}${letter}`));
+    }
+    const sheet = ex.files.find((f) => f.kind === 'text').text;
+    expect(sheet).toContain('bookcase – 4 pieces');
+    expect(sheet).toMatch(/piece 3 of 4 .*lies on a cut face.*2 parts/);
+    expect(ex.assembly).toEqual([expect.stringMatching(/^Cut A: .* push pieces 2 and 3 on together/), expect.stringMatching(/^Cut B: .* push piece 4 on/)]);
+    const r = await resultSplit(planned(p));
+    expect([...new Set(r.display.parts.filter((x) => x.kind === 'piece').map((x) => x.index))]).toEqual([1, 2, 3, 4]);
+    expect(r.pieces.map((x) => x.index)).toEqual([1, 2, 3, 4]);
+  });
+
   it('a box with its lid laid beside it is cut through the gap: four pieces, the lid in two', async () => {
     const body = own(cube([300, 200, 150], [150, 100, 75]).subtract(cube([294, 194, 150], [150, 100, 78])));
     const lid = own(own(cube([300, 200, 3], [150, 320, 1.5]).add(cube([293.2, 193.2, 8], [150, 320, 7]))).subtract(cube([287.2, 187.2, 10], [150, 320, 7])));
@@ -1017,6 +1121,19 @@ describe('the engine around a split', () => {
         await client.planSplit([], version, { printing, split: SPLIT_DEFAULTS, bed: BED, mode: 'fit' });
       }
       expect(watch.live()).toBeLessThanOrEqual(plate);
+      // nor where a box's loose shelves print apart: laid as modelled, two of the middle box's three would be held over
+      // the bed, so each is a piece of its own
+      const board = (z) => cube([300, 100, 8], [150, 50, z + 4]);
+      await load(own(wasm.Manifold.union([board(0), board(56), board(112), cube([8, 100, 120], [4, 50, 60]), cube([8, 100, 120], [296, 50, 60])])), 'shelf');
+      const shelf = (i) => S({ cuts: [cutAt(0, 100 + i), cutAt(0, 200 - i, 'c2')], orient: 'model' });
+      await resultSplit(shelf(0));
+      await exportSplit(shelf(0), { archive: 'zip' });
+      const shelves = watch.live();
+      for (let i = 1; i < 4; i++) {
+        expect((await resultSplit(shelf(i))).pieces).toHaveLength(5);
+        await exportSplit(shelf(i), { archive: 'zip' });
+      }
+      expect(watch.live()).toBeLessThanOrEqual(shelves);
     } finally {
       watch.stop();
     }

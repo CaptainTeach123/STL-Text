@@ -13,14 +13,14 @@ import { baseSurface, crumpleOf, findDetails, refitSpheres } from './details.js'
 import { DECOR_KINDS, buildDecor, decorPartId, normaliseDecorSpec } from './decor.js';
 import { strToU8, zipSync } from 'three/examples/jsm/libs/fflate.module.js';
 import {
-  CUT_TOLERANCE, FILAMENT, SPLIT_KEEP_TRIANGLES, SplitError, TO_PLANE, applyToSoup, assemblySteps, axisCuts, cellOfPoint, chooseOrientation,
-  cutPlane, fitsBed, glueFileName, gridCandidates, howToGlueText, letterFor, normaliseSplit, partFileName, pieceFileName, pinsFileName,
-  planCost, planGrid, planSamples, plateAxis, safeFileName, slabAxis, sizesFor, soupCells, splitActive, splitNote, statsWithSoup, usableBed, zipFileName,
-  cellSupport, flatProbes,
+  CUT_TOLERANCE, FILAMENT, SPLIT_KEEP_TRIANGLES, SplitError, TO_PLANE, applyToSoup, assemblySteps, axisCuts, cellOfPoint,
+  cutPlane, fitsBed, glueFileName, gridCandidates, howToGlueText, layPieces, letterFor, normaliseSplit, partFileName, pieceFileName, pinsFileName,
+  planCost, planGrid, planSamples, plateAxis, safeFileName, slabAxis, sizesFor, smallPieceNotes, soupCells, splitActive, splitNote, usableBed,
+  zipFileName, cellSupport, flatProbes,
 } from './split.js';
 import {
-  buildSplitDisplay, clearSplitCaches, cutPieces, drillPiece, fitTestCoupon, layoutSplit, pinAt, pinSheet, pinSpares, pinsPerSheet, planDovetails,
-  tabsAcross,
+  buildSplitDisplay, clearSplitCaches, cutPieces, drillPiece, fitTestCoupon, layoutSplit, partedSolids, pinAt, pinSheet, pinSpares, pinsPerSheet,
+  planDovetails, tabsAcross,
 } from './splitGeometry.js';
 
 /**
@@ -281,6 +281,21 @@ function perimeterOf(polygons) {
     }
   }
   return sum;
+}
+
+/**
+ * Polygons with each corner closer than `step` to the last one kept left out: plenty to tell which boxes of a grid
+ * an outline reaches, and light enough to keep for every sample the planner slices.
+ */
+function coarseOf(polygons, step) {
+  return polygons.map((ring) => {
+    const out = [ring[0]];
+    for (const p of ring) {
+      const q = out[out.length - 1];
+      if (Math.hypot(p[0] - q[0], p[1] - q[1]) >= step) out.push(p);
+    }
+    return out.length >= 3 ? out : ring;
+  });
 }
 
 /** The longest distance between two corners of polygons (on at most 64 of them: enough to tell whether two pins fit). */
@@ -2304,10 +2319,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const plan = platesFor(final, cuts, spec);
     const cut = cutStage(final, items, cuts, plan, progress);
     progress?.('Choosing how each piece lies…');
-    const slab = slabOf(final);
-    const lying = cut.pieces.map((p) => chooseOrientation(p.stats, U, spec.orient, { pieceIndex: p.index, flat: slab }));
-    const drill = drillStage(final, cut, { cuts, spec, joints: plan.joints, ups: lying.map((o) => o.up), nozzle }, progress);
-    return summarise({ final, spec, cuts, U, given, plan, cut, lying, drill });
+    // how each piece lies, and which of a box's shells print apart because lying that way they would not rest on the bed
+    const laid = layPieces(cut.pieces, U, spec.orient, { flat: slabOf(final), soups: cut.fragments });
+    const lying = laid.map((p) => p.lying);
+    const drill = drillStage(final, cut, laid, { cuts, spec, joints: plan.joints, nozzle }, progress);
+    return summarise({ final, spec, cuts, U, given, plan, cut, laid, lying, drill });
   }
 
   /** Stage A: the model cut into one piece per cell, each with its orientation statistics. */
@@ -2329,9 +2345,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const keep = solids.reduce((n, m) => n + m.numTri(), 0) <= splitKeepTriangles;
       const notes = [...made.notes, ...crossingNotes(final, items, cuts, pieces)];
       if (final.passthrough.length) notes.push(splitNote('SPLIT_UNREPAIRED', { count: final.passthrough.length / 9 }));
-      // a piece's file holds its loose triangles too: it is turned and judged with them
+      // a piece's file holds its loose triangles too: it is turned and judged with them (`layPieces`)
       const fragments = fragmentsFor(final, cuts, pieces);
-      for (const p of pieces) p.stats = statsWithSoup(p.stats, fragments.get(p.index));
       state.cut = {
         key,
         cuts,
@@ -2371,38 +2386,52 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     return { solids, owned: true };
   }
 
-  /** Stage C and D: pins and labels laid out (plain data), and every piece drilled. */
-  function drillStage(final, cut, { cuts, spec, joints, ups, nozzle }, progress) {
+  /**
+   * Stage C and D: pins and labels laid out (plain data), and every piece drilled. The pieces are those `layPieces`
+   * made of the cut's: the way each prints up and which shells print apart are in the key.
+   */
+  function drillStage(final, cut, laid, { cuts, spec, joints, nozzle }, progress) {
     const state = splitState(final);
     const { joint, diameter, depth, clearance, count, labels } = spec;
     const font = labels ? fontFor('inter') : null;
-    const key = `${cut.key}|drill:${stableKey({ joint, diameter, depth, clearance, count, labels, nozzle, ups, font: font?.key ?? null })}`;
+    const ups = laid.map((p) => p.lying.up);
+    const groups = laid.map((p) => [p.from, p.parts]);
+    const key = `${cut.key}|drill:${stableKey({ joint, diameter, depth, clearance, count, labels, nozzle, ups, groups, font: font?.key ?? null })}`;
     if (state.drill?.key === key) return state.drill;
     disposeSplitStage(state.drill);
     state.drill = null;
-    const layout = layoutSplit(final.solid, cuts, cut.pieces.map((p, i) => ({ index: p.index, cell: p.cell, up: ups[i] })), spec, {
+    const layout = layoutSplit(final.solid, cuts, laid.map((p) => ({ index: p.index, cell: p.cell, up: p.lying.up, boxes: p.boxes })), spec, {
       nozzle, joints, tabs: cut.tabs, font: font?.font ?? null, bounds: boxOf(final.solid), progress,
     });
-    const drilled = drillAll(final, cut, layout, font?.font ?? null, progress);
+    const drilled = drillAll(final, cut, laid, layout, font?.font ?? null, progress);
     const keep = drilled.reduce((n, m) => n + m.numTri(), 0) <= splitKeepTriangles;
     state.drill = { key, layout, display: null, solids: keep ? drilled : null, transient: keep ? null : drilled };
     return state.drill;
   }
 
-  /** Every piece with its own holes and labels taken out (new solids, the caller's). */
-  function drillAll(final, cut, layout, font, progress) {
+  /** Every piece with its own holes and labels taken out (new solids, the caller's), one per piece of `laid`. */
+  function drillAll(final, cut, laid, layout, font, progress) {
     const { solids, owned } = pieceSolids(final, cut, progress);
     const drilled = [];
+    let parted = [];
     try {
-      cut.pieces.forEach((p, i) => {
-        progress?.('Drilling pin holes…', { done: i + 1, total: cut.pieces.length });
-        drilled.push(drillPiece(solids[i], layout, p.index, { font }));
+      cut.pieces.forEach((c, i) => {
+        const mine = laid.filter((p) => p.from === c.index);
+        // a box whose shells print apart: each group of them is a piece of its own
+        parted = mine.length > 1 ? partedSolids(solids[i], c.parts, mine.map((p) => p.parts)) : [];
+        mine.forEach((p, k) => {
+          progress?.('Drilling pin holes…', { done: p.index, total: laid.length });
+          drilled.push(drillPiece(parted[k] ?? solids[i], layout, p.index, { font }));
+        });
+        parted.forEach((m) => m.delete());
+        parted = [];
       });
       return drilled;
     } catch (err) {
       drilled.forEach((m) => m.delete());
       throw err;
     } finally {
+      parted.forEach((m) => m.delete());
       if (owned) solids.forEach((m) => m.delete());
     }
   }
@@ -2417,7 +2446,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       return { solids, owned: true };
     }
     const font = drill.layout.labels.length ? fontFor('inter').font : null;
-    return { solids: drillAll(final, cut, drill.layout, font, progress), owned: true };
+    return { solids: drillAll(final, cut, split.laid, drill.layout, font, progress), owned: true };
   }
 
   /**
@@ -2426,10 +2455,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * note, the summary first.
    */
   function summarise(split) {
-    const { final, spec, cuts, U, given, plan, cut, lying, drill } = split;
+    const { final, spec, cuts, U, given, plan, cut, laid, lying, drill } = split;
     const { layout } = drill;
-    const n = cut.pieces.length;
-    const pieces = cut.pieces.map((p, i) => {
+    const n = laid.length;
+    const pieces = laid.map((p, i) => {
       const o = lying[i];
       return {
         index: p.index,
@@ -2443,7 +2472,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         down: o.down,
         up: o.up,
         dowels: layout.dowels.filter((d) => d.sides.some((s) => s.piece === p.index)).length,
-        unrepaired: (cut.fragments.get(p.index)?.length ?? 0) / 9,
+        unrepaired: (p.soup?.length ?? 0) / 9,
       };
     });
     const tabs = new Map(cut.dovetails.map((x) => [x.cutId, x.tabs]));
@@ -2494,7 +2523,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const seam = seams.find((s) => s.cutId === x.cutId && s.joint === 'dovetail');
       notes.push(splitNote('DOVETAIL', { letter: x.letter, cutId: x.cutId, tabs: x.tabs, pieces: seam?.pieces ?? [] }));
     }
-    notes.push(...given, ...plan.notes, ...cut.notes);
+    // the cut's notes number the boxes' pieces: a box whose shells print apart is more than one piece, so the thin
+    // pieces are looked for again and text is said to run into the first piece of its box
+    const first = new Map();
+    for (const p of laid) if (!first.has(p.from)) first.set(p.from, p.index);
+    const cutNotes = cut.notes.filter((x) => x.code !== 'SMALL_PIECE').map((x) => {
+      if (x.code !== 'CUT_THROUGH_TEXT' || !x.pieces?.length || laid.length === cut.pieces.length) return x;
+      const { level, code, text, ...fields } = x;
+      return splitNote(code, { ...fields, pieces: [...new Set(x.pieces.map((k) => first.get(k) ?? k))] });
+    });
+    notes.push(...given, ...plan.notes, ...smallPieceNotes(laid, cuts), ...cutNotes);
     // what prints on its own must fit the bed as it is saved too: a part lying pegs up, a pin on its flat
     for (const p of final.separate) {
       const b = boxOf(p.local);
@@ -2507,7 +2545,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     }
     lying.forEach((o, i) => {
       // a piece on a dovetail seam lies flat by design: that it cannot lie on its cut face is no news
-      const flatOnly = cut.pieces[i].stats.allowed.length < 6;
+      const flatOnly = laid[i].stats.allowed.length < 6;
       notes.push(...o.notes.filter((x) => !(flatOnly && x.code === 'ORIENT_FALLBACK')));
     });
     notes.push(...layout.notes);
@@ -2530,7 +2568,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           return simpler.numTri() < m.numTri() ? simpler : m;
         });
         const by = axisCuts(split.cuts);
-        const entries = cut.pieces.map((p, i) => ({ solid: shown[i], soup: cut.fragments.get(p.index) ?? null, part: { kind: 'piece', index: p.index } }));
+        const entries = split.laid.map((p, i) => ({ solid: shown[i], soup: p.soup, part: { kind: 'piece', index: p.index } }));
         for (const d of drill.layout.dowels) entries.push({ solid: temps.add(pinAt(d)), part: { kind: 'pin', cell: d.cell } });
         for (const p of final.separate) {
           const b = boxOf(p.world);
@@ -2574,8 +2612,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * sheet, packed in one zip (`archive: 'zip'`) or sent as separate files.
    */
   function splitExport(final, split, { name, printer, archive }, progress) {
-    const { cut, drill, lying, U, spec } = split;
-    const n = cut.pieces.length;
+    const { laid, drill, lying, U, spec } = split;
+    const n = laid.length;
     const files = [];
     const add = (file, soup, extra) => {
       const stl = writeBinarySTL(soup, `STL-Text ${file}`);
@@ -2583,10 +2621,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     };
     const { solids, owned } = drilledSolids(final, split, progress);
     try {
-      cut.pieces.forEach((p, i) => {
+      laid.forEach((p, i) => {
         progress?.('Writing piece files…', { done: i + 1, total: n });
         const { printMatrix, matrix, size, fits, lies, yaw } = lying[i];
-        const frags = cut.fragments.get(p.index);
+        const frags = p.soup;
         const soup = concatSoups([applyToSoup(manifoldToSoup(solids[i]), printMatrix), frags ? applyToSoup(frags, printMatrix) : null]);
         add(pieceFileName(name, p.index, n), soup, { kind: 'piece', index: p.index, size, fits, lies, yaw, matrix });
       });
@@ -2909,7 +2947,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         } finally {
           probed.dispose();
         }
-        const made = { samples, costs: planCost(profile, { items: text.map((b) => [b.min[a], b.max[a]]) }), tabs };
+        const made = { samples, costs: planCost(profile, { items: text.map((b) => [b.min[a], b.max[a]]) }), tabs, rings: profile.map((p) => p.rings) };
         profiles.set(key, made);
         return made;
       };
@@ -3000,14 +3038,17 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * also runs a hole's reach either side of the face: `beside` holds the
    * slices there, null past the model's end). Without that a slanted wall
    * looks roomy: near the end of a round shell the ring is wide, but a hole
-   * square to it breaks out a few mm in. Borrows the slices.
+   * square to it breaks out a few mm in. With them its outline (`rings`, a
+   * corner every millimetre or more), for which boxes of a grid hold model
+   * there (`planGrid`). Borrows the slices.
    */
   function sliceStats(face, pins, beside = null) {
     const temps = scope();
     try {
-      if (face.isEmpty()) return { area: 0, perimeter: 0, islands: 0, roomy: 0, noRoom: 0 };
+      if (face.isEmpty()) return { area: 0, perimeter: 0, islands: 0, roomy: 0, noRoom: 0, rings: [] };
       const area = face.area();
-      const perimeter = perimeterOf(polygonsOf(face));
+      const outline = polygonsOf(face);
+      const perimeter = perimeterOf(outline);
       let islands = 0;
       let roomy = 0;
       let bare = 0;
@@ -3041,7 +3082,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       } finally {
         list.forEach((c) => c.delete());
       }
-      return { area, perimeter, islands, roomy, noRoom: area > 0 ? Math.min(1, bare / area) : 0 };
+      return { area, perimeter, islands, roomy, noRoom: area > 0 ? Math.min(1, bare / area) : 0, rings: coarseOf(outline, 1) };
     } finally {
       temps.dispose();
     }

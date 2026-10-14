@@ -3,7 +3,7 @@ import {
   AUTO_DIAMETERS, AXES, BED_DEFAULTS, BED_PRESETS, CUT_COLOR, CUT_TOLERANCE, FILAMENT, HOLE_SEGMENTS, JOINTS, ORIENT_MODES, PIN_DIAMETERS,
   POLYGON_K, SPLIT_KEEP_TRIANGLES, TOO_BIG_COLOR, translationMat4, transposeMat4, DIRECTIONS, LAY_DOWN, PIECE_COLORS, PIN_COLOR, PLAN_WEIGHTS, SPLIT_DEFAULTS, SPLIT_LIMITS,
   SPLIT_NOTE_CODES, SplitError, TO_PLANE, TO_WORLD, YAW90, applyMat4, applyToSoup, assemblySteps, axisCuts, bedSize, cellOf,
-  cellFits, cellOfPoint, cellSizes, chooseCentres, chooseOffsets, chooseOrientation, clipSoupByPlane, cutPlane, dirAxis, dirOf,
+  cellFits, cellOfPoint, cellSizes, chooseCentres, chooseOffsets, chooseOrientation, clipSoupByPlane, clippedArea, cutPlane, dirAxis, dirOf,
   dovetailSize, evenCell, explodeOffset, fitsBed, footprintYaw, formatSize, glueFileName, gridCandidates, gridCounts, gridPoints,
   howToGlueText, invertRigid, isSymmetric, letterFor, localFrame, maxCellLength, mulMat4, nextCut, normaliseSplit, offsetAlongRay,
   oppositeDir, orientationStats, partFileName, pieceColorIndex, pieceFileName, pinsFileName, planAllowance, planCost, planGrid,
@@ -510,6 +510,32 @@ describe('planCost', () => {
       expect(r.offsets).toEqual([0]);
     });
 
+    it('with the boxes the other axes make, leaves the fewest pieces: a table is cut through its legs, not just inside its apron', () => {
+      // along z, three columns: the legs' (model all the way up) and the middle one (only the apron and top, from 220).
+      // A slice through the apron ring costs a little less than one through the four legs, so alone the cut goes 3.5 mm
+      // inside it, and the middle box below takes a 3.5 mm sliver of apron: a piece of its own
+      const samples = planSamples(0, 300, 1);
+      const costs = samples.map((t) => (t > 220 && t < 280 ? 5.8 : 7));
+      const limits = { lo: 0, hi: 300, k: 1, S: 249, minEnd: 15, minMid: 30 };
+      const alone = chooseOffsets(samples, costs, limits);
+      expect(alone.offsets[0]).toBeGreaterThan(220);
+      expect(alone.offsets[0]).toBeLessThan(225);
+      const occupied = samples.map((t) => Uint8Array.from([1, t >= 220 ? 1 : 0, 1]));
+      const r = chooseOffsets(samples, costs, { ...limits, occupied });
+      expect(r.offsets).toEqual([150]);
+      expect(r.parts).toBe(5);
+      expect(r.cost).toBeCloseTo(7, 9);
+    });
+
+    it('never pushes a cut to the model\'s end to empty a box: the strip it would leave there is a sliver', () => {
+      // two columns along x: one holds model all the way, the other only from 20 mm in (a gear plate's corner box).
+      // A cut at 15–20 mm would leave that box empty, one piece fewer, but a 15 mm strip in the other column
+      const samples = planSamples(0, 300, 1);
+      const occupied = samples.map((t) => Uint8Array.from([1, t >= 20 ? 1 : 0]));
+      const r = chooseOffsets(samples, samples.map(() => 0), { lo: 0, hi: 300, k: 1, S: 300, minEnd: 15, minMid: 30, occupied });
+      expect(r).toMatchObject({ offsets: [150], parts: 4, slivers: 0 });
+    });
+
     it('relaxes the minimums when they cannot be met, and gives up when pieces cannot fit', () => {
       const samples = planSamples(-20, 20, 1);
       const costs = samples.map(() => 0);
@@ -517,6 +543,17 @@ describe('planCost', () => {
       expect(r).toMatchObject({ relaxed: true, offsets: [0] });
       expect(chooseOffsets(samples, costs, { lo: -20, hi: 20, k: 1, S: 10 })).toBeNull();
     });
+  });
+});
+
+describe('clippedArea', () => {
+  it('measures outlines within a box, so a column inside a frame\'s opening holds nothing', () => {
+    // a 100 mm square frame 10 mm wide: outer ring counter-clockwise, its opening clockwise
+    const frame = [[[0, 0], [100, 0], [100, 100], [0, 100]], [[10, 10], [10, 90], [90, 90], [90, 10]]];
+    expect(clippedArea(frame, [-10, -10, 110, 110])).toBeCloseTo(100 * 100 - 80 * 80, 9);
+    expect(clippedArea(frame, [30, 30, 70, 70])).toBeCloseTo(0, 9);
+    expect(clippedArea(frame, [0, 0, 50, 50])).toBeCloseTo(50 * 50 - 40 * 40, 9);
+    expect(clippedArea(frame, [200, 0, 300, 100])).toBe(0);
   });
 });
 
@@ -859,6 +896,18 @@ describe('chooseOrientation', () => {
     expect(r).toMatchObject({ down: '+x', up: '-x', lies: 'on a cut face', score: 0 });
     expect(r.size).toEqual([30, 40, 60]);
     expect(chooseOrientation(boxStats([60, 40, 30], ['+x']), U, 'model')).toMatchObject({ down: '-z', score: 600, notes: [] });
+  });
+
+  it('a mating face goes down only where that costs next to no support: a hubbed gear\'s quarter lies flat', () => {
+    // as measured on one: on its cut edge (-x) 1758 mm² of cut face would be down, for 770 mm² of support against 80
+    const quarter = boxStats([138, 138, 40], ['-x', '+y'], {
+      '-z': { bed: 11374, support: 80 }, '+z': { bed: 200, support: 11263 }, '-x': { bed: 1758, footprint: 138 * 40, support: 770, cutArea: 1758 },
+      '+x': { bed: 0, support: 2175 }, '-y': { bed: 0, support: 2175 }, '+y': { bed: 1742, footprint: 138 * 40, support: 809, cutArea: 1742 },
+    });
+    expect(chooseOrientation(quarter, U)).toMatchObject({ down: '-z', lies: 'flat as modelled', fits: true });
+    // with the support the same either way, the cut face still goes down
+    const even = { ...quarter, dirs: { ...quarter.dirs, '-x': { ...quarter.dirs['-x'], support: 90 } } };
+    expect(chooseOrientation(even, U)).toMatchObject({ down: '-x', lies: 'on a cut face' });
   });
 
   it('a plate piece next to a dovetail seam lies on ±z only', () => {

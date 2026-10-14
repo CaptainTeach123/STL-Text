@@ -1,6 +1,6 @@
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
-import { PIN_DIAMETERS, TO_PLANE, chooseOrientation, isSymmetric, normaliseSplit, sizesFor } from '../src/split.js';
+import { FILAMENT, PIN_DIAMETERS, TO_PLANE, chooseOrientation, isSymmetric, normaliseSplit, sizesFor } from '../src/split.js';
 import {
   buildSplitDisplay,
   cutPieces,
@@ -346,6 +346,26 @@ describe('dovetail tabs through thin plates', () => {
     expect(c.plan.notes).toEqual([expect.objectContaining({ code: 'CONNECTORS_DROPPED', dovetail: true })]);
   });
 
+  it('tabs go only where the plate is solid right through: never across a sealed pocket or an engraving beside the cut', () => {
+    // an 8 mm plate with sealed magnet pockets in its lower half every 40 mm, and a 2 mm-deep engraved bar in its top
+    // beside the cut: neither reaches the plate's middle, where a tab was once checked
+    const pockets = [];
+    for (let x = -180; x <= 180; x += 40) for (const y of [-50, 0, 50]) pockets.push(cube([10.4, 10.4, 3.2], [x, y, 2.2]));
+    const sign = own(own(cube([400, 150, 8], [0, 0, 4]).subtract(own(wasm.Manifold.union(pockets)))).subtract(cube([30, 20, 4], [-20, -25, 8])));
+    const s = split(sign, [[0, -68.66], [0, 68.66]], { labels: false });
+    expect(s.plan.joints).toEqual({ c1: 'dovetail', c2: 'dovetail' });
+    expect(s.plan.tabs.seams.map((x) => x.tabs.length)).toEqual([3, 3]);
+    // every pocket stays sealed, whole, in the piece its column is in
+    const hollows = s.cut.pieces.map((p) => shells(p.solid).filter((m) => m.volume() < 0));
+    expect(hollows.map((list) => list.length)).toEqual([9, 12, 9]);
+    for (const m of hollows.flat()) expect(m.volume()).toBeCloseTo(-10.4 * 10.4 * 3.2, 3);
+    // the engraving is the middle piece's alone: no tab's socket runs through it
+    const groove = cube([30, 20, 2], [-20, -25, 7]);
+    expect(overlap(s.cut.pieces[0].solid, cube([40, 30, 4], [-20, -25, 6]))).toBeLessThan(1e-6);
+    expect(overlap(s.cut.pieces[1].solid, groove)).toBeLessThan(1e-6);
+    expect(own(cube([30, 20, 4], [-20, -25, 4]).subtract(groove)).volume() - overlap(s.cut.pieces[1].solid, cube([30, 20, 4], [-20, -25, 4]))).toBeCloseTo(0, 3);
+  });
+
   it('a tab never cuts through another plate at another height', () => {
     // a lower plate, and a narrower upper one 15 mm above it, joined at one end
     const rack = own(wasm.Manifold.union([cube([300, 100, 5], [0, 0, 2.5]), cube([300, 30, 5], [0, 25, 22.5]), cube([10, 100, 25], [-145, 0, 12.5])]));
@@ -651,6 +671,18 @@ describe('pins on the cut faces', () => {
     const thick = bar(6.3);
     expect(thick.layout.dowels.map((d) => d.d)).toEqual([1.75, 1.75]);
     expect(thick.layout.notes.map((n) => n.code)).toEqual(['CONNECTORS_FILAMENT']);
+  });
+
+  it('a cut whose filament holes come in two depths says to cut each length, never all of them to the longer', () => {
+    // a bar that takes Ø6 pins and two 8 mm rods too narrow for them; a pocket 6.2 mm behind the cut in the far rod
+    // makes its holes 3 mm deep, the other rod's 4 mm: an 8 mm rod in the shallower pair would hold the seam open
+    const rack = own(own(wasm.Manifold.union([cube([300, 40, 20], [0, 20, 10]), cube([300, 8, 8], [0, 50, 4]), cube([300, 8, 8], [0, 66, 4]), cube([10, 70, 8], [-145, 35, 4]), cube([10, 70, 8], [145, 35, 4])]))
+      .subtract(cube([3, 4, 7], [7.7, 66, 2.5])));
+    const s = split(rack, [[0, 0]], { labels: false });
+    expect(s.layout.dowels.filter((d) => d.d === FILAMENT).map((d) => d.depth).sort()).toEqual([3, 4]);
+    const note = s.layout.notes.find((n) => n.code === 'CONNECTORS_FILAMENT');
+    expect(note).toMatchObject({ count: 2, length: 8, lengths: [{ length: 8, count: 1 }, { length: 6, count: 1 }] });
+    expect(note.text).toBe('Cut A is too narrow for Ø6 pins: its holes take 1.75 mm filament – cut 1 piece 8 mm long and 1 piece 6 mm long.');
   });
 
   it('holes keep clear of a hidden pocket behind the face and of a cone\'s slanted side', () => {

@@ -37,12 +37,14 @@ import {
   gridPoints,
   liesFlat,
   localFrame,
+  mergeStats,
   orientationStats,
   polygonsCentroid,
   dovetailSize,
   flatProbes,
   sizesFor,
   sizesForRoom,
+  smallPieceNotes,
   splitNote,
   teardropApex,
 } from './split.js';
@@ -836,17 +838,19 @@ function plateBand(polygons, kl, kw, l0, l1) {
  * length N, clamp(⌊L / (2.5·head)⌋, 1, 8) tabs spread evenly inside the
  * island (head/2 + 3 from its ends), alternating sides, the lower-numbered
  * piece's first. A tab is extruded right through the model, so it may only
- * go where it and 2 mm round it hold nothing but its own plate: inside the
- * plate at mid-thickness, clear of anything standing 0.3 mm or more proud
- * of the plate above or below within reach of the cut (letters, a boss, a
- * plate at another height: a tab there would carry a slice of it into the
- * other piece), head/2 + 3 from a crossing cut's trace and as much again as
- * a crossing dovetail cut's tabs reach (or two tabs close off a corner of a
- * piece). Another plate the same cut runs through (the other leg of a U)
- * may lie in a tab's way if the tab lies wholly inside it too: it makes the
- * same tab there, and serves that plate as its own. A tab whose even spot
- * is taken moves along the plate to the nearest free one; the cut must be
- * N + 2 from parallel ones.
+ * go where it and 2 mm round it hold nothing but its own plate: where the
+ * plate is solid right through its thickness (a sealed pocket or an
+ * engraving 0.3 mm deep or more is air, which the tab's outline and its
+ * clearance would cut through), clear of anything standing 0.3 mm or more
+ * proud of the plate above or below within reach of the cut (letters, a
+ * boss, a plate at another height: a tab there would carry a slice of it
+ * into the other piece), head/2 + 3 from a crossing cut's trace and as much
+ * again as a crossing dovetail cut's tabs reach (or two tabs close off a
+ * corner of a piece). Another plate the same cut runs through (the other
+ * leg of a U) may lie in a tab's way if the tab lies wholly inside it too:
+ * it makes the same tab there, and serves that plate as its own. A tab
+ * whose even spot is taken moves along the plate to the nearest free one;
+ * the cut must be N + 2 from parallel ones.
  * @param {Manifold} solid (borrowed)
  * @param {{ id, letter, axis, at }[]} cuts every cut, normalised
  * @param {{ ids: string[], w: number|Object<string, number> }} dove the dovetail cuts and the plates' thickness axis
@@ -908,6 +912,21 @@ export function dovetailTabs(solid, cuts, dove, { frame = null } = {}) {
         return near;
       };
       const tabs = [];
+      // where the model near the cut is solid right through a plate's band (all but its outer 0.3 mm, the plate's own
+      // unevenness), seen along w: a tab and its socket are extruded right through the plate, so they go only there,
+      // never through a sealed pocket below the plate's middle or an engraving shallower than half of it
+      const solidThrough = ([a, b]) => {
+        const outline = outlineAt(w, (a + b) / 2);
+        if (!(b - a > 2 * PROUD)) return outline;
+        const sz = box.max.map((v, k) => v - box.min[k] + 4);
+        sz[s] = 2 * (reach + TAB_INSIDE + 1);
+        sz[w] = b - a - 2 * PROUD;
+        const at = box.min.map((v, k) => (v + box.max[k]) / 2);
+        at[s] = cut.at;
+        at[w] = (a + b) / 2;
+        const air = t.add(t.add(t.add(Manifold.cube(sz, true)).translate(at)).subtract(nearCut()));
+        return air.isEmpty() ? outline : t.add(outline.subtract(t.add(t.add(air.transform(TO_PLANE[w])).project())));
+      };
       // the model near the cut between a and b along w, seen along w (null when there is none)
       const seen = ([a, b]) => {
         const sz = box.max.map((v, k) => v - box.min[k] + 4);
@@ -922,11 +941,11 @@ export function dovetailTabs(solid, cuts, dove, { frame = null } = {}) {
         if (!size || parallel.some((c) => Math.abs(c.at - cut.at) < size.N + 2)) continue;
         const { N, H, E, count: m, span } = size;
         const [pw0, pw1] = island.band;
-        const outline = outlineAt(w, (pw0 + pw1) / 2);
+        const outline = solidThrough(island.band);
         // the other plates this cut runs through at other heights (the legs of a U, the shelves of a rack): a tab is
         // extruded through them too, and is welcome there as long as it lies wholly inside one or misses it
         const others = islands.filter((o) => o !== island && (o.band[1] < pw0 || o.band[0] > pw1)).map((o) => ({
-          outline: outlineAt(w, (o.band[0] + o.band[1]) / 2),
+          outline: solidThrough(o.band),
           layer: seen([o.band[0] - PROUD, o.band[1] + PROUD]),
           gap: [o.band[0] - PROUD, o.band[1] + PROUD],
         }));
@@ -1162,6 +1181,71 @@ const wOfCut = (dove, id) => (typeof dove.w === 'number' ? dove.w : dove.w?.[id]
 
 // ---------- cutting into pieces ----------
 
+/**
+ * Gives each sealed hollow no cut opens (a magnet pocket, a void to save material) to the smallest shell around it.
+ * `decompose()` gives such a hollow as a shell of its own, turned inside out, which no compose keeps: `fill(m)` makes
+ * what is taken out of the shell again once it is composed, and the hollow's volume comes off the shell's.
+ * @param {{ m: Manifold, v: number, box: object, hollows: Manifold[] }[]} solids the outer shells
+ * @param {{ m: Manifold, v: number, box: object }[]} hollows
+ */
+function hostHollows(solids, hollows, fill) {
+  for (const h of hollows) {
+    const around = solids.filter((x) => [0, 1, 2].every((a) => x.box.min[a] <= h.box.min[a] + 1e-6 && x.box.max[a] >= h.box.max[a] - 1e-6));
+    const host = around.sort((x, y) => x.v - y.v)[0];
+    if (host) {
+      host.hollows.push(fill(h.m));
+      host.v += h.v;
+    }
+  }
+}
+
+/**
+ * A piece parted into groups of its shells that print apart (`layPieces`):
+ * each group's shells composed, their sealed hollows kept.
+ * @param {Manifold} solid the piece (borrowed)
+ * @param {{ box: object }[]} parts its shells, as `cutPieces` lists them
+ * @param {number[][]} groups indices into `parts`
+ * @returns {Manifold[]} one per group, the caller's
+ */
+export function partedSolids(solid, parts, groups) {
+  const { Manifold } = manifold();
+  const t = scope();
+  const out = [];
+  try {
+    const solids = [];
+    const hollows = [];
+    for (const m of solid.decompose()) {
+      t.add(m);
+      const v = m.volume();
+      (v > 0 ? solids : hollows).push({ m, v, box: boxOf(m), hollows: [] });
+    }
+    hostHollows(solids, hollows, (h) => t.add(insideOut(h)));
+    // a shell is known by its box, which taking its hollows out does not change
+    const gap = (p, x) => Math.max(...[0, 1, 2].flatMap((a) => [Math.abs(p.box.min[a] - x.box.min[a]), Math.abs(p.box.max[a] - x.box.max[a])]));
+    const groupOf = new Map();
+    for (const x of solids) {
+      let best = 0;
+      parts.forEach((p, i) => {
+        if (gap(p, x) < gap(parts[best], x)) best = i;
+      });
+      groupOf.set(x, groups.findIndex((g) => g.includes(best)));
+    }
+    groups.forEach((_, k) => {
+      const mine = solids.filter((x) => groupOf.get(x) === k);
+      if (!mine.length) throw new SplitError('INTERNAL', 'A piece\'s shells came apart differently from how they were cut.');
+      const whole = mine.length > 1 ? t.add(Manifold.compose(mine.map((x) => x.m))) : mine[0].m;
+      const hollow = mine.flatMap((x) => x.hollows);
+      out.push(hollow.length ? whole.subtract(hollow.length > 1 ? t.add(Manifold.compose(hollow)) : hollow[0]) : whole.translate([0, 0, 0]));
+    });
+    return out;
+  } catch (err) {
+    out.forEach((m) => m.delete());
+    throw err;
+  } finally {
+    t.dispose();
+  }
+}
+
 /** A closed surface turned inside out: a sealed hollow, as `decompose()` gives it, made the solid that fills it. */
 function insideOut(m) {
   const wasm = manifold();
@@ -1176,22 +1260,25 @@ function insideOut(m) {
  * axis is cut by taking away the boxes over every other cell, then the
  * rest; a dovetail axis by taking away everything outside each cell's
  * solid. Shells under 1e-3 mm³ are removed as dust; every other shell goes
- * to the cell its box overlaps most, and a cell's shells make one piece. A
- * sealed hollow that no cut opens stays inside the shell around it.
- * Pieces are numbered bottom layer first, then front to back, then left to
- * right. Each comes with its orientation statistics; pieces on a dovetail
- * seam may only lie flat (±w, either plate's where dovetails through two
- * plates meet at a piece), and every piece of a thin plate (`flat`) lies
- * flat on it.
+ * to the cell its box overlaps most, and a cell's shells make one piece
+ * (`layPieces` may print some of them apart). A sealed hollow that no cut
+ * opens stays inside the shell around it. Pieces are numbered bottom layer
+ * first, then front to back, then left to right. Each shell comes with its
+ * orientation statistics, and the piece with theirs together: a shell whose
+ * material meets a dovetail seam may only lie flat (±w, either plate's where
+ * dovetails through two plates meet at it), and every shell of a thin plate
+ * (`flat`) lies flat on it.
  * @param {Manifold} solid the model (borrowed, never deleted)
  * @param {{ id, letter, axis, at }[]} cuts normalised
  * @param {{ dove?: { ids: string[], w: number|object, clearance: number }|null, tabs?: object|null, bounds?: object,
  *   flat?: number|null, frame?: function, progress?: function }} options `tabs` the tabs `planDovetails` placed for
  *   `dove` (worked out again when missing); `flat` the thickness axis when the whole model is a thin plate (`plateAxis`)
  * @returns {{ pieces: { index: number, cell: number[], solid: Manifold, shells: number, volume: number,
- *   bbox: { min: number[], max: number[] }, cuts: string[], stats: object }[], grid: number[],
+ *   bbox: { min: number[], max: number[] }, cuts: string[], stats: object,
+ *   parts?: { box: object, volume: number, cuts: string[], stats: object }[] }[], grid: number[],
  *   dovetails: { cutId, letter, axis, at, w, tabs: number }[], notes: object[], dust: number, gap: number, volume: number }}
- *   the piece solids belong to the caller; `gap` is the volume the dovetail clearances took, `dust` the slivers removed
+ *   the piece solids belong to the caller; `parts` each shell of a piece with more than one, in the order
+ *   `partedSolids` reads; `gap` is the volume the dovetail clearances took, `dust` the slivers removed
  * @throws {SplitError} `INTERNAL` when a piece comes out broken
  */
 export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null, flat = null, frame = null, progress = null } = {}) {
@@ -1305,17 +1392,8 @@ export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null
           m.delete();
         } else (v > 0 ? solids : hollows).push({ m: own(m), v, box: boxOf(m), hollows: [] });
       }
-      // a sealed hollow no cut opens (a magnet pocket, a void to save material) is a shell of its own, turned inside
-      // out, which no compose keeps: it goes with the smallest shell of the same part around it, to be taken out again
-      for (const h of hollows) {
-        const around = solids.filter((x) => [0, 1, 2].every((a) => x.box.min[a] <= h.box.min[a] + 1e-6 && x.box.max[a] >= h.box.max[a] - 1e-6));
-        const host = around.sort((x, y) => x.v - y.v)[0];
-        if (host) {
-          host.hollows.push(temps.add(insideOut(h.m)));
-          host.v += h.v;
-        }
-        drop(h.m);
-      }
+      hostHollows(solids, hollows, (h) => temps.add(insideOut(h)));
+      hollows.forEach((h) => drop(h.m));
       shells.push(...solids);
     }
     if (dustCount) notes.push(splitNote('SLIVER_REMOVED', { count: dustCount }));
@@ -1329,22 +1407,25 @@ export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null
     }
     const ordered = [...groups.values()].sort((p, q) => p.cell[2] - q.cell[2] || p.cell[1] - q.cell[1] || p.cell[0] - q.cell[0]);
     const pieces = ordered.map(({ cell, list }, n) => {
+      const index = n + 1;
+      // each shell's own statistics, judged from its outside: a sealed hollow's roof is bridged over, never held up by
+      // supports that could not come out, so a magnet pocket is no reason to stand a bar on its edge
+      const info = list.map((x) => {
+        // the cuts the shell's own material meets: one that ends a few millimetres short of a dovetail cut holds none of
+        // its plate (nothing near it changes hands, as the tabs keep clear of it), so the tabs ask nothing of how it lies
+        const touching = cuts.filter((c) => c.at >= x.box.min[c.axis] - 0.02 && c.at <= x.box.max[c.axis] + 0.02);
+        // a plate lies flat on its thickness; a shell on a dovetail seam on its plate's
+        const flatOn = flat !== null ? [flat] : [...new Set(touching.filter((c) => doveCuts.has(c.id)).map((c) => doveCuts.get(c.id).w ?? plan.w))];
+        const allowed = flatOn.length ? flatOn.flatMap((a) => [`-${AXES[a]}`, `+${AXES[a]}`]) : undefined;
+        const mesh = x.m.getMesh();
+        const stats = orientationStats(mesh.vertProperties, mesh.numProp, mesh.triVerts, touching, allowed ? { allowed } : {});
+        return { box: x.box, volume: x.v, cuts: touching.map((c) => c.id), stats };
+      });
       let m = list[0].m;
       if (list.length > 1) {
         m = own(Manifold.compose(list.map((x) => x.m)));
         list.forEach((x) => drop(x.m));
       }
-      const index = n + 1;
-      const bbox = boxOf(m);
-      const reachOf = (c) => (doveCuts.has(c.id) ? Math.max(...doveCuts.get(c.id).tabs.map((tb) => tb.E)) : 0);
-      const touching = cuts.filter((c) => c.at >= bbox.min[c.axis] - 0.02 - reachOf(c) && c.at <= bbox.max[c.axis] + 0.02 + reachOf(c));
-      // a plate lies flat on its thickness; a piece on a dovetail seam on its plate's
-      const flatOn = flat !== null ? [flat] : [...new Set(touching.filter((c) => doveCuts.has(c.id)).map((c) => doveCuts.get(c.id).w ?? plan.w))];
-      const allowed = flatOn.length ? flatOn.flatMap((a) => [`-${AXES[a]}`, `+${AXES[a]}`]) : undefined;
-      // how it lies is judged from its outside: a sealed hollow's roof is bridged over, never held up by supports that
-      // could not come out, so a magnet pocket is no reason to stand a bar on its edge
-      const mesh = m.getMesh();
-      const stats = orientationStats(mesh.vertProperties, mesh.numProp, mesh.triVerts, touching, allowed ? { allowed } : {});
       const hollow = list.flatMap((x) => x.hollows);
       if (hollow.length) {
         const emptied = own(m.subtract(hollow.length > 1 ? temps.add(Manifold.compose(hollow)) : hollow[0]));
@@ -1353,21 +1434,21 @@ export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null
       }
       const status = m.status();
       if (status !== 'NoError') throw new SplitError('INTERNAL', `Piece ${index} came out broken (${status}).`, { pieceIndex: index, status });
-      return { index, cell, solid: m, shells: list.length, volume: list.reduce((s, x) => s + x.v, 0), bbox, cuts: touching.map((c) => c.id), stats };
+      const ids = new Set(info.flatMap((x) => x.cuts));
+      return {
+        index,
+        cell,
+        solid: m,
+        shells: list.length,
+        volume: list.reduce((s, x) => s + x.v, 0),
+        bbox: boxOf(m),
+        cuts: cuts.filter((c) => ids.has(c.id)).map((c) => c.id),
+        stats: mergeStats(info.map((x) => x.stats)),
+        ...(info.length > 1 ? { parts: info } : {}),
+      };
     });
 
-    // a piece thinner than 5 mm between its cut faces prints and glues badly
-    for (const piece of pieces) {
-      let thin = null;
-      for (let a = 0; a < 3; a++) {
-        const along = cuts.filter((c) => c.axis === a && piece.cuts.includes(c.id));
-        const extent = piece.bbox.max[a] - piece.bbox.min[a];
-        if (along.length && extent < 5 && (!thin || extent < thin.thickness)) thin = { thickness: extent, along };
-      }
-      if (thin) {
-        notes.push(splitNote('SMALL_PIECE', { pieceIndex: piece.index, thickness: thin.thickness, letters: thin.along.map((c) => c.letter), cutId: thin.along[0].id }));
-      }
-    }
+    notes.push(...smallPieceNotes(pieces, cuts));
 
     const volume = solid.volume();
     const sum = pieces.reduce((s, p) => s + p.volume, 0);
@@ -1543,8 +1624,9 @@ function roomAround(cut, by, bounds) {
  * ("2A") go on each pinned face, in the same spot on both pieces.
  * @param {Manifold} solid the model (borrowed)
  * @param {{ id, letter, axis, at }[]} cuts normalised, in canonical order
- * @param {{ index: number, cell: number[], up?: string }[]} pieces from `cutPieces`, with the way each prints up
- *   (`chooseOrientation(...).up`); a hole is a teardrop on a piece whose up is not along the cut
+ * @param {{ index: number, cell: number[], up?: string, boxes?: object[] }[]} pieces from `cutPieces`, or `layPieces`, with
+ *   the way each prints up (`chooseOrientation(...).up`); a hole is a teardrop on a piece whose up is not along the cut.
+ *   Where a cell holds more than one, `boxes` (its shells') tell which holds each face
  * @param {object} spec the normalised settings (diameter, depth, clearance, count, labels)
  * @param {{ nozzle?: number, joints?: Object<string, string>, tabs?: object|null, font?: object, bounds?: object, progress?: function }} options
  *   `joints` per cut id (from `planDovetails`; dowels when missing); `tabs` its dovetail tabs, whose sockets reach past
@@ -1566,7 +1648,31 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
   const manual = Number(spec.diameter) > 0 ? Number(spec.diameter) : 0;
   const wanted = Number(spec.count) > 0 ? Math.round(Number(spec.count)) : 0;
   const labelsOn = spec.labels !== false && Boolean(font);
-  const pieceAt = new Map(pieces.map((p) => [p.cell.join(','), p]));
+  const inCell = new Map();
+  for (const p of pieces) {
+    const key = p.cell.join(',');
+    if (!inCell.has(key)) inCell.set(key, []);
+    inCell.get(key).push(p);
+  }
+  // the piece of a cell that holds a point of a face: a cell's shells printed apart are pieces of their own, and the
+  // point lies in the box of one of their shells (the smallest, where boxes nest)
+  const pieceAt = (cell, point) => {
+    const list = inCell.get(cell.join(','));
+    if (!list || list.length === 1) return list?.[0];
+    let best = list[0];
+    let room = Infinity;
+    for (const p of list) {
+      for (const b of p.boxes ?? []) {
+        if (![0, 1, 2].every((a) => point[a] >= b.min[a] - 1e-3 && point[a] <= b.max[a] + 1e-3)) continue;
+        const size = (b.max[0] - b.min[0]) * (b.max[1] - b.min[1]) * (b.max[2] - b.min[2]);
+        if (size < room) {
+          best = p;
+          room = size;
+        }
+      }
+    }
+    return best;
+  };
   const reachMax = Math.max(LABEL_REACH, sizesFor(manual || AUTO_DIAMETERS[0], c, nozzle, depth).reach);
   const notes = [];
   const dowels = [];
@@ -1702,7 +1808,9 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
         const { s, pts } = chosen;
         if (pts.length < need) one = true;
         if (s.d === FILAMENT && D !== FILAMENT) {
-          filament = { count: (filament?.count ?? 0) + pts.length, length: Math.max(filament?.length ?? 0, 2 * s.depth) };
+          // holes made shallower where air lies behind the face take shorter filament: each length is told apart
+          filament ??= new Map();
+          filament.set(2 * s.depth, (filament.get(2 * s.depth) ?? 0) + pts.length);
           suggest(smallerFit(ctx, patch, D, need, t));
         } else if (s.depth < full - 1e-9) shorter = Math.min(shorter ?? Infinity, s.depth);
         for (const [u, v] of pts) {
@@ -1733,7 +1841,13 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     });
     const base = { letter: cut.letter, cutId: cut.id };
     if (shorter !== null) notes.push(splitNote('CONNECTORS_SHORTER', { ...base, depth: shorter }));
-    if (filament) notes.push(splitNote('CONNECTORS_FILAMENT', { ...base, count: filament.count, diameter: D, length: filament.length, ...(suggested ? { suggestedDiameter: suggested } : {}) }));
+    if (filament) {
+      const lengths = [...filament].sort((p, q) => q[0] - p[0]).map(([length, count]) => ({ length, count }));
+      notes.push(splitNote('CONNECTORS_FILAMENT', {
+        ...base, count: lengths.reduce((n, g) => n + g.count, 0), diameter: D, length: lengths[0].length,
+        ...(lengths.length > 1 ? { lengths } : {}), ...(suggested ? { suggestedDiameter: suggested } : {}),
+      }));
+    }
     if (dropped) {
       notes.push(splitNote('CONNECTORS_DROPPED', { ...base, count: dropped, total, ...(thinWalls ? { wall: thinWalls } : {}), ...(suggested && !filament ? { suggestedDiameter: suggested } : {}) }));
     }
@@ -1843,11 +1957,12 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
       for (const patch of patches) {
         keep.add(patch.cs);
         const [u, v] = insidePoint(patch.polygons, patch.centroid);
-        const cell = cellOfPoint(applyMat4(TO_WORLD[a], [u, v, cut.at]), by);
+        const point = applyMat4(TO_WORLD[a], [u, v, cut.at]);
+        const cell = cellOfPoint(point, by);
         cell[a] = lo;
-        patch.lo = pieceAt.get(cell.join(','));
+        patch.lo = pieceAt(cell, point);
         cell[a] = lo + 1;
-        patch.hi = pieceAt.get(cell.join(','));
+        patch.hi = pieceAt(cell, point);
         patch.skip = !patch.lo || !patch.hi;
         patch.apex = patch.skip ? [null, null] : [teardropApex(patch.lo.up ?? '+z', a), teardropApex(patch.hi.up ?? '+z', a)];
         patch.dowels = [];

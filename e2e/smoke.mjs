@@ -910,6 +910,163 @@ try {
     check(zip.entries['long-bar-text-how-to-glue.txt']?.includes('1A ↔ 2A'), 'the glue sheet pairs the matching labels');
     check(/^Downloaded long-bar-text-2-pieces\.zip .*: 2 pieces, 3 pins/.test(await status()), 'the status line says what the zip holds', await status());
 
+    // Joints: Built-in pegs – square pegs printed on one piece fit sockets in the other, so there is no pins file
+    await page.click('#splitSettings label:has(input[data-split="joint"][value="pegs"])');
+    await idle();
+    const pegControls = await page.evaluate(() => ({
+      pins: [...document.querySelectorAll('[data-split="pins"]')].map((e) => e.disabled && !e.checked),
+      on: ['diameter', 'depth', 'count', 'clearance', 'labels'].map((k) => !document.querySelector(`[data-split="${k}"]`).disabled),
+      names: [...document.querySelectorAll('#splitSettings [data-peg-label]')].map((e) => e.textContent).join(', '),
+      filament: document.querySelector('[data-split="diameter"] option[value="1.75"]').hidden,
+    }));
+    check(
+      pegControls.pins.every(Boolean) && pegControls.on.every(Boolean) && pegControls.filament && pegControls.names === 'Peg size, Peg length, Pegs per face',
+      'Built-in pegs turns the pins choice off and the size, length and count over to the pegs, without filament',
+      JSON.stringify(pegControls),
+    );
+    await page.waitForFunction(() => /sockets/.test(document.querySelector('#pieceList').innerText) && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 60000 });
+    await measured();
+    const pegRows = await page.locator('#pieceList li').allInnerTexts();
+    check(
+      /^1 · 159 × 40 × 20 mm · .* · 2 pegs$/.test(pegRows[0]) && /^2 · 150 × 40 × 20 mm · .* · 2 sockets$/.test(pegRows[1]),
+      'piece 1 carries the pegs, its size counting how far they stand out, and piece 2 has their sockets',
+      pegRows.join(' / '),
+    );
+    check(/· pegs$/.test(await page.locator('#cutList .meta').innerText()), "the cut's row says it has pegs", await page.locator('#cutList .meta').innerText());
+    check((await page.locator('[data-split="diameter"] option[value="0"]').innerText()) === 'Auto (6 mm)', 'the size control shows the peg size Auto picked', await page.locator('[data-split="diameter"] option[value="0"]').innerText());
+    check(/^Cut into 2 pieces joined by \d+ built-in pegs \(\d+ mm square\)/.test(await splitNotes()), 'the summary says the pieces are joined by built-in pegs', await splitNotes());
+    await page.screenshot({ path: path.join(out, '8-split-pegs.png') });
+    // five joints share a row: on a panel narrowed by a scroll bar a long name wraps, and the row stays in the card
+    const jointsFit = await page.evaluate(async () => {
+      const panel = document.querySelector('.panel');
+      const seg = document.querySelector('#splitSettings fieldset.joints');
+      // the control inside the card (a fieldset is never narrower than its content: it would stick out instead), every
+      // name inside its own segment and every segment inside the control
+      const fits = () => {
+        const box = seg.getBoundingClientRect();
+        if (box.right > seg.parentElement.getBoundingClientRect().right + 0.5) return false;
+        return [...seg.querySelectorAll('label')].every((l) => {
+          const r = l.getBoundingClientRect();
+          const name = l.querySelector('span');
+          return r.left >= box.left - 0.5 && r.right <= box.right + 0.5 && name.scrollWidth <= name.clientWidth;
+        });
+      };
+      const wide = fits();
+      panel.style.paddingRight = '34px';
+      await new Promise((done) => requestAnimationFrame(done));
+      const narrow = fits();
+      panel.style.paddingRight = '';
+      return { wide, narrow, height: seg.getBoundingClientRect().height };
+    });
+    check(jointsFit.wide && jointsFit.narrow, 'the five joints fit the card, a long name wrapping on a narrower panel', JSON.stringify(jointsFit));
+    await page.waitForTimeout(1000); // Chromium lets a page start about ten downloads a second
+    const pegZip = await downloadZip();
+    const pegNames = Object.keys(pegZip.entries).sort();
+    check(
+      pegNames.join() === 'long-bar-text-how-to-glue.txt,long-bar-text-piece-1-of-2.stl,long-bar-text-piece-2-of-2.stl',
+      'the zip holds the two pieces and the glue sheet, and no pins',
+      pegNames.join(', '),
+    );
+    const [pegged, socketed] = ['long-bar-text-piece-1-of-2.stl', 'long-bar-text-piece-2-of-2.stl'].map((n) => pegZip.entries[n]);
+    check(
+      pegged?.volume > 120000 && socketed?.volume < 120000 && pegged.sizeOk && socketed.sizeOk && Math.abs(Math.max(extent(pegged, 0), extent(pegged, 1)) - 159) < 0.01,
+      'piece 1 is half the bar and its pegs, piece 2 half the bar less their sockets',
+      `${pegged?.volume?.toFixed(1)} / ${socketed?.volume?.toFixed(1)} mm³`,
+    );
+    check(/push piece 1's pegs \(1A\) in/.test(pegZip.entries['long-bar-text-how-to-glue.txt'] ?? ''), 'the glue sheet says to push piece 1\'s pegs in');
+    check(/^Downloaded long-bar-text-2-pieces\.zip .*: 2 pieces and how-to-glue\.txt\./.test(await status()), 'the status line counts no pins', await status());
+    await page.waitForTimeout(1000);
+    const pegTest = await fitTest('long-bar-pegs-fit-test.stl');
+    check(/the 6 mm peg pushes into its socket/.test(pegTest.status) && pegTest.shells.length === 2, 'the fit test is a block with a 6 mm peg and one with its socket', `${pegTest.shells.length} bodies | ${pegTest.status}`);
+    // 10 mm pegs don't fit the bar's 20 mm thickness: the cut takes smaller ones, and its note selects it
+    await page.selectOption('[data-split="diameter"]', '10');
+    await page.waitForFunction(() => /too narrow for 10 mm pegs/.test(document.querySelector('#splitNotes').innerText), null, { timeout: 60000 });
+    await idle();
+    const smallerNote = page.locator('#splitNotes li', { hasText: 'too narrow for 10 mm pegs' });
+    check(/^Cut A is too narrow for 10 mm pegs – it takes \d+ × \d+ mm pegs? instead\.$/.test(await smallerNote.locator('.text').innerText()), 'pegs too big for a face come smaller there, and the note says so', await smallerNote.locator('.text').innerText());
+    await smallerNote.locator('button').click();
+    check((await page.locator('#cutList li.selected').count()) === 1, 'its button selects the cut', await smallerNote.locator('button').innerText());
+    await page.keyboard.press('Escape');
+    // the fit test is of the pegs the pieces have, not of the size no face took
+    await page.waitForTimeout(1000);
+    const smallerTest = await fitTest('long-bar-pegs-10-fit-test.stl');
+    check(
+      /the 6 mm peg pushes into its socket/.test(smallerTest.status) && JSON.stringify(smallerTest.shells) === JSON.stringify(pegTest.shells),
+      'asked for 10 mm pegs the bar takes 6 mm ones, and so does its fit test',
+      smallerTest.status,
+    );
+    await page.selectOption('[data-split="diameter"]', '0');
+    await idle();
+    // the boxes either side of the cut count a peg's length on the one that will carry them, the piece below the cut
+    // where both fit, and a longer peg makes it longer once the cut is measured again
+    const setPegLength = async (v) => {
+      await page.evaluate((value) => {
+        const el = document.querySelector('[data-split="depth"]');
+        el.value = value;
+        el.dispatchEvent(new Event('change'));
+      }, String(v));
+      await measured();
+    };
+    await page.uncheck('#resultToggle');
+    await idle();
+    await setPegLength(20);
+    const pegBoxes = await page.locator('#pieceList li.predicted').allInnerTexts();
+    check(
+      pegBoxes.length === 2 && /^1 · 170 × 40 × 20 mm · fits/.test(pegBoxes[0]) && /^2 · 150 × 40 × 20 mm · fits/.test(pegBoxes[1]),
+      'a 20 mm peg length makes the box that carries the pegs 20 mm longer, and only that one',
+      pegBoxes.join(' / '),
+    );
+    // with no cuts, the model's note counts from its box the pieces a split takes, a peg's length for every cut: on a
+    // printer so small that a piece carrying 30 mm pegs has no room left for itself (39 mm tall at most) no split will
+    // do, and none is offered, where Auto's pegs leave room
+    const offerOnNote = async () => ({
+      note: (await page.locator('#modelNotes li').allInnerTexts()).some((t) => /bigger than your 60 × 60 × 40 mm printer/.test(t)),
+      offers: await page.locator('#modelNotes button').count(),
+    });
+    await setPegLength(0);
+    await page.evaluate(() => (document.querySelector('#bedPreset').closest('details').open = true));
+    for (const [id, v] of [['bedX', '60'], ['bedY', '60'], ['bedZ', '40']]) {
+      await page.fill(`#${id}`, v);
+      await page.dispatchEvent(`#${id}`, 'change');
+    }
+    await idle();
+    await page.click('#splitClearBtn');
+    await idle();
+    const autoPegs = await offerOnNote();
+    await page.click('#undoBtn');
+    await idle();
+    await setPegLength(30);
+    await page.click('#splitClearBtn');
+    await idle();
+    const longPegs = await offerOnNote();
+    check(
+      autoPegs.note && autoPegs.offers === 1 && longPegs.note && longPegs.offers === 0,
+      'on a tiny printer the model is offered a split with Auto pegs, and none with 30 mm pegs that leave no room',
+      JSON.stringify({ autoPegs, longPegs }),
+    );
+    await page.click('#undoBtn');
+    await idle();
+    await setPegLength(0);
+    await page.selectOption('#bedPreset', 'generic');
+    await idle();
+    // filament makes no peg: 1.75 mm set for pins reads as the smallest peg, 3 mm, while Built-in pegs is chosen
+    await page.click('#splitSettings label:has(input[data-split="joint"][value="auto"])');
+    await page.selectOption('[data-split="diameter"]', '1.75');
+    await page.click('#splitSettings label:has(input[data-split="joint"][value="pegs"])');
+    await idle();
+    const asPeg = await page.inputValue('[data-split="diameter"]');
+    await page.click('#splitSettings label:has(input[data-split="joint"][value="auto"])');
+    await idle();
+    const asPin = await page.inputValue('[data-split="diameter"]');
+    check(asPeg === '3' && asPin === '1.75', 'a 1.75 mm filament size shows as 3 mm pegs, and as filament again for pins', `${asPeg} / ${asPin}`);
+    await page.selectOption('[data-split="diameter"]', '0');
+    await idle();
+    await page.check('#resultToggle');
+    await idle();
+    await page.click('#splitSettings label:has(input[data-split="joint"][value="auto"])');
+    await idle();
+    check(!(await page.isDisabled('[data-split="pins"][value="print"]')) && (await page.isChecked('[data-split="pins"][value="print"]')), 'back on Auto, the pins are printed again', '');
+
     // on a bigger printer the bar fits whole: Fit to my printer takes the cut away again, as one undo step
     await page.selectOption('#bedPreset', 'coreonel');
     await idle();
@@ -1302,6 +1459,60 @@ try {
       'and after the cut is moved, the download of pieces with no pins file says so in the row too',
       `${tubeMetaAfter} | ${Object.keys(tubeZip.entries).join(', ')}`,
     );
+    // nor does a built-in peg fit it, and the joint never falls back to pins: once the fit test finds nothing to try,
+    // the row planned for pegs says glue only
+    await page.click('#splitSettings label:has(input[data-split="joint"][value="pegs"])');
+    await measured();
+    const tubePegMeta = await page.locator('#cutList .meta').innerText();
+    // nothing is saved, so no download to wait for: the status line says why
+    await page.click('#splitFitTestBtn');
+    await page.waitForFunction(() => /^Nothing to try/.test(document.querySelector('#status').textContent), null, { timeout: 60000 }).catch(() => null);
+    await idle();
+    const tubePegStatus = await status();
+    const tubePegMetaAfter = await page.locator('#cutList .meta').innerText();
+    check(
+      /· pegs$/.test(tubePegMeta) && tubePegStatus === 'Nothing to try: these cuts get no pegs or tabs, only glue.' && /· glue only$/.test(tubePegMetaAfter),
+      'with Built-in pegs the tube has nothing to try either, and its row goes from pegs to glue only',
+      `${tubePegMeta} | ${tubePegStatus} | ${tubePegMetaAfter}`,
+    );
+    await page.click('#splitSettings label:has(input[data-split="joint"][value="auto"])');
+    await idle();
+    await page.click('#splitClearBtn');
+    await idle();
+
+    // Built-in pegs on a plate with a thin tube standing on it: the cut through the plate gets dovetail tabs, the one
+    // through the tube has no room for a peg. The fit test is the dovetail alone, and the tube's row then says glue only
+    const stand = Manifold.union(
+      Manifold.cube([200, 60, 5], true).translate([0, 0, 2.5]),
+      Manifold.cylinder(75, 20, 20, 64).subtract(Manifold.cylinder(77, 18, 18, 64).translate([0, 0, -1])).translate([50, 0, 4]),
+    );
+    const standFile = writeFixture('plate-and-tube.stl', soupOf(stand));
+    stand.delete();
+    await openStl(standFile, 'plate-and-tube');
+    await page.click('#addCutBtn');
+    await idle();
+    await page.click('#addCutBtn');
+    await idle();
+    await page.click('#cutList li >> nth=1 >> .seg label:has-text("Z")');
+    await idle();
+    for (const [n, at] of [[0, '-50'], [1, '40']]) {
+      await page.fill(`#cutList li >> nth=${n} >> input[data-cut-at]`, at);
+      await page.dispatchEvent(`#cutList li >> nth=${n} >> input[data-cut-at]`, 'change');
+    }
+    await page.click('#splitSettings label:has(input[data-split="joint"][value="pegs"])');
+    await measured();
+    const standMeta = await page.locator('#cutList .meta').allInnerTexts();
+    await page.waitForTimeout(1000);
+    const standTest = await fitTest('plate-and-tube-fit-test.stl');
+    const standMetaAfter = await page.locator('#cutList .meta').allInnerTexts();
+    check(
+      /· dovetails$/.test(standMeta[0]) && /· pegs$/.test(standMeta[1]) && /the tab drops into its socket/.test(standTest.status) && !/peg/.test(standTest.status) &&
+        /· dovetails$/.test(standMetaAfter[0]) && /· glue only$/.test(standMetaAfter[1]),
+      'a fit test with a dovetail but no peg turns the row of the cut planned for pegs to glue only',
+      `${standMeta.join(' / ')} | ${standTest.status} | ${standMetaAfter.join(' / ')}`,
+    );
+    await page.click('#splitSettings label:has(input[data-split="joint"][value="auto"])');
+    await idle();
     await page.click('#splitClearBtn');
     await idle();
 

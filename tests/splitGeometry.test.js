@@ -1,6 +1,6 @@
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
-import { FILAMENT, PIN_DIAMETERS, TO_PLANE, chooseOrientation, isSymmetric, normaliseSplit, sizesFor } from '../src/split.js';
+import { FILAMENT, PIN_DIAMETERS, TO_PLANE, chooseOrientation, isSymmetric, normaliseSplit, pegMales, pegSizesFor, sizesFor } from '../src/split.js';
 import {
   buildSplitDisplay,
   cutPieces,
@@ -12,12 +12,16 @@ import {
   halfHole,
   labelSolid,
   layoutSplit,
+  pegAt,
+  pegSolid,
   pinAt,
   pinSheet,
   pinSolid,
   pinSpares,
   pinsPerSheet,
   planDovetails,
+  socketAt,
+  socketSolid,
 } from '../src/splitGeometry.js';
 import { inter, setup } from './helpers.js';
 
@@ -70,8 +74,12 @@ function split(solid, list, patch = {}, { passthrough = false } = {}) {
   const plan = planDovetails(solid, cuts, spec, { passthrough });
   const cut = cutPieces(solid, cuts, { dove: plan.dove, tabs: plan.tabs });
   cut.pieces.forEach((p) => own(p.solid));
-  const pieces = cut.pieces.map((p) => ({ ...p, up: chooseOrientation(p.stats, BED, spec.orient, { pieceIndex: p.index }).up }));
-  const layout = layoutSplit(solid, cuts, pieces, spec, { joints: plan.joints, tabs: plan.tabs, font });
+  const pieces = cut.pieces.map((p) => {
+    const lying = chooseOrientation(p.stats, BED, spec.orient, { pieceIndex: p.index });
+    return { ...p, lying, up: lying.up };
+  });
+  const males = spec.joint === 'pegs' ? pegMales(pieces, BED, spec.orient) : null;
+  const layout = layoutSplit(solid, cuts, pieces, spec, { joints: plan.joints, tabs: plan.tabs, font, pegMales: males });
   const drilled = pieces.map((p) => own(drillPiece(p.solid, layout, p.index, { font })));
   return { spec, cuts, plan, cut, pieces, layout, drilled };
 }
@@ -214,6 +222,193 @@ describe('holes and pins', () => {
     // a split held by tabs alone tries just the tab in its socket
     const tabs = shells(own(fitTestCoupon({ diameter: 5 }, 0.4, { dovetail: true, pins: false })));
     expect(tabs.map((m) => +boxOf(m).size[2].toFixed(6))).toEqual([5, 5]);
+  });
+});
+
+describe('built-in square pegs', () => {
+  const p = pegSizesFor(6, 0.15, 0.4);
+  const w = 6 + 2 * 0.15; // the socket's side
+  const m = w + 2 * 0.5; // its mouth's, chamfer counted
+  const lead = 6 - 2 * p.e; // the side of the peg's tip
+  /** What a peg adds beyond its face, and what its socket takes from the other piece: from the shapes' sizes. */
+  const pegOut = 36 * (p.length - p.e) + (p.e / 3) * (36 + lead * lead + 6 * lead);
+  const socketIn = (0.5 / 3) * (m * m + w * w + m * w) + w * w * (p.h - 0.5) + (w * w * p.tip) / 3;
+  /** A peg standing out of a face at x = 0 into the piece beyond it, at (y, z) = (10, 5). */
+  const placed = { axis: 0, at: 0, centre: [0, 10, 5], dir: 1, ...p };
+  /** The steepest a solid's faces look down for a piece lying with `up` up, leaving out those on the bed (n·up, −1 straight down). */
+  function steepest(solid, up) {
+    const { vertProperties: P, numProp, triVerts: T } = solid.getMesh();
+    const at = (i, a) => P[T[i] * numProp + a];
+    let bed = Infinity;
+    for (let i = 0; i < T.length; i++) bed = Math.min(bed, [0, 1, 2].reduce((sum, a) => sum + at(i, a) * up[a], 0));
+    let worst = 1;
+    for (let t = 0; t < T.length; t += 3) {
+      const [a, b, c] = [0, 1, 2].map((k) => [0, 1, 2].map((x) => at(t + k, x)));
+      const u = b.map((v, k) => v - a[k]);
+      const v = c.map((x, k) => x - a[k]);
+      const n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+      const len = Math.hypot(...n);
+      const height = Math.max(...[a, b, c].map((q) => q[0] * up[0] + q[1] * up[1] + q[2] * up[2]));
+      if (!(len > 0) || height <= bed + 1e-4) continue;
+      worst = Math.min(worst, (n[0] * up[0] + n[1] * up[1] + n[2] * up[2]) / len);
+    }
+    return worst;
+  }
+  const ups = [[0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+
+  it('a peg and its socket are whole solids: the peg s square with a lead-in, the socket s + 2c with its chamfer, room for glue and a point', () => {
+    const peg = own(pegSolid(p));
+    const socket = own(socketSolid(p));
+    for (const solid of [peg, socket]) {
+      expect(solid.status()).toBe('NoError');
+      expect(solid.genus()).toBe(0);
+      expect(shells(solid)).toHaveLength(1);
+    }
+    // a square turned 45°: its corners on x and y, 6 mm sides, from 0.5 mm inside the face out to its length
+    const r = 3 * Math.SQRT2;
+    expect(boxOf(peg).min.map((v) => +v.toFixed(6))).toEqual([-r, -r, -0.5].map((v) => +v.toFixed(6)));
+    expect(boxOf(peg).max.map((v) => +v.toFixed(6))).toEqual([r, r, 9].map((v) => +v.toFixed(6)));
+    expect(own(peg.slice(4)).area()).toBeCloseTo(36, 6);
+    expect(peg.volume()).toBeCloseTo(36 * 0.5 + pegOut, 6);
+    expect(socket.volume()).toBeCloseTo(m * m + socketIn, 6);
+    // past the peg's tip the socket runs on at full size for 0.5 mm of glue, then closes to a point 3.15 mm on
+    expect(own(peg.slice(9.25)).isEmpty()).toBe(true);
+    expect(own(socket.slice(9.25)).area()).toBeCloseTo(w * w, 6);
+    expect(own(socket.slice(0.25)).area()).toBeCloseTo((w + 0.5) ** 2, 6); // half way down the mouth's chamfer
+    expect(boxOf(socket).max[2]).toBeCloseTo(p.h + p.tip, 9);
+    expect(p.h - p.length).toBeCloseTo(0.5, 12);
+  });
+
+  it('a peg sits in its socket with the clearance on each side, and touches it nowhere', () => {
+    const female = own(cube([30, 40, 40], [15, 10, 5]).subtract(own(socketAt(placed))));
+    const peg = own(pegAt(placed));
+    expect(female.status()).toBe('NoError');
+    expect(female.volume()).toBeCloseTo(30 * 40 * 40 - socketIn, 4);
+    expect(boxOf(peg).size.map((v) => +v.toFixed(6))).toEqual([9.5, 6 * Math.SQRT2, 6 * Math.SQRT2].map((v) => +v.toFixed(6)));
+    expect(overlap(peg, female)).toBeLessThan(1e-9);
+    expect(peg.minGap(female, 1)).toBeCloseTo(0.15, 6);
+    // pushed square to each side a little less than the clearance it still clears; a little more and it hits
+    for (const [dy, dz] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+      const n = [0, dy * Math.SQRT1_2, dz * Math.SQRT1_2];
+      expect(overlap(own(peg.translate(n.map((v) => v * 0.14))), female)).toBeLessThan(1e-9);
+      expect(overlap(own(peg.translate(n.map((v) => v * 0.16))), female)).toBeGreaterThan(0.1);
+    }
+    // all the way in along its axis, with 0.5 mm to spare at the tip
+    expect(overlap(own(peg.translate([0.49, 0, 0])), female)).toBeLessThan(1e-9);
+  });
+
+  it('needs no support: no face of a peg lying down, or of a socket printed mouth down or lying down, looks down steeper than 45°', () => {
+    const peg = own(pegAt(placed));
+    for (const up of ups) expect(steepest(peg, up), `peg, up ${up}`).toBeCloseTo(-Math.SQRT1_2, 5);
+    // pointing up is fine too: nothing of it faces down
+    expect(steepest(peg, [1, 0, 0])).toBeGreaterThan(-1e-9);
+    const female = own(cube([30, 40, 40], [15, 10, 5]).subtract(own(socketAt(placed))));
+    // mouth down, on its face on the bed, and lying down any way
+    for (const up of [[1, 0, 0], ...ups]) expect(steepest(female, up), `socket, up ${up}`).toBeGreaterThanOrEqual(-Math.SQRT1_2 - 1e-5);
+    expect(steepest(female, [1, 0, 0])).toBeCloseTo(-Math.SQRT1_2, 5);
+    // what the check catches: a round hole lying down has a flat roof
+    const round = own(cube([30, 40, 40], [15, 10, 5]).subtract(own(own(halfHole({ R: 3.15, h: 9.5, ch: 0.5 })).transform([0, 0, -1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 10, 5, 1]))));
+    expect(steepest(round, [0, 0, 1])).toBeLessThan(-0.99);
+  });
+
+  it('the fit test for built-in pegs is a block with one peg and a block with its socket, both lying as a bar\'s halves do', () => {
+    const coupon = own(fitTestCoupon({ diameter: 6, clearance: 0.15, joint: 'pegs' }, 0.4));
+    expect(coupon.status()).toBe('NoError');
+    const [a, b] = shells(coupon);
+    expect([a.genus(), b.genus()]).toEqual([0, 0]);
+    expect(boxOf(coupon).min[2]).toBeCloseTo(0, 6);
+    const side = 20;
+    const long = p.h + p.tip + p.wall + 2;
+    expect(coupon.volume()).toBeCloseTo(side ** 3 + pegOut + side * side * long - socketIn, 4);
+    // the peg stands out of its block's side, its corners up and down: it needs no support
+    const male = [a, b].find((x) => x.volume() > side ** 3);
+    expect(boxOf(male).size.map((v) => +v.toFixed(6))).toEqual([side, side + 9, side]);
+    expect(steepest(male, [0, 0, 1])).toBeCloseTo(-Math.SQRT1_2, 5);
+    // with dovetails as well, the plates come after
+    expect(shells(own(fitTestCoupon({ diameter: 6, joint: 'pegs' }, 0.4, { dovetail: true })))).toHaveLength(4);
+  });
+
+  it('a box cut with built-in pegs: one piece carries them all, the other has their sockets, no pins or teardrops, labels clear of both', () => {
+    const box = own(wasm.Manifold.cube([120, 40, 30], true));
+    const s = split(box, [[0, 0]], { joint: 'pegs' });
+    expect(s.plan.joints).toEqual({ c1: 'pegs' });
+    expect(s.layout).toMatchObject({ diameter: null, pegSize: 6, dowels: [] });
+    expect(s.layout.pegs).toHaveLength(2);
+    // both halves stand on their cut faces: the first carries the pegs, and will lie another way
+    for (const g of s.layout.pegs) {
+      expect(g).toMatchObject({ s: 6, length: 9, male: 0, dir: 1, axis: 0 });
+      expect(g.sides).toEqual([{ piece: 1, peg: true }, { piece: 2, peg: false }]);
+    }
+    expect(isSymmetric(s.layout.pegs.map((g) => g.uv), [0, 0], 3)).toBe(false);
+    expect(s.layout.seams).toEqual([expect.objectContaining({ letter: 'A', pieces: [1, 2], joint: 'pegs', male: 1, labels: ['1A', '2A'] })]);
+    expect(s.layout.notes).toEqual([]);
+    const [male, female] = s.drilled;
+    for (const piece of s.drilled) {
+      expect(piece.status()).toBe('NoError');
+      expect(shells(piece)).toHaveLength(1);
+      expect(piece.genus()).toBe(0);
+    }
+    // the labels are engraved 2 mm or more from the sockets' mouths, never into a peg or a socket
+    for (const g of s.layout.pegs) {
+      expect(own(own(pegAt(g)).subtract(male)).volume()).toBeLessThan(1e-6);
+      expect(overlap(own(socketAt(g)), female)).toBeLessThan(1e-6);
+    }
+    expect(s.layout.labels).toHaveLength(1);
+    for (const label of s.layout.labels) {
+      for (const side of label.sides) {
+        const cutter = own(labelSolid({ text: side.text, size: label.size, font, centre: label.centre, outward: side.outward, axis: label.axis }));
+        for (const g of s.layout.pegs) expect(cutter.minGap(own(socketAt(g)), 5)).toBeGreaterThanOrEqual(2);
+      }
+    }
+    expect(boxOf(male).max[0]).toBeCloseTo(9, 9);
+    expect(boxOf(female).min[0]).toBeCloseTo(0, 9);
+  });
+});
+
+describe('built-in pegs on the cut faces', () => {
+  it('a plate\'s cut takes dovetail tabs; one through a plate thin the other way on the same axis takes pegs and says so', () => {
+    const corner = own(wasm.Manifold.union([cube([200, 100, 5], [100, 50, 2.5]), cube([205, 5, 100], [297.5, 2.5, 50])]));
+    const { spec, cuts } = cutsFor(corner, [[0, 100], [0, 300]], { joint: 'pegs' });
+    const plan = planDovetails(corner, cuts, spec);
+    expect(plan.joints).toEqual({ c1: 'dovetail', c2: 'pegs' });
+    expect(plan.notes).toEqual([expect.objectContaining({ code: 'DOVETAIL_NOT_PLATE', pegs: true, text: 'Cut B isn\'t through a thin plate, so it uses built-in pegs.' })]);
+  });
+
+  /** Every peg and socket lies inside the model, the sockets a wall's thickness from its outside. */
+  function expectPegsInside(solid, layout) {
+    const b = boxOf(solid);
+    const air = own(cube(b.size.map((v) => v + 40), b.min.map((v, a) => (v + b.max[a]) / 2)).subtract(solid));
+    for (const g of layout.pegs) {
+      const socket = own(socketAt(g));
+      expect(own(socket.subtract(solid)).volume()).toBeLessThan(1e-6);
+      expect(own(own(pegAt(g)).subtract(solid)).volume()).toBeLessThan(1e-6);
+      expect(socket.minGap(air, 5)).toBeGreaterThanOrEqual(pegSizesFor(g.s).wall - 1e-6);
+    }
+  }
+
+  it('keep a wall from the air and from each other: a void behind the face takes shorter pegs, parallel cuts never meet', () => {
+    // a sealed void 8 mm behind the face: a 4 mm peg's socket reaches it, a 3 mm peg's does not
+    const hollow = own(cube([200, 40, 40]).subtract(cube([52, 30, 30], [34, 0, 0])));
+    let s = split(hollow, [[0, 0]], { joint: 'pegs', labels: false });
+    expect(s.layout.pegs.map((g) => [g.s, g.length])).toEqual([[4, 3], [4, 3]]);
+    expect(s.layout.notes).toEqual([expect.objectContaining({ code: 'CONNECTORS_SHORTER', pegs: true, depth: 3 })]);
+    expectPegsInside(hollow, s.layout);
+    // a middle piece 20 mm long between two cuts gets sockets from both: the second cut's keep clear of the first's
+    const bar = own(wasm.Manifold.cube([300, 40, 20], true));
+    s = split(bar, [[0, 0], [0, 20]], { joint: 'pegs', labels: false });
+    expect(s.layout.seams.map((x) => [x.pieces, x.male])).toEqual([[[1, 2], 1], [[2, 3], 3]]);
+    expectPegsInside(bar, s.layout);
+    const [first, second] = ['c1', 'c2'].map((id) => s.layout.pegs.filter((g) => g.cutId === id));
+    expect(first.length).toBeGreaterThanOrEqual(2);
+    expect(second.length).toBeGreaterThanOrEqual(2);
+    for (const g of first) {
+      const used = own(own(socketAt(g)).add(own(pegAt(g))));
+      for (const h of second) expect(used.minGap(own(own(socketAt(h)).add(own(pegAt(h)))), 10)).toBeGreaterThanOrEqual(pegSizesFor(h.s).wall - 1e-6);
+    }
+    for (const piece of s.drilled) {
+      expect(piece.status()).toBe('NoError');
+      expect(piece.genus()).toBe(0);
+    }
   });
 });
 

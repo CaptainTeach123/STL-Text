@@ -16,7 +16,8 @@ import {
   CUT_TOLERANCE, FILAMENT, SPLIT_KEEP_TRIANGLES, SplitError, TO_PLANE, applyToSoup, assemblySteps, axisCuts, cellOfPoint,
   cutPlane, fitsBed, glueFileName, gridCandidates, howToGlueText, layPieces, letterFor, normaliseSplit, partFileName, pieceFileName, pinsFileName,
   planCost, planGrid, planSamples, plateAxis, safeFileName, slabAxis, sizesFor, smallPieceNotes, soupCells, splitActive, splitNote, usableBed,
-  zipFileName, cellSupport, flatProbes, outlineColumns, textNotes, baseAxis, modelPlates,
+  zipFileName, cellSupport, flatProbes, outlineColumns, textNotes, baseAxis, modelPlates, layPegged, pegAllowance, pegMales, pegSizeOf, pegSizesFor,
+  pegSides, cellFits,
 } from './split.js';
 import {
   buildSplitDisplay, clearSplitCaches, cutPieces, drillPiece, fitTestCoupon, layoutSplit, partedSolids, pinAt, pinSheet, pinSpares, pinsPerSheet,
@@ -39,17 +40,19 @@ import {
  *   preview     { item, baseVersion, printing }         -> { empty } | { geometry, bounds, stats, notes }
  *   result      { items, baseVersion, printing, split?, bed? }
  *                                                       -> { display, notes, info }
- *                                                          (+ pieces, grid, seams, diameter with a split)
+ *                                                          (+ pieces, grid, seams, diameter, pegSize with a split)
  *   export      { items, baseVersion, name, printing, split?, bed?, printer?, archive?: 'zip'|'files' }
  *                                                       -> { stl, triangles, notes, extra }
- *                                                          (stl null, + files, zip, pieces, seams, assembly with a split)
+ *                                                          (stl null, + files, zip, pieces, seams, assembly, diameter,
+ *                                                          pegSize with a split)
  *   split.plan  { items, baseVersion, printing, split, bed, mode: 'fit'|'measure' }
  *                                                       -> fit: { cuts, counts, pieces, notes }
  *                                                          measure: { bounds, cuts, notes } (a dovetail cut also has
- *                                                          tabs, reach [below, above] and w, for `cellSizes`; estimate:
- *                                                          true when the faces are the model's without the text)
+ *                                                          tabs, reach [below, above] and w, for `cellSizes`, and a cut
+ *                                                          with built-in pegs reach [L, L]; estimate: true when the
+ *                                                          faces are the model's without the text)
  *   split.fitTest { items?, baseVersion?, split, printing, bed?, name, dovetail? }
- *                                                       -> { stl, name, triangles, diameter, pins, dovetail }
+ *                                                       -> { stl, name, triangles, diameter, pins, dovetail, pegs, pegSize }
  *   ping        {}                                      -> { ready: true, caches }
  *
  * `display` = { positions, normals, index, passthroughStart, bvhRoots } —
@@ -2321,8 +2324,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * how each piece lies (pure, never cached), and the pins, labels and
    * drilling (booleans, keyed by the cut, the connector settings and each
    * piece's way up – so a new bed that turns no piece over costs nothing).
-   * Returns null without cuts; `{ notes }` when the model is exported whole
-   * after all (it cannot be split, or every cut missed); else the split.
+   * A piece that carries built-in pegs is laid again once they are placed:
+   * they stand out of it, and never point down. Returns null without cuts;
+   * `{ notes }` when the model is exported whole after all (it cannot be
+   * split, or every cut missed); else the split.
    */
   function splitFor(final, items, { split, bed, printing }, progress) {
     if (!splitActive(split)) return null;
@@ -2339,8 +2344,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     progress?.('Choosing how each piece lies…');
     // how each piece lies, and which of a box's shells print apart because lying that way they would not rest on the bed
     const laid = layPieces(cut.pieces, U, spec.orient, { flat: slabOf(final), soups: cut.fragments });
-    const lying = laid.map((p) => p.lying);
-    const drill = drillStage(final, cut, laid, { cuts, spec, joints: plan.joints, nozzle }, progress);
+    const drill = drillStage(final, cut, laid, { cuts, spec, joints: plan.joints, nozzle, U }, progress);
+    const lying = layPegged(laid, drill.layout.pegs, U, spec.orient, { flat: slabOf(final) });
     return summarise({ final, spec, cuts, U, given, plan, cut, laid, lying, drill });
   }
 
@@ -2408,21 +2413,24 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   }
 
   /**
-   * Stage C and D: pins and labels laid out (plain data), and every piece drilled. The pieces are those `layPieces`
-   * made of the cut's: the way each prints up and which shells print apart are in the key.
+   * Stage C and D: pins, pegs and labels laid out (plain data), and every piece drilled. The pieces are those
+   * `layPieces` made of the cut's: the way each prints up and which shells print apart are in the key. Which piece of a
+   * pair carries built-in pegs follows from how they lie on the bed (`pegMales`), so with pegs the bed is in it too.
    */
-  function drillStage(final, cut, laid, { cuts, spec, joints, nozzle }, progress) {
+  function drillStage(final, cut, laid, { cuts, spec, joints, nozzle, U }, progress) {
     const state = splitState(final);
-    const { joint, diameter, depth, clearance, count, labels } = spec;
+    const { joint, diameter, depth, clearance, count, labels, orient } = spec;
     const font = labels ? fontFor('inter') : null;
     const ups = laid.map((p) => p.lying.up);
     const groups = laid.map((p) => [p.from, p.parts]);
-    const key = `${cut.key}|drill:${stableKey({ joint, diameter, depth, clearance, count, labels, nozzle, ups, groups, font: font?.key ?? null })}`;
+    const pegged = joint === 'pegs' ? { U, orient } : {};
+    const key = `${cut.key}|drill:${stableKey({ joint, diameter, depth, clearance, count, labels, nozzle, ups, groups, font: font?.key ?? null, ...pegged })}`;
     if (state.drill?.key === key) return state.drill;
     disposeSplitStage(state.drill);
     state.drill = null;
     const layout = layoutSplit(final.solid, cuts, laid.map((p) => ({ index: p.index, cell: p.cell, up: p.lying.up, boxes: p.boxes })), spec, {
       nozzle, joints, tabs: cut.tabs, font: font?.font ?? null, bounds: boxOf(final.solid), progress,
+      pegMales: joint === 'pegs' ? pegMales(laid, U, orient, { flat: slabOf(final), length: pegAllowance(spec) }) : null,
     });
     const drilled = drillAll(final, cut, laid, layout, font?.font ?? null, progress);
     const keep = drilled.reduce((n, m) => n + m.numTri(), 0) <= splitKeepTriangles;
@@ -2493,6 +2501,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         down: o.down,
         up: o.up,
         dowels: layout.dowels.filter((d) => d.sides.some((s) => s.piece === p.index)).length,
+        // the built-in pegs it carries, and the sockets it has for another piece's
+        pegs: layout.pegs.filter((g) => g.sides.some((s) => s.peg && s.piece === p.index)).length,
+        sockets: layout.pegs.filter((g) => g.sides.some((s) => !s.peg && s.piece === p.index)).length,
         unrepaired: (p.soup?.length ?? 0) / 9,
       };
     });
@@ -2509,6 +2520,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       dowels: s.dowels.map((d) => ({
         centre: d.centre, axis: d.axis, d: d.d, depth: d.depth, R: d.R, h: d.h, ch: d.ch, cell: d.cell, patch: d.patch, tear: d.sides.map((x) => x.tear), sides: d.sides,
       })),
+      pegs: s.pegs.map((g) => ({
+        centre: g.centre, axis: g.axis, at: g.at, s: g.s, length: g.length, c: g.c, half: g.half, ch: g.ch, e: g.e, h: g.h, tip: g.tip, a: g.a,
+        cell: g.cell, patch: g.patch, male: g.male, dir: g.dir, sides: g.sides,
+      })),
+      male: s.male,
     }));
     // one group per pin size: the pins file holds each group, with spares
     const groups = new Map();
@@ -2529,10 +2545,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     // the summary counts every pin, and says how many of each size, or of each length of one size, when they differ
     const sized = main ? pins.filter((g) => g.d === main.d) : [];
     const pairs = seams.filter((s) => s.labels?.length === 2).map((s) => `${s.labels[0]} ↔ ${s.labels[1]}`);
+    // built-in pegs by size, the size the layout chose first
+    const pegSizes = [...layout.pegs.reduce((m, g) => m.set(g.s, (m.get(g.s) ?? 0) + 1), new Map())]
+      .sort((p, q) => (p[0] === layout.pegSize ? 0 : 1) - (q[0] === layout.pegSize ? 0 : 1) || q[0] - p[0])
+      .map(([size, count]) => ({ size, count }));
     notes.push(splitNote('SPLIT', {
       pieces: n, dowels: pins.reduce((k, g) => k + g.count, 0), diameter: main?.d ?? null, length: main?.length ?? null,
       ...(sized.length > 1 ? { lengths: sized.map((g) => ({ length: g.length, count: g.count })) } : {}),
       ...(sized.length < pins.length ? { sizes: pins.map((g) => ({ diameter: g.d, length: g.length, count: g.count })) } : {}),
+      ...(pegSizes.length ? { pegs: layout.pegs.length, pegSize: pegSizes[0].size } : {}),
+      ...(pegSizes.length > 1 ? { pegSizes } : {}),
       dovetails: cut.dovetails.length, pairs,
     }));
     for (const g of pins) {
@@ -2542,7 +2564,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     }
     for (const x of cut.dovetails) {
       const seam = seams.find((s) => s.cutId === x.cutId && s.joint === 'dovetail');
-      notes.push(splitNote('DOVETAIL', { letter: x.letter, cutId: x.cutId, tabs: x.tabs, pieces: seam?.pieces ?? [] }));
+      notes.push(splitNote('DOVETAIL', { letter: x.letter, cutId: x.cutId, tabs: x.tabs, pieces: seam?.pieces ?? [], ...(spec.joint === 'pegs' ? { pegs: true } : {}) }));
     }
     // the cut numbers the boxes' pieces: a box whose shells print apart is more than one piece, so the thin pieces are
     // looked for again, and text through a cut names the pieces as they print, beside the cut's other notes
@@ -2561,12 +2583,14 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       if (one && !fitsBed(one, U, { flat: 2 }).fits) notes.push(splitNote('PART_TOO_BIG', { pins: true, size: one, bed: U }));
     }
     lying.forEach((o, i) => {
-      // a piece on a dovetail seam lies flat by design: that it cannot lie on its cut face is no news
-      const flatOnly = laid[i].stats.allowed.length < 6;
-      notes.push(...o.notes.filter((x) => !(flatOnly && x.code === 'ORIENT_FALLBACK')));
+      // a piece on a dovetail seam lies flat by design, and one carrying pegs never lies on them: that it cannot lie on
+      // its cut face (or as modelled) is no news
+      const held = laid[i].stats.allowed.length < 6 || o.pegged;
+      notes.push(...o.notes.filter((x) => !(held && x.code === 'ORIENT_FALLBACK')));
     });
     notes.push(...layout.notes);
-    return { ...split, pieces, seams, pins, notes, grid: cut.grid, diameter: layout.diameter };
+    // the peg size is the one the pieces have, as the summary says: a size asked for that no face took is none of theirs
+    return { ...split, pieces, seams, pins, notes, grid: cut.grid, diameter: layout.diameter, pegSize: pegSizes[0]?.size ?? layout.pegSize };
   }
 
   /** The `result` reply with a split: the pieces exploded apart in the viewer, one range per piece, pin and part. */
@@ -2615,6 +2639,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         grid: split.grid,
         seams: split.seams,
         diameter: split.diameter,
+        pegSize: split.pegSize,
         notes: [...final.notes, ...split.notes],
         skipped: final.skipped,
         info: { triangles: d.index.length / 3, pieces: split.pieces.length },
@@ -2684,7 +2709,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const triangles = files.reduce((t, f) => t + (f.triangles ?? 0), 0);
     const message = {
       stl: null, triangles, notes: [...final.notes, ...split.notes], skipped: final.skipped, extra: [],
-      pieces: split.pieces, seams: split.seams, assembly: assembly.map((s) => s.text), diameter: split.diameter,
+      pieces: split.pieces, seams: split.seams, assembly: assembly.map((s) => s.text), diameter: split.diameter, pegSize: split.pegSize,
     };
     if (archive === 'files') {
       message.files = files;
@@ -2886,13 +2911,22 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         const seam = plan.tabs?.seams.find((x) => x.cutId === kept.id);
         const tabs = seam?.tabs ?? [];
         const reach = (dir) => Math.max(0, ...tabs.filter((tb) => tb.dir === dir).map((tb) => tb.E));
+        const joint = plan.joints[kept.id] ?? 'dowels';
+        // a cut's built-in pegs make one of the pieces either side longer, as far as the longest peg its faces take
+        // stands out (`pegSides` says which), and lay neither flat
+        const pegged = joint === 'pegs' && islands > 0;
         return {
-          id, letter, axis: kept.axis, at: plane.at, area: face.area(), islands, joint: plan.joints[kept.id] ?? 'dowels',
+          id, letter, axis: kept.axis, at: plane.at, area: face.area(), islands, joint,
           crosses: textCrossing(final, items, kept, temps), ...(kept.id !== id ? { merged: kept.id } : {}),
           ...(tabs.length ? { tabs: tabs.length, reach: [reach(1), reach(-1)], w: seam.w ?? plan.tabs.w } : {}),
+          ...(pegged ? { peg: pegAllowance(spec, [1, 2].map((k) => bounds.max[(kept.axis + k) % 3] - bounds.min[(kept.axis + k) % 3])) } : {}),
         };
       });
-      return { bounds: { min: [...bounds.min], max: [...bounds.max] }, cuts: measured, notes, ...(pieces ? { pieces } : {}) };
+      // the pegs go on the side the boxes fit best, as the pieces will have them: only boxes that make a piece count
+      const filled = pieces ? new Set(pieces.map((p) => p.cell.join(','))) : null;
+      const fits = U ? (c) => (filled && !filled.has(c.cell.join(','))) || cellFits(c, U) : null;
+      const sided = pegSides(bounds, measured, fits).map(({ peg, ...c }) => c);
+      return { bounds: { min: [...bounds.min], max: [...bounds.max] }, cuts: sided, notes, ...(pieces ? { pieces } : {}) };
     } finally {
       temps.dispose();
     }
@@ -2940,12 +2974,18 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const candidatesOf = new Map(ways.map((lying) => [lying, gridCandidates(E, U, { flat: lying }).filter((c) => c.pieces > 1)]));
     const tooMany = { cuts: [], counts: null, pieces: [], notes: [splitNote('PLAN_TOO_MANY')] };
     if (![...candidatesOf.values()].some((list) => list.length)) return tooMany;
-    // the pieces at either end must take a hole and its wall, and middle ones a hole from each side
-    const probe = sizesFor(spec.diameter || 5, spec.clearance, nozzle, spec.depth);
-    const pins = sizesFor(5, spec.clearance, nozzle);
+    // the pieces at either end must take a hole (or a peg's socket) and its wall, and middle ones one from each side
+    const pegged = spec.joint === 'pegs';
+    const sizes = pegged ? (d, ...rest) => pegSizesFor(pegSizeOf(d) || 5, ...rest) : (d, ...rest) => sizesFor(d || 5, ...rest);
+    const probe = sizes(spec.diameter, spec.clearance, nozzle, spec.depth);
+    const pins = sizes(5, spec.clearance, nozzle);
     const minEnd = probe.reach + 1;
     const minMid = 2 * probe.reach + 1;
-    const tabsOn = (spec.joint === 'auto' || spec.joint === 'dovetail') && !final.passthrough.length;
+    const tabsOn = (spec.joint === 'auto' || spec.joint === 'dovetail' || pegged) && !final.passthrough.length;
+    // built-in pegs make one of the pieces either side of every other cut longer, as far as the longest peg the cut's
+    // faces take stands out
+    const solidE = [0, 1, 2].map((a) => solidBox.max[a] - solidBox.min[a]);
+    const peg = [0, 1, 2].map((a) => (pegged ? pegAllowance(spec, [solidE[(a + 1) % 3], solidE[(a + 2) % 3]]) : 0));
     const text = final.itemBounds.filter((b) => !b.part);
     const temps = scope();
     try {
@@ -3017,9 +3057,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
             return faces.get(x);
           };
           tabs = profile.map((p) => {
-            if (!p.plate) return null;
+            const pegs = peg[a] > 0 && p.area > 0 ? { below: peg[a], above: peg[a], peg: true } : null;
+            if (!p.plate) return pegs;
             const probes = flatProbes(p.t, Math.max(bounds.min[a], p.t - reach), Math.min(bounds.max[a], p.t + reach)).map(snap);
-            return tabsAcross(faceAt(p.t), { axis: a, at: p.t }, { sliceAt: faceAt, probes });
+            return tabsAcross(faceAt(p.t), { axis: a, at: p.t }, { sliceAt: faceAt, probes }) ?? pegs;
           });
         } finally {
           probed.dispose();
@@ -3045,7 +3086,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           for (const group of new Set(candidates.map((c) => c.pieces))) {
             let best = null;
             for (const { k } of candidates.filter((c) => c.pieces === group)) {
-              const plan = planGrid(k, { E, U, bounds, flat: lying, minEnd, minMid, profileOf, support, stable });
+              const plan = planGrid(k, { E, U, bounds, flat: lying, minEnd, minMid, profileOf, support, stable, peg });
               // an L leaves a box empty: fewer pieces win, then the cost; candidates come fewest axes first, then fewest
               // Z cuts, so an equal cost keeps the earlier one
               if (plan && (!best || plan.pieces.length < best.pieces.length || (plan.pieces.length === best.pieces.length && plan.cost < best.cost - 1e-9))) best = plan;
@@ -3181,35 +3222,48 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * The fit test: a small print to try the joints before printing the
    * pieces. Given the model (`items`, `baseVersion`) and a split with cuts,
    * it is made from what that split really uses – the pin size Auto chose,
-   * pin holes only when some seam has pins, a dovetail whenever some seam
-   * has tabs – by working the split out as the pieces view does (cached, so
-   * the download after it costs nothing). Without them the settings say:
-   * the pin size set (5 mm for Auto), a dovetail when Joints is Dovetails.
-   * `dovetail` forces the plates in or out. No pins and no tabs (glue only)
-   * gives no file (`stl: null`).
+   * pin holes only when some seam has pins, a peg and its socket at the size
+   * the pegs have when some seam has built-in pegs, a dovetail whenever some
+   * seam has tabs – by working the split out as the pieces view does
+   * (cached, so the download after it costs nothing). Without them the
+   * settings say: the pin size set (5 mm for Auto), a peg of the size set
+   * (5 mm for Auto) when Joints is Built-in pegs, a dovetail when Joints is
+   * Dovetails. `dovetail` forces the plates in or out. No pins, pegs or tabs
+   * (glue only) gives no file (`stl: null`).
    */
   function fitTest({ items = null, baseVersion = null, split = null, printing = null, bed = null, name = 'model', dovetail = null }, progress) {
     const { spec } = normaliseSplit({ ...(split ?? {}), cuts: [] });
-    const uses = { pins: spec.joint !== 'none', dovetail: spec.joint === 'dovetail', diameter: spec.diameter || 5 };
+    const pegJoint = spec.joint === 'pegs';
+    const uses = {
+      pins: spec.joint !== 'none' && !pegJoint, pegs: pegJoint, dovetail: spec.joint === 'dovetail',
+      diameter: spec.diameter || 5, pegSize: pegSizeOf(spec.diameter) || 5,
+    };
     if (Array.isArray(items) && splitActive(split)) {
       const final = finalFor(items, baseVersion, printing, progress);
       const parted = splitFor(final, items, { split, bed, printing }, progress);
       if (parted?.cut) {
         uses.pins = parted.seams.some((s) => s.dowels.length > 0);
+        uses.pegs = parted.seams.some((s) => s.pegs.length > 0);
         uses.dovetail = parted.cut.dovetails.length > 0;
         uses.diameter = parted.diameter ?? uses.diameter;
+        uses.pegSize = parted.pegSize ?? uses.pegSize;
       }
     }
     if (dovetail !== null) uses.dovetail = Boolean(dovetail);
     const file = `${safeFileName(name)}-fit-test`;
-    if (!uses.pins && !uses.dovetail) return { message: { stl: null, name: file, triangles: 0, diameter: null, pins: false, dovetail: false }, transfer: [] };
+    if (!uses.pins && !uses.pegs && !uses.dovetail) {
+      return { message: { stl: null, name: file, triangles: 0, diameter: null, pins: false, dovetail: false, pegs: false, pegSize: null }, transfer: [] };
+    }
     progress?.('Making the fit test…');
-    const coupon = fitTestCoupon({ ...spec, diameter: uses.diameter }, printing?.nozzle ?? 0.4, { dovetail: uses.dovetail, pins: uses.pins });
+    const coupon = fitTestCoupon({ ...spec, diameter: uses.pegs ? uses.pegSize : uses.diameter }, printing?.nozzle ?? 0.4, { dovetail: uses.dovetail, pins: uses.pins, pegs: uses.pegs });
     try {
       const soup = manifoldToSoup(coupon);
       const stl = writeBinarySTL(soup, `STL-Text ${file}`);
       return {
-        message: { stl, name: file, triangles: soup.length / 9, diameter: uses.pins ? uses.diameter : null, pins: uses.pins, dovetail: uses.dovetail },
+        message: {
+          stl, name: file, triangles: soup.length / 9, diameter: uses.pins ? uses.diameter : null, pins: uses.pins, dovetail: uses.dovetail,
+          pegs: uses.pegs, pegSize: uses.pegs ? uses.pegSize : null,
+        },
         transfer: [stl],
       };
     } finally {

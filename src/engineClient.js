@@ -275,7 +275,7 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
 
     /**
      * The fit test for a split (`{ printing, split, bed, name }`): made from
-     * the pin size and joints the split really uses, so it needs the model.
+     * the pin or peg size and joints the split really uses, so it needs the model.
      * On the misc channel, so a measure never supersedes it.
      */
     fitTest(items, baseVersion, options = {}) {

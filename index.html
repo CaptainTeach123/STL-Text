@@ -428,14 +428,15 @@
           <ul class="plan" id="cutList" aria-label="Cuts"></ul>
           <div class="split-settings" id="splitSettings" hidden>
             <span class="label">Joints</span>
-            <fieldset class="seg wide" aria-label="Joints">
+            <fieldset class="seg wide joints" aria-label="Joints">
               <label title="Auto: printed pins; dovetail tabs through thin plates"><input type="radio" name="splitJoint" data-split="joint" value="auto" checked /><span>Auto</span></label>
               <label title="Pins in matching holes on both faces of every cut"><input type="radio" name="splitJoint" data-split="joint" value="dowels" /><span>Pins</span></label>
+              <label title="Square pegs printed on one piece fit square sockets in the other – nothing extra to print or buy"><input type="radio" name="splitJoint" data-split="joint" value="pegs" /><span>Built-in pegs</span></label>
               <label title="Tabs through thin plates, so the pieces lock as they are laid together (pins where a cut is not through a plate)"><input type="radio" name="splitJoint" data-split="joint" value="dovetail" /><span>Dovetails</span></label>
               <label title="Flat faces with nothing to line them up"><input type="radio" name="splitJoint" data-split="joint" value="none" /><span>Glue only</span></label>
             </fieldset>
-            <label class="field inline" title="One pin size for the whole model. Auto picks the largest that fits every face; 1.75 mm is a piece of filament.">
-              <span>Pin size</span>
+            <label class="field inline" title="One pin size for the whole model – with built-in pegs, the side of the square. Auto picks the largest that fits every face; 1.75 mm is a piece of filament.">
+              <span data-pin-label="Pin size" data-peg-label="Peg size">Pin size</span>
               <select data-split="diameter">
                 <option value="0">Auto</option>
                 <option value="1.75">1.75 mm (filament)</option>
@@ -451,20 +452,20 @@
               <label title="A file of pins to print with the pieces"><input type="radio" name="splitPins" data-split="pins" value="print" checked /><span>Print the pins</span></label>
               <label title="Holes only: use wooden or steel dowels, or filament"><input type="radio" name="splitPins" data-split="pins" value="own" /><span>My own dowels</span></label>
             </fieldset>
-            <label class="check" title="Engrave the same label on both faces of each joint with pins – put each one on its match. Dovetail and glue-only joints get none."><input type="checkbox" data-split="labels" checked /> Matching labels <small>1A ↔ 2A</small></label>
+            <label class="check" title="Engrave the same label on both faces of each joint with pins or pegs – put each one on its match. Dovetail and glue-only joints get none."><input type="checkbox" data-split="labels" checked /> Matching labels <small>1A ↔ 2A</small></label>
             <details class="disclosure">
               <summary>Fine-tune</summary>
               <div class="grid2">
-                <label class="field num" title="How deep each hole goes into each piece. 0 picks a depth from the pin size and keeps the holes clear of the sides.">
-                  <span>Depth per side <small>mm · 0 = auto</small></span>
+                <label class="field num" title="How deep each hole goes into each piece – with built-in pegs, how far each peg stands out. 0 picks it from the size and keeps the holes clear of the sides.">
+                  <span><span data-pin-label="Depth per side" data-peg-label="Peg length">Depth per side</span> <small>mm · 0 = auto</small></span>
                   <input type="number" data-split="depth" min="0" max="30" step="0.5" value="0" />
                 </label>
-                <label class="field num" title="Room around each pin, per side, so it slides in after printing. Applied to the holes and dovetail sockets only.">
+                <label class="field num" title="Room around each pin or peg, per side, so it slides in after printing. Applied to the holes and sockets only.">
                   <span>Clearance per side <small>mm</small></span>
                   <input type="number" data-split="clearance" min="0" max="0.5" step="0.05" value="0.15" />
                 </label>
-                <label class="field num" title="Pins on each face where the cut meets the model. 0 places two to six, more on a bigger face, as far as there is room.">
-                  <span>Pins per face <small>0 = auto</small></span>
+                <label class="field num" title="Pins (or pegs) on each face where the cut meets the model. 0 places two to six, more on a bigger face, as far as there is room.">
+                  <span><span data-pin-label="Pins per face" data-peg-label="Pegs per face">Pins per face</span> <small>0 = auto</small></span>
                   <input type="number" data-split="count" min="0" max="6" step="1" value="0" />
                 </label>
                 <label class="field" title="How each piece is turned in its file: the side that needs the least support down, a cut face down, or as it is in the model">
@@ -480,13 +481,13 @@
             </details>
             <div class="row spread">
               <span class="hint">Not sure of the fit?</span>
-              <button type="button" id="splitFitTestBtn" class="btn small" title="A small print of the joints these cuts get – holes and a pin of the size the pieces use, a dovetail where a cut has one – to try before printing the pieces">Download fit test</button>
+              <button type="button" id="splitFitTestBtn" class="btn small" title="A small print of the joints these cuts get – holes and a pin of the size the pieces use, a peg and its socket with built-in pegs, a dovetail where a cut has one – to try before printing the pieces">Download fit test</button>
             </div>
           </div>
           <ul class="plan" id="pieceList" aria-label="Pieces"></ul>
           <div class="row spread" id="piecesHint" hidden>
             <span class="hint">Sizes of the boxes between the cuts.</span>
-            <button type="button" id="showPiecesBtn" class="btn small" title="Work out the real pieces, their pins and how each one lies">Show the pieces</button>
+            <button type="button" id="showPiecesBtn" class="btn small" title="Work out the real pieces, their joints and how each one lies">Show the pieces</button>
           </div>
           <ul class="notes" id="splitNotes" aria-live="polite"></ul>
         </section>

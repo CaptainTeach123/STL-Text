@@ -9,7 +9,8 @@ import {
   oppositeDir, orientationStats, partFileName, pieceColorIndex, pieceFileName, pinsFileName, planAllowance, planCost, planGrid,
   planSamples, plateAxis, polygonsArea, polygonsCentroid, printTransform, safeFileName, cellSupport, fitPieces, flatProbes, liesFlat, statsWithSoup,
   sizesFor, sizesForRoom, soupCells, splitActive, splitNote, teardropApex, usableBed, yawMat4, zipFileName, triangleInBox, baseAxis,
-  outlineColumns, pieceHolding, textNotes,
+  outlineColumns, pieceHolding, textNotes, AUTO_PEGS, SMALLEST_PEG, layPegged, pegAllowance, pegMales, pegSides, pegSizeOf, pegSizesFor,
+  pegSizesForRoom, statsWithPegs,
 } from '../src/split.js';
 
 const U = [210, 210, 249]; // the default printer's usable bed
@@ -1401,6 +1402,343 @@ describe('viewer maths', () => {
   });
 });
 
+describe('built-in pegs', () => {
+  it('sizes follow from the side: a square exactly s, the clearance on its socket, glue room past its tip and a 45° point', () => {
+    const p = pegSizesFor(6, 0.15, 0.4);
+    expect(p).toMatchObject({ s: 6, d: 6, c: 0.15, ch: 0.5, e: 0.48, wall: 2.4, length: 9, depth: 9, h: 9.5 });
+    expect(p.minDepth).toBeCloseTo(3.6, 12);
+    expect(p.half).toBeCloseTo(3.15, 12);
+    expect(p.tip).toBeCloseTo(3.15, 12); // 45° faces: as high as the socket's side is from its axis
+    expect(p.h - p.length).toBeCloseTo(0.5, 12); // the glue's room past the peg's tip
+    expect(p.a).toBeCloseTo(3.65 * Math.SQRT2, 12); // the mouth's half-diagonal, chamfer counted
+    expect(p.rho).toBeCloseTo(3.65 * Math.SQRT2 + 2.4, 12);
+    expect(p.rhoTear).toBe(p.rho); // a diamond needs no teardrop
+    expect(p.sMin).toBe(18);
+    expect(p.reach).toBeCloseTo(9.5 + 3.15 + 2.4 + 0.01, 12);
+    // the length is 1.5 s to the half millimetre, or the depth set; the lead-in 0.4–0.5 mm
+    expect([4, 5, 8, 10].map((s) => pegSizesFor(s).length)).toEqual([6, 7.5, 12, 15]);
+    expect([4, 5, 8].map((s) => pegSizesFor(s).e)).toEqual([0.4, 0.4, 0.5]);
+    expect(pegSizesFor(5, 0.15, 0.4, 11).length).toBe(11);
+    // a socket kept within the room behind a face: shorter, or none under the minimum
+    expect(pegSizesForRoom(6, 0.15, 0.4, 0, 20)).toEqual(p);
+    expect(pegSizesForRoom(6, 0.15, 0.4, 0, 15).length).toBe(8.9);
+    expect(pegSizesForRoom(6, 0.15, 0.4, 0, 9)).toBeNull();
+    expect(AUTO_PEGS).toEqual([8, 6, 5, 4]);
+    expect([0, 1.75, 3, 6, 10].map(pegSizeOf)).toEqual([0, SMALLEST_PEG, 3, 6, 10]);
+    // what the planner counts before anyone knows which piece carries them: the largest automatic peg, or the size set
+    expect(pegAllowance({})).toBe(12);
+    expect(pegAllowance({ diameter: 5 })).toBe(7.5);
+    expect(pegAllowance({ diameter: 5, depth: 10 })).toBe(10);
+  });
+
+  it('the planner counts how far pegs stand out, on the one piece of a cut that carries them, without laying it flat', () => {
+    // a 420 mm board takes two pieces with pins, three with pegs: its 210 mm halves fit, but not with 9 mm pegs on one
+    expect(fitPieces([420, 150, 20], U, { joint: 'dowels' }).pieces).toBe(2);
+    expect(fitPieces([420, 150, 20], U, { joint: 'pegs' }).pieces).toBe(3);
+    // where the pegs push no piece over the bed, as many pieces either way: a 410 mm board's cut moves towards the half
+    // that carries them, and a 534 mm bar that fits across the bed in two on its side is not counted with the 12 mm
+    // pegs that a 20 mm bar never gets
+    expect(fitPieces([410, 150, 20], U, { joint: 'pegs' }).pieces).toBe(2);
+    expect(fitPieces([534, 40, 20], U, { joint: 'dowels' }).pieces).toBe(2);
+    expect(fitPieces([534, 40, 20], U, { joint: 'pegs' }).pieces).toBe(2);
+    expect(fitPieces([300, 40, 20], U, { joint: 'pegs' }).pieces).toBe(2);
+    // half a peg either side of each cut, as `evenCell` shares a reach out: faces 20 mm across take 6 mm pegs (9 mm
+    // long), faces 40 mm across 8 mm ones (12 mm)
+    expect(planAllowance([300, 40, 20], { joint: 'pegs' })).toEqual({ flat: null, grow: [4.5, 4.5, 6] });
+    expect(planAllowance([300, 40, 20], { joint: 'pegs', diameter: 4 })).toEqual({ flat: null, grow: [3, 3, 3] });
+    // the longest peg a face takes: Auto none wider than a third of it (the smallest when none is), a size set none
+    // whose socket and wall are wider than it, and a length set whatever the size
+    expect([[40, 20], [40, 30], [300, 24], [100, 11]].map((face) => pegAllowance({}, face))).toEqual([9, 12, 12, 6]);
+    expect([[40, 30], [40, 18], [40, 12]].map((face) => pegAllowance({ diameter: 10 }, face))).toEqual([15, 9, 6]);
+    expect(pegAllowance({ diameter: 10, depth: 20 }, [40, 12])).toBe(20);
+    // a thin plate has no room for pegs: its cuts take dovetail tabs, as with Auto
+    expect(planAllowance([400, 100, 4], { joint: 'pegs' })).toEqual(planAllowance([400, 100, 4], { joint: 'auto' }));
+    expect(planAllowance([400, 100, 4], { joint: 'pegs' }, { passthrough: true })).toEqual({ flat: 2, grow: [0, 0, 0] });
+    // per sample, a cut with pegs makes the piece below it or the one above it longer, below where either fits, and
+    // holds them to what fits any way (S), never flat (Sflat): pegs too long for even halves move the cut towards the
+    // piece that carries them
+    const samples = planSamples(-200, 200, 1);
+    const limits = { lo: -200, hi: 200, k: 1, S: 215, Sflat: 150 };
+    const zero = samples.map(() => 0);
+    const pegsOf = (L) => samples.map(() => ({ below: L, above: L, peg: true }));
+    expect(chooseOffsets(samples, zero, { ...limits, grow: pegsOf(12) })).toMatchObject({ offsets: [0], reach: [[12, 0]] });
+    expect(chooseOffsets(samples, zero, { ...limits, grow: pegsOf(16) })).toMatchObject({ offsets: [-2], reach: [[16, 0]] });
+    expect(chooseOffsets(samples, zero, { ...limits, grow: pegsOf(32) })).toBeNull();
+    expect(chooseOffsets(samples, zero, { ...limits, grow: samples.map(() => ({ below: 12, above: 12 })) })).toBeNull();
+    // a grid: each piece as it will print, a peg's length past the cuts whose pegs it carries, lying any way
+    const E = [410, 150, 20];
+    const bounds = { min: [-205, -75, 0], max: [205, 75, 20] };
+    const profileOf = (a, k) => {
+      const list = planSamples(bounds.min[a], bounds.max[a], k);
+      return { samples: list, costs: list.map(() => 0), tabs: list.map(() => ({ below: 12, above: 12, peg: true })) };
+    };
+    expect(planGrid([1, 0, 0], { E, U, bounds, flat: 2, profileOf, peg: 12 })).toBeNull();
+    const three = planGrid([2, 0, 0], { E, U, bounds, flat: 2, profileOf, peg: 12 });
+    const ends = [-205, ...three.offsets[0], 205];
+    expect(three.pieces.map((x) => x.size[0])).toEqual(ends.slice(1).map((t, i) => t - ends[i] + (i < 2 ? 12 : 0)));
+    expect(three.pieces.every((x) => x.fits)).toBe(true);
+    const plain = (a, k) => ({ ...profileOf(a, k), tabs: planSamples(bounds.min[a], bounds.max[a], k).map(() => null) });
+    expect(planGrid([1, 0, 0], { E, U, bounds, flat: 2, profileOf: plain })).not.toBeNull();
+    // pegs on two axes of a block lay nothing flat: its pieces stand however suits them
+    const block = { min: [-150, -150, 0], max: [150, 150, 120] };
+    const blockOf = (a, k) => {
+      const list = planSamples(block.min[a], block.max[a], k);
+      return { samples: list, costs: list.map(() => 0), tabs: list.map(() => ({ below: 12, above: 12, peg: true })) };
+    };
+    const quarters = planGrid([1, 1, 0], { E: [300, 300, 120], U, bounds: block, profileOf: blockOf, peg: 12 });
+    expect(quarters.pieces.map((x) => x.size)).toEqual([[162, 162, 120], [150, 162, 120], [162, 150, 120], [150, 150, 120]]);
+    // a 30 mm slab's quarters lie flat: 200 mm and a peg is more than the bed, so each cut moves 2 mm towards the
+    // piece below it, which carries its pegs
+    const slab = { min: [-200, -200, 0], max: [200, 200, 30] };
+    const slabPegs = (a, k) => {
+      const list = planSamples(slab.min[a], slab.max[a], k);
+      return { samples: list, costs: list.map(() => 0), tabs: list.map(() => (a < 2 ? { below: 12, above: 12, peg: true } : null)) };
+    };
+    const flatQuarters = planGrid([1, 1, 0], { E: [400, 400, 30], U, bounds: slab, flat: 2, profileOf: slabPegs, peg: 12 });
+    expect(flatQuarters.offsets).toEqual([[-2], [-2], []]);
+    expect(flatQuarters.pieces.map((x) => x.size)).toEqual([[210, 210, 30], [202, 210, 30], [210, 202, 30], [202, 202, 30]]);
+    // a plate's cut that cannot keep its tabs (a cut along the plate's thickness runs through it) has pegs instead
+    const slabBox = { min: [-150, -50, 0], max: [150, 50, 30] };
+    const slabOf = (a, k) => {
+      const list = planSamples(slabBox.min[a], slabBox.max[a], k);
+      const tabs = a === 0 ? { below: 8, above: 8, w: 2, span: [0, 30], t: 4 } : null;
+      return { samples: list, costs: list.map(() => 0), tabs: list.map(() => tabs) };
+    };
+    const layered = (peg) => planGrid([1, 0, 1], { E: [300, 100, 30], U, bounds: slabBox, profileOf: slabOf, peg }).pieces.map((x) => x.size[0]);
+    expect(layered(12)).toEqual([162, 150, 162, 150]);
+    expect(layered([12, 0, 0])).toEqual([162, 150, 162, 150]);
+    expect(layered(0)).toEqual([150, 150, 150, 150]);
+  });
+
+  it('the boxes between the cuts count each cut\'s pegs on the one side that carries them, as the pieces fit best', () => {
+    // an 80 × 80 × 660 mm post on a 170 × 170 × 179 mm bed, cut in four: each piece but the top one carries the pegs of
+    // the cut over it, 177 mm tall, not of both its cuts (189 mm, too tall)
+    const small = [170, 170, 179];
+    const post = { min: [0, 0, 0], max: [80, 80, 660] };
+    const postCuts = [165, 330, 495].map((at, i) => ({ id: `c${i + 1}`, axis: 2, at, peg: 12 }));
+    const sided = pegSides(post, postCuts, (c) => cellFits(c, small));
+    expect(sided.map((c) => c.reach)).toEqual([[12, 0], [12, 0], [12, 0]]);
+    expect(cellSizes(post, sided).cells.map((c) => c.size[2])).toEqual([177, 177, 177, 165]);
+    // a column cut 25 mm right of its middle: the 155 mm piece carries them, and both fit
+    const column = { min: [-180, -50, 0], max: [180, 50, 240] };
+    const [off] = pegSides(column, [{ id: 'c1', axis: 0, at: 25, peg: 12 }], (c) => cellFits(c, U));
+    expect(off.reach).toEqual([0, 12]);
+    expect(cellSizes(column, [off]).cells.map((c) => c.size[0])).toEqual([205, 167]);
+    // a run of cuts that must all hand their pegs up: the first piece has no room for them, so the second carries
+    // that cut's, the third the next one's, and the last the third cut's
+    const bar = { min: [0, -50, -50], max: [805, 50, 50] };
+    const run = pegSides(bar, [245, 475, 705].map((at, i) => ({ id: `c${i + 1}`, axis: 0, at, peg: 12 })), (c) => cellFits(c, U));
+    expect(run.map((c) => c.reach)).toEqual([[0, 12], [0, 12], [0, 12]]);
+    expect(cellSizes(bar, run).cells.map((c) => c.size[0])).toEqual([245, 242, 242, 112]);
+    // with no bed to fit, every cut's pegs go below it; cuts without pegs are left alone
+    expect(pegSides(post, [...postCuts, { id: 'c4', axis: 0, at: 40 }]).map((c) => c.reach ?? null)).toEqual([[12, 0], [12, 0], [12, 0], null]);
+  });
+
+  // a ball's eighth: three cut faces to lie on, the inside of the shell over each, and nothing flat outside
+  const corner = (cell) => {
+    const cuts = cell.map((c, a) => `${c ? '-' : '+'}${AXES[a]}`);
+    const extra = Object.fromEntries(Object.keys(DIRECTIONS).map((d) => [d, cuts.includes(d) ? { support: 2000 } : { bed: 0, support: 7000 }]));
+    return boxStats([140, 140, 140], cuts, extra);
+  };
+  const laidOf = (list) => list.map(({ index, cell = [0, 0, 0], stats }) => ({ index, cell, stats, lying: chooseOrientation(stats, U, 'auto', { pieceIndex: index }) }));
+
+  it('one piece of each pair carries the pegs, and never the one left lying on that face', () => {
+    // box halves both stand on their cut faces: the first, as both lose as much, lies another way
+    const halves = laidOf([{ index: 1, stats: boxStats([60, 40, 30], ['+x']) }, { index: 2, stats: boxStats([60, 40, 30], ['-x']) }]);
+    expect(halves.map((p) => p.lying.down)).toEqual(['+x', '-x']);
+    expect(pegMales(halves, U)([{ axis: 0, lo: 1, hi: 2 }])).toEqual([0]);
+    // only one lies on the face: the other carries them
+    const one = laidOf([{ index: 1, stats: boxStats([150, 40, 20], ['+x']) }, { index: 2, stats: boxStats([60, 40, 30], ['-x']) }]);
+    expect(one.map((p) => p.lying.down)).toEqual(['-z', '-x']);
+    expect(pegMales(one, U)([{ axis: 0, lo: 1, hi: 2 }])).toEqual([0]);
+    const other = laidOf([{ index: 1, stats: boxStats([60, 40, 30], ['+x']) }, { index: 2, stats: boxStats([150, 40, 20], ['-x']) }]);
+    expect(pegMales(other, U)([{ axis: 0, lo: 1, hi: 2 }])).toEqual([1]);
+    // neither does: the one printing its pegs lying down (along the layers) over one printing them pointing up
+    const flat = laidOf([{ index: 1, stats: boxStats([150, 40, 20], ['+x']) }, { index: 2, stats: boxStats([150, 40, 20], ['-x']) }]);
+    expect(flat.map((p) => p.lying.down)).toEqual(['-z', '-z']);
+    expect(pegMales(flat, U)([{ axis: 0, lo: 1, hi: 2 }])).toEqual([0]); // both lie down: the lower-numbered
+    // a block under a Z cut stands on its foot, its pegs would point up; the wall over it lies on its side, its pegs along
+    // the bed
+    const heavy = { support: 9000 };
+    const wall = boxStats([40, 150, 100], ['-z'], { '-z': heavy, '+z': heavy, '-y': heavy, '+y': heavy });
+    const upright = laidOf([{ index: 1, stats: boxStats([60, 60, 100], ['+z']) }, { index: 2, stats: wall }]);
+    expect(upright.map((p) => p.lying.down)).toEqual(['-z', '-x']);
+    expect(pegMales(upright, U)([{ axis: 2, lo: 1, hi: 2 }])).toEqual([1]);
+    // of two standing on it, the one that still fits once it lies another way with its pegs: on a small printer a 170 mm
+    // piece with 12 mm pegs on its end is 182 mm tall, so the 100 mm one carries them
+    const small = [170, 170, 179];
+    const tall = [{ index: 1, stats: boxStats([170, 150, 150], ['+x']) }, { index: 2, stats: boxStats([100, 150, 150], ['-x']) }]
+      .map(({ index, stats }) => ({ index, stats, lying: chooseOrientation(stats, small) }));
+    expect(tall.map((p) => p.lying.down)).toEqual(['+x', '-x']);
+    expect(pegMales(tall, small, 'auto', { length: 12 })([{ axis: 0, lo: 1, hi: 2 }])).toEqual([1]);
+    expect(pegMales(tall, small)([{ axis: 0, lo: 1, hi: 2 }])).toEqual([0]);
+    // a piece with no way down left without the face never carries them
+    const held = laidOf([{ index: 1, stats: { ...boxStats([150, 40, 5], ['+x']), allowed: ['+x'] } }, { index: 2, stats: boxStats([150, 40, 5], ['-x']) }]);
+    expect(pegMales(held, U)([{ axis: 0, lo: 1, hi: 2 }])).toEqual([1]);
+    const both = laidOf([{ index: 1, stats: { ...boxStats([150, 40, 5], ['+x']), allowed: ['+x'] } }, { index: 2, stats: { ...boxStats([150, 40, 5], ['-x']), allowed: ['-x'] } }]);
+    expect(pegMales(both, U)([{ axis: 0, lo: 1, hi: 2 }])).toEqual([null]);
+  });
+
+  it('no piece is left with every good way to lie pegged: each corner of a ball cut in eight keeps a cut face', () => {
+    const cells = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]];
+    const laid = laidOf(cells.map((cell, i) => ({ index: i + 1, cell, stats: corner(cell) })));
+    const pairs = [];
+    for (let a = 0; a < 3; a++) {
+      for (const p of laid) {
+        if (p.cell[a] !== 0) continue;
+        const q = laid.find((x) => x.cell.every((c, b) => c === (b === a ? 1 : p.cell[b])));
+        pairs.push({ axis: a, lo: p.index, hi: q.index });
+      }
+    }
+    const males = pegMales(laid, U)(pairs);
+    expect(males.every((m) => m === 0 || m === 1)).toBe(true);
+    for (const p of laid) {
+      const pegged = pairs.filter((x, i) => [x.lo, x.hi][males[i]] === p.index).map((x, i) => x);
+      const faces = pegged.map((x) => `${x.lo === p.index ? '+' : '-'}${AXES[x.axis]}`);
+      expect(faces.length, `piece ${p.index}`).toBeLessThan(3);
+      // laid again with its pegs, it lies on a cut face it keeps
+      const pegs = pegged.map((x) => ({ axis: x.axis, at: 140, centre: [70, 70, 70], s: 4, length: 6, dir: x.lo === p.index ? 1 : -1, sides: [{ piece: p.index, peg: true }] }));
+      const [o] = layPegged([p], pegs, U);
+      expect(o.lies).toBe('on a cut face');
+      expect(Boolean(o.pegged)).toBe(pegs.length > 0);
+      expect(faces).not.toContain(o.down);
+    }
+  });
+
+  it('the pegs go on the piece that still fits carrying them, whichever way the two lie', () => {
+    // a column cut 25 mm right of its middle: both halves stand as modelled, so the first would carry them, but 205 mm
+    // wide with 12 mm pegs it fits no way, and the 155 mm half carries them
+    const column = laidOf([{ index: 1, stats: boxStats([205, 100, 240], ['+x']) }, { index: 2, stats: boxStats([155, 100, 240], ['-x']) }]);
+    expect(column.map((p) => p.lying.down)).toEqual(['-z', '-z']);
+    expect(pegMales(column, U, 'auto', { length: 12 })([{ axis: 0, lo: 1, hi: 2 }])).toEqual([1]);
+    // at the pegs' own length, once their size is known, 4 mm leaves it room
+    expect(pegMales(column, U, 'auto', { length: 12 })([{ axis: 0, lo: 1, hi: 2 }], 4)).toEqual([0]);
+    // a bar lying flat, cut near the bed's diagonal: the longer half would carry them, and the shorter one does
+    const bar = laidOf([{ index: 1, stats: boxStats([272, 40, 20], ['+x']) }, { index: 2, stats: boxStats([262, 40, 20], ['-x']) }]);
+    expect(pegMales(bar, U, 'auto', { length: 9 })([{ axis: 0, lo: 1, hi: 2 }])).toEqual([1]);
+    // a tower cut high: its top stands on the cut face, so its foot would carry them, 252 mm tall either way; the top
+    // carries them, lying on its own top
+    const tower = laidOf([{ index: 1, stats: boxStats([100, 100, 240], ['+z']) }, { index: 2, stats: boxStats([100, 100, 160], ['-z']) }]);
+    expect(tower.map((p) => p.lying.down)).toEqual(['-z', '-z']);
+    expect(pegMales(tower, U, 'auto', { length: 12 })([{ axis: 2, lo: 1, hi: 2 }])).toEqual([1]);
+    // a middle piece given the pegs of both its cuts hands one cut's back to the piece below when that one has room:
+    // the first stands on its cut face, so the second carries cut A's; neither of the next two lies on cut B, so the
+    // second would carry those too, 284 mm long, which fits no way, and nor would the third with them – but the first
+    // has room for cut A's
+    const heavy = { bed: 0, support: 9000 };
+    const chain = laidOf([
+      { index: 1, stats: boxStats([60, 40, 20], ['+x'], { '-z': heavy, '+z': heavy, '-y': heavy, '+y': heavy, '-x': heavy }) },
+      { index: 2, stats: boxStats([260, 40, 20], ['-x', '+x']) },
+      { index: 3, stats: boxStats([270, 40, 20], ['-x']) },
+    ]);
+    expect(chain.map((p) => p.lying.down)).toEqual(['+x', '-y', '-y']);
+    expect(pegMales(chain, U, 'auto', { length: 12 })([{ axis: 0, lo: 1, hi: 2 }, { axis: 0, lo: 2, hi: 3 }])).toEqual([0, 0]);
+  });
+
+  it('a piece of several shells carries pegs only where they all still rest on the bed', () => {
+    // the ends of a fork's two prongs, cut off at x = 0, share only their cut face to rest on: lying any other way one
+    // prong is held over the bed. Its head across the cut stands on the cut face too, and would cost more to turn over,
+    // so before the prongs' ends would have carried the pegs and been laid flat with a prong in the air
+    const heavy = { bed: 0, support: 9000 };
+    const head = boxStats([100, 100, 60], ['+x'], { '-z': heavy, '+z': heavy, '-y': heavy, '+y': heavy, '-x': heavy });
+    const loose = { bed: 0, support: 2000 };
+    const prongs = boxStats([15, 80, 50], ['-x'], { '-z': loose, '+z': loose, '-y': loose, '+y': loose, '+x': { bed: 0, support: 100000 } });
+    const shells = [{ min: [0, 0, 0], max: [10, 30, 30] }, { min: [0, 50, 20], max: [15, 80, 50] }];
+    const laid = laidOf([{ index: 1, stats: head }, { index: 2, stats: prongs }]);
+    expect(laid.map((p) => p.lying.down)).toEqual(['+x', '-x']);
+    expect(pegMales(laid, U, 'auto', { length: 9 })([{ axis: 0, lo: 1, hi: 2 }])).toEqual([1]);
+    laid[1].boxes = shells;
+    expect(pegMales(laid, U, 'auto', { length: 9 })([{ axis: 0, lo: 1, hi: 2 }])).toEqual([0]);
+    // and a piece of several shells that does carry pegs is laid again with every shell on the bed: the prongs' ends
+    // both reaching x = 15, they stand on them, pegs up, though lying flat would cost less with one prong in the air
+    const even = [{ min: [0, 0, 0], max: [15, 30, 30] }, { min: [0, 50, 20], max: [15, 80, 50] }];
+    const pegs = [{ axis: 0, at: 0, centre: [0, 15, 15], s: 6, length: 9, dir: -1, sides: [{ piece: 1, peg: false }, { piece: 2, peg: true }] }];
+    const [, before] = layPegged([laid[0], { ...laid[1], boxes: null }], pegs, U);
+    expect(before.down).not.toBe('+x');
+    const [, after] = layPegged([laid[0], { ...laid[1], boxes: even }], pegs, U);
+    expect(after).toMatchObject({ pegged: true, down: '+x' });
+  });
+
+  it('a dome cut in two: the half carrying the pegs is told that they, not its shape, leave it nothing flat to lie on', () => {
+    const curved = { bed: 0, support: 6000 };
+    const dome = boxStats([70, 70, 55], ['+z'], { '-z': curved, '-x': curved, '+x': curved, '-y': curved, '+y': curved });
+    const laid = laidOf([{ index: 1, stats: dome }]);
+    expect(laid[0].lying).toMatchObject({ down: '+z', notes: [] });
+    const pegs = [{ axis: 2, at: 55, centre: [35, 35, 55], s: 6, length: 9, dir: 1, sides: [{ piece: 1, peg: true }, { piece: 2, peg: false }] }];
+    const [o] = layPegged(laid, pegs, U);
+    expect(o.notes).toEqual([expect.objectContaining({ code: 'PIECE_UNSTABLE', level: 'warn', pieceIndex: 1, pegs: true })]);
+    expect(o.notes[0].text).toBe('Piece 1 has nothing flat to stand on but the face its built-in pegs stand out of – it rests on a curve or an edge and needs supports. With pins (Joints: Pins) it lies on that face.');
+    // a piece with nothing flat even before its pegs keeps the note about its shape
+    const ball = laidOf([{ index: 1, stats: boxStats([70, 70, 55], [], { '-z': curved, '+z': curved, '-x': curved, '+x': curved, '-y': curved, '+y': curved }) }]);
+    expect(layPegged(ball, pegs, U)[0].notes).toEqual([expect.objectContaining({ code: 'PIECE_UNSTABLE', text: expect.stringMatching(/Another cut through it/) })]);
+  });
+
+  it('a piece carrying pegs is laid again with them: its printed size counts them, and it never lies on them', () => {
+    const half = boxStats([60, 40, 30], ['+x']);
+    const pegs = [12, -12].map((y) => ({ axis: 0, at: 60, centre: [60, 20 + y, 15], s: 6, length: 9, dir: 1, sides: [{ piece: 1, peg: true }, { piece: 2, peg: false }] }));
+    const grown = statsWithPegs(half, pegs);
+    expect(grown.bbox.max[0]).toBe(69);
+    expect(grown.dims).toEqual([69, 40, 30]);
+    expect(grown.dirs['+x'].extent).toBe(69);
+    expect(grown.allowed).not.toContain('+x');
+    expect(grown.dirs['+x'].cutArea).toBe(0); // upright, the face prints its pegs along the layers: no reason to avoid it
+    expect(statsWithPegs(half, [])).toBe(half);
+    const laid = [{ index: 1, stats: half, lying: chooseOrientation(half, U) }, { index: 2, stats: half, lying: chooseOrientation(half, U) }];
+    const [male, female] = layPegged(laid, pegs, U);
+    expect(female).toBe(laid[1].lying);
+    expect(male).toMatchObject({ pegged: true, fits: true });
+    expect(male.down).not.toBe('+x');
+    expect([...male.size].sort((p, q) => p - q)).toEqual([30, 40, 69]);
+    // a male that no longer fits says so with its pegs counted
+    const big = boxStats([205, 205, 240], ['+x']);
+    expect(chooseOrientation(big, U).fits).toBe(true);
+    const tight = [{ axis: 0, at: 205, centre: [205, 100, 120], s: 8, length: 12, dir: 1, sides: [{ piece: 1, peg: true }] }];
+    const [o] = layPegged([{ index: 1, stats: big, lying: chooseOrientation(big, U) }], tight, U);
+    expect(o).toMatchObject({ fits: false });
+    expect(o.notes.map((n) => n.code)).toEqual(['PIECE_TOO_BIG']);
+    expect([...o.size].sort((p, q) => p - q)).toEqual([205, 217, 240]);
+  });
+
+  it('the notes, the steps and the glue sheet speak of built-in pegs', () => {
+    expect(splitNote('SPLIT', { pieces: 3, pegs: 4, pegSize: 6 }).text).toBe('Cut into 3 pieces joined by 4 built-in pegs (6 mm square).');
+    expect(splitNote('SPLIT', { pieces: 3, pegs: 5, pegSize: 6, pegSizes: [{ size: 6, count: 3 }, { size: 4, count: 2 }], dovetails: 2 }).text)
+      .toBe('Cut into 3 pieces joined by 5 built-in pegs (3 × 6 mm, 2 × 4 mm square) and dovetail tabs.');
+    expect(splitNote('PEGS_SMALLER', { letter: 'A', asked: 6, pegSizes: [{ size: 5, count: 2 }] }).text).toBe('Cut A is too narrow for 6 mm pegs – it takes 2 × 5 mm pegs instead.');
+    expect(splitNote('CONNECTORS_SHORTER', { letter: 'B', depth: 8.9, pegs: true }).text).toBe('Cut B uses 8.9 mm-long pegs – longer ones would break through the side.');
+    expect(splitNote('CONNECTORS_DROPPED', { letter: 'A', count: 1, total: 1, wall: 10.7, pegs: true }).text)
+      .toBe('No peg fits on 1 of 1 face at cut A (walls under 10.7 mm) – it is a flat glue joint. A strip glued inside makes it stronger.');
+    expect(splitNote('ONE_CONNECTOR', { letter: 'C', pegs: true }).text).toBe('Only one peg fits on part of cut C – line the pieces up while the glue sets.');
+    expect(splitNote('DOWELS_CAPPED', { placed: 48, dropped: 2, pegs: true }).text).toBe('48 pegs placed; 2 small faces are glued flat.');
+    expect(splitNote('DOVETAIL_NOT_PLATE', { letter: 'A', lying: true, pegs: true }).text).toBe('Cut A goes through a plate that its pieces can\'t lie flat on, so it uses built-in pegs.');
+    // the glue goes in the sockets; the piece carrying the pegs is pushed in, whichever side of the cut it is
+    const pieces = [{ index: 1, cell: [0, 0, 0], size: [69, 40, 30], lies: 'flat as modelled' }, { index: 2, cell: [1, 0, 0], size: [30, 40, 60], lies: 'on a cut face' }];
+    const seam = { letter: 'A', axis: 0, at: 0, pieces: [1, 2], joint: 'pegs', dowels: [], pegs: [{}, {}], male: 1, labels: ['1A', '2A'] };
+    const [step] = assemblySteps({ pieces, seams: [seam] });
+    expect(step).toMatchObject({ pins: 0, pegs: 2 });
+    expect(step.text).toBe('Cut A: a little glue in the sockets of face 2A and on the face, push piece 1\'s pegs (1A) in. Hold 1 minute.');
+    expect(assemblySteps({ pieces, seams: [{ ...seam, male: 2 }] })[0].text).toBe('Cut A: a little glue in the sockets of face 1A and on the face, push piece 2\'s pegs (2A) in. Hold 1 minute.');
+    expect(assemblySteps({ pieces, seams: [{ ...seam, labels: null }] })[0].text).toBe('Cut A: a little glue in the sockets of piece 2 and on the face, push piece 1\'s pegs in. Hold 1 minute.');
+    // a face of the same cut too narrow for a peg is glued flat in the same step, and its pieces are told of too
+    const grid = [[0, 0, 0], [1, 0, 0], [0, 0, 1], [1, 0, 1]].map((cell, i) => ({ index: i + 1, cell, size: [10, 10, 10], lies: 'flat as modelled' }));
+    const mixed = assemblySteps({
+      pieces: grid,
+      seams: [
+        { letter: 'A', axis: 0, at: 130, pieces: [1, 2], joint: 'none', dowels: [], pegs: [], male: null, labels: null },
+        { letter: 'B', axis: 2, at: 150, pieces: [1, 3], joint: 'pegs', dowels: [], pegs: [{}, {}, {}], male: 3, labels: ['1B', '3B'] },
+        { letter: 'B', axis: 2, at: 150, pieces: [2, 4], joint: 'none', dowels: [], pegs: [], male: null, labels: null },
+      ],
+    });
+    expect(mixed[1]).toMatchObject({ pieces: [1, 2], joins: [3, 4], pegs: 3 });
+    expect(mixed[1].text).toBe('Cut B: a little glue in the sockets of face 1B and on the faces, push piece 3\'s pegs (3B) in and press piece 4 onto piece 2. Hold 1 minute.');
+    const text = howToGlueText({ name: 'box', pieces, seams: [seam] });
+    expect(text).toContain('PRINT (each file is already turned the way to print it; pegs and sockets need no supports)');
+    expect(text).toContain('Pegs should push into their sockets by hand. Too tight: raise Clearance by 0.05 mm and download again.');
+    expect(text).toContain('(medium/thick CA or 5-minute epoxy; sockets have 0.15 mm of room per side)');
+    expect(text).toContain('Not sure about the fit? Print the fit test first');
+    expect(text).not.toMatch(/pins|filament|dowels/);
+  });
+});
+
 describe('limits and constants', () => {
   it('match the design', () => {
     expect(SPLIT_LIMITS).toEqual({ cuts: 12, cells: 64, dowels: 48 });
@@ -1410,7 +1748,7 @@ describe('limits and constants', () => {
     expect(PIN_DIAMETERS).toEqual([1.75, 3, 4, 5, 6, 8, 10]);
     expect(AUTO_DIAMETERS).toEqual([8, 6, 5, 4, 3]);
     expect(FILAMENT).toBe(1.75);
-    expect(JOINTS).toEqual(['auto', 'dowels', 'dovetail', 'none']);
+    expect(JOINTS).toEqual(['auto', 'dowels', 'pegs', 'dovetail', 'none']);
     expect(ORIENT_MODES).toEqual(['auto', 'cut', 'model']);
     expect(AXES).toEqual(['x', 'y', 'z']);
     expect(HOLE_SEGMENTS).toBe(32);

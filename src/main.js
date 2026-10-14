@@ -9,7 +9,7 @@ import { SIDES, placementMatrix, snapPartTo } from './placement.js';
 import { BUNDLED_FONTS, canQueryLocalFonts, fetchBundledFont, listLocalFonts, localFontBytes } from './fontCatalog.js';
 import {
   BED_DEFAULTS, BED_PRESETS, FILAMENT, PIECE_COLORS, SPLIT_LIMITS, SPLIT_NOTE_CODES, axisCuts, bedSize, cellFits, cellSizes, cutPlane, fitPieces, formatSize,
-  letterFor, nextCut, pieceColorIndex, splitActive, splitNote, usableBed,
+  letterFor, nextCut, pegSizeOf, pieceColorIndex, splitActive, splitNote, usableBed,
 } from './split.js';
 
 const $ = (id) => document.getElementById(id);
@@ -50,10 +50,10 @@ const MAX_FATALS = 3;
 // split for printing: view state, never in the document
 let selectedCutId = null; // the cut the arrow keys move (selecting an item lets go of it)
 let lastSplitKey = ''; // what the pieces depend on besides the content: the split, the printer and the nozzle
-let lastPieces = null; // the pieces last computed: { key, content, pieces, seams, grid, diameter, notes }
+let lastPieces = null; // the pieces last computed: { key, content, pieces, seams, grid, diameter, pegSize, notes }
 let measured = null; // the cuts last measured on the model: { key, cuts: Map(id -> { area, islands, joint, crosses }), notes, pieces }
 let downloaded = null; // { key, content, count }: how many pieces the last download held, for the split and content it was made for
-let joined = null; // { key, content, joints: Map(id -> 'dovetail' | 'dowels' | 'none') } the joint each cut got when the split was last worked out
+let joined = null; // { key, content, joints: Map(id -> 'dovetail' | 'dowels' | 'pegs' | 'none') } the joint each cut got when the split was last worked out
 let splitBounds = null; // { version, key, bounds } of the model and its text from the last measure (text-only work has no other)
 let planNotes = null; // { key, content, notes } of a Fit to my printer that cut nothing
 let offerPlan = null; // { key, plan } of the last Fit to my printer planned, ahead or on a click: the count the Model card offers
@@ -261,15 +261,17 @@ let tooBigFor = { key: null, note: null };
  * first guess from its box at the pieces it takes (`pieces`, 0 when even 64
  * would not do), or null when it fits. A thin plate is counted lying flat,
  * with the dovetail tabs its joints may get: stood on its edge it might fit,
- * but it is never printed that way. Worked out here, not by the engine: it
- * knows no printer. The number the note offers is the plan's (`offerLabel`).
+ * but it is never printed that way. Built-in pegs make pieces longer by as
+ * far as they stand out, which the peg size and depth decide. Worked out
+ * here, not by the engine: it knows no printer. The number the note offers
+ * is the plan's (`offerLabel`).
  */
 function bedTooSmall() {
   if (!modelInfo?.hasModel || !modelInfo.size || splitActive(doc.split)) return null;
   const U = usableBed(bed);
   const spec = { ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split }; // the joints decide whether a plate's pieces grow tabs
   const passthrough = (modelInfo.passthroughTriangles ?? 0) > 0; // unrepaired triangles rule dovetails out
-  const key = `${modelInfo.size}|${U}|${bedSize(bed)}|${spec.joint}|${passthrough}`;
+  const key = `${modelInfo.size}|${U}|${bedSize(bed)}|${spec.joint}|${spec.diameter}|${spec.depth}|${passthrough}`;
   if (tooBigFor.key !== key) {
     const fit = fitPieces(modelInfo.size, U, spec, { passthrough });
     tooBigFor = { key, note: fit.fits ? null : splitNote('BED_TOO_SMALL', { size: modelInfo.size, bed: bedSize(bed), pieces: fit.pieces }) };
@@ -1039,7 +1041,9 @@ async function showResult(on, { keep = false } = {}) {
     if (r.pieces) viewer.setPieces(r.display, r.pieces, r.grid);
     else viewer.setResult(r.display);
     // without pieces a split still has its say: every cut missed, or the model cannot be split
-    lastPieces = split ? { key: splitFor, content: requestedFor, pieces: r.pieces ?? [], seams: r.seams ?? [], grid: r.grid, diameter: r.diameter, notes: r.notes.filter(isSplitNote) } : null;
+    lastPieces = split
+      ? { key: splitFor, content: requestedFor, pieces: r.pieces ?? [], seams: r.seams ?? [], grid: r.grid, diameter: r.diameter, pegSize: r.pegSize ?? null, notes: r.notes.filter(isSplitNote) }
+      : null;
     if (split) rememberJoints(splitFor, requestedFor, jointsOfSeams(r.seams));
     viewer.showResult(true);
     // pulled apart, the pieces take more room than the model: fit them in view once, then leave the camera to the user
@@ -1199,13 +1203,14 @@ const cutBounds = () => measuredBounds() ?? (modelInfo?.hasModel ? modelInfo.bou
 /** Whether the pieces on hand are for the split, the printer and the content as they are now. */
 const piecesCurrent = () => !!lastPieces && lastPieces.key === lastSplitKey && lastPieces.content === lastContentKey;
 
-/** Whether a box between the cuts (from `cellSizes`, dovetail tabs counted) is too big for the printer. */
+/** Whether a box between the cuts (from `cellSizes`, dovetail tabs and built-in pegs counted) is too big for the printer. */
 const cellTooBig = (cell) => !cellFits(cell, usableBed(bed));
 
 /**
  * The cuts, each with what the last measure found its dovetail tabs add to
- * the pieces either side (`reach`) and the side those pieces must lie on
- * (`w`), for `cellSizes`; a cut moved since keeps them until it is measured again.
+ * the pieces either side, or its built-in pegs to the one that carries them
+ * (`reach`), and the side those pieces must lie on (`w`, tabs only), for
+ * `cellSizes`; a cut moved since keeps them until it is measured again.
  */
 function cutsWithTabs() {
   return (doc.split?.cuts ?? []).map((c) => {
@@ -1451,9 +1456,13 @@ let measureFor = null; // { cuts, content } of the measure last asked for
 const boundsKey = () => stableKey({ version: version(), items: doc.items.filter((i) => hasText(i) && !isSpot(i)).map((i) => [shapeKey(i), placeKey(i), !!i.cover]) });
 /**
  * What a measure of the cuts depends on besides that: the cuts and the joint settings, and – for the pieces it counts,
- * as some loose parts of a box print apart only lying a certain way – the printer and how the pieces lie.
+ * as some loose parts of a box print apart only lying a certain way – the printer and how the pieces lie. With
+ * built-in pegs the size and depth too: how far a peg stands out makes one of the pieces either side of its cut longer.
  */
-const cutsKey = () => stableKey({ cuts: doc.split?.cuts ?? [], joint: doc.split?.joint, clearance: doc.split?.clearance, orient: doc.split?.orient, bed: usableBed(bed) });
+const cutsKey = () => {
+  const { joint, clearance, orient, diameter, depth } = doc.split ?? {};
+  return stableKey({ cuts: doc.split?.cuts ?? [], joint, clearance, orient, bed: usableBed(bed), ...(joint === 'pegs' ? { diameter, depth } : {}) });
+};
 const measureKey = () => `${cutsKey()}|${boundsKey()}`;
 
 /**
@@ -1560,22 +1569,32 @@ function fillSplit() {
   const settings = { ...SPLIT_DEFAULTS, ...splitDefaults, ...(split ?? {}) };
   const filament = Number(settings.diameter) === FILAMENT;
   const glueOnly = settings.joint === 'none';
+  // built-in pegs are printed on their piece: there are no pins to print or buy, and the size is the side of a square
+  // peg, which filament can't be (the engine reads it as the smallest peg)
+  const pegs = settings.joint === 'pegs';
   filling = true;
   try {
     document.querySelectorAll('[data-split]').forEach((el) => {
       const key = el.dataset.split;
-      const value = key === 'pins' && filament ? 'own' : settings[key]; // filament comes off the spool: there is nothing to print
+      let value = settings[key];
+      if (key === 'pins' && filament) value = 'own'; // filament comes off the spool: there is nothing to print
+      if (key === 'pins' && pegs) value = null; // neither: nothing to print or buy
+      if (key === 'diameter' && pegs) value = pegSizeOf(value);
       if (el.type === 'radio') el.checked = el.value === String(value);
       else if (el.type === 'checkbox') el.checked = !!value;
       else if (el.type === 'number') {
         if (el !== document.activeElement && Number.parseFloat(el.value) !== value) el.value = value;
       } else if (el.value !== String(value)) el.value = String(value);
-      el.disabled = !usable || (glueOnly && PIN_SETTINGS.has(key)) || (filament && key === 'pins');
+      el.disabled = !usable || (glueOnly && PIN_SETTINGS.has(key)) || ((filament || pegs) && key === 'pins');
     });
   } finally {
     filling = false;
   }
-  const chosen = piecesCurrent() && lastPieces.diameter;
+  const filamentOption = document.querySelector(`[data-split="diameter"] option[value="${FILAMENT}"]`);
+  filamentOption.hidden = filamentOption.disabled = pegs;
+  // the pin settings size the pegs: their names say which
+  document.querySelectorAll('#splitSettings [data-peg-label]').forEach((el) => relabel(el, pegs ? el.dataset.pegLabel : el.dataset.pinLabel));
+  const chosen = piecesCurrent() && (pegs ? lastPieces.pegSize : lastPieces.diameter);
   document.querySelector('[data-split="diameter"] option[value="0"]').textContent = chosen ? `Auto (${chosen} mm)` : 'Auto';
   $('splitCard').classList.toggle('active', active);
   const hint = !usable
@@ -1693,14 +1712,14 @@ function cutRow(id) {
 }
 
 /**
- * The joint each cut got in a worked-out split, from its seams: pins when
- * some face of it takes one (its note tells of those left flat), tabs on a
- * dovetail cut that had room for them, otherwise none.
+ * The joint each cut got in a worked-out split, from its seams: pins or
+ * built-in pegs when some face of it takes one (its note tells of those left
+ * flat), tabs on a dovetail cut that had room for them, otherwise none.
  */
 function jointsOfSeams(seams = []) {
   const joints = new Map();
   for (const s of seams) {
-    const got = s.joint === 'dovetail' && s.tabs ? 'dovetail' : s.dowels?.length ? 'dowels' : 'none';
+    const got = s.joint === 'dovetail' && s.tabs ? 'dovetail' : s.pegs?.length ? 'pegs' : s.dowels?.length ? 'dowels' : 'none';
     if ((joints.get(s.cutId) ?? 'none') === 'none') joints.set(s.cutId, got);
   }
   return joints;
@@ -1724,9 +1743,9 @@ function cutMeta(cut, plane) {
   if (m.merged) return `in the same place as cut ${cutLetter(m.merged) ?? ''}`.trim();
   if (!m.islands) return 'crosses no material – nothing to join'; // between letters of a sign: the pieces never touch here
   const parts = [`${Math.round(m.area).toLocaleString()} mm²${m.islands > 1 ? ` in ${m.islands} parts` : ''}`];
-  // the measure plans pins wherever there are no tabs; once the split is worked out, a cut no pin fits is glue only
+  // the measure plans pins (or pegs) wherever there are no tabs; once the split is worked out, a cut none fits is glue only
   const got = joined?.key === lastSplitKey && joined.content === lastContentKey ? joined.joints.get(cut.id) : null;
-  parts.push({ dovetail: 'dovetails', none: 'glue only' }[got ?? m.joint] ?? 'pins');
+  parts.push({ dovetail: 'dovetails', pegs: 'pegs', none: 'glue only' }[got ?? m.joint] ?? 'pins');
   const through = (m.crosses ?? []).map((itemId) => doc.items.find((i) => i.id === itemId)).filter(Boolean);
   if (through.length) parts.push(`through ${through.map((i) => `“${itemLabel(i)}”`).join(', ')}`);
   return parts.join(' · ');
@@ -1750,7 +1769,13 @@ function renderPieces() {
       size: p.size,
       fits: p.fits,
       lies: `lies ${p.lies}${p.yaw ? `, turned ${p.yaw}°` : ''}`,
-      extra: [p.shells > 1 ? `${p.shells} parts` : '', p.dowels ? `${p.dowels} ${p.dowels === 1 ? 'pin' : 'pins'}` : ''].filter(Boolean),
+      extra: [
+        p.shells > 1 ? `${p.shells} parts` : '',
+        p.dowels ? `${p.dowels} ${p.dowels === 1 ? 'pin' : 'pins'}` : '',
+        // which piece carries a face's built-in pegs, and which has their sockets
+        p.pegs ? `${p.pegs} ${p.pegs === 1 ? 'peg' : 'pegs'}` : '',
+        p.sockets ? `${p.sockets} ${p.sockets === 1 ? 'socket' : 'sockets'}` : '',
+      ].filter(Boolean),
     }));
   } else if (active) {
     // a box whose loose parts print apart (a bookcase's shelves between two cuts) says how many pieces it makes
@@ -1801,6 +1826,7 @@ const splitNoteActions = (() => {
     CUT_NOT_STRAIGHT: remove,
     CONNECTORS_DROPPED: smaller,
     CONNECTORS_FILAMENT: smaller,
+    PEGS_SMALLER: select,
     PLAN_TOO_MANY: () => ({ label: 'Choose a printer', run: openPrinting }),
   };
 })();
@@ -1821,8 +1847,8 @@ function renderSplitNotes() {
 
 /**
  * The drag readout by a cut's handle: "A · X = 12 mm · 162 | 138 mm", how
- * long the pieces either side are (dovetail tabs counted, as in the piece
- * list), a side in red when a piece there won't fit.
+ * long the pieces either side are (dovetail tabs and built-in pegs counted,
+ * as in the piece list), a side in red when a piece there won't fit.
  */
 function showReadout(id, at, screen) {
   const el = $('cutReadout');
@@ -1843,7 +1869,7 @@ function showReadout(id, at, screen) {
     const hi = Math.min(b.max[axis], ...others.filter((t) => t > at + 1e-6));
     const { cells } = cellSizes(b, live);
     // the pieces either side of this cut: below it, those whose box ends at it; above it, those whose box starts there.
-    // Their length is their box's, which counts the tabs of a dovetail cut at either end as the red and the piece list do
+    // Their length is their box's, which counts the tabs or pegs of a cut at either end as the red and the piece list do
     const side = (end, bare) => {
       const span = document.createElement('span');
       const those = cells.filter((c) => Math.abs(c[end][axis] - at) < 1e-6);
@@ -1879,8 +1905,8 @@ function offerSplit() {
 
 /**
  * A small print to try the joints before printing the pieces: the engine
- * works out the split as it stands, so the coupon has the pin size Auto
- * picks and a dovetail when a cut gets one (whatever the Joints setting).
+ * works out the split as it stands, so the coupon has the pin or peg size
+ * Auto picks and a dovetail when a cut gets one (whatever the Joints setting).
  */
 async function downloadFitTest() {
   const active = activeSplit();
@@ -1892,16 +1918,19 @@ async function downloadFitTest() {
     if (!(await syncBase())) return setStatus('The model is still being updated – try again in a moment.', '');
     const r = await client.fitTest(doc.items, version(), { printing, split, bed: usableBed(bed), name: exportName() });
     if (!r) return;
-    if (active && !r.pins) {
-      // it worked the split out and found no pins in it: the cuts planned to have them have none (nor tabs, with no file)
-      const none = split.cuts.filter((c) => !r.stl || measured?.cuts.get(c.id)?.joint === 'dowels');
+    // it worked the split out and found no pins (or no pegs) in it: the cuts planned to have them have none (nor tabs,
+    // with no file)
+    const planned = (c) => measured?.cuts.get(c.id)?.joint;
+    const none = active ? split.cuts.filter((c) => !r.stl || (planned(c) === 'dowels' && !r.pins) || (planned(c) === 'pegs' && !r.pegs)) : [];
+    if (none.length) {
       rememberJoints(splitFor, requestedFor, none.map((c) => [c.id, 'none']));
       renderCuts();
     }
     if (!r.stl) {
       // cuts between the letters of a sign cross no material: nothing is joined, not even with glue
       const apart = split.cuts.length > 0 && split.cuts.every((c) => measured?.cuts.get(c.id)?.islands === 0);
-      return setStatus(apart ? 'Nothing to try: these cuts cross no material, so nothing is joined.' : 'Nothing to try: these cuts get no pins or tabs, only glue.', '');
+      const joints = split.joint === 'pegs' ? 'pegs' : 'pins';
+      return setStatus(apart ? 'Nothing to try: these cuts cross no material, so nothing is joined.' : `Nothing to try: these cuts get no ${joints} or tabs, only glue.`, '');
     }
     const file = save(r.stl, r.name);
     const own = split.pins === 'own';
@@ -1910,6 +1939,7 @@ async function downloadFitTest() {
       const d = `Ø${r.diameter} mm`;
       checks.push(`${r.diameter === FILAMENT ? 'a piece of filament slides' : own ? `your ${d} dowels slide` : `the ${d} pin slides`} into both holes`);
     }
+    if (r.pegs) checks.push(`the ${r.pegSize} mm peg pushes into its socket`);
     if (r.dovetail) checks.push('the tab drops into its socket');
     setStatus(`Downloaded ${file.name} (${file.kb} KB). Print it and check that ${checks.join(' and that ')} by hand – too tight: raise Clearance by 0.05 mm.`, 'ok');
   } catch (err) {

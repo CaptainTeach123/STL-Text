@@ -8,8 +8,8 @@ import { createItem, createPart } from '../src/document.js';
 import { manifold } from '../src/manifold.js';
 import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
-import { FILAMENT, SPLIT_DEFAULTS, TO_PLANE, cellSizes, cellSupport, fitPieces, isSymmetric, orientationStats, sizesFor } from '../src/split.js';
-import { clearSplitCaches, dowelHole, halfHole, pinAt, pinSolid } from '../src/splitGeometry.js';
+import { FILAMENT, SPLIT_DEFAULTS, TO_PLANE, cellSizes, cellSupport, fitPieces, isSymmetric, orientationStats, pegSizesFor, sizesFor } from '../src/split.js';
+import { clearSplitCaches, dowelHole, halfHole, pegAt, pinAt, pinSolid } from '../src/splitGeometry.js';
 import { setup, soupOf as soupGeometry } from './helpers.js';
 
 const fontBytes = (pkg, file) => {
@@ -1341,5 +1341,221 @@ describe('the engine around a split', () => {
     r = await client.fitTest([], version, { printing, split: S({ cuts: [], joint: 'dovetail' }), bed: BED, name: 'sign' });
     expect(r).toMatchObject({ diameter: 5, pins: true, dovetail: true });
     expect(shellSizes(r)).toHaveLength(5);
+  });
+});
+
+describe('built-in pegs', () => {
+  /** What a peg adds beyond its face, and what its socket takes from the other piece, from their sizes. */
+  const volumes = (side) => {
+    const p = pegSizesFor(side, 0.15, 0.4);
+    const w = side + 0.3;
+    const m = w + 1;
+    const lead = side - 2 * p.e;
+    return {
+      p,
+      peg: side * side * (p.length - p.e) + (p.e / 3) * (side * side + lead * lead + side * lead),
+      socket: (0.5 / 3) * (m * m + w * w + m * w) + w * w * (p.h - 0.5) + (w * w * p.tip) / 3,
+    };
+  };
+
+  it('a box cut with built-in pegs: one piece carries them, the other has their sockets, and the pieces add up and fit together', async () => {
+    await load(cube([120, 40, 30]));
+    const ex = await exportSplit(S({ joint: 'pegs', labels: false }));
+    // nothing to print or buy apart: the pieces and the glue sheet
+    expect(ex.files.map((f) => f.kind)).toEqual(['piece', 'piece', 'text']);
+    expect(ex).toMatchObject({ diameter: null, pegSize: 6 });
+    expect(codes(ex)).toEqual(['SPLIT']);
+    const [seam] = ex.seams;
+    expect(seam).toMatchObject({ letter: 'A', pieces: [1, 2], joint: 'pegs', male: 1, dowels: [] });
+    expect(seam.pegs).toHaveLength(2);
+    const { peg, socket } = volumes(6);
+    const [A, B] = piecesOf(ex);
+    expect(volumeOfStl(A.stl)).toBeCloseTo(72000 + 2 * peg, 1);
+    expect(volumeOfStl(B.stl)).toBeCloseTo(72000 - 2 * socket, 1);
+    // put back together they never overlap, and each peg sits in its socket with the clearance all round
+    const [a, b] = piecesOf(ex).map(assembled);
+    expect(overlap(a, b)).toBeLessThan(0.01);
+    for (const g of seam.pegs) {
+      const inPlace = own(pegAt(g));
+      expect(own(inPlace.subtract(a)).volume()).toBeLessThan(1e-3);
+      expect(overlap(inPlace, b)).toBeLessThan(1e-3);
+      expect(inPlace.minGap(b, 1)).toBeGreaterThanOrEqual(0.15 - 1e-4);
+    }
+    // the box halves both stood on their cut faces: the one carrying the pegs lies flat instead, its pegs along the bed,
+    // and its printed size counts them
+    expect(ex.pieces.map((p) => [p.lies, p.down, p.pegs, p.sockets])).toEqual([['flat as modelled', '-z', 2, 0], ['on a cut face', '-x', 0, 2]]);
+    expect(ex.pieces[0].size.map((v) => +v.toFixed(3))).toEqual([69, 40, 30]);
+    expect(boxOf(pieceSolid(A)).size.map((v) => +v.toFixed(3))).toEqual([69, 40, 30]);
+  });
+
+  it('says so in the summary, the steps and the glue sheet, and the zip holds no pins file', async () => {
+    await load(cube([120, 40, 30]));
+    const ex = await exportSplit(S({ joint: 'pegs' }), { archive: 'zip' });
+    expect(Object.keys(unzipSync(new Uint8Array(ex.zip))).sort()).toEqual(['box-how-to-glue.txt', 'box-piece-1-of-2.stl', 'box-piece-2-of-2.stl']);
+    expect(noteOf(ex, 'SPLIT').text).toBe('Cut into 2 pieces joined by 2 built-in pegs (6 mm square). Glue matching letters together: 1A ↔ 2A.');
+    expect(ex.assembly).toEqual(['Cut A: a little glue in the sockets of face 2A and on the face, push piece 1\'s pegs (1A) in. Hold 1 minute.']);
+    const text = strFromU8(unzipSync(new Uint8Array(ex.zip))['box-how-to-glue.txt']);
+    expect(text).toContain('pegs and sockets need no supports');
+    expect(text).toContain('Pegs should push into their sockets by hand.');
+    expect(text).toContain(ex.assembly[0]);
+    expect(text).not.toMatch(/\bpins?\b/);
+  });
+
+  it('a thin sign still gets dovetail tabs: they are built in too, and pegs have no room in a plate', async () => {
+    await load(cube([360, 100, 4]), 'sign');
+    const ex = await exportSplit(S({ joint: 'pegs', labels: false }), { name: 'sign' });
+    expect(ex.seams).toEqual([expect.objectContaining({ joint: 'dovetail', pegs: [], dowels: [] })]);
+    expect(ex.files.map((f) => f.kind)).toEqual(['piece', 'piece', 'text']);
+    expect(noteOf(ex, 'SPLIT').text).toBe('Cut into 2 pieces with dovetail tabs.');
+    expect(codes(ex)).toEqual(['SPLIT', 'DOVETAIL']);
+    expect(noteOf(ex, 'DOVETAIL').text).toBe('Cut A goes through a thin plate, so it has 2 dovetail tabs instead of pegs – lay both pieces flat and lower piece 2 onto piece 1.');
+  });
+
+  it('narrower faces take smaller pegs, shorter ones or just one, then glue only – never pins', async () => {
+    const tube = (w) => cube([60, 60, 200]).subtract(cube([60 - 2 * w, 60 - 2 * w, 210]));
+    const cutZ = { cuts: [cutAt(2, 0)], labels: false };
+    // 12 mm walls: Auto takes 4 mm pegs in the corners; asked for 6 mm, the faces take 5 mm and say so
+    await load(own(tube(12)), 'tube');
+    let ex = await exportSplit(S({ ...cutZ, joint: 'pegs' }), { name: 'tube' });
+    expect(ex.pegSize).toBe(4);
+    expect(ex.seams[0].pegs.map((g) => g.s)).toEqual([4, 4, 4]);
+    ex = await exportSplit(S({ ...cutZ, joint: 'pegs', diameter: 6 }), { name: 'tube' });
+    // in three of the corners, a wall's inset from both faces
+    expect(ex.seams[0].pegs.map((g) => [g.s, Math.abs(g.centre[0]), Math.abs(g.centre[1])])).toEqual([[5, 23.5, 23.5], [5, 23.5, 23.5], [5, 23.5, 23.5]]);
+    expect(noteOf(ex, 'PEGS_SMALLER')).toMatchObject({ level: 'info', letter: 'A', asked: 6, text: 'Cut A is too narrow for 6 mm pegs – it takes 3 × 5 mm pegs instead.' });
+    expect(noteOf(ex, 'SPLIT').text).toBe('Cut into 2 pieces joined by 3 built-in pegs (5 mm square).');
+    // 8 mm walls: no peg fits, and the cut is glued – no pins, no filament
+    await load(own(tube(8)), 'tube');
+    ex = await exportSplit(S({ ...cutZ, joint: 'pegs' }), { name: 'tube' });
+    expect(ex.seams).toEqual([expect.objectContaining({ joint: 'none', pegs: [], dowels: [] })]);
+    expect(ex.files.map((f) => f.kind)).toEqual(['piece', 'piece', 'text']);
+    expect(noteOf(ex, 'CONNECTORS_DROPPED')).toMatchObject({
+      level: 'warn', pegs: true, text: 'No peg fits on 1 of 1 face at cut A (walls under 10.7 mm) – it is a flat glue joint. A strip glued inside makes it stronger.',
+    });
+    // 15 mm from a bar's end the sockets have room for 8.9 mm pegs, not 9 mm ones
+    await load(cube([300, 40, 20]), 'bar');
+    ex = await exportSplit(S({ cuts: [cutAt(0, -135, 'c1'), cutAt(0, 0, 'c2')], joint: 'pegs', labels: false }), { name: 'bar' });
+    expect(ex.seams.map((x) => x.pegs.map((g) => g.length))).toEqual([[8.9, 8.9], [9, 9]]);
+    expect(noteOf(ex, 'CONNECTORS_SHORTER')).toMatchObject({ letter: 'A', depth: 8.9, text: 'Cut A uses 8.9 mm-long pegs – longer ones would break through the side.' });
+    // a 14 mm rod has room for one
+    await load(cube([100, 14, 14]), 'rod');
+    ex = await exportSplit(S({ joint: 'pegs', labels: false }), { name: 'rod' });
+    expect(ex.seams[0].pegs.map((g) => g.s)).toEqual([4]);
+    expect(noteOf(ex, 'ONE_CONNECTOR').text).toBe('Only one peg fits on part of cut A – line the pieces up while the glue sets.');
+    expect(ex.files.map((f) => f.kind)).toEqual(['piece', 'piece', 'text']);
+  });
+
+  it('the fit test is a block with one peg and a block with its socket, at the size the split uses', async () => {
+    await load(cube([120, 40, 30]));
+    const r = await client.fitTest([], version, { printing, split: S({ joint: 'pegs' }), bed: BED, name: 'box' });
+    expect(r).toMatchObject({ pegs: true, pegSize: 6, pins: false, dovetail: false, diameter: null });
+    const m = own(solidOfStl(r.stl));
+    expect(m.status()).toBe('NoError');
+    expect(m.decompose().map(own)).toHaveLength(2);
+    const { p, peg, socket } = volumes(6);
+    expect(m.volume()).toBeCloseTo(20 ** 3 + peg + 20 * 20 * (p.h + p.tip + p.wall + 2) - socket, 1);
+    // a size no face of the split takes: the fit test is of the 6 mm pegs the pieces have, as the summary says
+    await load(cube([300, 40, 20]), 'bar');
+    const asked = S({ joint: 'pegs', diameter: 10, labels: false });
+    expect(noteOf(await exportSplit(asked, { name: 'bar' }), 'SPLIT').text).toMatch(/\(6 mm square\)/);
+    const small = await client.fitTest([], version, { printing, split: asked, bed: BED, name: 'bar' });
+    expect(small).toMatchObject({ pegs: true, pegSize: 6 });
+    expect(boxOf(own(solidOfStl(small.stl))).size.map((v) => +v.toFixed(2))).toEqual(boxOf(own(solidOfStl(r.stl))).size.map((v) => +v.toFixed(2)));
+    await load(cube([120, 40, 30]));
+    // no cuts yet: the size set, or 5 mm for Auto
+    const bare = await client.fitTest([], version, { printing, split: S({ cuts: [], joint: 'pegs' }), bed: BED, name: 'box' });
+    expect(bare).toMatchObject({ pegs: true, pegSize: 5, pins: false });
+    // a sign joined by dovetail tabs alone: just the tab
+    await load(cube([360, 100, 4]), 'sign');
+    const sign = await client.fitTest([], version, { printing, split: S({ joint: 'pegs' }), bed: BED, name: 'sign' });
+    expect(sign).toMatchObject({ pegs: false, pegSize: null, pins: false, dovetail: true });
+  });
+
+  it('which piece carries the pegs follows the printer: on a small one the piece that still fits with them on its end', async () => {
+    await load(cube([270, 150, 150], [135, 0, 75]), 'block');
+    const split = S({ cuts: [cutAt(0, 170)], joint: 'pegs', labels: false });
+    let ex = await exportSplit(split, { name: 'block' });
+    expect(ex.seams[0]).toMatchObject({ male: 1 });
+    expect(ex.pieces.map((p) => p.fits)).toEqual([true, true]);
+    // both halves stand on their cut faces either way, so the pieces lie as before: only the pegs move
+    ex = await exportSplit(split, { name: 'block', bed: [170, 170, 179] });
+    expect(ex.seams[0]).toMatchObject({ male: 2 });
+    expect(ex.pieces.map((p) => [p.fits, p.pegs])).toEqual([[true, 0], [true, 6]]);
+    expect(codes(ex)).toEqual(['SPLIT']);
+    // asked to lie on their cut faces, the piece with the pegs lies another way, as it must, and is not told it could not
+    await load(cube([120, 40, 30]));
+    ex = await exportSplit(S({ joint: 'pegs', labels: false, orient: 'cut' }));
+    expect(ex.pieces.map((p) => p.lies)).toEqual(['flat as modelled', 'on a cut face']);
+    expect(codes(ex)).toEqual(['SPLIT']);
+  });
+
+  it('Fit to my printer counts the pegs on the piece that carries them: a 420 mm board takes three pieces where pins take two', async () => {
+    await load(cube([420, 150, 20]), 'board');
+    const pins = await client.planSplit([], version, { printing, split: { ...SPLIT_DEFAULTS, joint: 'dowels' }, bed: BED, mode: 'fit' });
+    expect(pins.pieces).toHaveLength(2);
+    const split = { ...SPLIT_DEFAULTS, joint: 'pegs' };
+    const plan = await client.planSplit([], version, { printing, split, bed: BED, mode: 'fit' });
+    expect(plan.pieces).toHaveLength(3);
+    expect(plan.pieces.every((p) => p.fits)).toBe(true);
+    const cuts = plan.cuts.map((c, i) => ({ id: `c${i + 1}`, ...c }));
+    const ex = await exportSplit({ ...split, cuts, labels: false }, { name: 'board' });
+    expect(ex.pieces.map((p) => p.fits)).toEqual([true, true, true]);
+    expect(ex.pieces.map((p) => p.pegs)).toEqual([3, 3, 0]);
+    // while the cuts are edited, a cut with pegs is measured as reaching as far as the 9 mm pegs a 20 mm board takes,
+    // on the side that carries them, so the boxes are the pieces' lengths
+    const measured = await client.planSplit([], version, { printing, split: { ...split, cuts }, bed: BED, mode: 'measure' });
+    expect(measured.cuts.map((c) => [c.joint, c.reach])).toEqual([['pegs', [9, 0]], ['pegs', [9, 0]]]);
+    const sorted = (size) => size.map((v) => +v.toFixed(3)).sort((p, q) => p - q);
+    expect(cellSizes(measured.bounds, measured.cuts).cells.map((c) => sorted(c.size))).toEqual(ex.pieces.map((p) => sorted(p.size)));
+    // a 534 mm bar fits across the bed on its side in two, with its 9 mm pegs too
+    await load(cube([534, 40, 20]), 'bar');
+    const bar = await client.planSplit([], version, { printing, split, bed: BED, mode: 'fit' });
+    expect(bar.pieces).toHaveLength(2);
+    const halves = await exportSplit({ ...split, cuts: bar.cuts.map((c, i) => ({ id: `c${i + 1}`, ...c })), labels: false }, { name: 'bar' });
+    expect(halves.pieces.map((p) => [p.fits, p.pegs > 0])).toEqual([[true, true], [true, false]]);
+  });
+
+  it('a 30 mm slab cut in four with pegs still lies flat: each cut moves towards the pieces that carry its pegs', async () => {
+    await load(cube([400, 400, 30]), 'slab');
+    const split = { ...SPLIT_DEFAULTS, joint: 'pegs' };
+    const plan = await client.planSplit([], version, { printing, split, bed: BED, mode: 'fit' });
+    expect(plan.pieces).toHaveLength(4);
+    const ex = await exportSplit({ ...split, cuts: plan.cuts.map((c, i) => ({ id: `c${i + 1}`, ...c })), labels: false }, { name: 'slab' });
+    expect(ex.pieces.map((p) => [p.fits, p.lies, +p.size[2].toFixed(3)])).toEqual(Array.from({ length: 4 }, () => [true, 'flat as modelled', 30]));
+    expect(ex.pieces.map((p) => p.pegs > 0)).toEqual([true, true, true, false]);
+  });
+
+  it('the pegs go on the piece that still fits carrying them: a column cut right of its middle, a tower cut high', async () => {
+    // both halves of the column stand as modelled; the 205 mm one would be 217 mm with the pegs, so the other carries them
+    await load(cube([360, 100, 240], [0, 0, 120]), 'column');
+    let ex = await exportSplit(S({ cuts: [cutAt(0, 25)], joint: 'pegs', labels: false }), { name: 'column' });
+    expect(ex.seams[0]).toMatchObject({ male: 2 });
+    expect(ex.pieces.map((p) => [p.fits, p.pegs > 0])).toEqual([[true, false], [true, true]]);
+    expect(codes(ex)).toEqual(['SPLIT']);
+    // the tower's top stands on its cut face, so its foot would carry them, 252 mm tall; the top carries them instead
+    await load(cube([100, 100, 400], [0, 0, 200]), 'tower');
+    ex = await exportSplit(S({ cuts: [cutAt(2, 240)], joint: 'pegs', labels: false }), { name: 'tower' });
+    expect(ex.seams[0]).toMatchObject({ male: 2 });
+    expect(ex.pieces.map((p) => [p.fits, p.pegs > 0, p.down === '-z'])).toEqual([[true, false, true], [true, true, false]]);
+    expect(codes(ex)).toEqual(['SPLIT']);
+  });
+
+  it('two stubs cut across rest together only on their cut faces: neither piece carries pegs, and the note says why', async () => {
+    // lying any other way, one stub of either piece would be held over the bed (before, one carried the pegs anyway and
+    // was laid flat with a stub in the air)
+    await load(own(cube([20, 30, 30], [0, -25, 15]).add(cube([30, 30, 30], [0, 25, 35]))), 'stubs');
+    const ex = await exportSplit(S({ joint: 'pegs', labels: false }), { name: 'stubs' });
+    expect(ex.pieces.map((p) => [p.shells, p.lies, p.pegs])).toEqual([[2, 'on a cut face', 0], [2, 'on a cut face', 0]]);
+    expect(noteOf(ex, 'CONNECTORS_DROPPED')).toMatchObject({
+      lying: true, text: 'On 2 of 2 faces at cut A neither piece can lie on the bed with pegs standing out of it – they are flat glue joints. Pins (Joints: Pins) would join them.',
+    });
+  });
+
+  it('a sheet too thin for anything is glued, and the note speaks of pegs', async () => {
+    await load(cube([300, 100, 1.5]), 'sheet');
+    const ex = await exportSplit(S({ joint: 'pegs', labels: false }), { name: 'sheet' });
+    expect(noteOf(ex, 'CONNECTORS_DROPPED')).toMatchObject({
+      pegs: true, text: 'No peg fits on 1 of 1 face at cut A (walls under 2 mm) – it is a flat glue joint. A strip glued inside makes it stronger.',
+    });
   });
 });

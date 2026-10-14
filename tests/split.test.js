@@ -589,6 +589,16 @@ describe('checking and planning cuts', () => {
     expect(pieces + holes).toBeCloseTo(solid.volume(), 0);
   });
 
+  it('a cut through letters in both rows of a grid names both pairs of pieces they are split between', async () => {
+    // three upright bars, the middle one on cut A, all three across cut B: each cut splits letters in two columns
+    await load(cube([300, 100, 4], [0, 0, 2]), 'sign');
+    const bars = createItem({ text: 'III', fontId: 'inter', size: 40, depth: 3, position: [0, 0, 4], normal: [0, 0, 1] });
+    const ex = await exportSplit(S({ cuts: [cutAt(0, 0, 'c1'), cutAt(1, 0, 'c2')], joint: 'none', labels: false }), { items: [bars], name: 'sign' });
+    const notes = ex.notes.filter((n) => n.code === 'CUT_THROUGH_TEXT');
+    expect(notes.map((n) => [n.letter, n.pairs, n.pieces])).toEqual([['A', [[1, 2], [3, 4]], [1, 2, 3, 4]], ['B', [[1, 3], [2, 4]], [1, 2, 3, 4]]]);
+    expect(notes[0].text).toBe('Cut A runs through “III” – its letters are split where piece 1 meets piece 2 and piece 3 meets piece 4.');
+  });
+
   it('a text-only sign splits by cell, at the word gap', async () => {
     await client.loadBase({ kind: 'none', version: ++version });
     const sign = createItem({ text: 'HELLO WORLD', fontId: 'inter', size: 20 });
@@ -818,6 +828,44 @@ describe('planning pieces that really print', () => {
     expect(r.pieces.every((x) => x.size[2] === 40)).toBe(true);
   });
 
+  it('a tile with a tower on it is cut into pieces that lie flat, never stood on a cut edge as a 4 mm wall', async () => {
+    // stood on a cut edge, a quarter rested on the cut through its tower too, so it looked as steady as a block and
+    // the cut face went down: a 4 mm wall 150 mm tall. On a printer where its quarters fit only on their edges the
+    // tile is planned lying flat first, as a slab is
+    const post = (r, h, at) => own(own(wasm.Manifold.cylinder(h + 1, r, r, 48)).translate([at[0], at[1], at[2] - 1]));
+    const tile = (side, t, r, h, at) => own(wasm.Manifold.union([cube([side, side, t], [side / 2, side / 2, t / 2]), post(r, h, [...at, t])]));
+    // a terrain tile: ruined walls, a tower and two rocks
+    const rock = (r, at) => own(own(own(wasm.Manifold.sphere(r, 32)).translate([...at, 4])).intersect(cube([2 * r + 2, 2 * r + 2, r + 1], [at[0], at[1], 4 + (r + 1) / 2])));
+    const terrain = own(wasm.Manifold.union([
+      cube([300, 300, 4], [150, 150, 2]), cube([80, 20, 66], [70, 40, 37]), cube([20, 90, 51], [40, 75, 29.5]), post(25, 90, [220, 80, 4]), rock(20, [150, 220]), rock(28, [80, 230]),
+    ]));
+    for (const [name, model, bed] of [
+      ['terrain', terrain, BED],
+      ['tower in the middle', tile(300, 4, 25, 90, [150, 150]), BED],
+      ['tower off centre', tile(300, 4, 25, 90, [220, 80]), BED],
+      ['tower off centre on a 240 × 200 bed', tile(300, 4, 25, 90, [220, 80]), [240, 200, 219]],
+      ['figure on a base', tile(320, 6, 18, 200, [160, 160]), BED],
+    ]) {
+      await load(model, 'tile');
+      const p = await plan([], bed);
+      const r = await resultSplit(planned(p, { labels: false }), { bed });
+      expect(r.pieces.map((x) => [x.down, x.fits]), name).toEqual(r.pieces.map(() => ['-z', true]));
+    }
+  });
+
+  it('offers the pieces Fit makes: a cone\'s cuts leave its tip boxes empty, though its long sides span them', async () => {
+    const cone = own(wasm.Manifold.cylinder(320, 120, 0, 24));
+    await load(cone, 'cone');
+    const p = await plan();
+    const ex = await exportSplit(planned(p, { labels: false }), { name: 'cone' });
+    expect(p.pieces).toHaveLength(piecesOf(ex).length);
+    // Fit cut the model as it planned it: the pieces view that follows cuts nothing again
+    stages.length = 0;
+    await plan();
+    await resultSplit(planned(p, { labels: false }));
+    expect(stages.some((s) => /Cutting/.test(s))).toBe(false);
+  });
+
   it('only a piece whose material meets a dovetail cut is held flat by it: the top of a T\'s stem lies on its side', async () => {
     // the arm's cut is a dovetail 3.5 mm from the stem, closer than its tab reaches; the stem's top never meets it
     const T = (stem) => own(wasm.Manifold.union([cube([300, 40, 8], [0, 20, 4]), cube([8, 40, stem], [0, 20, stem / 2])]));
@@ -844,9 +892,16 @@ describe('planning pieces that really print', () => {
     await load(bookcase, 'bookcase');
     const p = await plan();
     expect(p.counts).toEqual([2, 0, 0]);
+    // the offer counts the shelves that print apart: as many pieces as the download holds
+    expect(p.pieces).toHaveLength(4);
     const ex = await exportSplit(planned(p), { name: 'bookcase' });
     const files = piecesOf(ex);
     expect(files).toHaveLength(4);
+    // and so does the measure of cuts moved by hand, for the download button before the pieces are worked out
+    const moved = planned(p);
+    moved.cuts[0] = cutAt(0, 202, moved.cuts[0].id);
+    const m = await client.planSplit([], version, { printing, split: moved, bed: BED, mode: 'measure' });
+    expect(m.pieces.map((x) => x.cell[0])).toEqual([0, 1, 1, 2]);
     expect(ex.pieces.map((x) => [x.cell[0], x.shells, x.fits])).toEqual([[0, 1, true], [1, 1, true], [1, 2, true], [2, 1, true]]);
     for (const f of files) {
       // every shell of every file starts on the bed (a sealed hollow would come back inside out, with no volume of its own)
@@ -871,6 +926,15 @@ describe('planning pieces that really print', () => {
     const r = await resultSplit(planned(p));
     expect([...new Set(r.display.parts.filter((x) => x.kind === 'piece').map((x) => x.index))]).toEqual([1, 2, 3, 4]);
     expect(r.pieces.map((x) => x.index)).toEqual([1, 2, 3, 4]);
+    // letters on the top board across cut A are split with the boards over the bottom one: piece 3, not 2
+    const books = createItem({ text: 'BOOKS', fontId: 'inter', size: 40, depth: 3, position: [200, 100, 240], normal: [0, 0, 1] });
+    const lettered = await exportSplit(planned(p, { labels: false }), { items: [books], name: 'bookcase' });
+    expect(noteOf(lettered, 'CUT_THROUGH_TEXT')).toMatchObject({ letter: 'A', pieces: [1, 3] });
+    const above = (f) => {
+      const top = own(assembled(f).intersect(cube([700, 300, 10], [300, 100, 245])));
+      return top.volume();
+    };
+    expect(piecesOf(lettered).map((f) => above(f) > 100)).toEqual([true, false, true, false]);
   });
 
   it('a box with its lid laid beside it is cut through the gap: four pieces, the lid in two', async () => {

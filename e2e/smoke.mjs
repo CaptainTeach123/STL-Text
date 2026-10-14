@@ -1159,6 +1159,63 @@ try {
     check(retyped.plans === 0 && retyped.offer === 'Split to fit', 'retyping the text starts no plan: the note offers "Split to fit" until clicked', JSON.stringify(retyped));
     await setText('');
 
+    // a taller cone: Fit moves its cuts off the axis, which leaves the boxes round its tip empty though its long sides
+    // span them. The note offers the pieces the cuts make, not the boxes
+    const spire = Manifold.cylinder(320, 120, 0, 96);
+    const spireFile = writeFixture('spire.stl', soupOf(spire));
+    spire.delete();
+    await openStl(spireFile, 'spire');
+    const spireOffer = await offered();
+    await page.click('#modelNotes button');
+    await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
+    await idle();
+    const spirePieces = await page.locator('#pieceList li').count();
+    check(
+      spireOffer === `Split into ${spirePieces} pieces` && (await page.locator('#downloadBtn').innerText()) === `Download ${spirePieces} pieces (.zip)`,
+      'a cone whose cuts leave the boxes round its tip empty is offered the pieces Fit makes, not the boxes its sides span',
+      `offered "${spireOffer}", Fit made ${spirePieces}`,
+    );
+    await page.click('#splitClearBtn');
+    await idle();
+
+    // a bookcase lying on its back: the middle box's shelves would be held over the bed, so they print as a piece of
+    // their own. The offer, the download button and the zip all count it, before the pieces are worked out too
+    const bookcase = Manifold.union([
+      Manifold.cube([600, 200, 15]), Manifold.cube([600, 200, 15]).translate([0, 0, 110]), Manifold.cube([600, 200, 15]).translate([0, 0, 225]),
+      Manifold.cube([15, 200, 240]), Manifold.cube([15, 200, 240]).translate([585, 0, 0]),
+    ]);
+    const bookcaseFile = writeFixture('bookcase.stl', soupOf(bookcase));
+    bookcase.delete();
+    await openStl(bookcaseFile, 'bookcase');
+    const shelfOffer = await offered();
+    await page.click('#modelNotes button');
+    await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
+    await idle();
+    const shelfPieces = await page.locator('#pieceList li').count();
+    check(shelfOffer === 'Split into 4 pieces' && shelfPieces === 4, 'a bookcase on its back is offered the 4 pieces Fit makes, its loose shelves counted', `offered "${shelfOffer}", Fit made ${shelfPieces}`);
+    await page.uncheck('#resultToggle');
+    await idle();
+    const shelfAt = Number.parseFloat(await page.inputValue('#cutList li:first-child input[data-cut-at]'));
+    await page.fill('#cutList li:first-child input[data-cut-at]', String(shelfAt + 2));
+    await page.press('#cutList li:first-child input[data-cut-at]', 'Tab');
+    await measured();
+    const shelfRows = await page.locator('#pieceList li.predicted').allInnerTexts();
+    const shelfLabel = await page.locator('#downloadBtn').innerText();
+    check(
+      shelfLabel === 'Download 4 pieces (.zip)' && shelfRows.length === 3 && shelfRows.filter((r) => /prints as 2 pieces/.test(r)).length === 1,
+      'with a cut moved and the pieces not shown, the download button counts the shelves that print apart, and their box says so',
+      `${shelfLabel} / ${shelfRows.join(' / ')}`,
+    );
+    const shelfZip = await downloadZip();
+    const shelfFiles = Object.keys(shelfZip.entries).filter((e) => /-piece-\d+-of-\d+\.stl$/.test(e));
+    check(
+      shelfFiles.length === 4 && shelfFiles.every((e) => /-of-4\.stl$/.test(e)) && (await page.locator('#downloadBtn').innerText()) === 'Download 4 pieces (.zip)',
+      'and the zip holds those 4 pieces, the button still saying so after the download',
+      `${shelfZip.name}: ${shelfFiles.join(', ')} / ${await page.locator('#downloadBtn').innerText()}`,
+    );
+    await page.click('#splitClearBtn');
+    await idle();
+
     // a thin sign prints lying flat, with dovetail tabs that make its pieces longer: the model's note offers as many pieces as Fit makes
     const sign = Manifold.cube([400, 100, 5], true);
     const signFile = writeFixture('sign.stl', soupOf(sign));

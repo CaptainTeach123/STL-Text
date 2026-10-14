@@ -16,7 +16,7 @@ import {
   CUT_TOLERANCE, FILAMENT, SPLIT_KEEP_TRIANGLES, SplitError, TO_PLANE, applyToSoup, assemblySteps, axisCuts, cellOfPoint,
   cutPlane, fitsBed, glueFileName, gridCandidates, howToGlueText, layPieces, letterFor, normaliseSplit, partFileName, pieceFileName, pinsFileName,
   planCost, planGrid, planSamples, plateAxis, safeFileName, slabAxis, sizesFor, smallPieceNotes, soupCells, splitActive, splitNote, usableBed,
-  zipFileName, cellSupport, flatProbes,
+  zipFileName, cellSupport, flatProbes, outlineColumns, textNotes, baseAxis, modelPlates,
 } from './split.js';
 import {
   buildSplitDisplay, clearSplitCaches, cutPieces, drillPiece, fitTestCoupon, layoutSplit, partedSolids, pinAt, pinSheet, pinSpares, pinsPerSheet,
@@ -2239,26 +2239,44 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   }
 
   /**
-   * Notes on what the cuts run through: text whose letters end up split
-   * between two pieces, and separately printed parts that span a cut and so
-   * are glued on after the pieces. Exact: each item's own solid is sliced.
+   * Where the cuts run through text: for each cut and each text item whose
+   * letters it really cuts, the letters' face on the cut, island by island,
+   * in each column of the boxes the other cuts make (`outlineColumns`), so
+   * that the note can name every pair of pieces the letters are split
+   * between once the pieces are laid out (`textNotes`). Exact: each item's
+   * own solid is sliced.
    */
-  function crossingNotes(final, items, cuts, pieces) {
-    const notes = [];
+  function textCrossings(final, items, cuts) {
+    const out = [];
     const by = axisCuts(cuts);
-    const pieceAt = new Map(pieces.map((p) => [p.cell.join(','), p.index]));
     const temps = scope();
     try {
       for (const cut of cuts) {
-        for (const id of textCrossing(final, items, cut, temps)) {
-          const item = items.find((i) => i.id === id);
-          const b = final.itemBounds.find((x) => x.id === id);
-          const cell = cellOfPoint(b.min.map((v, a) => (v + b.max[a]) / 2), by);
-          const lo = by[cut.axis].indexOf(cut.at);
-          const sides = [lo, lo + 1].map((k) => pieceAt.get(cell.map((c, a) => (a === cut.axis ? k : c)).join(','))).filter(Boolean);
-          notes.push(splitNote('CUT_THROUGH_TEXT', { itemId: id, cutId: cut.id, letter: cut.letter, name: quote(item), pieces: sides }));
+        const index = by[cut.axis].indexOf(cut.at);
+        for (const b of final.itemBounds) {
+          if (b.part || !(b.min[cut.axis] < cut.at && b.max[cut.axis] > cut.at)) continue;
+          const item = items.find((i) => i.id === b.id);
+          if (!item) continue;
+          const face = temps.add(itemInPlane(item, cut.axis, temps).slice(cut.at));
+          if (face.isEmpty() || !(face.area() > 1e-9)) continue;
+          const columns = face.decompose().map((island) => temps.add(island)).flatMap((island) => outlineColumns(polygonsOf(island), cut, index, by));
+          out.push({ itemId: item.id, cutId: cut.id, letter: cut.letter, name: quote(item), columns });
         }
       }
+    } finally {
+      temps.dispose();
+    }
+    return out;
+  }
+
+  /**
+   * Notes on the separately printed parts the cuts run through: they span a
+   * cut and so are glued on after the pieces. Exact: each part is sliced.
+   */
+  function crossingNotes(final, items, cuts) {
+    const notes = [];
+    const temps = scope();
+    try {
       for (const p of final.separate) {
         const pb = boxOf(p.world);
         const cut = cuts.find((c) => pb.min[c.axis] < c.at && pb.max[c.axis] > c.at && cutsThrough(c.axis === 2 ? p.world : temps.add(p.world.transform(TO_PLANE[c.axis])), c.at));
@@ -2343,7 +2361,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     try {
       const pieces = made.pieces.map(({ solid, ...plain }) => plain);
       const keep = solids.reduce((n, m) => n + m.numTri(), 0) <= splitKeepTriangles;
-      const notes = [...made.notes, ...crossingNotes(final, items, cuts, pieces)];
+      // text through a cut is told of once the pieces are laid out: a box whose shells print apart is more than one piece
+      const crossings = textCrossings(final, items, cuts);
+      const notes = [...made.notes, ...crossingNotes(final, items, cuts)];
       if (final.passthrough.length) notes.push(splitNote('SPLIT_UNREPAIRED', { count: final.passthrough.length / 9 }));
       // a piece's file holds its loose triangles too: it is turned and judged with them (`layPieces`)
       const fragments = fragmentsFor(final, cuts, pieces);
@@ -2357,6 +2377,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         dovetails: made.dovetails,
         fragments,
         notes,
+        crossings,
         solids: keep ? solids : null,
         transient: keep ? null : solids, // made for this call only: the drill stage takes them
       };
@@ -2523,15 +2544,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const seam = seams.find((s) => s.cutId === x.cutId && s.joint === 'dovetail');
       notes.push(splitNote('DOVETAIL', { letter: x.letter, cutId: x.cutId, tabs: x.tabs, pieces: seam?.pieces ?? [] }));
     }
-    // the cut's notes number the boxes' pieces: a box whose shells print apart is more than one piece, so the thin
-    // pieces are looked for again and text is said to run into the first piece of its box
-    const first = new Map();
-    for (const p of laid) if (!first.has(p.from)) first.set(p.from, p.index);
-    const cutNotes = cut.notes.filter((x) => x.code !== 'SMALL_PIECE').map((x) => {
-      if (x.code !== 'CUT_THROUGH_TEXT' || !x.pieces?.length || laid.length === cut.pieces.length) return x;
-      const { level, code, text, ...fields } = x;
-      return splitNote(code, { ...fields, pieces: [...new Set(x.pieces.map((k) => first.get(k) ?? k))] });
-    });
+    // the cut numbers the boxes' pieces: a box whose shells print apart is more than one piece, so the thin pieces are
+    // looked for again, and text through a cut names the pieces as they print, beside the cut's other notes
+    const cutNotes = cut.notes.filter((x) => x.code !== 'SMALL_PIECE');
+    const after = cutNotes.findIndex((x) => x.code === 'PART_SPANS_CUT' || x.code === 'SPLIT_UNREPAIRED');
+    cutNotes.splice(after < 0 ? cutNotes.length : after, 0, ...textNotes(cut.crossings, laid));
     notes.push(...given, ...plan.notes, ...smallPieceNotes(laid, cuts), ...cutNotes);
     // what prints on its own must fit the bed as it is saved too: a part lying pegs up, a pin on its flat
     for (const p of final.separate) {
@@ -2696,24 +2713,28 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * its joint (and a dovetail cut's tabs) and the text it runs through, for
    * the card while cuts are edited. Slices, but for one small boolean round
    * each dovetail cut, which keeps its tabs clear of what stands proud of the
-   * plate. While the final result for the text is not built (the text is
+   * plate, and – on a model that is not dense – the cut itself, for how many
+   * pieces the download will hold (kept for the pieces view and the
+   * download). While the final result for the text is not built (the text is
    * being edited) a model's cuts are measured on the model and the items' own
    * solids instead, with no boolean of the two (`estimate: true`). A fit plan
    * is kept with the final result, for the bed, nozzle and joint settings it
    * was made for: asked again (the Model card's count, then its button), it
-   * comes back at once.
+   * comes back at once. Its pieces are those the split will make: the model
+   * is cut where it says (`planPieces`), so the count offered is the number
+   * of files the download holds.
    */
   function planSplitRequest({ items, baseVersion, printing, split = null, bed = null, mode = 'fit' }, progress) {
     if (mode === 'measure' && sketchWill(items, baseVersion)) {
       // the final result for this text is not built: a measure while the text is edited must not build it
-      const message = measureCuts(sketchFor(items, baseVersion), items, split, progress);
+      const message = measureCuts(sketchFor(items, baseVersion), items, split, null, progress);
       return { message: { ...message, estimate: true }, transfer: [] };
     }
     const final = finalFor(items, baseVersion, printing, progress);
     let message;
     if (base.kind !== 'none' && !base.current?.watertight) message = { bounds: null, cuts: [], notes: [splitNote('SPLIT_UNAVAILABLE')] };
     else if (!final.solid) message = { bounds: null, cuts: [], notes: [] };
-    else if (mode === 'measure') message = measureCuts(final, items, split, progress);
+    else if (mode === 'measure') message = measureCuts(final, items, split, bedOf(bed), progress);
     else {
       // the plan is kept with the result it was made for, so the count the Model card offers and the cuts the offer's
       // button asks for again come from one plan, worked out once
@@ -2722,10 +2743,49 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const { spec } = normaliseSplit({ ...(split ?? {}), cuts: [] });
       const key = stableKey({ U, nozzle, joint: spec.joint, diameter: spec.diameter, depth: spec.depth, clearance: spec.clearance });
       const state = splitState(final);
-      if (state.fit?.key !== key) state.fit = { key, message: fitCuts(final, items, split, U, nozzle, progress) };
-      message = state.fit.message;
+      if (state.fit?.key !== key) state.fit = { key, plan: fitCuts(final, items, split, U, nozzle, progress), made: new Map() };
+      // how the pieces lie decides which loose parts print apart: worked out again only for another way of laying them
+      if (!state.fit.made.has(spec.orient)) {
+        state.fit.made.set(spec.orient, planPieces(final, items, state.fit.plan, spec, U, progress));
+        releaseFrame(final); // the tabs' look at the plates is done: the copy would only hold memory
+      }
+      const { cuts, counts, notes } = state.fit.plan;
+      message = { cuts, counts, pieces: state.fit.made.get(spec.orient), notes };
     }
     return { message, transfer: [] };
+  }
+
+  /**
+   * The pieces Fit to my printer's cuts make, as the split will make them:
+   * the model cut there (the cut stage, kept for the pieces view and the
+   * download that follow at once) and the pieces laid out, so a box whose
+   * loose boards would be held over the bed counts as each piece it prints
+   * as. Each is given the size of its box as planned, tabs counted, and
+   * whether it fits as it will lie. Should the cut fail, the boxes stand:
+   * the split itself will say what is wrong.
+   */
+  function planPieces(final, items, plan, spec, U, progress) {
+    const boxes = plan.pieces.map(({ cell, size, fits }) => ({ cell, size, fits }));
+    if (!plan.cuts.length) return boxes.map(({ size, fits }) => ({ size, fits }));
+    try {
+      // the cuts as the document will hold them once taken: numbered in order, so the split that follows finds this cut
+      const { cuts } = normaliseSplit({ ...spec, cuts: plan.cuts.map((c, i) => ({ id: `c${i + 1}`, ...c })) }, splitBounds(final));
+      const laid = layCuts(final, items, cuts, spec, U, progress);
+      const box = new Map(boxes.map((b) => [b.cell.join(','), b]));
+      return laid.map((p) => ({ size: box.get(p.cell.join(','))?.size ?? p.lying.size, fits: p.lying.fits }));
+    } catch {
+      return boxes.map(({ size, fits }) => ({ size, fits }));
+    }
+  }
+
+  /**
+   * The model cut by `cuts` (normalised) as the split cuts it, and the pieces laid out as they will print: one per
+   * file. The cut is kept for the pieces view or the download that follows (pieces too dense to keep, for its next
+   * call only, as ever).
+   */
+  function layCuts(final, items, cuts, spec, U, progress) {
+    const cut = cutStage(final, items, cuts, platesFor(final, cuts, spec), progress);
+    return layPieces(cut.pieces, U, spec.orient, { flat: slabOf(final), soups: cut.fragments });
   }
 
   let sketch = null; // { base, solid, passthrough, itemBounds, split }: the model and the text's boxes, for a cheap measure
@@ -2792,12 +2852,25 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     sketch = null;
   }
 
-  /** Each stored cut measured on the model, in list order (a cut that misses has joint 'miss'). */
-  function measureCuts(final, items, split, progress) {
+  /**
+   * Each stored cut measured on the model, in list order (a cut that misses has joint 'miss'). On the final result of
+   * a model that is not dense, with the bed (`U`), also the pieces the download will hold (`pieces`, the box each
+   * comes from): the model is cut as the split cuts it, as a box whose loose parts print apart is more than one piece.
+   */
+  function measureCuts(final, items, split, U, progress) {
     progress?.('Measuring the cuts…');
     const bounds = splitBounds(final);
     const { spec, cuts, notes } = normaliseSplit(split, bounds);
     const plan = platesFor(final, cuts, spec);
+    // a dense model takes seconds to cut: its count waits for the pieces themselves
+    let pieces = null;
+    if (U && cuts.length && final.solid.numTri() <= Math.min(lodTriangles, splitKeepTriangles)) {
+      try {
+        pieces = layCuts(final, items, cuts, spec, U, progress).map((p) => ({ cell: p.cell }));
+      } catch {
+        pieces = null; // the pieces view or the download says what is wrong
+      }
+    }
     const temps = scope();
     try {
       const measured = (Array.isArray(split?.cuts) ? split.cuts : []).map((stored, i) => {
@@ -2819,7 +2892,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           ...(tabs.length ? { tabs: tabs.length, reach: [reach(1), reach(-1)], w: seam.w ?? plan.tabs.w } : {}),
         };
       });
-      return { bounds: { min: [...bounds.min], max: [...bounds.max] }, cuts: measured, notes };
+      return { bounds: { min: [...bounds.min], max: [...bounds.max] }, cuts: measured, notes, ...(pieces ? { pieces } : {}) };
     } finally {
       temps.dispose();
     }
@@ -2842,7 +2915,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * stand rather than along its depth into halves that lie on one leg. A
    * cut through a plate is planned with dovetail tabs only where the pieces
    * beside it can lie flat on the plate. When no grid's pieces can all lie
-   * on something flat, they are planned as they fit.
+   * on something flat, they are planned as they fit. Its `pieces` are the
+   * boxes that hold model, each with its `cell`: `planPieces` makes them the
+   * pieces the cut gives.
    */
   function fitCuts(final, items, split, U, nozzle, progress) {
     progress?.('Planning cuts…');
@@ -2856,8 +2931,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       return { cuts: [], counts: [0, 0, 0], pieces: [{ size: E, fits: true }], notes: [splitNote('SPLIT_NOT_NEEDED', { yaw: whole.yaw, down: whole.down })] };
     }
     // a slab too thick for a plate (a 15 mm plaque) is best printed lying flat too: stood on its edge it is a tall
-    // wall with its face upright. Its pieces are planned lying flat first, and only stand when no grid of flat ones works
-    const slab = slabAxis(E);
+    // wall with its face upright. Its pieces are planned lying flat first, and only stand when no grid of flat ones
+    // works; so are those of a model on a base plate (a terrain tile with a tower on it), which would be walls of it
+    let mesh = null;
+    const slab = slabAxis(E) ?? (flat === null ? baseAxis(modelPlates((mesh = final.solid.getMesh()).vertProperties, mesh.numProp, mesh.triVerts)) : null);
     const ways = slab === null ? [flat] : [slab, null];
     // tabs only make pieces longer, so the grids whose plain even cells fit are the only ones worth a profile
     const candidatesOf = new Map(ways.map((lying) => [lying, gridCandidates(E, U, { flat: lying }).filter((c) => c.pieces > 1)]));
@@ -2952,7 +3029,6 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         return made;
       };
       // what each box of a grid holds: whether it is a piece at all, and what it could lie on
-      let mesh = null;
       const held = new Map();
       const support = (by) => {
         const key = by.map((l) => l.join(',')).join('|');
@@ -2978,7 +3054,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
             const cuts = best.offsets.flatMap((list, a) =>
               list.map((t) => ({ position: centre.map((c, i) => (i === a ? t : c)), normal: [0, 1, 2].map((i) => (i === a ? 1 : 0)) })),
             );
-            return { cuts, counts: best.k, pieces: best.pieces.map(({ size, fits }) => ({ size, fits })), notes: [] };
+            return { cuts, counts: best.k, pieces: best.pieces, notes: [] };
           }
         }
       }

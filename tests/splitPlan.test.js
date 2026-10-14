@@ -8,7 +8,8 @@ import {
   howToGlueText, invertRigid, isSymmetric, letterFor, localFrame, maxCellLength, mulMat4, nextCut, normaliseSplit, offsetAlongRay,
   oppositeDir, orientationStats, partFileName, pieceColorIndex, pieceFileName, pinsFileName, planAllowance, planCost, planGrid,
   planSamples, plateAxis, polygonsArea, polygonsCentroid, printTransform, safeFileName, cellSupport, fitPieces, flatProbes, liesFlat, statsWithSoup,
-  sizesFor, sizesForRoom, soupCells, splitActive, splitNote, teardropApex, usableBed, yawMat4, zipFileName,
+  sizesFor, sizesForRoom, soupCells, splitActive, splitNote, teardropApex, usableBed, yawMat4, zipFileName, triangleInBox, baseAxis,
+  outlineColumns, pieceHolding, textNotes,
 } from '../src/split.js';
 
 const U = [210, 210, 249]; // the default printer's usable bed
@@ -714,6 +715,26 @@ describe('cells', () => {
     expect(lPlan.pieces.map((p) => p.cell)).toEqual([[0, 0, 0], [1, 0, 0], [0, 0, 1]]);
   });
 
+  it('a box holds model only where a triangle enters it: a long facet\'s own box spans boxes it misses', () => {
+    // a sliver along the diagonal of a 2 × 2 grid: its box covers all four, it runs through two and touches the other
+    // two at a point
+    const sliver = [-10, -10, 0, 10, 10, 0, 10, 10, 1];
+    const box = (i, j) => [[i ? 0 : -Infinity, j ? 0 : -Infinity, -Infinity], [i ? Infinity : 0, j ? Infinity : 0, Infinity]];
+    expect([[0, 0], [1, 1], [0, 1], [1, 0]].map(([i, j]) => triangleInBox(sliver, [-10, -10, 0], [10, 10, 1], ...box(i, j)))).toEqual([true, true, false, false]);
+    // a face lying on a cut puts nothing in the box beyond it
+    expect(triangleInBox([0, 0, 5, 10, 0, 5, 0, 10, 5], [0, 0, 5], [10, 10, 5], [-Infinity, -Infinity, 5], [Infinity, Infinity, Infinity])).toBe(false);
+    // a cone's long sides span every box of a grid cut 60 mm off its axis and half way up; round the tip, past the
+    // cuts, the boxes hold nothing, and the Model card's offer is the pieces the rest make
+    const seg = 48;
+    const cone = [];
+    for (let i = 0; i < seg; i++) {
+      const [a, b] = [i, i + 1].map((k) => [120 * Math.cos((2 * Math.PI * k) / seg), 120 * Math.sin((2 * Math.PI * k) / seg)]);
+      cone.push([...a, 0, ...b, 0, 0, 0, 320], [0, 0, 0, ...b, 0, ...a, 0]);
+    }
+    const held = cellSupport(meshOf(cone), [[-60], [-60], [160]]);
+    expect([...held.values()].filter((c) => c.filled).map((c) => c.cell.join(''))).toEqual(['000', '100', '010', '110', '111']);
+  });
+
   it('keeps a grid whose even pieces fit, when each axis on its own would take its room the same way', () => {
     // a 230 mm cube on the 210 × 210 × 249 bed: eighths of 115 fit. Cutting 100 mm out is cheap on every axis, and
     // each axis, planned against the others' even pieces, could stand its 215 mm piece upright: together they make a
@@ -942,6 +963,36 @@ describe('chooseOrientation', () => {
     expect(r.notes[0].text).toBe('Piece 2 (300 × 40 × 20 mm) doesn\'t fit your printer in any position – it has room for 210 × 210 × 249 mm.');
   });
 
+  it('a thin tile with something standing on it lies flat: on its cut edge the tile would be a wall however the stub spreads its bed', () => {
+    // a 150 mm quarter of a 4 mm tile with the quarter of a tower 90 tall in its cut corner. Stood on its cut edge it
+    // rests on the cut through the tower too, so its bed spans 150 × 94 mm and it looked as steady as a block: on the
+    // cut face it went, a 4 mm wall 150 mm tall
+    const mesh = meshOf([boxSoup([0, 0, 0], [150, 150, 4]), boxSoup([125, 125, 4], [150, 150, 94])]);
+    const cuts = [{ axis: 0, at: 150 }, { axis: 1, at: 150 }];
+    const stats = orientationStats(mesh.vertProperties, mesh.numProp, mesh.triVerts, cuts);
+    expect(stats.plates[2]).toMatchObject({ t: 4, lo: 0, hi: 4, area: 150 * 150 });
+    expect(chooseOrientation(stats, U)).toMatchObject({ down: '-z', lies: 'flat as modelled', fits: true });
+    // a quarter of a terrain tile whose rocks and walls hold its plate along most of its run: lying flat needs about as
+    // much support as standing on the cut edge, and a piece that is mostly a plate lies on it
+    const rocky = {
+      ...boxStats([150, 210, 55], ['+x', '-y'], {
+        '-z': { support: 2205 }, '+z': { support: 30000 }, '+x': { support: 2193, bed: 1464, footprint: 5040 }, '-x': { support: 9000 }, '+y': { support: 9000 }, '-y': { support: 9000 },
+      }),
+      plates: [null, null, { t: 4, lo: 0, hi: 4, box: [0, 0, 150, 210], area: 30034 }],
+    };
+    expect(chooseOrientation(rocky, U)).toMatchObject({ down: '-z', lies: 'flat as modelled' });
+    expect(chooseOrientation({ ...rocky, plates: null }, U)).toMatchObject({ down: '+x', lies: 'on a cut face' });
+    // a tower as thick as the tile is wide stands on the cut face as before: nothing there is a thin plate
+    const block = meshOf([boxSoup([0, 0, 0], [150, 150, 30]), boxSoup([125, 125, 30], [150, 150, 94])]);
+    expect(chooseOrientation(orientationStats(block.vertProperties, block.numProp, block.triVerts, cuts), U).lies).toBe('on a cut face');
+    // the floor of a channel is held by its walls: where lying on the floor costs support, half of it stands on its
+    // cut face, its walls upright
+    const channel = meshOf([boxSoup([0, 0, 0], [100, 200, 3]), boxSoup([0, 0, 3], [100, 3, 60]), boxSoup([0, 197, 3], [100, 200, 60])]);
+    const half = orientationStats(channel.vertProperties, channel.numProp, channel.triVerts, [{ axis: 0, at: 100 }]);
+    expect(half.plates[2]).toMatchObject({ t: 3 });
+    expect(chooseOrientation({ ...half, dirs: { ...half.dirs, '-z': { ...half.dirs['-z'], support: 5000 } } }, U).lies).toBe('on a cut face');
+  });
+
   it('says when a piece fits only resting on a point of a curve', () => {
     // a ball's quarter: nothing flat but its two cut faces, which are too long to lie on
     const none = Object.fromEntries(Object.keys(DIRECTIONS).map((d) => [d, { bed: 0, support: 7000 }]));
@@ -1011,6 +1062,22 @@ describe('orientationStats', () => {
     const wide = new Float32Array(9 * 4);
     for (let v = 0; v < 9; v++) for (let k = 0; k < 3; k++) wide[v * 4 + k] = soup[v * 3 + k];
     expect(orientationStats(wide, 4, tris, [{ axis: 0, at: 10 }]).dirs['+x'].cutArea).toBeCloseTo(50, 6);
+  });
+
+  it('finds a model\'s base plate: one at its end with only towers on it, not one with another plate over it', () => {
+    const stats = (soups) => {
+      const m = meshOf(soups);
+      return orientationStats(m.vertProperties, m.numProp, m.triVerts);
+    };
+    // a terrain tile: a 4 mm plate with a tower and a wall on it
+    expect(baseAxis(stats([boxSoup([0, 0, 0], [300, 300, 4]), boxSoup([200, 50, 4], [250, 100, 94]), boxSoup([30, 30, 4], [110, 50, 70])]))).toBe(2);
+    // a sign's base strip standing on its side is a base all the same
+    expect(baseAxis(stats([boxSoup([0, 0, 0], [6, 300, 120]), boxSoup([6, 100, 40], [60, 140, 80])]))).toBe(0);
+    // a bookcase lying on its back: each board has another over it, and so has each side
+    const bookcase = [boxSoup([0, 0, 0], [600, 200, 15]), boxSoup([0, 0, 110], [600, 200, 125]), boxSoup([0, 0, 225], [600, 200, 240]), boxSoup([0, 0, 15], [15, 200, 225]), boxSoup([585, 0, 15], [600, 200, 225])];
+    expect(baseAxis(stats(bookcase))).toBeNull();
+    // a 30 mm slab is too thick for a plate
+    expect(baseAxis(stats([boxSoup([0, 0, 0], [300, 300, 30]), boxSoup([100, 100, 30], [150, 150, 94])]))).toBeNull();
   });
 });
 
@@ -1255,6 +1322,8 @@ describe('notes', () => {
     expect(splitNote('CUT_THROUGH_TEXT', { letter: 'A', name: 'HELLO', pieces: [1, 2], itemId: 'i1' })).toMatchObject({
       level: 'info', itemId: 'i1', text: 'Cut A runs through “HELLO” – its letters are split between pieces 1 and 2.',
     });
+    expect(splitNote('CUT_THROUGH_TEXT', { letter: 'I', name: 'Workshop', pieces: [1, 2, 10, 11], pairs: [[1, 10], [2, 11]] }).text)
+      .toBe('Cut I runs through “Workshop” – its letters are split where piece 1 meets piece 10 and piece 2 meets piece 11.');
     expect(splitNote('PART_SPANS_CUT', { name: '“Logo”', letter: 'A' }).text).toBe('“Logo” prints separately and spans cut A – glue it on after the pieces.');
     expect(splitNote('SPLIT_UNREPAIRED', { count: 312 }).text).toBe('312 triangles that couldn\'t be repaired were cut with the pieces but have no pins or labels.');
     expect(splitNote('SPLIT_NOT_NEEDED', { yaw: 40 }).text).toBe('This model already fits your printer (turned 40° on the bed) – no need to split.');
@@ -1262,6 +1331,41 @@ describe('notes', () => {
     expect(splitNote('PLAN_TOO_MANY').text).toBe('This would need more than 64 pieces – scale the model down or choose a bigger printer.');
     expect(splitNote('BED_TOO_SMALL', { size: [300, 40, 20], bed: [220, 220, 250], pieces: 2 }).text).toBe('300 × 40 × 20 mm – bigger than your 220 × 220 × 250 mm printer.');
     expect(formatSize([262.04, 120, 79.96])).toBe('262 × 120 × 80 mm');
+  });
+});
+
+describe('text through a cut', () => {
+  it('finds the letters\' face in every column the other cuts make, with the boxes either side', () => {
+    // a bar of letters 100 × 20 on a cut across x at 0, with cuts at y = 0 and z = 5: in the plane frame of an x cut,
+    // u is y and v is z
+    const bar = [[[-50, -10], [50, -10], [50, 10], [-50, 10]]];
+    const columns = outlineColumns(bar, { axis: 0, at: 0 }, 0, [[0], [0], [5]]);
+    expect(columns.map((c) => c.cells)).toEqual([
+      [[0, 0, 0], [1, 0, 0]], [[0, 0, 1], [1, 0, 1]], [[0, 1, 0], [1, 1, 0]], [[0, 1, 1], [1, 1, 1]],
+    ]);
+    expect(columns[1]).toMatchObject({ min: [0, -50, 5], max: [0, 0, 10] });
+    // a column the letters miss is left out
+    expect(outlineColumns(bar, { axis: 0, at: 0 }, 0, [[0], [60], []]).map((c) => c.cells[0])).toEqual([[0, 0, 0]]);
+  });
+
+  it('names the pieces either side that hold the letters, in every column, as the pieces print', () => {
+    // a bookcase lying on its back, its middle box printed as two pieces: the bottom board (2), and the two boards
+    // over it (3), the top one lettered across cut A at x = 200
+    const laid = [
+      { index: 1, cell: [0, 0, 0], boxes: [{ min: [0, 0, 0], max: [200, 200, 243] }] },
+      { index: 2, cell: [1, 0, 0], boxes: [{ min: [200, 0, 0], max: [400, 200, 15] }] },
+      { index: 3, cell: [1, 0, 0], boxes: [{ min: [200, 0, 110], max: [400, 200, 125] }, { min: [200, 0, 225], max: [400, 200, 243] }] },
+      { index: 4, cell: [2, 0, 0], boxes: [{ min: [400, 0, 0], max: [600, 200, 240] }] },
+    ];
+    const letters = { cells: [[0, 0, 0], [1, 0, 0]], min: [200, 80, 240], max: [200, 120, 243] };
+    expect(pieceHolding(laid, [1, 0, 0], letters.min, letters.max)).toBe(3);
+    const [note] = textNotes([{ itemId: 'i1', cutId: 'c1', letter: 'A', name: '“BOOKS”', columns: [letters] }], laid);
+    expect(note).toMatchObject({ code: 'CUT_THROUGH_TEXT', letter: 'A', pieces: [1, 3], text: 'Cut A runs through “BOOKS” – its letters are split between pieces 1 and 3.' });
+    // a sign cut in a grid: the cut splits letters in both rows, and the note names both pairs
+    const grid = [[0, 0], [1, 0], [0, 1], [1, 1]].map(([i, j], k) => ({ index: k + 1, cell: [i, j, 0], boxes: [{ min: [i ? 0 : -150, j ? 0 : -50, 0], max: [i ? 150 : 0, j ? 50 : 0, 7] }] }));
+    const rows = [0, 1].map((j) => ({ cells: [[0, j, 0], [1, j, 0]], min: [0, j ? 0 : -20, 4], max: [0, j ? 20 : 0, 7] }));
+    const [both] = textNotes([{ itemId: 'i1', cutId: 'c1', letter: 'A', name: '“III”', columns: rows }], grid);
+    expect(both).toMatchObject({ pieces: [1, 2, 3, 4], pairs: [[1, 2], [3, 4]] });
   });
 });
 

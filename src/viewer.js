@@ -41,7 +41,9 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { MeshBVH, acceleratedRaycast } from 'three-mesh-bvh';
 import { geometryFromBuffers } from './mesh.js';
 import { clickRadius, surfaceNormalAt } from './surfaceNormal.js';
-import { CUT_COLOR, PIECE_COLORS, PIN_COLOR, TOO_BIG_COLOR, axisCuts, cellSizes, cutPlane, explodeOffset, letterFor, offsetAlongRay, pieceColorIndex } from './split.js';
+import {
+  CUT_COLOR, PIECE_COLORS, PIN_COLOR, TOO_BIG_COLOR, axisCuts, cellSizes, cutPlane, explodeOffset, letterFor, offsetAlongRay, pieceColorIndex, triangleInBox,
+} from './split.js';
 
 Mesh.prototype.raycast = acceleratedRaycast;
 
@@ -86,11 +88,13 @@ function slot(t, cuts) {
 }
 
 /**
- * Mark every slot of the grid between the cuts that some triangle's box
- * overlaps, for a geometry placed by `matrix` (a Matrix4) when given. A box
- * can claim a slot the triangle misses, which only counts a box too many;
- * sampling vertices instead would lose a slot between two cuts that no
- * vertex falls in, such as the middle of a long plain box.
+ * Mark every slot of the grid between the cuts that some triangle enters,
+ * for a geometry placed by `matrix` (a Matrix4) when given. A triangle
+ * within one slot marks it; one across a cut is tested against each slot
+ * its box overlaps, as its box can claim a slot it misses (the long sides of
+ * a cone span the empty slots round its tip). Sampling vertices instead
+ * would lose a slot between two cuts that no vertex falls in, such as the
+ * middle of a long plain box.
  */
 function markCells(seen, geometry, byAxis, grid, matrix = null) {
   const pos = geometry.attributes.position.array;
@@ -99,7 +103,12 @@ function markCells(seen, geometry, byAxis, grid, matrix = null) {
   const e = matrix?.elements ?? null;
   const lo = [0, 0, 0];
   const hi = [0, 0, 0];
-  const p = [0, 0, 0];
+  const corners = new Float64Array(9);
+  const from = [0, 0, 0];
+  const to = [0, 0, 0];
+  const slo = [0, 0, 0];
+  const shi = [0, 0, 0];
+  const edge = (a, c, upper) => (upper ? (c < byAxis[a].length ? byAxis[a][c] : Infinity) : c > 0 ? byAxis[a][c - 1] : -Infinity);
   for (let t = 0; t < triangles; t++) {
     for (let a = 0; a < 3; a++) {
       lo[a] = Infinity;
@@ -111,25 +120,38 @@ function markCells(seen, geometry, byAxis, grid, matrix = null) {
       const y = pos[v + 1];
       const z = pos[v + 2];
       if (e) {
-        p[0] = e[0] * x + e[4] * y + e[8] * z + e[12];
-        p[1] = e[1] * x + e[5] * y + e[9] * z + e[13];
-        p[2] = e[2] * x + e[6] * y + e[10] * z + e[14];
+        corners[3 * k] = e[0] * x + e[4] * y + e[8] * z + e[12];
+        corners[3 * k + 1] = e[1] * x + e[5] * y + e[9] * z + e[13];
+        corners[3 * k + 2] = e[2] * x + e[6] * y + e[10] * z + e[14];
       } else {
-        p[0] = x;
-        p[1] = y;
-        p[2] = z;
+        corners[3 * k] = x;
+        corners[3 * k + 1] = y;
+        corners[3 * k + 2] = z;
       }
       for (let a = 0; a < 3; a++) {
-        if (p[a] < lo[a]) lo[a] = p[a];
-        if (p[a] > hi[a]) hi[a] = p[a];
+        if (corners[3 * k + a] < lo[a]) lo[a] = corners[3 * k + a];
+        if (corners[3 * k + a] > hi[a]) hi[a] = corners[3 * k + a];
       }
     }
-    const i1 = slot(hi[0], byAxis[0]);
-    const j1 = slot(hi[1], byAxis[1]);
-    const k1 = slot(hi[2], byAxis[2]);
-    for (let k = slot(lo[2], byAxis[2]); k <= k1; k++) {
-      for (let j = slot(lo[1], byAxis[1]); j <= j1; j++) {
-        for (let i = slot(lo[0], byAxis[0]); i <= i1; i++) seen[(k * grid[1] + j) * grid[0] + i] = 1;
+    for (let a = 0; a < 3; a++) {
+      from[a] = slot(lo[a], byAxis[a]);
+      to[a] = slot(hi[a], byAxis[a]);
+    }
+    const across = from[0] !== to[0] || from[1] !== to[1] || from[2] !== to[2];
+    for (let k = from[2]; k <= to[2]; k++) {
+      for (let j = from[1]; j <= to[1]; j++) {
+        for (let i = from[0]; i <= to[0]; i++) {
+          const s = (k * grid[1] + j) * grid[0] + i;
+          if (seen[s]) continue;
+          if (across) {
+            [i, j, k].forEach((c, a) => {
+              slo[a] = edge(a, c, false);
+              shi[a] = edge(a, c, true);
+            });
+            if (!triangleInBox(corners, lo, hi, slo, shi)) continue;
+          }
+          seen[s] = 1;
+        }
       }
     }
   }

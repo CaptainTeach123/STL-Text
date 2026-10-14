@@ -51,7 +51,8 @@ const MAX_FATALS = 3;
 let selectedCutId = null; // the cut the arrow keys move (selecting an item lets go of it)
 let lastSplitKey = ''; // what the pieces depend on besides the content: the split, the printer and the nozzle
 let lastPieces = null; // the pieces last computed: { key, content, pieces, seams, grid, diameter, notes }
-let measured = null; // the cuts last measured on the model: { key, cuts: Map(id -> { area, islands, joint, crosses }), notes }
+let measured = null; // the cuts last measured on the model: { key, cuts: Map(id -> { area, islands, joint, crosses }), notes, pieces }
+let downloaded = null; // { key, content, count }: how many pieces the last download held, for the split and content it was made for
 let joined = null; // { key, content, joints: Map(id -> 'dovetail' | 'dowels' | 'none') } the joint each cut got when the split was last worked out
 let splitBounds = null; // { version, key, bounds } of the model and its text from the last measure (text-only work has no other)
 let planNotes = null; // { key, content, notes } of a Fit to my printer that cut nothing
@@ -1121,9 +1122,11 @@ async function download() {
     const warnings = r.notes.filter((n) => n.level === 'warn');
     const warned = warnings.length ? `\n${warnings.map((n) => n.text).join('\n')}` : '';
     if (r.zip) {
-      // the cut rows say what the download gave each cut: a face no pin fits makes it glue only
+      // the cut rows say what the download gave each cut: a face no pin fits makes it glue only, and the download
+      // button how many pieces it held
       rememberJoints(splitFor, requestedFor, jointsOfSeams(r.seams));
-      renderCuts();
+      downloaded = { key: splitFor, content: requestedFor, count: (r.files ?? []).filter((f) => f.kind === 'piece').length };
+      renderSplit();
       // the pieces, the pins, the separately printed parts and the glue sheet come as one file: a browser
       // drops or asks about many downloads from one click
       const zip = save(r.zip, r.zipName, 'application/zip', '');
@@ -1446,8 +1449,11 @@ let measureFor = null; // { cuts, content } of the measure last asked for
  * decides which cuts run through letters.
  */
 const boundsKey = () => stableKey({ version: version(), items: doc.items.filter((i) => hasText(i) && !isSpot(i)).map((i) => [shapeKey(i), placeKey(i), !!i.cover]) });
-/** What a measure of the cuts depends on besides that: the cuts and the joint settings. */
-const cutsKey = () => stableKey({ cuts: doc.split?.cuts ?? [], joint: doc.split?.joint, clearance: doc.split?.clearance });
+/**
+ * What a measure of the cuts depends on besides that: the cuts and the joint settings, and – for the pieces it counts,
+ * as some loose parts of a box print apart only lying a certain way – the printer and how the pieces lie.
+ */
+const cutsKey = () => stableKey({ cuts: doc.split?.cuts ?? [], joint: doc.split?.joint, clearance: doc.split?.clearance, orient: doc.split?.orient, bed: usableBed(bed) });
 const measureKey = () => `${cutsKey()}|${boundsKey()}`;
 
 /**
@@ -1478,7 +1484,7 @@ function scheduleMeasure() {
       const v = version();
       const r = await client.planSplit(doc.items, v, { printing, split: { ...SPLIT_DEFAULTS, ...doc.split }, bed: usableBed(bed), mode: 'measure' });
       if (!r || measureKey() !== key) return;
-      measured = { key, cuts: new Map(r.cuts.map((c) => [c.id, c])), notes: r.notes };
+      measured = { key, cuts: new Map(r.cuts.map((c) => [c.id, c])), notes: r.notes, pieces: r.pieces ?? null };
       if (r.bounds) splitBounds = { version: v, key: want.content, bounds: r.bounds };
       renderSplit();
     } catch (err) {
@@ -1499,10 +1505,22 @@ function filledBoxes() {
   return filled ? cells.filter((c) => filled.has(c.cell.join(','))) : cells;
 }
 
-/** How many pieces a download makes: those computed, or until then one for each box between the cuts with something in it. */
+/**
+ * The pieces the engine's last measure found the cuts make, each with the box it comes from, while they are the cuts
+ * measured (a box whose loose parts print apart makes more than one), or null: a dense model is not cut to count.
+ */
+const measuredPieces = () => (measured?.pieces && measured.key === measureKey() ? measured.pieces : null);
+
+/**
+ * How many pieces a download makes: those computed, or the measure's count, or the last download's for the same
+ * split; until one is known, one for each box between the cuts with something in it.
+ */
 function piecesToDownload() {
   if (!splitActive(doc.split)) return 0;
   if (piecesCurrent()) return lastPieces.pieces.length;
+  const counted = measuredPieces();
+  if (counted) return counted.length;
+  if (downloaded?.key === lastSplitKey && downloaded.content === lastContentKey) return downloaded.count;
   return filledBoxes().length;
 }
 
@@ -1735,7 +1753,12 @@ function renderPieces() {
       extra: [p.shells > 1 ? `${p.shells} parts` : '', p.dowels ? `${p.dowels} ${p.dowels === 1 ? 'pin' : 'pins'}` : ''].filter(Boolean),
     }));
   } else if (active) {
-    rows = filledBoxes().map((c, i) => ({ index: i + 1, cell: c.cell, size: c.size, fits: !cellTooBig(c), predicted: true }));
+    // a box whose loose parts print apart (a bookcase's shelves between two cuts) says how many pieces it makes
+    const counted = measuredPieces();
+    const makes = (cell) => counted?.filter((p) => p.cell.join(',') === cell.join(',')).length ?? 1;
+    rows = filledBoxes().map((c, i) => ({
+      index: i + 1, cell: c.cell, size: c.size, fits: !cellTooBig(c), predicted: true, extra: makes(c.cell) > 1 ? [`prints as ${makes(c.cell)} pieces`] : [],
+    }));
   }
   list.classList.toggle('stale', !!computed && !piecesCurrent());
   $('piecesHint').hidden = !rows.length || !rows[0].predicted || $('resultToggle').checked;

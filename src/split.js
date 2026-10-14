@@ -592,6 +592,30 @@ export function plateAxis(dims, thickest = PLATE_THICKNESS.max) {
 export const slabAxis = (dims) => (plateAxis(dims) === null ? plateAxis(dims, PLATE_THICKNESS.slab) : null);
 
 /**
+ * The axis a model stands on a base plate across – a terrain tile's, a
+ * diorama's, a figure's – or null: a plate of `orientationStats`' `plates`,
+ * at most a slab thick, at one end of the model along that axis, as wide as
+ * the model both ways (to 90 %), and with what stands on it topped by flat
+ * faces of under half its area – a tower or a figure, not another plate
+ * over it (the second leg of a U, a bookcase's shelves). Its pieces are
+ * planned lying flat on it first, as a slab's are: stood on a cut edge, a
+ * piece would be a wall of the plate with a tower or a figure's foot beside it.
+ * @param {object} stats `orientationStats` (or `modelPlates`) of the whole model
+ */
+export function baseAxis(stats) {
+  let best = null;
+  (stats.plates ?? []).forEach((plate, w) => {
+    if (!plate) return;
+    const [u, v] = [(w + 1) % 3, (w + 2) % 3];
+    const wide = plate.box[2] - plate.box[0] >= 0.9 * stats.dims[u] && plate.box[3] - plate.box[1] >= 0.9 * stats.dims[v];
+    const under = plate.lo <= stats.bbox.min[w] + 0.01 && plate.above < 0.5 * plate.area;
+    const over = plate.hi >= stats.bbox.max[w] - 0.01 && plate.below < 0.5 * plate.area;
+    if (wide && (under || over) && (!best || plate.area > best.area)) best = { w, area: plate.area };
+  });
+  return best?.w ?? null;
+}
+
+/**
  * What the pieces of a model with extents E will be allowed, for counting
  * them before anything has been sliced (the "Split into N pieces" note): a
  * thin plate lies flat, and when its joints may be dovetails (Auto or
@@ -689,48 +713,93 @@ function median(values) {
 /** Less of a slice than this (mm²) in a column is no model there, for counting the pieces a grid's boxes make. */
 const MIN_HELD = 1;
 
-/**
- * The signed area of outlines (outer rings counter-clockwise, holes clockwise, as `CrossSection.toPolygons()` gives
- * them) within the rectangle [u0, v0, u1, v1]: each ring clipped to it (Sutherland–Hodgman), so a ring's hole leaves
- * a column inside it empty.
- */
-export function clippedArea(rings, [u0, v0, u1, v1]) {
-  let sum = 0;
-  for (const ring of rings) {
-    let lo0 = Infinity;
-    let lo1 = Infinity;
-    let hi0 = -Infinity;
-    let hi1 = -Infinity;
-    for (const [x, y] of ring) {
-      lo0 = Math.min(lo0, x);
-      hi0 = Math.max(hi0, x);
-      lo1 = Math.min(lo1, y);
-      hi1 = Math.max(hi1, y);
-    }
-    if (hi0 <= u0 || lo0 >= u1 || hi1 <= v0 || lo1 >= v1) continue;
-    let pts = ring;
-    for (const [k, bound, keepAbove] of [[0, u0, true], [0, u1, false], [1, v0, true], [1, v1, false]]) {
-      const inside = (p) => (keepAbove ? p[k] >= bound : p[k] <= bound);
-      const out = [];
-      for (let i = 0; i < pts.length; i++) {
-        const p = pts[i];
-        const q = pts[(i + 1) % pts.length];
-        if (inside(p)) out.push(p);
-        if (inside(p) !== inside(q)) {
-          const f = (bound - p[k]) / (q[k] - p[k]);
-          out.push([p[0] + (q[0] - p[0]) * f, p[1] + (q[1] - p[1]) * f]);
-        }
-      }
-      pts = out;
-      if (!pts.length) break;
-    }
+/** A ring of an outline clipped to the rectangle [u0, v0, u1, v1] (Sutherland–Hodgman): its corners, none when it misses. */
+export function clipRing(ring, [u0, v0, u1, v1]) {
+  let lo0 = Infinity;
+  let lo1 = Infinity;
+  let hi0 = -Infinity;
+  let hi1 = -Infinity;
+  for (const [x, y] of ring) {
+    lo0 = Math.min(lo0, x);
+    hi0 = Math.max(hi0, x);
+    lo1 = Math.min(lo1, y);
+    hi1 = Math.max(hi1, y);
+  }
+  if (hi0 <= u0 || lo0 >= u1 || hi1 <= v0 || lo1 >= v1) return [];
+  let pts = ring;
+  for (const [k, bound, keepAbove] of [[0, u0, true], [0, u1, false], [1, v0, true], [1, v1, false]]) {
+    const inside = (p) => (keepAbove ? p[k] >= bound : p[k] <= bound);
+    const out = [];
     for (let i = 0; i < pts.length; i++) {
-      const [x0, y0] = pts[i];
-      const [x1, y1] = pts[(i + 1) % pts.length];
-      sum += (x0 * y1 - x1 * y0) / 2;
+      const p = pts[i];
+      const q = pts[(i + 1) % pts.length];
+      if (inside(p)) out.push(p);
+      if (inside(p) !== inside(q)) {
+        const f = (bound - p[k]) / (q[k] - p[k]);
+        out.push([p[0] + (q[0] - p[0]) * f, p[1] + (q[1] - p[1]) * f]);
+      }
     }
+    pts = out;
+    if (!pts.length) break;
+  }
+  return pts;
+}
+
+/** The signed area of a ring (counter-clockwise positive). */
+function ringArea(pts) {
+  let sum = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const [x0, y0] = pts[i];
+    const [x1, y1] = pts[(i + 1) % pts.length];
+    sum += (x0 * y1 - x1 * y0) / 2;
   }
   return sum;
+}
+
+/**
+ * The signed area of outlines (outer rings counter-clockwise, holes clockwise, as `CrossSection.toPolygons()` gives
+ * them) within the rectangle [u0, v0, u1, v1]: each ring clipped to it, so a ring's hole leaves a column inside it
+ * empty.
+ */
+export function clippedArea(rings, rect) {
+  return rings.reduce((sum, ring) => sum + ringArea(clipRing(ring, rect)), 0);
+}
+
+/**
+ * Where an outline on a cut (in the cut axis's plane coordinates, `TO_PLANE`) lies in the columns the other cuts
+ * make: for each column it reaches with more than `least` mm², the cells either side of the cut and the box the
+ * outline spans there, in the world. The cut is the `index`-th on its axis.
+ * @param {number[][][]} rings the outline (`CrossSection.toPolygons()`)
+ * @param {{ axis: number, at: number }} cut
+ * @param {number} index
+ * @param {number[][]} cutsByAxis sorted positions per axis (`axisCuts`)
+ * @returns {{ cells: number[][], min: number[], max: number[] }[]}
+ */
+export function outlineColumns(rings, { axis, at }, index, cutsByAxis, least = 0.01) {
+  const [u, v] = [(axis + 1) % 3, (axis + 2) % 3];
+  const eu = [-Infinity, ...(cutsByAxis[u] ?? []), Infinity];
+  const ev = [-Infinity, ...(cutsByAxis[v] ?? []), Infinity];
+  const out = [];
+  for (let i = 0; i + 1 < eu.length; i++) {
+    for (let j = 0; j + 1 < ev.length; j++) {
+      const clipped = rings.map((ring) => clipRing(ring, [eu[i], ev[j], eu[i + 1], ev[j + 1]]));
+      if (!(clipped.reduce((sum, pts) => sum + ringArea(pts), 0) > least)) continue;
+      const min = [0, 0, 0];
+      const max = [0, 0, 0];
+      min[axis] = max[axis] = at;
+      min[u] = min[v] = Infinity;
+      max[u] = max[v] = -Infinity;
+      for (const [x, y] of clipped.flat()) {
+        min[u] = Math.min(min[u], x);
+        max[u] = Math.max(max[u], x);
+        min[v] = Math.min(min[v], y);
+        max[v] = Math.max(max[v], y);
+      }
+      const cell = (k) => [0, 1, 2].map((a) => (a === axis ? k : a === u ? i : j));
+      out.push({ cells: [cell(index), cell(index + 1)], min, max });
+    }
+  }
+  return out;
 }
 
 /** Linear interpolation of the profile's area at t, held at the end values beyond the samples. */
@@ -1218,10 +1287,60 @@ function factsOf(mesh) {
   return facts;
 }
 
+/** How far inside a cut a triangle must reach to put material in the box beyond it (mm): a face lying on the cut puts none. */
+const BOX_SKIN = 1e-4;
+
+/**
+ * Whether a triangle (`t`: its corners' x, y, z one after another) meets the
+ * box [lo, hi]: no separating axis among the box's three, the triangle's
+ * normal and the nine crossings of the two's edges. The box must be finite.
+ */
+export function triangleMeetsBox(t, lo, hi) {
+  const c0 = (lo[0] + hi[0]) / 2;
+  const c1 = (lo[1] + hi[1]) / 2;
+  const c2 = (lo[2] + hi[2]) / 2;
+  const h0 = (hi[0] - lo[0]) / 2;
+  const h1 = (hi[1] - lo[1]) / 2;
+  const h2 = (hi[2] - lo[2]) / 2;
+  const ax = t[0] - c0, ay = t[1] - c1, az = t[2] - c2;
+  const bx = t[3] - c0, by = t[4] - c1, bz = t[5] - c2;
+  const cx = t[6] - c0, cy = t[7] - c1, cz = t[8] - c2;
+  const apart = (p, q, s, r) => Math.min(p, q, s) > r || Math.max(p, q, s) < -r;
+  if (apart(ax, bx, cx, h0) || apart(ay, by, cy, h1) || apart(az, bz, cz, h2)) return false;
+  for (const [ex, ey, ez] of [[bx - ax, by - ay, bz - az], [cx - bx, cy - by, cz - bz], [ax - cx, ay - cy, az - cz]]) {
+    // the box's x, y and z each crossed with this edge
+    if (apart(ey * az - ez * ay, ey * bz - ez * by, ey * cz - ez * cy, h1 * Math.abs(ez) + h2 * Math.abs(ey))) return false;
+    if (apart(ez * ax - ex * az, ez * bx - ex * bz, ez * cx - ex * cz, h0 * Math.abs(ez) + h2 * Math.abs(ex))) return false;
+    if (apart(ex * ay - ey * ax, ex * by - ey * bx, ex * cy - ey * cx, h0 * Math.abs(ey) + h1 * Math.abs(ex))) return false;
+  }
+  const nx = (by - ay) * (cz - az) - (bz - az) * (cy - ay);
+  const ny = (bz - az) * (cx - ax) - (bx - ax) * (cz - az);
+  const nz = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+  return Math.abs(nx * ax + ny * ay + nz * az) <= h0 * Math.abs(nx) + h1 * Math.abs(ny) + h2 * Math.abs(nz);
+}
+
+/**
+ * Whether a triangle whose box is [tlo, thi] reaches into the box between `lo` and `hi` (either may be infinite: the
+ * grid's outer boxes run on past the model), more than `BOX_SKIN` past a side of it that is a cut: its box can
+ * overlap a box the triangle itself misses, as the long side of a cone overlaps the empty corners round its tip.
+ */
+export function triangleInBox(t, tlo, thi, lo, hi) {
+  const blo = [0, 0, 0];
+  const bhi = [0, 0, 0];
+  for (let a = 0; a < 3; a++) {
+    blo[a] = Math.max(tlo[a], lo[a] + BOX_SKIN);
+    bhi[a] = Math.min(thi[a], hi[a] - BOX_SKIN);
+    if (blo[a] > bhi[a]) return false;
+  }
+  return triangleMeetsBox(t, blo, bhi);
+}
+
 /**
  * What each box of a grid holds of a mesh, for the planner: whether it
- * holds any of the model (a box no triangle reaches is wholly inside the
- * model or wholly outside it: a ray from its centre tells which), and on
+ * holds any of the model (a box no triangle enters is wholly inside the
+ * model or wholly outside it: a ray from its centre tells which; a
+ * triangle's own box is no guide, as a cone's long sides span the empty
+ * boxes round its tip), and on
  * which axes the model it holds rests on something flat where it ends –
  * facets facing that way, wholly within 0.1 mm of the furthest the box's
  * material goes, of 25 mm² or more: the bed `orientationStats` counts. A
@@ -1262,12 +1381,27 @@ export function cellSupport(mesh, cutsByAxis) {
   const from = [0, 0, 0];
   const to = [0, 0, 0];
   const cell = [0, 0, 0];
+  const corners = new Float64Array(9);
+  const tlo = [0, 0, 0];
+  const thi = [0, 0, 0];
+  const blo = [0, 0, 0];
+  const bhi = [0, 0, 0];
+  const { vertProperties: P, numProp, triVerts: T } = mesh;
   for (let t = 0; t < count; t++) {
     for (let a = 0; a < 3; a++) {
       from[a] = first(a, box[6 * t + a]);
       to[a] = first(a, box[6 * t + 3 + a]);
     }
     const f = face[t];
+    // a triangle across a cut is looked at box by box: its own box overlaps boxes it never enters
+    const across = from[0] !== to[0] || from[1] !== to[1] || from[2] !== to[2];
+    if (across) {
+      for (let v = 0; v < 3; v++) for (let a = 0; a < 3; a++) corners[3 * v + a] = P[T[3 * t + v] * numProp + a];
+      for (let a = 0; a < 3; a++) {
+        tlo[a] = box[6 * t + a];
+        thi[a] = box[6 * t + 3 + a];
+      }
+    }
     for (let k = from[2]; k <= to[2]; k++) {
       for (let j = from[1]; j <= to[1]; j++) {
         for (let i = from[0]; i <= to[0]; i++) {
@@ -1275,6 +1409,13 @@ export function cellSupport(mesh, cutsByAxis) {
           cell[0] = i;
           cell[1] = j;
           cell[2] = k;
+          if (across) {
+            for (let a = 0; a < 3; a++) {
+              blo[a] = edgeLo(a, cell[a]);
+              bhi[a] = edgeHi(a, cell[a]);
+            }
+            if (!triangleInBox(corners, tlo, thi, blo, bhi)) continue;
+          }
           touched[b] = 1;
           for (let a = 0; a < 3; a++) {
             lo[b * 3 + a] = Math.min(lo[b * 3 + a], Math.max(box[6 * t + a], edgeLo(a, cell[a])));
@@ -1649,6 +1790,135 @@ const COS45 = Math.SQRT1_2;
 const FLAT = 0.999;
 /** Less than this much on the bed (mm²) and a piece stands on a point or an edge: it needs supports. */
 const STEADY = 25;
+/** How many slices of a piece along each axis `orientationStats` measures its spread in. */
+const BANDS = 16;
+
+/**
+ * Widen the band boxes of one axis (`band`: `{ lo, step, boxes }`, four numbers a band, [u0, v0, u1, v1]) with a
+ * triangle, given as its corners' positions along the axis (`t`) and across it (`u`, `v`): in each band it crosses,
+ * the part of it that lies in that band.
+ */
+function spreadInBands(band, t, u, v) {
+  const { lo, step, boxes } = band;
+  const last = boxes.length / 4 - 1;
+  const k0 = Math.min(last, Math.max(0, Math.floor((Math.min(t[0], t[1], t[2]) - lo) / step)));
+  const k1 = Math.min(last, Math.max(0, Math.floor((Math.max(t[0], t[1], t[2]) - lo) / step)));
+  const widen = (k, x, y) => {
+    if (x < boxes[4 * k]) boxes[4 * k] = x;
+    if (y < boxes[4 * k + 1]) boxes[4 * k + 1] = y;
+    if (x > boxes[4 * k + 2]) boxes[4 * k + 2] = x;
+    if (y > boxes[4 * k + 3]) boxes[4 * k + 3] = y;
+  };
+  if (k0 === k1) {
+    // most triangles of a fine mesh lie in one slice
+    for (let i = 0; i < 3; i++) widen(k0, u[i], v[i]);
+    return;
+  }
+  for (let k = k0; k <= k1; k++) {
+    const s0 = k === k0 ? -Infinity : lo + k * step;
+    const s1 = k === k1 ? Infinity : lo + (k + 1) * step;
+    for (let i = 0; i < 3; i++) {
+      if (t[i] >= s0 && t[i] <= s1) widen(k, u[i], v[i]);
+      const j = (i + 1) % 3;
+      for (const s of [s0, s1]) {
+        if (!((t[i] - s) * (t[j] - s) < 0)) continue;
+        const f = (s - t[i]) / (t[j] - t[i]);
+        widen(k, u[i] + (u[j] - u[i]) * f, v[i] + (v[j] - v[i]) * f);
+      }
+    }
+  }
+}
+
+/** Empty band boxes for an axis of a piece from `lo` to `hi`. */
+const emptyBands = (lo, hi) => ({
+  lo, step: Math.max((hi - lo) / BANDS, EPS), boxes: Array.from({ length: 4 * BANDS }, (_, i) => (i % 4 < 2 ? Infinity : -Infinity)),
+});
+
+/** How many of a direction's largest flat faces are paired up when looking for a plate. */
+const PLATE_FACES = 32;
+
+/**
+ * File a triangle (corners at offsets a, b, c of P) facing along `axis` (`plus`: its positive way) with the flat
+ * faces square to that axis (`faces`: by direction, then by position to 0.01 mm), when all of it lies at one position.
+ */
+function binFace(faces, P, a, b, c, axis, plus, area) {
+  const pa = P[a + axis];
+  const pb = P[b + axis];
+  const pc = P[c + axis];
+  if (!(Math.max(pa, pb, pc) - Math.min(pa, pb, pc) <= 0.01)) return;
+  const at = (pa + pb + pc) / 3;
+  const bin = faces[(plus ? '+' : '-') + AXES[axis]];
+  const key = Math.round(at * 100);
+  if (!bin.has(key)) bin.set(key, { at, area: 0, box: [Infinity, Infinity, -Infinity, -Infinity] });
+  const f = bin.get(key);
+  f.area += area;
+  for (let i = 0; i < 2; i++) {
+    const k = (axis + 1 + i) % 3;
+    f.box[i] = Math.min(f.box[i], P[a + k], P[b + k], P[c + k]);
+    f.box[2 + i] = Math.max(f.box[2 + i], P[a + k], P[b + k], P[c + k]);
+  }
+}
+
+/**
+ * The box of a whole model and the thin plate across each axis it holds (as `orientationStats` gives them, without
+ * the rest), for `baseAxis`: only its flat faces are looked at.
+ */
+export function modelPlates(vertProperties, numProp, triVerts) {
+  const P = vertProperties;
+  const T = triVerts;
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  const faces = Object.fromEntries(DIR_KEYS.map((d) => [d, new Map()]));
+  for (let t = 0; t + 2 < T.length; t += 3) {
+    const a = T[t] * numProp;
+    const b = T[t + 1] * numProp;
+    const c = T[t + 2] * numProp;
+    for (let k = 0; k < 3; k++) {
+      const lo = Math.min(P[a + k], P[b + k], P[c + k]);
+      const hi = Math.max(P[a + k], P[b + k], P[c + k]);
+      if (lo < min[k]) min[k] = lo;
+      if (hi > max[k]) max[k] = hi;
+    }
+    const ux = P[b] - P[a], uy = P[b + 1] - P[a + 1], uz = P[b + 2] - P[a + 2];
+    const vx = P[c] - P[a], vy = P[c + 1] - P[a + 1], vz = P[c + 2] - P[a + 2];
+    const n = [uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx];
+    const len = Math.hypot(n[0], n[1], n[2]);
+    if (!(len > 0)) continue;
+    let axis = 0;
+    for (let k = 1; k < 3; k++) if (Math.abs(n[k]) > Math.abs(n[axis])) axis = k;
+    if (!(Math.abs(n[axis]) / len > FLAT)) continue;
+    binFace(faces, P, a, b, c, axis, n[axis] > 0, len / 2);
+  }
+  return { bbox: { min, max }, dims: max.map((v, k) => v - min[k]), plates: [0, 1, 2].map((w) => plateOf(faces, w)) };
+}
+
+/**
+ * The thin plate across axis w among a piece's flat faces (`faces`: per direction, by position, `{ at, area, box }`,
+ * the box across the other two axes in their cyclic order): a face looking down w with one looking up it at most a
+ * slab's thickness above, material between them (two faces looking at each other have air between), as much of
+ * both as they share, and four times as wide both ways as it is thick. The one with the most area, or null; with
+ * the area of the flat faces past it either way that look away from it (`above`, `below`): the tops of what stands
+ * on it, or of another plate over it.
+ */
+function plateOf(faces, w) {
+  const largest = (d) => [...faces[d].values()].sort((p, q) => q.area - p.area).slice(0, PLATE_FACES);
+  let best = null;
+  for (const under of largest(`-${AXES[w]}`)) {
+    for (const over of largest(`+${AXES[w]}`)) {
+      const t = over.at - under.at;
+      if (!(t > 0 && t <= PLATE_THICKNESS.slab)) continue;
+      const box = [Math.max(under.box[0], over.box[0]), Math.max(under.box[1], over.box[1]), Math.min(under.box[2], over.box[2]), Math.min(under.box[3], over.box[3])];
+      const du = box[2] - box[0];
+      const dv = box[3] - box[1];
+      if (!(du >= 4 * t && dv >= 4 * t)) continue;
+      const area = Math.min(under.area, over.area, du * dv);
+      if (!best || area > best.area) best = { t, lo: under.at, hi: over.at, box, area };
+    }
+  }
+  if (!best) return null;
+  const past = (d, beyond) => [...faces[d].values()].reduce((sum, f) => sum + (beyond(f.at) ? f.area : 0), 0);
+  return { ...best, above: past(`+${AXES[w]}`, (at) => at > best.hi + 0.01), below: past(`-${AXES[w]}`, (at) => at < best.lo - 0.01) };
+}
 
 /**
  * What each way down would mean for a piece, from its own mesh: for each of
@@ -1656,7 +1926,9 @@ const STEADY = 25;
  * bed (facets facing d within 0.1 mm of the piece's extreme along d) and the
  * area of the box that bed spans, the area that would need support (facets
  * facing within 45° of d, not on the bed) and the area of its own cut faces
- * facing d.
+ * facing d; and for each axis, how far it spreads across the other two in
+ * each of 16 slices along it (`bands`) and the thin plate across it, if it
+ * holds one (`plates`), for how slender it stands.
  * @param {Float32Array|number[]} vertProperties
  * @param {number} numProp
  * @param {Uint32Array|number[]} triVerts
@@ -1664,8 +1936,11 @@ const STEADY = 25;
  * @param {{ allowed?: string[] }} options `allowed`: the ways down to consider (pieces on a dovetail seam lie flat: ±w only)
  * @returns {{ bbox: { min: number[], max: number[] }, dims: number[], allowed: string[],
  *   dirs: Object<string, { extent: number, bed: number, footprint: number, support: number, cutArea: number,
- *   spread: number[]|null }> }} `spread` the box the bed spans across the other two axes, in their cyclic order
- *   ([u0, v0, u1, v1]), null with nothing on the bed
+ *   spread: number[]|null }>, bands: { lo: number, step: number, boxes: number[] }[], plates: ({ t: number, lo: number,
+ *   hi: number, box: number[], area: number }|null)[] }} `spread` the box the bed spans across the other two axes, in
+ *   their cyclic order ([u0, v0, u1, v1]), null with nothing on the bed; `bands` per axis, from `lo` in slices `step`
+ *   long, the box each slice's material spans the same way (four numbers each, empty as [∞, ∞, −∞, −∞]); `plates` per
+ *   axis, a plate `t` thick between its faces at `lo` and `hi` along it, spanning `box` across it
  */
 export function orientationStats(vertProperties, numProp, triVerts, cutsOnPiece = [], { allowed = DIR_KEYS } = {}) {
   const P = vertProperties;
@@ -1687,11 +1962,30 @@ export function orientationStats(vertProperties, numProp, triVerts, cutsOnPiece 
   // the ring's whole outline keeps it steady
   const spread = Object.fromEntries(DIR_KEYS.map((d) => [d, [Infinity, Infinity, -Infinity, -Infinity]]));
   const planes = cutsOnPiece.map(cutPlane).filter(Boolean);
+  const bands = [0, 1, 2].map((k) => emptyBands(min[k], max[k]));
+  // the faces square to an axis, by direction and position: a thin plate is two of them, a slab's thickness apart
+  const faces = Object.fromEntries(DIR_KEYS.map((d) => [d, new Map()]));
+  const along = [0, 0, 0];
+  const across = [[0, 0, 0], [0, 0, 0]];
   const T = triVerts;
   for (let t = 0; t + 2 < T.length; t += 3) {
     const a = T[t] * numProp;
     const b = T[t + 1] * numProp;
     const c = T[t + 2] * numProp;
+    for (let k = 0; k < 3; k++) {
+      const u = (k + 1) % 3;
+      const v = (k + 2) % 3;
+      along[0] = P[a + k];
+      along[1] = P[b + k];
+      along[2] = P[c + k];
+      across[0][0] = P[a + u];
+      across[0][1] = P[b + u];
+      across[0][2] = P[c + u];
+      across[1][0] = P[a + v];
+      across[1][1] = P[b + v];
+      across[1][2] = P[c + v];
+      spreadInBands(bands[k], along, across[0], across[1]);
+    }
     const ux = P[b] - P[a], uy = P[b + 1] - P[a + 1], uz = P[b + 2] - P[a + 2];
     const vx = P[c] - P[a], vy = P[c + 1] - P[a + 1], vz = P[c + 2] - P[a + 2];
     const n = [uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx];
@@ -1716,6 +2010,7 @@ export function orientationStats(vertProperties, numProp, triVerts, cutsOnPiece 
       });
     } else s.support += area;
     if (nd > FLAT && planes.some((p) => p.axis === axis && Math.max(Math.abs(pa - p.at), Math.abs(pb - p.at), Math.abs(pc - p.at)) <= 0.01)) s.cutArea += area;
+    binFace(faces, P, a, b, c, axis, plus, area);
   }
   for (const d of DIR_KEYS) {
     const [u0, v0, u1, v1] = spread[d];
@@ -1727,6 +2022,8 @@ export function orientationStats(vertProperties, numProp, triVerts, cutsOnPiece 
     dims: max.map((v, k) => v - min[k]),
     allowed: DIR_KEYS.filter((d) => allowed.includes(d)),
     dirs,
+    bands,
+    plates: [0, 1, 2].map((w) => plateOf(faces, w)),
   };
 }
 
@@ -1756,10 +2053,60 @@ function laidDims(dims, down) {
   return [0, 1, 2].map((r) => Math.abs(L[r]) * dims[0] + Math.abs(L[4 + r]) * dims[1] + Math.abs(L[8 + r]) * dims[2]);
 }
 
+/** What standing `tall` over a base of `base` mm² costs: nothing up to twice the base's side, then fast more. */
+const slenderCost = (tall, base) => (tall > 2 ? 50 * (tall - 2) ** 2 * Math.sqrt(base) : 0);
+
+/**
+ * How slender a thin plate in a piece (`orientationStats`' `plates`) stands lying `down`, on its edge: a wall as
+ * tall as the plate runs up and as thick as it, however far a tower or a figure's foot beside it spreads the bed –
+ * when it stands alone (a slice of the piece holds nothing across the plate but the plate) over half its run or
+ * more. One held up along most of its run (the strip under a row of letters, the floor of a box between its
+ * walls) is no wall.
+ */
+function wallCost(stats, down) {
+  const a = dirAxis(down);
+  const band = stats.bands?.[a];
+  if (!band || !stats.plates) return 0;
+  let worst = 0;
+  stats.plates.forEach((plate, w) => {
+    if (!plate || w === a) return;
+    // the plate's box across w: its run along the way up, and its length along the third axis
+    const along = (a - w + 3) % 3 - 1; // 0 when a follows w, 1 when it comes after that
+    const [r0, r1] = [plate.box[along], plate.box[2 + along]];
+    const length = plate.box[3 - along] - plate.box[1 - along];
+    const across = w === (a + 1) % 3 ? 0 : 1; // where w's extent is in a slice's box
+    let alone = 0;
+    for (let k = 0; k < BANDS; k++) {
+      const s0 = Math.max(r0, band.lo + k * band.step);
+      const s1 = Math.min(r1, band.lo + (k + 1) * band.step);
+      if (s1 > s0 && band.boxes[4 * k + 2 + across] - band.boxes[4 * k + across] <= plate.t + 0.5) alone += s1 - s0;
+    }
+    if (!(alone >= 0.5 * (r1 - r0))) return;
+    const base = plate.t * length;
+    worst = Math.max(worst, slenderCost((r1 - r0) / Math.sqrt(base), base));
+  });
+  return worst;
+}
+
+/**
+ * Whether lying `down` puts a piece on the face of a thin plate (`orientationStats`' `plates`) that covers at least
+ * half of the piece's box that way, resting on it – the only plate it holds: boards joined across one another (the
+ * side of a shelf unit and its shelves) lie whichever way needs least.
+ */
+function onPlate(stats, down) {
+  const w = dirAxis(down);
+  const plate = stats.plates?.[w];
+  if (!plate || stats.plates.filter(Boolean).length > 1 || stats.dirs[down].bed < STEADY) return false;
+  const face = down[0] === '-' ? plate.lo <= stats.bbox.min[w] + 0.01 : plate.hi >= stats.bbox.max[w] - 0.01;
+  return face && plate.area >= 0.5 * stats.dims[(w + 1) % 3] * stats.dims[(w + 2) % 3];
+}
+
 /**
  * What lying `down` costs a piece, lower being better: `need` what printing it that way takes – support, a slender
  * tower, a small footprint – and `score` that plus its mating faces printed upright (weaker, holes horizontal). How
- * slender a piece stands is judged by the box its bed spans: a tube's ring holds it as steady as a block.
+ * slender a piece stands is judged by the box its bed spans: a tube's ring holds it as steady as a block. A thin
+ * plate standing on its edge is a wall all the same where something beside it spreads the bed (`wallCost`): a
+ * terrain tile's quarter stood on its cut edge rests on the cut through its tower too, but the tile above is 4 mm.
  */
 function orientationScore(stats, down) {
   const s = stats.dirs[down];
@@ -1767,8 +2114,7 @@ function orientationScore(stats, down) {
   let cutV = 0;
   for (const d of DIR_KEYS) if (dirAxis(d) !== axis) cutV += stats.dirs[d].cutArea;
   const bed = Math.max(s.bed, s.footprint ?? 0, 1);
-  const tall = s.extent / Math.sqrt(bed);
-  const slender = tall > 2 ? 50 * (tall - 2) ** 2 * Math.sqrt(bed) : 0;
+  const slender = Math.max(slenderCost(s.extent / Math.sqrt(bed), bed), wallCost(stats, down));
   const unstable = s.bed < STEADY ? 1e4 : 0;
   const need = s.support + slender + unstable;
   return { need, score: need + 0.5 * cutV };
@@ -1810,11 +2156,13 @@ export function printTransform(bbox, down = '-z', yaw = 0) {
  * How a piece is printed: of the allowed ways down that fit the bed (turned
  * straight, a quarter turn or across the diagonal), those that need about
  * the least support (within 10 % or 25 mm², slender towers and points
- * counted in: `orientationScore`'s `need`), and of those the best by score,
- * so a mating face goes down only where that costs next to no support: a
- * gear's quarter lies flat rather than standing on its cut edge with its
- * teeth over supports. Scores within 1 % tie, and then the model's own down
- * wins, then a cut face down, then the lower height, then no turn.
+ * counted in: `orientationScore`'s `need`); of those, the ones that lay a
+ * piece that is mostly a thin plate on it where there are any (`onPlate`):
+ * a tile's quarter with rocks on it lies on the tile; and of those the best
+ * by score, so a mating face goes down only where that costs next to no
+ * support: a gear's quarter lies flat rather than standing on its cut edge
+ * with its teeth over supports. Scores within 1 % tie, and then the model's
+ * own down wins, then a cut face down, then the lower height, then no turn.
  * `orient: 'cut'` takes the largest cut face that fits and `'model'` the
  * model's own down; if that does not fit, the best way is used with
  * `ORIENT_FALLBACK`. If nothing fits, the best way regardless (`fits:
@@ -1842,8 +2190,12 @@ export function chooseOrientation(stats, U, orient = 'auto', { pieceIndex = null
     if (!list.length) return null;
     const least = Math.min(...list.map((o) => o.need));
     const near = list.filter((o) => o.need <= least + Math.max(STEADY, 0.1 * least));
-    const best = Math.min(...near.map((o) => o.score));
-    const tied = near.filter((o) => o.score <= best + Math.max(0.01 * Math.abs(best), EPS));
+    // a piece that is mostly a thin plate lies on it where that needs about as little, its cut faces upright, rather
+    // than stand the plate on its cut edge
+    const plated = near.filter((o) => onPlate(stats, o.down));
+    const pool = plated.length ? plated : near;
+    const best = Math.min(...pool.map((o) => o.score));
+    const tied = pool.filter((o) => o.score <= best + Math.max(0.01 * Math.abs(best), EPS));
     const rank = (o) => [o.down === '-z' ? 0 : 1, o.cut ? 0 : 1, o.h, o.yaw ? 1 : 0, order(o)];
     return tied.sort((p, q) => {
       const rp = rank(p);
@@ -1910,7 +2262,25 @@ export function mergeStats(list) {
   }
   const held = list.filter((s) => s.allowed.length < DIR_KEYS.length);
   const allowed = held.length ? DIR_KEYS.filter((d) => held.some((s) => s.allowed.includes(d))) : [...DIR_KEYS];
-  return { bbox: { min, max }, dims: max.map((v, k) => v - min[k]), allowed, dirs };
+  // each shell's slices widen every slice of the whole they overlap
+  const bands = list.every((s) => s.bands) ? [0, 1, 2].map((a) => {
+    const band = emptyBands(min[a], max[a]);
+    for (const s of list) {
+      const { lo, step, boxes } = s.bands[a];
+      for (let k = 0; k < boxes.length / 4; k++) {
+        if (!(boxes[4 * k] <= boxes[4 * k + 2])) continue;
+        const k0 = Math.max(0, Math.floor((lo + k * step - band.lo) / band.step + 1e-9));
+        const k1 = Math.min(BANDS - 1, Math.ceil((lo + (k + 1) * step - band.lo) / band.step - 1e-9) - 1);
+        for (let j = k0; j <= k1; j++) {
+          for (let i = 0; i < 4; i++) band.boxes[4 * j + i] = (i < 2 ? Math.min : Math.max)(band.boxes[4 * j + i], boxes[4 * k + i]);
+        }
+      }
+    }
+    return band;
+  }) : undefined;
+  // the largest plate of any shell is the piece's
+  const plates = list.every((s) => s.plates) ? [0, 1, 2].map((w) => list.map((s) => s.plates[w]).filter(Boolean).sort((p, q) => q.area - p.area)[0] ?? null) : undefined;
+  return { bbox: { min, max }, dims: max.map((v, k) => v - min[k]), allowed, dirs, ...(bands ? { bands } : {}), ...(plates ? { plates } : {}) };
 }
 
 /** Whether a shell (its stats) reaches the bed when the shells it prints with (their stats) lie with `down` on it. */
@@ -2025,6 +2395,62 @@ export function smallPieceNotes(pieces, cuts) {
     if (thin) notes.push(splitNote('SMALL_PIECE', { pieceIndex: piece.index, thickness: thin.thickness, letters: thin.along.map((c) => c.letter), cutId: thin.along[0].id }));
   }
   return notes;
+}
+
+/**
+ * The piece of the laid-out ones (`layPieces`) from the box `cell` that
+ * holds what spans the box [min, max] on a cut: the only one, or – where
+ * the box's shells print apart – the one whose shells' boxes reach the cut
+ * and cover the most of it. Null when the box makes no piece.
+ */
+export function pieceHolding(laid, cell, min, max) {
+  const mine = laid.filter((p) => p.cell.every((c, a) => c === cell[a]));
+  if (mine.length < 2) return mine[0]?.index ?? null;
+  const slack = 0.05;
+  const cover = (b) => {
+    let area = 1;
+    for (let a = 0; a < 3; a++) {
+      const lo = Math.max(b.min[a] - slack, min[a] - slack);
+      const hi = Math.min(b.max[a] + slack, max[a] + slack);
+      if (hi < lo) return -1;
+      if (max[a] > min[a]) area *= hi - lo; // the cut's own axis: reaching it is enough
+    }
+    return area;
+  };
+  let best = mine[0];
+  let most = -1;
+  for (const p of mine) {
+    const c = Math.max(...(p.boxes ?? [p.bbox]).map(cover));
+    if (c > most) {
+      best = p;
+      most = c;
+    }
+  }
+  return best.index;
+}
+
+/**
+ * A `CUT_THROUGH_TEXT` note for each cut through letters, naming the pieces
+ * as they print: in every column of the boxes where the cut splits letters,
+ * the piece either side that holds them (`pieceHolding`), so a sign cut in
+ * a grid names each pair a cut divides letters between, and a box whose
+ * lettered board prints apart names that board's piece.
+ * @param {{ itemId: string, cutId: string, letter: string, name: string, columns: { cells: number[][], min: number[],
+ *   max: number[] }[] }[]} crossings each cut through an item's letters, and where its face lies (`outlineColumns`)
+ * @param {object[]} laid the pieces from `layPieces`
+ * @returns {object[]}
+ */
+export function textNotes(crossings, laid) {
+  return crossings.map(({ columns = [], ...fields }) => {
+    const pairs = [];
+    for (const { cells, min, max } of columns) {
+      const [lower, upper] = cells.map((cell) => pieceHolding(laid, cell, min, max));
+      if (lower && upper && lower !== upper && !pairs.some(([a, b]) => a === lower && b === upper)) pairs.push([lower, upper]);
+    }
+    pairs.sort((p, q) => p[0] - q[0] || p[1] - q[1]);
+    const pieces = [...new Set(pairs.flat())].sort((p, q) => p - q);
+    return splitNote('CUT_THROUGH_TEXT', { ...fields, pieces, ...(pairs.length > 1 ? { pairs } : {}) });
+  });
 }
 
 /** A triangle soup (9 numbers per triangle) moved by a column-major 4×4 matrix, as a new array of the same type. */
@@ -2237,7 +2663,12 @@ const NOTE_TEXT = {
     const pct = Math.abs(ratio) * 100;
     return `The pieces add up to ${pct < 0.01 ? 'under 0.01' : pct.toFixed(2)} % ${ratio < 0 ? 'less' : 'more'} than the model – check them in your slicer.`;
   },
-  CUT_THROUGH_TEXT: ({ letter, name, pieces = [] }) => `Cut ${letter} runs through ${quoted(name)} – its letters are split between ${pieces.length > 1 ? `pieces ${listOf(pieces)}` : 'pieces'}.`,
+  CUT_THROUGH_TEXT: ({ letter, name, pieces = [], pairs = [] }) => {
+    const where = pairs.length > 1
+      ? `split where ${listOf(pairs.map(([a, b]) => `piece ${a} meets piece ${b}`))}`
+      : `split between ${pieces.length > 1 ? `pieces ${listOf(pieces)}` : 'pieces'}`;
+    return `Cut ${letter} runs through ${quoted(name)} – its letters are ${where}.`;
+  },
   PART_SPANS_CUT: ({ name, letter }) => `${quoted(name)} prints separately and spans cut ${letter} – glue it on after the pieces.`,
   DOVETAIL_NOT_PLATE: ({ letter, lying = false }) => (lying
     ? `Cut ${letter} goes through a plate that its pieces can't lie flat on, so it uses pins.`
@@ -2265,7 +2696,8 @@ const NOTE_TEXT = {
  * DOWELS_CAPPED `{ placed, dropped }`; LABELS_SKIPPED `{ letters }`;
  * PIECE_TOO_BIG `{ pieceIndex, size, bed }`; SMALL_PIECE `{ pieceIndex, thickness, letters, cutId }`;
  * CUTS_MERGED `{ letters, cutIds }`; SPLIT_CHECK `{ ratio }` (signed, (pieces − model) / model);
- * CUT_THROUGH_TEXT `{ itemId, cutId, letter, name, pieces }`; PART_SPANS_CUT `{ itemId, name, letter }`;
+ * CUT_THROUGH_TEXT `{ itemId, cutId, letter, name, pieces, pairs }` (`pairs` the pieces either side of each stretch of
+ * the cut that splits letters, when there is more than one); PART_SPANS_CUT `{ itemId, name, letter }`;
  * DOVETAIL_NOT_PLATE `{ letter, lying }` (`lying`: through a plate, but a piece beside it can't lie flat on it);
  * ORIENT_FALLBACK `{ pieceIndex, mode, lies }`; PIECE_UNSTABLE `{ pieceIndex }`; PART_TOO_BIG `{ name, size, bed, pins }`
  * (a part printed separately, or with `pins` a single pin, too big for the bed); SPLIT_NOT_NEEDED `{ yaw, down }` (down

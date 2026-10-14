@@ -758,6 +758,39 @@ try {
         return n;
       });
 
+    /** A point on a cut's handle in the view: a pixel in the cuts' violet where the pointer gets the grab cursor, or null. */
+    const findHandle = async () => {
+      const violet = await page.evaluate(() => {
+        const c = document.querySelector('#stage canvas');
+        const rect = c.getBoundingClientRect();
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        const found = [];
+        for (let y = 0; y < c.height; y += 2) {
+          for (let x = 0; x < c.width; x += 2) {
+            const i = (y * c.width + x) * 4;
+            // the handle is unlit: exactly the cut colour, or its lighter hover colour
+            const off = Math.min(Math.abs(d[i] - 139) + Math.abs(d[i + 1] - 92) + Math.abs(d[i + 2] - 246), Math.abs(d[i] - 167) + Math.abs(d[i + 1] - 139) + Math.abs(d[i + 2] - 250));
+            if (off < 40) found.push([rect.left + (x * rect.width) / c.width, rect.top + (y * rect.height) / c.height, off]);
+          }
+        }
+        return found.sort((p, q) => p[2] - q[2]);
+      });
+      const tried = [];
+      for (const [x, y] of violet) {
+        if (tried.some(([a, b]) => Math.hypot(a - x, b - y) < 12)) continue;
+        tried.push([x, y]);
+        if (tried.length > 150) break;
+        await page.mouse.move(x, y);
+        await page.waitForTimeout(40);
+        if ((await page.evaluate(() => document.querySelector('#stage canvas').style.cursor)) === 'grab') return [x, y];
+      }
+      return null;
+    };
     /** The split card's notes, one line. */
     const splitNotes = async () => (await page.locator('#splitNotes li').allInnerTexts()).join(' / ');
     /** Wait for the cuts to be measured again: that waits for the edits to pause (a second for text). */
@@ -1091,7 +1124,81 @@ try {
     await idle();
     const signPieces = await page.locator('#pieceList li').count();
     check(offer === `Split into ${signPieces} pieces` && signPieces === 3, 'a thin sign is offered the pieces Fit makes of it lying flat', `offered "${offer}", Fit made ${signPieces}`);
+    // dragging a dovetail cut's handle: the readout gives the pieces either side as long as they come out, tabs and all,
+    // so a side turns red only once its number is more than the bed takes
+    const grip = await findHandle();
+    const readout = { text: '', sides: [] };
+    if (grip) {
+      await page.mouse.move(...grip);
+      await page.mouse.down();
+      for (let i = 1; i <= 80 && !readout.sides.some((s) => s.red); i++) {
+        await page.mouse.move(grip[0] - 4 * i, grip[1]);
+        await page.waitForTimeout(30);
+        const now = await page.evaluate(() => ({
+          text: document.querySelector('#cutReadout').textContent,
+          sides: [...document.querySelectorAll('#cutReadout span')].map((s) => ({ length: Number(s.textContent), red: s.classList.contains('err') })),
+        }));
+        Object.assign(readout, now);
+      }
+      await page.mouse.up();
+      await idle();
+      await page.waitForFunction(() => !document.querySelector('#pieceList').classList.contains('stale') && !document.querySelector('#pieceList li.predicted'), null, { timeout: 60000 });
+      await idle();
+    }
+    const red = readout.sides.filter((s) => s.red);
+    check(red.length > 0 && red.every((s) => s.length > 210), 'dragging a dovetail cut, the readout turns a side red only when it reads more than the 210 mm the bed takes', readout.text || 'no handle found');
+    const dropped = (await page.locator('#pieceList li').allInnerTexts()).map((r) => Number(r.match(/· ([\d.]+) ×/)?.[1]));
+    // its tabs are those measured before the drag, which the pieces may re-plan a tenth or two longer or shorter
+    // (a readout without them is 12 mm short for each tab)
+    check(
+      readout.sides.length === 2 && readout.sides.every((s) => dropped.some((v) => Math.abs(v - s.length) < 0.5)),
+      'and its two lengths are those of the pieces either side once the cut is dropped, tabs counted',
+      `${readout.text} | pieces ${dropped.join(' / ')} mm`,
+    );
+    // Joints: Pins on a 5 mm sign: no pin fits through it, and once the fit test finds that the cut rows say glue only
     await page.uncheck('#resultToggle');
+    await page.click('#splitSettings label:has(input[data-split="joint"][value="dowels"])');
+    await measured();
+    const noPinTest = await fitTest('sign-fit-test.stl');
+    const signMeta = await page.locator('#cutList .meta').allInnerTexts();
+    check(
+      /only glue/.test(noPinTest.status) && signMeta.length === signPieces - 1 && signMeta.every((m) => /glue only/.test(m) && !/pins/.test(m)),
+      'Pins on a sign no pin fits: after the fit test finds nothing to try, every cut row says glue only, not pins',
+      `${signMeta.join(' / ')} | ${noPinTest.status}`,
+    );
+    await page.click('#splitSettings label:has(input[data-split="joint"][value="auto"])');
+    await idle();
+    await page.click('#splitClearBtn');
+    await idle();
+
+    // a tube whose wall no pin fits: once the split is worked out, for the pieces or the download, its cut row says glue only
+    const tube = Manifold.cylinder(40, 30, 30, 64, true).subtract(Manifold.cylinder(42, 28, 28, 64, true));
+    const tubeFile = writeFixture('tube.stl', soupOf(tube));
+    tube.delete();
+    await openStl(tubeFile, 'tube');
+    await page.click('#addCutBtn');
+    await measured();
+    await page.check('#resultToggle');
+    await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
+    await idle();
+    const tubeMeta = await page.locator('#cutList .meta').innerText();
+    check(
+      /in 2 parts · glue only/.test(tubeMeta) && /No pin fits on 2 of 2 faces at cut A/.test(await splitNotes()),
+      'a cut through a tube whose wall no pin fits says glue only in its row once the pieces are worked out, as its note does',
+      `${tubeMeta} | ${await splitNotes()}`,
+    );
+    await page.uncheck('#resultToggle');
+    await page.fill('#cutList input[data-cut-at]', '5');
+    await page.dispatchEvent('#cutList input[data-cut-at]', 'change');
+    await measured();
+    await page.waitForTimeout(1000); // Chromium lets a page start about ten downloads a second
+    const tubeZip = await downloadZip();
+    const tubeMetaAfter = await page.locator('#cutList .meta').innerText();
+    check(
+      /glue only/.test(tubeMetaAfter) && !Object.keys(tubeZip.entries).some((n) => /pins/.test(n)),
+      'and after the cut is moved, the download of pieces with no pins file says so in the row too',
+      `${tubeMetaAfter} | ${Object.keys(tubeZip.entries).join(', ')}`,
+    );
     await page.click('#splitClearBtn');
     await idle();
 

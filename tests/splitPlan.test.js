@@ -488,6 +488,18 @@ describe('planCost', () => {
       expect(chooseOffsets(samples, samples.map(() => 0), { ...limits, grow: samples.map(() => null) }).offsets).toEqual([0]);
     });
 
+    it('keeps a round shell’s cut in the middle: the ring shrinking towards the ends is no reason to move it there', () => {
+      // a hollow ball 230 mm across with a 3 mm wall: every slice has the same area, the ring's length falls towards
+      // the ends, and no ring takes two pins
+      const R = 115;
+      const samples = planSamples(-R, R, 1);
+      const profile = samples.map((t) => ({ t, area: 2 * Math.PI * R * 3, perimeter: 4 * Math.PI * Math.sqrt(R * R - t * t), islands: 1, noRoom: 1, letters: false }));
+      const reach = sizesFor(5).reach;
+      const S = maxCellLength([115, 115, 115], 0, U);
+      const r = chooseOffsets(samples, planCost(profile), { lo: -R, hi: R, k: 1, S, minEnd: reach + 1, minMid: 2 * reach + 1 });
+      expect(r.offsets).toEqual([0]);
+    });
+
     it('relaxes the minimums when they cannot be met, and gives up when pieces cannot fit', () => {
       const samples = planSamples(-20, 20, 1);
       const costs = samples.map(() => 0);
@@ -653,6 +665,24 @@ describe('cells', () => {
         return { samples, costs: samples.map(() => 0), tabs: samples.map(() => null) };
       } });
     expect(lPlan.pieces.map((p) => p.cell)).toEqual([[0, 0, 0], [1, 0, 0], [0, 0, 1]]);
+  });
+
+  it('keeps a grid whose even pieces fit, when each axis on its own would take its room the same way', () => {
+    // a 230 mm cube on the 210 × 210 × 249 bed: eighths of 115 fit. Cutting 100 mm out is cheap on every axis, and
+    // each axis, planned against the others' even pieces, could stand its 215 mm piece upright: together they make a
+    // corner piece that fits no way
+    const E = [230, 230, 230];
+    const bounds = { min: [-115, -115, -115], max: [115, 115, 115] };
+    const profileOf = (a, k) => {
+      const samples = planSamples(-115, 115, k);
+      return { samples, costs: samples.map((t) => (Math.abs(t) < 100 ? 5 : 0)), tabs: samples.map(() => null) };
+    };
+    const reach = sizesFor(5).reach;
+    const plan = planGrid([1, 1, 1], { E, U, bounds, minEnd: reach + 1, minMid: 2 * reach + 1, profileOf });
+    // held to pieces that fit together, no cut can reach the cheap ends, and the even ones win
+    expect(plan.offsets).toEqual([[0], [0], [0]]);
+    expect(plan.pieces).toHaveLength(8);
+    expect(plan.pieces.every((p) => p.fits)).toBe(true);
   });
 
   it('looks for a plate staying flat half way along each neighbour and most of the way to its end', () => {

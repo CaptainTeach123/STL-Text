@@ -15,7 +15,7 @@ import { strToU8, zipSync } from 'three/examples/jsm/libs/fflate.module.js';
 import {
   CUT_TOLERANCE, FILAMENT, SPLIT_KEEP_TRIANGLES, SplitError, TO_PLANE, applyToSoup, assemblySteps, axisCuts, cellOfPoint, chooseOrientation,
   cutPlane, fitsBed, glueFileName, gridCandidates, howToGlueText, letterFor, normaliseSplit, partFileName, pieceFileName, pinsFileName,
-  planCost, planGrid, planSamples, plateAxis, safeFileName, sizesFor, soupCells, splitActive, splitNote, statsWithSoup, usableBed, zipFileName,
+  planCost, planGrid, planSamples, plateAxis, safeFileName, slabAxis, sizesFor, soupCells, splitActive, splitNote, statsWithSoup, usableBed, zipFileName,
   cellSupport, flatProbes,
 } from './split.js';
 import {
@@ -2039,6 +2039,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   }
 
   function resultDisplay({ items, baseVersion, printing, split = null, bed = null }, progress) {
+    unsplit(split);
     const final = finalFor(items, baseVersion, printing, progress);
     const parted = splitFor(final, items, { split, bed, printing }, progress);
     if (parted?.cut) return splitResult(final, parted, progress);
@@ -2079,6 +2080,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   }
 
   function exportStl({ items, baseVersion, printing, name = 'model', split = null, bed = null, printer = null, archive = 'zip' }, progress) {
+    unsplit(split);
     const final = finalFor(items, baseVersion, printing, progress);
     const parted = splitFor(final, items, { split, bed, printing }, progress);
     if (parted?.cut) return splitExport(final, parted, { name, printer, archive }, progress);
@@ -2130,8 +2132,12 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     if (sketch) releaseFrame(sketch);
   };
 
-  /** Lets go of a split's solids once the model is asked for whole again (its cuts removed, or all of them missing). */
+  /**
+   * Lets go of a split's solids once the model is asked for whole again (its cuts removed, or all of them missing),
+   * and of the measure's copy of the model, made while the cuts were edited.
+   */
   function releaseSplit(final) {
+    if (sketch) releaseFrame(sketch);
     const state = final.split;
     if (!state) return;
     releaseFrame(final);
@@ -2139,6 +2145,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     disposeSplitStage(state.drill);
     state.cut = null;
     state.drill = null;
+  }
+
+  /**
+   * With no cuts asked for, what a split kept goes before the final result is built: a copy of a dense model weighs as
+   * much as the model, and the booleans of the model with the text need the room.
+   */
+  function unsplit(split) {
+    if (splitActive(split)) return;
+    if (sketch) releaseFrame(sketch);
+    if (result) releaseSplit(result);
   }
 
   /** What a split keeps on its final result: the frame copy, the plate test, and the cut and drill stages. */
@@ -2162,6 +2178,12 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   function plateOf(final) {
     const b = splitBounds(final);
     return plateAxis([0, 1, 2].map((a) => b.max[a] - b.min[a]));
+  }
+
+  /** The thickness axis when the whole model is a slab such as a plaque (its pieces lie flat where they can), else null. */
+  function slabOf(final) {
+    const b = splitBounds(final);
+    return slabAxis([0, 1, 2].map((a) => b.max[a] - b.min[a]));
   }
 
   /** The plate test of every cut (slices only), kept while the cuts and the joint settings stay the same. */
@@ -2282,7 +2304,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const plan = platesFor(final, cuts, spec);
     const cut = cutStage(final, items, cuts, plan, progress);
     progress?.('Choosing how each piece lies…');
-    const lying = cut.pieces.map((p) => chooseOrientation(p.stats, U, spec.orient, { pieceIndex: p.index }));
+    const slab = slabOf(final);
+    const lying = cut.pieces.map((p) => chooseOrientation(p.stats, U, spec.orient, { pieceIndex: p.index, flat: slab }));
     const drill = drillStage(final, cut, { cuts, spec, joints: plan.joints, ups: lying.map((o) => o.up), nozzle }, progress);
     return summarise({ final, spec, cuts, U, given, plan, cut, lying, drill });
   }
@@ -2751,7 +2774,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   /**
    * Fit to my printer: see `planSplitRequest`. Every piece is judged the
    * way it will really print: a thin plate is planned lying flat and never
-   * cut through its thickness, a cut through a flat plate that takes
+   * cut through its thickness (a thicker slab, such as a plaque, lying flat
+   * when some grid allows it), a cut through a flat plate that takes
    * dovetail tabs makes the pieces either side lie flat and reach a tab's
    * length past it, a box that holds none of the model is no piece, and a
    * piece must lie on one of its cut faces or on something flat of the
@@ -2773,10 +2797,14 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     if (whole.fits) {
       return { cuts: [], counts: [0, 0, 0], pieces: [{ size: E, fits: true }], notes: [splitNote('SPLIT_NOT_NEEDED', { yaw: whole.yaw, down: whole.down })] };
     }
+    // a slab too thick for a plate (a 15 mm plaque) is best printed lying flat too: stood on its edge it is a tall
+    // wall with its face upright. Its pieces are planned lying flat first, and only stand when no grid of flat ones works
+    const slab = slabAxis(E);
+    const ways = slab === null ? [flat] : [slab, null];
     // tabs only make pieces longer, so the grids whose plain even cells fit are the only ones worth a profile
-    const candidates = gridCandidates(E, U, { flat }).filter((c) => c.pieces > 1);
+    const candidatesOf = new Map(ways.map((lying) => [lying, gridCandidates(E, U, { flat: lying }).filter((c) => c.pieces > 1)]));
     const tooMany = { cuts: [], counts: null, pieces: [], notes: [splitNote('PLAN_TOO_MANY')] };
-    if (!candidates.length) return tooMany;
+    if (![...candidatesOf.values()].some((list) => list.length)) return tooMany;
     // the pieces at either end must take a hole and its wall, and middle ones a hole from each side
     const probe = sizesFor(spec.diameter || 5, spec.clearance, nozzle, spec.depth);
     const pins = sizesFor(5, spec.clearance, nozzle);
@@ -2801,18 +2829,47 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         const apart = grid.length > 1 ? grid[1] - grid[0] : 0;
         const samples = apart > 2 && text.length ? withGaps(grid, (t) => lettersAt(letters, items, a, t, temps)) : grid;
         progressOf.total += samples.length;
-        const profile = samples.map((t) => {
-          progress?.('Planning cuts…', { done: ++progressOf.done, total: progressOf.total });
-          const at = `${a}|${t.toFixed(6)}`;
-          if (!slices.has(at)) {
-            const face = frameOf(final, a).slice(t);
-            const plate = tabsOn ? tabsAcross(face, { axis: a, at: t }) !== null : false;
-            const cut = lettersAt(letters, items, a, t, temps);
-            const near = !cut && apart > 2 ? [-2, -1, 1, 2].some((d) => lettersAt(letters, items, a, t + d, temps)) : undefined;
-            slices.set(at, { t, ...sliceStats(face, pins), letters: cut, nearLetters: near, plate });
+        // whether a face has room for pins is judged where the model runs a hole's reach either side too: the samples
+        // nearest there are looked at, so each is sliced once, and kept only while a sample within reach may need it
+        const kept = new Map();
+        const faceAt = (x) => {
+          if (!kept.has(x)) kept.set(x, frameOf(final, a).slice(x));
+          return kept.get(x);
+        };
+        const nearest = (x) => {
+          if (x < solidBox.min[a] || x > solidBox.max[a]) return null; // past the model's end: nothing there
+          let lo = 0;
+          let hi = samples.length - 1;
+          while (hi - lo > 1) {
+            const mid = (lo + hi) >> 1;
+            if (samples[mid] <= x) lo = mid;
+            else hi = mid;
           }
-          return slices.get(at);
-        });
+          return Math.abs(samples[hi] - x) < Math.abs(samples[lo] - x) ? samples[hi] : samples[lo];
+        };
+        const profile = [];
+        try {
+          for (const t of samples) {
+            progress?.('Planning cuts…', { done: ++progressOf.done, total: progressOf.total });
+            const at = `${a}|${t.toFixed(6)}`;
+            if (!slices.has(at)) {
+              const face = faceAt(t);
+              const beside = [-pins.reach, pins.reach].map((d) => nearest(t + d)).map((x) => (x === null ? null : faceAt(x)));
+              const plate = tabsOn ? tabsAcross(face, { axis: a, at: t }) !== null : false;
+              const cut = lettersAt(letters, items, a, t, temps);
+              const near = !cut && apart > 2 ? [-2, -1, 1, 2].some((d) => lettersAt(letters, items, a, t + d, temps)) : undefined;
+              slices.set(at, { t, ...sliceStats(face, pins, beside), letters: cut, nearLetters: near, plate });
+            }
+            profile.push(slices.get(at));
+            for (const [x, face] of kept) {
+              if (x >= t - pins.reach - Math.max(apart, 1)) continue;
+              face.delete();
+              kept.delete(x);
+            }
+          }
+        } finally {
+          for (const face of kept.values()) face.delete();
+        }
         // a plate's tabs need it to stay flat out to about an even piece's length either side
         const reach = (bounds.max[a] - bounds.min[a]) / (k + 1);
         const snap = (x) => samples.reduce((best, t) => (Math.abs(t - x) < Math.abs(best - x) ? t : best), samples[0]);
@@ -2849,19 +2906,22 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       };
       const centre = bounds.min.map((v, a) => (v + bounds.max[a]) / 2);
       for (const stable of [true, false]) {
-        for (const group of new Set(candidates.map((c) => c.pieces))) {
-          let best = null;
-          for (const { k } of candidates.filter((c) => c.pieces === group)) {
-            const plan = planGrid(k, { E, U, bounds, flat, minEnd, minMid, profileOf, support, stable });
-            // an L leaves a box empty: fewer pieces win, then the cost; candidates come fewest axes first, then fewest Z
-            // cuts, so an equal cost keeps the earlier one
-            if (plan && (!best || plan.pieces.length < best.pieces.length || (plan.pieces.length === best.pieces.length && plan.cost < best.cost - 1e-9))) best = plan;
+        for (const lying of ways) {
+          const candidates = candidatesOf.get(lying);
+          for (const group of new Set(candidates.map((c) => c.pieces))) {
+            let best = null;
+            for (const { k } of candidates.filter((c) => c.pieces === group)) {
+              const plan = planGrid(k, { E, U, bounds, flat: lying, minEnd, minMid, profileOf, support, stable });
+              // an L leaves a box empty: fewer pieces win, then the cost; candidates come fewest axes first, then fewest
+              // Z cuts, so an equal cost keeps the earlier one
+              if (plan && (!best || plan.pieces.length < best.pieces.length || (plan.pieces.length === best.pieces.length && plan.cost < best.cost - 1e-9))) best = plan;
+            }
+            if (!best) continue;
+            const cuts = best.offsets.flatMap((list, a) =>
+              list.map((t) => ({ position: centre.map((c, i) => (i === a ? t : c)), normal: [0, 1, 2].map((i) => (i === a ? 1 : 0)) })),
+            );
+            return { cuts, counts: best.k, pieces: best.pieces.map(({ size, fits }) => ({ size, fits })), notes: [] };
           }
-          if (!best) continue;
-          const cuts = best.offsets.flatMap((list, a) =>
-            list.map((t) => ({ position: centre.map((c, i) => (i === a ? t : c)), normal: [0, 1, 2].map((i) => (i === a ? 1 : 0)) })),
-          );
-          return { cuts, counts: best.k, pieces: best.pieces.map(({ size, fits }) => ({ size, fits })), notes: [] };
         }
       }
       return tooMany;
@@ -2916,15 +2976,29 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * A slice of the model for the planner: its area, perimeter and islands
    * (of 1 mm² or more), and the share of its area on islands with no room
    * for two pins of the probe's size (smaller than 50 mm², or too narrow
-   * once inset by ρ). Deletes the slice.
+   * once inset by ρ where the model also runs a hole's reach either side
+   * of the face: `beside` holds the slices there, null past the model's
+   * end). Without that a slanted wall looks roomy: near the end of a round
+   * shell the ring is wide, but a hole square to it breaks out a few mm in.
+   * Borrows the slices.
    */
-  function sliceStats(face, pins) {
+  function sliceStats(face, pins, beside = null) {
+    const temps = scope();
     try {
       if (face.isEmpty()) return { area: 0, perimeter: 0, islands: 0, noRoom: 0 };
       const area = face.area();
       const perimeter = perimeterOf(polygonsOf(face));
       let islands = 0;
       let bare = 0;
+      const ends = (beside ?? []).includes(null); // a hole's reach from the model's end: no room anywhere
+      let deep = null; // the face where the model runs on either side: made once, when an island is big enough to ask
+      const deepFace = () => {
+        if (!deep) {
+          deep = face;
+          for (const s of beside ?? []) deep = temps.add(deep.intersect(s));
+        }
+        return deep;
+      };
       const list = face.decompose();
       try {
         for (const island of list) {
@@ -2932,14 +3006,13 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           if (a < 1) continue;
           islands++;
           let room = false;
-          if (a >= 50) {
+          if (a >= 50 && !ends) {
+            const core = temps.add(island.intersect(deepFace()));
             // a dense outline is thinned a little first: insetting thousands of corners takes 50 times longer for
             // the same answer, and this is only a cost for the planner
-            const thin = island.simplify(0.05);
-            const inset = thin.offset(-pins.rho, 'Round', 2, 16);
+            const thin = temps.add(core.simplify(0.05));
+            const inset = temps.add(thin.offset(-pins.rho, 'Round', 2, 16));
             room = !inset.isEmpty() && spreadOf(polygonsOf(inset)) >= pins.sMin;
-            inset.delete();
-            thin.delete();
           }
           if (!room) bare += a;
         }
@@ -2948,7 +3021,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       }
       return { area, perimeter, islands, noRoom: area > 0 ? Math.min(1, bare / area) : 0 };
     } finally {
-      face.delete();
+      temps.dispose();
     }
   }
 

@@ -301,26 +301,30 @@ function holeProfile(rad, tear) {
   return drop;
 }
 
-/** A slab of the hole's profile from z0 to z0 + h. */
-function holePrism(rad, tear, z0, h) {
-  const p = holeProfile(rad, tear);
-  const m = extrudeSection(p, h);
-  const moved = m.translate([0, 0, z0]);
-  p.delete();
-  m.delete();
-  return moved;
-}
-
-/** The half-hole of these sizes in its own frame, kept: never delete it, transform or copy it. */
+/**
+ * The half-hole of these sizes in its own frame, kept: never delete it, transform or copy it. It is two convex hulls of
+ * the profile's own corners, the bore with its cone end and the chamfered mouth, which meet on the bore's corners at
+ * z = ch: built from thin slabs, it had corners a few millionths of a millimetre apart that an STL's float32 merges
+ * into zero-area triangles.
+ */
 function cachedHalfHole(R, h, ch, tear) {
   return HOLES.get([R, h, ch, tear].join('|'), () => {
     const { Manifold } = manifold();
     const t = scope();
     try {
-      const bore = t.add(holePrism(R, tear, -1, h + 1));
-      const tip = t.add(Manifold.hull([t.add(holePrism(R, tear, h - 0.01, 0.01)), [0, 0, h + R]]));
-      const mouth = t.add(Manifold.hull([t.add(holePrism(R + ch, tear, -1, 1)), t.add(holePrism(R, tear, ch, 0.01))]));
-      return Manifold.union([bore, tip, mouth]);
+      const ring = (rad) => {
+        const p = holeProfile(rad, tear);
+        try {
+          return polygonsOf(p).flat();
+        } finally {
+          p.delete();
+        }
+      };
+      const at = (pts, z) => pts.map(([x, y]) => [x, y, z]);
+      const bore = ring(R);
+      const tipped = t.add(Manifold.hull([...at(bore, -1), ...at(bore, h), [0, 0, h + R]]));
+      const mouth = t.add(Manifold.hull([...at(ring(R + ch), -1), ...at(ring(R + ch), 0), ...at(bore, ch)]));
+      return Manifold.union([tipped, mouth]);
     } finally {
       t.dispose();
     }
@@ -829,12 +833,15 @@ function plateBand(polygons, kl, kw, l0, l1) {
  * piece's first. A tab is extruded right through the model, so it may only
  * go where it and 2 mm round it hold nothing but its own plate: inside the
  * plate at mid-thickness, clear of anything standing 0.3 mm or more proud
- * of the plate above or below within reach of the cut (letters, a boss,
- * another plate at another height: a tab there would carry a slice of it
- * into the other piece), head/2 + 3 from a crossing cut's trace and as much
- * again as a crossing dovetail cut's tabs reach (or two tabs close off a
- * corner of a piece). A tab whose even spot is taken moves along the plate
- * to the nearest free one; the cut must be N + 2 from parallel ones.
+ * of the plate above or below within reach of the cut (letters, a boss, a
+ * plate at another height: a tab there would carry a slice of it into the
+ * other piece), head/2 + 3 from a crossing cut's trace and as much again as
+ * a crossing dovetail cut's tabs reach (or two tabs close off a corner of a
+ * piece). Another plate the same cut runs through (the other leg of a U)
+ * may lie in a tab's way if the tab lies wholly inside it too: it makes the
+ * same tab there, and serves that plate as its own. A tab whose even spot
+ * is taken moves along the plate to the nearest free one; the cut must be
+ * N + 2 from parallel ones.
  * @param {Manifold} solid (borrowed)
  * @param {{ id, letter, axis, at }[]} cuts every cut, normalised
  * @param {{ ids: string[], w: number|Object<string, number> }} dove the dovetail cuts and the plates' thickness axis
@@ -844,7 +851,7 @@ function plateBand(polygons, kl, kw, l0, l1) {
  *   in world mm; `w` each seam's plate thickness axis (the top-level one when they all share it)
  */
 export function dovetailTabs(solid, cuts, dove, { frame = null } = {}) {
-  const { Manifold } = manifold();
+  const { CrossSection, Manifold } = manifold();
   const frames = planeFrames(solid, frame);
   const outlines = new Map();
   const box = boxOf(solid);
@@ -896,47 +903,63 @@ export function dovetailTabs(solid, cuts, dove, { frame = null } = {}) {
         return near;
       };
       const tabs = [];
+      // the model near the cut between a and b along w, seen along w (null when there is none)
+      const seen = ([a, b]) => {
+        const sz = box.max.map((v, k) => v - box.min[k] + 4);
+        sz[w] = b - a;
+        const at = box.min.map((v, k) => (v + box.max[k]) / 2);
+        at[w] = (a + b) / 2;
+        const there = t.add(nearCut().intersect(t.add(t.add(Manifold.cube(sz, true)).translate(at))));
+        return there.isEmpty() ? null : t.add(t.add(there.transform(TO_PLANE[w])).project());
+      };
       for (const island of islands) {
         const { size, l0, l1 } = island;
         if (!size || parallel.some((c) => Math.abs(c.at - cut.at) < size.N + 2)) continue;
         const { N, H, E, count: m, span } = size;
         const [pw0, pw1] = island.band;
         const outline = outlineAt(w, (pw0 + pw1) / 2);
-        // anything standing proud of this island's plate near the cut, seen along w
-        const size2 = box.max.map((v, k) => v - box.min[k] + 4);
-        const centre = box.min.map((v, k) => (v + box.max[k]) / 2);
-        const beyond = [[box.min[w] - 2, pw0 - PROUD], [pw1 + PROUD, box.max[w] + 2]].filter(([a, b]) => b > box.min[w] && a < box.max[w]).map(([a, b]) => {
-          const sz = [...size2];
-          sz[w] = b - a;
-          const at = [...centre];
-          at[w] = (a + b) / 2;
-          return t.add(t.add(Manifold.cube(sz, true)).translate(at));
-        });
-        let proud = null;
-        if (beyond.length) {
-          const above = t.add(nearCut().intersect(t.add(Manifold.union(beyond))));
-          if (!above.isEmpty()) proud = t.add(t.add(above.transform(TO_PLANE[w])).project());
-        }
+        // the other plates this cut runs through at other heights (the legs of a U, the shelves of a rack): a tab is
+        // extruded through them too, and is welcome there as long as it lies wholly inside one or misses it
+        const others = islands.filter((o) => o !== island && (o.band[1] < pw0 || o.band[0] > pw1)).map((o) => ({
+          outline: outlineAt(w, (o.band[0] + o.band[1]) / 2),
+          layer: seen([o.band[0] - PROUD, o.band[1] + PROUD]),
+          gap: [o.band[0] - PROUD, o.band[1] + PROUD],
+        }));
+        // anything else standing proud of this island's plate near the cut, seen along w
+        let stretches = [[box.min[w] - 2, pw0 - PROUD], [pw1 + PROUD, box.max[w] + 2]];
+        for (const { gap: [g0, g1] } of others) stretches = stretches.flatMap(([a, b]) => [[a, Math.min(b, g0)], [Math.max(a, g1), b]]);
+        const beyond = stretches.filter(([a, b]) => b > a && b > box.min[w] && a < box.max[w]).map(seen).filter(Boolean);
+        const proud = beyond.length > 1 ? t.add(CrossSection.union(beyond)) : beyond[0] ?? null;
         const lo = l0 + H / 2 + 3;
         const placed = [];
+        const near = (p, l) => Math.abs(p.l - l) < (p.H + H) / 2 + 2 * TAB_INSIDE;
+        const inside = (tab, u) => u.add(u.add(tabSection(tab, cut.at, s, w, TAB_INSIDE, 'Round')).subtract(outline)).area() < 0.01;
         const free = (tab) => {
           if (crossing.some((c) => Math.abs(c.at - tab.l) < H / 2 + 3 + c.keep)) return false;
-          if (placed.some((p) => Math.abs(p.l - tab.l) < H + 2 * TAB_INSIDE)) return false;
+          // the tabs of this cut's other plates run through this one too
+          if ([...tabs, ...placed].some((p) => near(p, tab.l))) return false;
           const u = scope();
           try {
             const grown = u.add(tabSection(tab, cut.at, s, w, TAB_INSIDE, 'Round'));
             if (u.add(grown.subtract(outline)).area() >= 0.01) return false;
-            if (!proud) return true;
             // only the far side of the cut changes hands (and a millimetre more, for the rounded corners at the root)
             const [s0, s1] = tab.dir > 0 ? [cut.at - 1, cut.at + E + TAB_INSIDE + 1] : [cut.at - E - TAB_INSIDE - 1, cut.at + 1];
-            const far = u.add(planeRect(s0, s1, tab.l - H, tab.l + H, s, w));
-            return u.add(u.add(grown.intersect(far)).intersect(proud)).area() < 0.01;
+            const far = u.add(u.add(planeRect(s0, s1, tab.l - H, tab.l + H, s, w)).intersect(grown));
+            if (proud && u.add(far.intersect(proud)).area() >= 0.01) return false;
+            return others.every((o) => !o.layer || u.add(far.intersect(o.layer)).area() < 0.01 || u.add(grown.subtract(o.outline)).area() < 0.01);
           } finally {
             u.dispose();
           }
         };
         for (let j = 0; j < m; j++) {
           const ideal = lo + ((j + 0.5) * span) / m;
+          // a tab of another plate of this cut, through this one already and inside it, takes the place of this one
+          const served = scope();
+          try {
+            if (tabs.some((p) => near(p, ideal) && inside(p, served))) continue;
+          } finally {
+            served.dispose();
+          }
           const dir = j % 2 ? -1 : 1;
           // the even spot when it is free, pointing the other way if need be, else the nearest free spot along the
           // plate, a millimetre at a time

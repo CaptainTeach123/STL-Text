@@ -8,7 +8,7 @@ import { createItem, createPart } from '../src/document.js';
 import { manifold } from '../src/manifold.js';
 import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
-import { SPLIT_DEFAULTS, cellSizes, isSymmetric, sizesFor } from '../src/split.js';
+import { SPLIT_DEFAULTS, TO_PLANE, cellSizes, cellSupport, fitPieces, isSymmetric, orientationStats, sizesFor } from '../src/split.js';
 import { clearSplitCaches, dowelHole, halfHole, pinAt, pinSolid } from '../src/splitGeometry.js';
 import { setup, soupOf as soupGeometry } from './helpers.js';
 
@@ -168,11 +168,11 @@ describe('cutting a model into pieces', () => {
       expect(low.area()).toBeCloseTo(1139.39, 1);
       expect(high.area()).toBeCloseTo(1155.734, 2);
       expect(high.numContour()).toBe(3);
-      expect(m.volume()).toBeCloseTo(72000 - 2 * 209.945, 0);
+      expect(m.volume()).toBeCloseTo(72000 - 2 * 209.901, 0);
     }
     // the volume each half-hole takes out of the solid, from the shape itself
     const above = cube([100, 100, 100], [0, 0, 50]);
-    expect(overlap(own(halfHole({ R: 2.65, h: 8.5, ch: 0.5 })), above)).toBeCloseTo(209.945, 2);
+    expect(overlap(own(halfHole({ R: 2.65, h: 8.5, ch: 0.5 })), above)).toBeCloseTo(209.901, 2);
   });
 
   it('auto lays bar halves flat, picks Ø6 pins from the 20 mm thickness, and gives the horizontal holes a teardrop roof', async () => {
@@ -187,11 +187,33 @@ describe('cutting a model into pieces', () => {
     expect(seam).toMatchObject({ letter: 'A', axis: 0, at: 0, pieces: [1, 2], joint: 'dowels', labels: null });
     expect(seam.dowels).toHaveLength(2);
     for (const d of seam.dowels) expect(d).toMatchObject({ d: 6, depth: 9.5, tear: [true, true], cell: [0.5, 0, 0] });
-    // a teardrop hole takes 372.735 mm³ from each side, a round one would take 348.232
-    for (const f of piecesOf(ex)) expect(volumeOfStl(f.stl)).toBeCloseTo(120000 - 2 * 372.735, 0);
+    // a teardrop hole takes 372.679 mm³ from each side, a round one would take 348.180
+    for (const f of piecesOf(ex)) expect(volumeOfStl(f.stl)).toBeCloseTo(120000 - 2 * 372.679, 0);
     // the pins fit one way only: turned half round, the face would not match
     expect(isSymmetric(seam.dowels.map((d) => [d.centre[1], d.centre[2]]), [0, 0], 3)).toBe(false);
     expect(noteOf(ex, 'SPLIT').text).toBe('Cut into 2 pieces with 2 pins Ø6 × 19 mm.');
+  });
+
+  it('pieces with Ø8 holes are saved with no zero-area triangles, every edge met once each way', async () => {
+    // a 500 mm tower in three: Auto takes Ø8 pins, and the pieces stand on their cut faces with round holes
+    await load(cube([60, 60, 500], [0, 0, 250]), 'tower');
+    const ex = await exportSplit(S({ cuts: [cutAt(2, 500 / 3, 'c1'), cutAt(2, 1000 / 3, 'c2')], labels: false }), { name: 'tower' });
+    expect(new Set(dowelsOf(ex).map((d) => d.d))).toEqual(new Set([8]));
+    for (const f of piecesOf(ex)) {
+      // read as a slicer reads it: float32 corners, matched exactly
+      const p = parseSTL(f.stl).attributes.position.array;
+      const key = (i) => `${p[i]},${p[i + 1]},${p[i + 2]}`;
+      const edges = new Map();
+      let degenerate = 0;
+      for (let t = 0; t < p.length; t += 9) {
+        const k = [key(t), key(t + 3), key(t + 6)];
+        if (k[0] === k[1] || k[1] === k[2] || k[0] === k[2]) degenerate++;
+        for (let i = 0; i < 3; i++) edges.set(`${k[i]}|${k[(i + 1) % 3]}`, (edges.get(`${k[i]}|${k[(i + 1) % 3]}`) ?? 0) + 1);
+      }
+      let open = 0;
+      for (const [e, n] of edges) if (n !== 1 || edges.get(e.split('|').reverse().join('|')) !== 1) open++;
+      expect({ degenerate, open }, f.file).toEqual({ degenerate: 0, open: 0 });
+    }
   });
 
   it('pins fit their holes with the clearance at any turn, and the pieces never overlap', async () => {
@@ -553,7 +575,7 @@ describe('checking and planning cuts', () => {
     const solid = own(solidOfStl(whole.stl));
     const halves = [-200, 200].map((x) => own(solid.intersect(cube([400, 400, 400], [x, 0, 0]))));
     const holes = holesOf(ex).reduce((s, x) => s + overlap(x.m, halves[x.side]), 0);
-    expect(holes).toBeCloseTo(4 * 372.735, 1);
+    expect(holes).toBeCloseTo(4 * 372.679, 1);
     const pieces = piecesOf(ex).reduce((s, f) => s + volumeOfStl(f.stl), 0);
     expect(pieces + holes).toBeCloseTo(solid.volume(), 0);
   });
@@ -692,6 +714,60 @@ describe('planning pieces that really print', () => {
     expect(r.notes.filter((n) => n.code === 'PIECE_UNSTABLE').map((n) => n.pieceIndex)).toEqual([1, 2, 3, 4]);
   });
 
+  it('a piece rests on a side of the model only where it could lie on the bed: a ball\'s tip is no flat end', () => {
+    // the facets round this sphere's tips lean 1–2°: their centres are within 0.1 mm of the end, their outer corners are not
+    const ball = own(wasm.Manifold.sphere(120, 128));
+    const half = own(ball.trimByPlane([0, 1, 0], 0));
+    const { vertProperties, numProp, triVerts } = half.getMesh();
+    const stats = orientationStats(vertProperties, numProp, triVerts, [{ axis: 1, at: 0 }]);
+    expect(['+x', '-x', '+z', '-z'].map((d) => stats.dirs[d].bed)).toEqual([0, 0, 0, 0]);
+    expect(cellSupport(ball.getMesh(), [[], [0], []]).get('0,1,0').rests).toEqual([false, false, false]);
+  });
+
+  it('a hollow ball or bowl is cut through its middle into even pieces, not lopsided ones round a sliver', async () => {
+    // on a round shell every slice has the same area and the ring shrinks towards the ends; near an end the ring is
+    // wide too, but a hole square to it breaks out of the slanted wall
+    const shell = (R, wall) => own(own(wasm.Manifold.sphere(R, 64)).subtract(own(wasm.Manifold.sphere(R - wall, 64))));
+    for (const [name, solid, counts] of [
+      ['globe', shell(115, 3), [1, 1, 1]],
+      ['thick globe', shell(130, 8), [1, 1, 1]],
+      ['bowl', own(shell(130, 6).subtract(cube([400, 400, 200], [0, 0, 100]))), [1, 1, 0]],
+    ]) {
+      await load(solid, name);
+      const p = await plan();
+      expect(p.counts, name).toEqual(counts);
+      for (const c of p.cuts) expect(Math.abs(c.position[c.normal.indexOf(1)]), name).toBeLessThan(0.5);
+      expect(p.pieces.every((x) => x.fits), name).toBe(true);
+    }
+  });
+
+  it('a plaque too thick for a plate is still cut into pieces that lie flat, between the words', async () => {
+    // 12 mm: no dovetails, but stood on its edge a piece would be a 200 mm wall with its words upright
+    await load(cube([300, 200, 12], [0, 0, 6]), 'plaque');
+    const words = [
+      createItem({ text: 'IN MEMORY', fontId: 'inter', size: 30, mode: 'engrave', depth: 2, position: [0, 30, 12], normal: [0, 0, 1] }),
+      createItem({ text: '1932 - 2024', fontId: 'inter', size: 22, mode: 'engrave', depth: 2, position: [0, -30, 12], normal: [0, 0, 1] }),
+    ];
+    const p = await plan(words);
+    expect(p.counts).toEqual([1, 0, 0]);
+    const r = await resultSplit(planned(p, { labels: false }), { items: words });
+    expect(r.pieces.map((x) => [x.down, x.fits])).toEqual([['-z', true], ['-z', true]]);
+    expect(codes(r)).not.toContain('CUT_THROUGH_TEXT');
+    // counted the same way from the box alone
+    expect(fitPieces([300, 200, 12], BED, SPLIT_DEFAULTS).pieces).toBe(2);
+    expect(fitPieces([400, 300, 18], BED, SPLIT_DEFAULTS).pieces).toBe(4);
+  });
+
+  it('pieces of a hollow column stand on their cut faces, not on their sides with the inside of the tube to support', async () => {
+    // an 80 mm square tube with 4 mm walls and a 60 mm one with 3 mm walls: they stand on a thin ring, but on its whole outline
+    for (const [side, wall] of [[80, 4], [60, 3]]) {
+      await load(own(cube([side, side, 600], [0, 0, 300]).subtract(cube([side - 2 * wall, side - 2 * wall, 600], [0, 0, 300 + wall]))), 'column');
+      const r = await resultSplit(S({ cuts: [cutAt(2, 200, 'c1'), cutAt(2, 400, 'c2')], labels: false }));
+      // the bottom piece stands on the tube's floor
+      expect(r.pieces.map((x) => [x.lies, x.down[1], x.fits]), `${side} mm`).toEqual([['flat as modelled', 'z', true], ...Array(2).fill(['on a cut face', 'z', true])]);
+    }
+  });
+
   it('a thin plate cut by hand lies flat whatever its joint, and says when it is then too big', async () => {
     for (const [t, joint] of [[1.6, 'auto'], [4, 'dowels'], [4, 'none']]) {
       await load(cube([400, 100, t]), 'plate');
@@ -820,6 +896,41 @@ describe('the engine around a split', () => {
       expect((await client.call('ping', {})).caches.frame).toBe(1);
     } finally {
       wrapped.forEach((restore) => restore());
+    }
+  });
+
+  it('a cut measured while the text is edited and then removed leaves no copy of the model behind', async () => {
+    await load(cube([300, 40, 20]), 'bar');
+    const hello = createItem({ text: 'HELLO', fontId: 'inter', size: 12, position: [0, 0, 10], normal: [0, 0, 1] });
+    // the measure turns the whole model into the cut's frame: watch that copy, and whether it is alive at the booleans
+    const copies = [];
+    const proto = Object.getPrototypeOf(cube(1));
+    const { transform } = proto;
+    proto.transform = function (m) {
+      const out = transform.call(this, m);
+      if (m.every((v, i) => v === TO_PLANE[0][i]) && this.numTri() === 12) copies.push(out);
+      return out;
+    };
+    const held = [];
+    const { union } = wasm.Manifold;
+    wasm.Manifold.union = (...args) => {
+      held.push(copies.some((c) => !c.isDeleted()));
+      return union(...args);
+    };
+    try {
+      const m = await client.planSplit([hello], version, { printing, split: S({ cuts: [cutAt(0, 50)] }), bed: BED, mode: 'measure' });
+      expect(m.estimate).toBe(true);
+      expect((await client.call('ping', {})).caches.frame).toBe(1);
+      // the cut is removed: the app asks for the whole model
+      await client.result([hello], version, { printing });
+      expect(held.length).toBeGreaterThan(0);
+      expect(held.some(Boolean)).toBe(false);
+      expect((await client.call('ping', {})).caches.frame).toBe(0);
+      await client.export([hello], version, 'bar', { printing });
+      expect((await client.call('ping', {})).caches.frame).toBe(0);
+    } finally {
+      proto.transform = transform;
+      wasm.Manifold.union = union;
     }
   });
 

@@ -547,8 +547,11 @@ export function maxCellLength(cell, axis, U, options = {}) {
 
 // ---------- thin plates ----------
 
-/** How thick a plate may be for dovetail tabs through it (mm); thinner than `min` is glued, thicker takes pins. */
-export const PLATE_THICKNESS = Object.freeze({ min: 2, max: 10 });
+/**
+ * How thick a plate may be for dovetail tabs through it (mm); thinner than `min` is glued, thicker takes pins. A slab
+ * up to `slab` thick (a plaque) is planned lying flat too, when some grid of flat pieces fits.
+ */
+export const PLATE_THICKNESS = Object.freeze({ min: 2, max: 10, slab: 25 });
 
 /**
  * The dovetail tabs along a cut through a plate island L mm long (along the
@@ -569,16 +572,24 @@ export function dovetailSize(L) {
 
 /**
  * The axis a box of these sides is a thin plate across – at most 10 mm
- * thick and at least four times as wide both ways – or null. A thin plate
- * prints lying flat: stood on its edge it is a wobbly wall, and the letters
- * of a sign would stand upright.
+ * thick (`thickest`) and at least four times as wide both ways – or null. A
+ * thin plate prints lying flat: stood on its edge it is a wobbly wall, and
+ * the letters of a sign would stand upright.
  */
-export function plateAxis(dims) {
+export function plateAxis(dims, thickest = PLATE_THICKNESS.max) {
   let a = 0;
   for (let b = 1; b < 3; b++) if (dims[b] < dims[a]) a = b;
   const width = Math.min(...dims.filter((_, b) => b !== a));
-  return dims[a] > 0 && dims[a] <= PLATE_THICKNESS.max && width >= 4 * dims[a] ? a : null;
+  return dims[a] > 0 && dims[a] <= thickest && width >= 4 * dims[a] ? a : null;
 }
+
+/**
+ * The axis a box of these sides is a slab across – too thick for a thin
+ * plate but at most 25 mm, and at least four times as wide both ways, as a
+ * 15 mm plaque is – or null. Its pieces lie flat where they fit that way,
+ * for the same reasons as a plate's, but may stand on an edge when not.
+ */
+export const slabAxis = (dims) => (plateAxis(dims) === null ? plateAxis(dims, PLATE_THICKNESS.slab) : null);
 
 /**
  * What the pieces of a model with extents E will be allowed, for counting
@@ -605,9 +616,10 @@ export function planAllowance(E, spec = {}, { passthrough = false } = {}) {
 /**
  * What Fit to my printer will make of a model whose box is E, from the box
  * alone (for the "Split into N pieces" note and the offer when a model is
- * loaded): the same plate rule, tab allowance and grids as the plan. The
- * plan itself may end with fewer pieces where some boxes hold nothing (an
- * L shape), or more where a piece would have nothing flat to stand on.
+ * loaded): the same plate rule, tab allowance and grids as the plan, and a
+ * slab (`slabAxis`) counted lying flat when that can be done. The plan
+ * itself may end with fewer pieces where some boxes hold nothing (an L
+ * shape), or more where a piece would have nothing flat to stand on.
  * @param {number[]} E the model's extents
  * @param {number[]} U the usable bed
  * @param {{ joint?: string }} spec the split's settings
@@ -619,7 +631,9 @@ export function fitPieces(E, U, spec = {}, { passthrough = false } = {}) {
   const allowance = planAllowance(E, spec, { passthrough });
   const whole = fitsBed(E, U, { flat: allowance.flat });
   if (whole.fits) return { fits: true, pieces: 1, down: whole.down, yaw: whole.yaw };
-  return { fits: false, pieces: gridCounts(E, U, allowance).pieces, down: null, yaw: null };
+  const slab = slabAxis(E);
+  const lying = slab === null ? 0 : gridCounts(E, U, { flat: slab }).pieces;
+  return { fits: false, pieces: lying || gridCounts(E, U, allowance).pieces, down: null, yaw: null };
 }
 
 // ---------- planning where the cuts go ----------
@@ -634,7 +648,10 @@ export const PLAN_WEIGHTS = Object.freeze({
   islands: 2, // each island needs its own pins
   noRoom: 5, // prefer faces that take pins
   perimeter: 1, // seam length: the glue line and how much it shows
-  even: 0.001, // per mm from the even position: a tie-break towards even pieces
+  // per even piece's length a cut moves from its even position: uneven pieces must buy something real. Above the
+  // perimeter's pull on purpose: on a round shell every slice has the same area and only the ring shrinks towards
+  // the ends, so a weaker pull sends every cut to the end of its room, a sliver beside a piece too big to fit
+  even: 2,
 });
 
 /**
@@ -710,7 +727,8 @@ export function planCost(profile, { items = [] } = {}) {
 
 /**
  * Where to put k cuts on one axis: the samples t₁ < … < t_k with the least
- * total cost (plus a small pull towards even pieces), found by dynamic
+ * total cost (plus a pull towards even pieces, `PLAN_WEIGHTS.even` per even
+ * piece's length a cut is off its even position), found by dynamic
  * programming. End pieces must be between `minEnd` and `S` long and middle
  * pieces between `minMid` and `S`; when that is impossible both minimums
  * drop to 0 (`relaxed`).
@@ -732,7 +750,8 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
   const E = hi - lo;
   const tol = 1e-6;
   const even = (j) => lo + (E * (j + 1)) / (k + 1);
-  const own = (i, j) => costs[i] + PLAN_WEIGHTS.even * Math.abs(samples[i] - even(j));
+  const cell = E / (k + 1) || 1;
+  const own = (i, j) => costs[i] + (PLAN_WEIGHTS.even * Math.abs(samples[i] - even(j))) / cell;
   const tabs = (i) => grow?.[i] ?? null;
   // a piece between a cut `a` under it and a cut `b` over it (either may be the model's end): its length, then with
   // the tabs that reach past its cuts against what fits the way it may lie
@@ -780,7 +799,9 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
  * piece when another axis has dovetail cuts (each of its cuts runs right
  * across the model). The pieces that come out are then checked as they will
  * print, tabs counted; if one is too big because another axis's pieces came
- * out longer than even, the axes are planned again against those lengths.
+ * out longer than even, the axes are planned again against those lengths,
+ * and failing that with every piece held to the even one grown alike on
+ * every side as far as it fits: a grid whose even pieces fit is never lost.
  *
  * A dovetail cut keeps its tabs as the cut stage would: not when a cut
  * along the plate's thickness runs through that plate (it would part the
@@ -792,9 +813,10 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
  * @param {number[]} k cuts per axis
  * @param {{ E: number[], U: number[], bounds: { min: number[], max: number[] }, flat?: number|null, minEnd?: number,
  *   minMid?: number, profileOf: function, support?: function|null, stable?: boolean }} options E the model's extents,
- *   `flat` the axis every piece lies flat on (a thin plate) or null; `profileOf(axis, k)` gives `{ samples, costs, tabs }`
- *   for k cuts on that axis, `tabs` per sample `{ below, above, w, span }` when a cut there would take dovetail tabs (see
- *   `chooseOffsets`; `span` the plate's extent along w), else null; `support(cutsByAxis)` gives `cellSupport`'s map
+ *   `flat` the axis every piece lies flat on (a thin plate, or a slab planned lying flat) or null; `profileOf(axis, k)`
+ *   gives `{ samples, costs, tabs }` for k cuts on that axis, `tabs` per sample `{ below, above, w, span }` when a cut
+ *   there would take dovetail tabs (see `chooseOffsets`; `span` the plate's extent along w), else null;
+ *   `support(cutsByAxis)` gives `cellSupport`'s map
  * @returns {{ k: number[], offsets: number[][], cost: number, pieces: { cell: number[], size: number[], fits: true }[] }|null}
  *   `pieces` every box that makes a piece, as it will print, tabs counted
  */
@@ -805,13 +827,14 @@ export function planGrid(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0,
   const grow = [0, 1, 2].map((a) => (k[a] ? Math.max(0, ...tabsOf.get(a).map((x) => (x ? Math.max(x.below, x.above) : 0))) : 0));
   const ws = [...new Set(axes.flatMap((a) => tabsOf.get(a)).filter(Boolean).map((x) => x.w))].sort();
   const even = evenCell(E, k, grow);
-  const run = (lengths) => {
+  // `room`: when given, no piece may be longer on an axis than it says
+  const run = (lengths, room = null) => {
     const offsets = [[], [], []];
     let cost = 0;
     for (const a of axes) {
       const cell = lengths.map((v, b) => (b === a ? even[a] : v));
-      const S = maxCellLength(cell, a, U, { flat });
-      const Sflat = flat === null && ws.length ? maxCellLength(cell, a, U, { flat: ws }) : S;
+      const S = Math.min(maxCellLength(cell, a, U, { flat }), room?.any[a] ?? Infinity);
+      const Sflat = flat === null && ws.length ? Math.min(maxCellLength(cell, a, U, { flat: ws }), room?.flat[a] ?? Infinity) : S;
       const others = axes.some((b) => b !== a && grow[b] > 0);
       const { samples, costs } = profile.get(a);
       const choice = chooseOffsets(samples, costs, { lo: bounds.min[a], hi: bounds.max[a], k: k[a], S: others ? Sflat : S, Sflat, minEnd, minMid, grow: tabsOf.get(a) });
@@ -836,21 +859,49 @@ export function planGrid(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0,
     for (const c of cells) {
       const s = held?.get(c.cell.join(','));
       if (held && !s?.filled) continue;
-      // a piece lies on a cut face, or where the model it holds is flat; a plate's, or one beside dovetails, lies flat
+      // a piece lies on a cut face, or where the model it holds is flat; a plate's, or one beside dovetails, lies flat,
+      // and so does a slab's when `flat` asks it to (with nothing flat on that side it cannot)
       let ways = c.flat;
       if (ways === null && held && stable) ways = [0, 1, 2].filter((a) => c.cell[a] > 0 || c.cell[a] < k[a] || s.rests[a]);
+      if (c.flat === null && flat !== null) ways = ways === null || [].concat(ways).includes(flat) ? flat : [];
       pieces.push({ cell: c.cell, size: c.size, fits: fitsBed(c.size, U, { flat: ways }).fits });
     }
     return { k, offsets, cost, cells, pieces };
   };
+  const fitted = (p) => p && p.pieces.length > 0 && p.pieces.every((x) => x.fits);
   let plan = run(even);
-  if (plan && !plan.pieces.every((p) => p.fits)) {
+  if (plan && !fitted(plan)) {
     const longest = [0, 1, 2].map((b) => Math.max(...plan.cells.map((c) => c.size[b])));
     plan = run(longest);
   }
-  if (!plan || !plan.pieces.length || !plan.pieces.every((p) => p.fits)) return null;
+  if (!fitted(plan)) {
+    // each axis is planned against the others' even pieces, so all of them may take their room the same way and
+    // leave a corner piece too big for any bed they were planned against. The even pieces fit, so the grid is
+    // planned once more with every piece held to the even one grown alike on every side, as far as that fits
+    const any = sharedRoom(even, U, flat);
+    const room = any && { any, flat: flat === null && ws.length ? sharedRoom(even, U, ws) ?? any : any };
+    if (room) plan = run(even, room);
+  }
+  if (!fitted(plan)) return null;
   const { cells, ...rest } = plan;
   return rest;
+}
+
+/**
+ * A box grown alike on every side as far as it fits the bed (bisection on
+ * `fitsBed`, `flat` as there), or null when it does not fit as it is.
+ */
+function sharedRoom(box, U, flat) {
+  const fits = (f) => fitsBed(box.map((v) => v * f), U, { flat }).fits;
+  if (!fits(1)) return null;
+  let lo = 1;
+  let hi = (Math.hypot(...U) + 1) / Math.max(EPS, Math.min(...box)); // nothing longer than the bed's diagonal fits
+  for (let i = 0; i < 48 && hi - lo > 1e-9; i++) {
+    const mid = (lo + hi) / 2;
+    if (fits(mid)) lo = mid;
+    else hi = mid;
+  }
+  return box.map((v) => v * lo);
 }
 
 /**
@@ -870,7 +921,10 @@ export function flatProbes(at, lo, hi) {
   return out;
 }
 
-/** Each triangle's box and, for one facing along an axis, which way, its area and where it lies, worked out once per mesh. */
+/**
+ * Each triangle's box and, for one facing along an axis, which way, its area and where its corner furthest from that
+ * end lies, worked out once per mesh.
+ */
 const meshFacts = new WeakMap();
 function factsOf(mesh) {
   if (meshFacts.has(mesh)) return meshFacts.get(mesh);
@@ -906,7 +960,10 @@ function factsOf(mesh) {
     if (Math.abs(along) / len <= FLAT) continue;
     face[t] = axis * 2 + (along < 0 ? 0 : 1);
     area[t] = len / 2;
-    pos[t] = (P[a + axis] + P[b + axis] + P[c + axis]) / 3;
+    // the corner furthest from the bed it would lie on: a facet is bed only when all of it is at the end, as
+    // `orientationStats` counts it; the facets round a ball's pole lean a little, so their centres are there and
+    // their outer corners are not
+    pos[t] = along < 0 ? box[6 * t + 3 + axis] : box[6 * t + axis];
   }
   const facts = { n, box, face, area, pos, min, max };
   meshFacts.set(mesh, facts);
@@ -918,9 +975,10 @@ function factsOf(mesh) {
  * holds any of the model (a box no triangle reaches is wholly inside the
  * model or wholly outside it: a ray from its centre tells which), and on
  * which axes the model it holds rests on something flat where it ends –
- * facets facing that way, within 0.1 mm of the furthest the box's material
- * goes, of 25 mm² or more: the bed `orientationStats` counts. A ball's
- * quarter has nothing flat but its cut faces. What is worked out from the
+ * facets facing that way, wholly within 0.1 mm of the furthest the box's
+ * material goes, of 25 mm² or more: the bed `orientationStats` counts. A
+ * ball's quarter has nothing flat but its cut faces, and a bowl's half
+ * cannot stand on the tip of its curve. What is worked out from the
  * mesh alone is kept with it, so trying grid after grid costs little.
  * @param {{ vertProperties: Float32Array|number[], numProp: number, triVerts: Uint32Array|number[] }} mesh
  * @param {number[][]} cutsByAxis sorted positions per axis (`axisCuts`)
@@ -1282,16 +1340,17 @@ const STEADY = 25;
 /**
  * What each way down would mean for a piece, from its own mesh: for each of
  * the six directions d, its extent along d, the area that would rest on the
- * bed (facets facing d within 0.1 mm of the piece's extreme along d), the
- * area that would need support (facets facing within 45° of d, not on the
- * bed) and the area of its own cut faces facing d.
+ * bed (facets facing d within 0.1 mm of the piece's extreme along d) and the
+ * area of the box that bed spans, the area that would need support (facets
+ * facing within 45° of d, not on the bed) and the area of its own cut faces
+ * facing d.
  * @param {Float32Array|number[]} vertProperties
  * @param {number} numProp
  * @param {Uint32Array|number[]} triVerts
  * @param {({ axis: number, at: number }|{ position: number[], normal: number[] })[]} cutsOnPiece the cuts this piece touches
  * @param {{ allowed?: string[] }} options `allowed`: the ways down to consider (pieces on a dovetail seam lie flat: ±w only)
  * @returns {{ bbox: { min: number[], max: number[] }, dims: number[], allowed: string[],
- *   dirs: Object<string, { extent: number, bed: number, support: number, cutArea: number }> }}
+ *   dirs: Object<string, { extent: number, bed: number, footprint: number, support: number, cutArea: number }> }}
  */
 export function orientationStats(vertProperties, numProp, triVerts, cutsOnPiece = [], { allowed = DIR_KEYS } = {}) {
   const P = vertProperties;
@@ -1308,7 +1367,10 @@ export function orientationStats(vertProperties, numProp, triVerts, cutsOnPiece 
     max.fill(0);
   }
   const dirs = {};
-  for (const d of DIR_KEYS) dirs[d] = { extent: max[dirAxis(d)] - min[dirAxis(d)], bed: 0, support: 0, cutArea: 0 };
+  for (const d of DIR_KEYS) dirs[d] = { extent: max[dirAxis(d)] - min[dirAxis(d)], bed: 0, support: 0, cutArea: 0, footprint: 0 };
+  // how far the bed spreads across the other two axes, for each way down: a hollow section stands on a thin ring, but
+  // the ring's whole outline keeps it steady
+  const spread = Object.fromEntries(DIR_KEYS.map((d) => [d, [Infinity, Infinity, -Infinity, -Infinity]]));
   const planes = cutsOnPiece.map(cutPlane).filter(Boolean);
   const T = triVerts;
   for (let t = 0; t + 2 < T.length; t += 3) {
@@ -1330,9 +1392,19 @@ export function orientationStats(vertProperties, numProp, triVerts, cutsOnPiece 
     const area = len / 2;
     const pa = P[a + axis], pb = P[b + axis], pc = P[c + axis];
     const onBed = plus ? Math.min(pa, pb, pc) >= max[axis] - 0.1 : Math.max(pa, pb, pc) <= min[axis] + 0.1;
-    if (nd > FLAT && onBed) s.bed += area;
-    else s.support += area;
+    if (nd > FLAT && onBed) {
+      s.bed += area;
+      const box = spread[(plus ? '+' : '-') + AXES[axis]];
+      [(axis + 1) % 3, (axis + 2) % 3].forEach((k, i) => {
+        box[i] = Math.min(box[i], P[a + k], P[b + k], P[c + k]);
+        box[2 + i] = Math.max(box[2 + i], P[a + k], P[b + k], P[c + k]);
+      });
+    } else s.support += area;
     if (nd > FLAT && planes.some((p) => p.axis === axis && Math.max(Math.abs(pa - p.at), Math.abs(pb - p.at), Math.abs(pc - p.at)) <= 0.01)) s.cutArea += area;
+  }
+  for (const d of DIR_KEYS) {
+    const [u0, v0, u1, v1] = spread[d];
+    if (u1 > u0 && v1 > v0) dirs[d].footprint = (u1 - u0) * (v1 - v0);
   }
   return {
     bbox: { min, max },
@@ -1368,13 +1440,16 @@ function laidDims(dims, down) {
   return [0, 1, 2].map((r) => Math.abs(L[r]) * dims[0] + Math.abs(L[4 + r]) * dims[1] + Math.abs(L[8 + r]) * dims[2]);
 }
 
-/** Lower is better: support, mating faces printed upright (weaker, holes horizontal), slender towers, a small footprint. */
+/**
+ * Lower is better: support, mating faces printed upright (weaker, holes horizontal), slender towers, a small footprint.
+ * How slender a piece stands is judged by the box its bed spans: a tube's ring holds it as steady as a block.
+ */
 function orientationScore(stats, down) {
   const s = stats.dirs[down];
   const axis = dirAxis(down);
   let cutV = 0;
   for (const d of DIR_KEYS) if (dirAxis(d) !== axis) cutV += stats.dirs[d].cutArea;
-  const bed = Math.max(s.bed, 1);
+  const bed = Math.max(s.bed, s.footprint ?? 0, 1);
   const tall = s.extent / Math.sqrt(bed);
   const slender = tall > 2 ? 50 * (tall - 2) ** 2 * Math.sqrt(bed) : 0;
   const unstable = s.bed < STEADY ? 1e4 : 0;
@@ -1422,14 +1497,17 @@ export function printTransform(bbox, down = '-z', yaw = 0) {
  * does not fit, the best way is used with `ORIENT_FALLBACK`. If nothing
  * fits, the best way regardless (`fits: false`, `PIECE_TOO_BIG`). A piece
  * that fits only resting on a point or an edge is told of (`PIECE_UNSTABLE`).
+ * A piece of a slab (`flat`, as Fit plans it) lies flat on it whenever it
+ * fits that way and has something flat there to rest on.
  * @param {object} stats from `orientationStats`
  * @param {number[]} U the usable bed
  * @param {'auto'|'cut'|'model'} orient
- * @param {{ pieceIndex?: number }} options the piece's number, for the notes
+ * @param {{ pieceIndex?: number, flat?: number|null }} options the piece's number, for the notes; `flat` the slab's
+ *   thickness axis (`slabAxis`)
  * @returns {{ down: string, up: string, yaw: number, fits: boolean, size: number[], printMatrix: number[], matrix: number[],
  *   lies: 'flat as modelled'|'on a cut face'|'on its side'|'upside down'|'on a curve', score: number, notes: object[] }}
  */
-export function chooseOrientation(stats, U, orient = 'auto', { pieceIndex = null } = {}) {
+export function chooseOrientation(stats, U, orient = 'auto', { pieceIndex = null, flat = null } = {}) {
   const allowed = (stats.allowed?.length ? stats.allowed : DIR_KEYS).filter((d) => LAY_DOWN[d]);
   const options = allowed.map((down) => {
     const [a, b, h] = laidDims(stats.dims, down);
@@ -1455,7 +1533,8 @@ export function chooseOrientation(stats, U, orient = 'auto', { pieceIndex = null
     : orient === 'model' ? options.filter((o) => o.down === '-z') : null;
   let chosen = forced ? forced.find((o) => o.fits) : null;
   let fallback = Boolean(forced) && !chosen;
-  if (!chosen) chosen = pick(fitting);
+  const lyingFlat = flat === null ? [] : fitting.filter((o) => dirAxis(o.down) === flat && stats.dirs[o.down].bed >= STEADY);
+  if (!chosen) chosen = pick(forced || !lyingFlat.length ? fitting : lyingFlat);
   const fits = Boolean(chosen);
   if (!chosen) {
     // nothing fits at all: a forced choice is still honoured, and turning it is no use

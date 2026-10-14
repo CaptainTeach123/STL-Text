@@ -1,6 +1,6 @@
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
-import { TO_PLANE, chooseOrientation, isSymmetric, normaliseSplit, sizesFor } from '../src/split.js';
+import { PIN_DIAMETERS, TO_PLANE, chooseOrientation, isSymmetric, normaliseSplit, sizesFor } from '../src/split.js';
 import {
   buildSplitDisplay,
   cutPieces,
@@ -92,7 +92,8 @@ function expectHolesInside(solid, layout) {
 describe('holes and pins', () => {
   it('half-holes remove the verified volumes and leave a drilled block whole', () => {
     const above = cube([100, 100, 100], [0, 0, 50]);
-    for (const [D, depth, tear, volume] of [[5, 8, false, 209.945], [5, 8, true, 224.718], [6, 9.5, false, 348.232], [6, 9.5, true, 372.735]]) {
+    // exactly the designed shape's: the chamfer's frustum, the bore and the cone on the profile's own area
+    for (const [D, depth, tear, volume] of [[5, 8, false, 209.9005], [5, 8, true, 224.6701], [6, 9.5, false, 348.1798], [6, 9.5, true, 372.6793]]) {
       const s = sizesFor(D);
       expect(s.depth).toBe(depth);
       const hole = own(halfHole({ R: s.R, h: s.h, ch: s.ch, tear }));
@@ -102,6 +103,21 @@ describe('holes and pins', () => {
       expect(drilled.status()).toBe('NoError');
       expect(drilled.genus()).toBe(0);
       expect(shells(drilled)).toHaveLength(1);
+    }
+  });
+
+  it('half-holes have no corners a hair apart, at any size and depth, so a piece\'s STL keeps no zero-area triangles', () => {
+    const close = (m) => {
+      const { vertProperties: P, numProp: k } = m.getMesh();
+      let n = 0;
+      for (let i = 0; i < P.length; i += k) for (let j = i + k; j < P.length; j += k) if (Math.hypot(P[i] - P[j], P[i + 1] - P[j + 1], P[i + 2] - P[j + 2]) < 1e-3) n++;
+      return n;
+    };
+    for (const D of PIN_DIAMETERS) {
+      for (const depth of [0, 10, 15, 20, 25, 30]) {
+        const s = sizesFor(D, 0.15, 0.4, depth);
+        for (const tear of [false, true]) expect(close(own(halfHole({ R: s.R, h: s.h, ch: s.ch, tear }))), `Ø${D} ${depth} mm ${tear}`).toBe(0);
+      }
     }
   });
 
@@ -175,11 +191,11 @@ describe('holes and pins', () => {
     const drilled = own(drillPiece(block, { dowels: [dowel(-10, -5), dowel(10, 4)], labels: [] }, 2));
     const low = own(drilled.slice(0.05));
     const high = own(drilled.slice(0.6));
-    expect(low.area()).toBeCloseTo(1139.386, 3);
+    expect(low.area()).toBeCloseTo(1139.424, 3);
     expect(high.area()).toBeCloseTo(1155.734, 3);
     expect(high.numContour()).toBe(3);
     expect(drilled.genus()).toBe(0);
-    expect(block.volume() - drilled.volume()).toBeCloseTo(2 * 209.945, 2);
+    expect(block.volume() - drilled.volume()).toBeCloseTo(2 * 209.901, 2);
   });
 
   it('the fit test is an upright-hole block, a lying teardrop-hole block and a pin; filament has no pin, dovetails add two plates', () => {
@@ -188,7 +204,7 @@ describe('holes and pins', () => {
     expect(shells(coupon)).toHaveLength(3);
     expect(boxOf(coupon).min[2]).toBeCloseTo(0, 6);
     const long = 8.5 + 2.65 + 2 + 2;
-    expect(coupon.volume()).toBeCloseTo(2 * 24 * 24 * long - 209.945 - 224.718 + 280.701, 1);
+    expect(coupon.volume()).toBeCloseTo(2 * 24 * 24 * long - 209.901 - 224.670 + 280.701, 1);
     expect(shells(own(fitTestCoupon({ diameter: 1.75 }, 0.4)))).toHaveLength(2);
     expect(shells(own(fitTestCoupon({ diameter: 5, pins: 'own' }, 0.4)))).toHaveLength(2);
     const dove = own(fitTestCoupon({ diameter: 5, joint: 'dovetail' }, 0.4));
@@ -244,7 +260,7 @@ describe('labels', () => {
       expect(plain.drilled[k].volume() - piece.volume()).toBeGreaterThan(5);
       expect(piece.genus()).toBe(0);
     });
-    expect(plain.drilled[0].volume()).toBeCloseTo(72000 - 2 * 209.945, 2);
+    expect(plain.drilled[0].volume()).toBeCloseTo(72000 - 2 * 209.901, 2);
   });
 });
 
@@ -343,6 +359,28 @@ describe('dovetail tabs through thin plates', () => {
     expect(lost(2.5)).toBeLessThan(0.01);
     expect(lost(22.5)).toBeLessThan(0.01);
     expect(s.cut.pieces).toHaveLength(2);
+  });
+
+  it('the two legs of a U cut across both get the same tabs, each wholly inside both legs', () => {
+    // a base 150 × 50 × 8 and two legs 8 × 50 × 300: seen along x the legs cover each other, near the cut
+    const U = own(wasm.Manifold.union([cube([150, 50, 8], [75, 25, 4]), cube([8, 50, 300], [4, 25, 150]), cube([8, 50, 300], [146, 25, 150])]));
+    const s = split(U, [[2, 150]], { labels: false });
+    expect(s.plan.joints).toEqual({ c1: 'dovetail' });
+    expect(s.plan.tabs.seams[0].tabs.map((t) => t.dir)).toEqual([1, -1]);
+    expect(s.plan.notes).toEqual([]);
+    const [A, B] = s.cut.pieces.map((p) => p.solid);
+    for (const p of s.cut.pieces) {
+      expect(p.solid.status()).toBe('NoError');
+      expect(shells(p.solid)).toHaveLength(p.index === 1 ? 1 : 2);
+    }
+    // no slice of a leg changes hands: each leg's part above the cut is the upper piece's, tabs and sockets aside
+    const sum = s.cut.pieces.reduce((v, p) => v + p.volume, 0);
+    expect(sum + s.cut.gap).toBeCloseTo(U.volume(), 3);
+    // both legs lock: pulled apart the heads bite in each leg, and the pieces slide together along x
+    const moved = (x, y, z) => overlap(A, own(B.translate([x, y, z])));
+    expect(moved(0, 0, 0)).toBeLessThan(1e-6);
+    for (const x of [4, 146]) expect(overlap(own(A.intersect(cube([12, 60, 60], [x, 25, 150]))), own(B.translate([0, 0, 2])))).toBeGreaterThan(10);
+    for (const x of [20, 70, 142]) expect(moved(x, 0, 0)).toBeLessThan(1e-6);
   });
 
   it('crossing dovetail cuts never close off a loose corner of a piece', () => {
@@ -506,7 +544,7 @@ describe('pins on the cut faces', () => {
     expect(s.layout.dowels).toHaveLength(2);
     for (const d of s.layout.dowels) expect(d.sides.map((x) => x.tear)).toEqual([false, false]);
     for (const piece of s.drilled) {
-      expect(piece.volume()).toBeCloseTo(72000 - 2 * 209.945, 2);
+      expect(piece.volume()).toBeCloseTo(72000 - 2 * 209.901, 2);
       expect(shells(piece)).toHaveLength(1);
       expect(piece.genus()).toBe(0);
     }
@@ -524,7 +562,7 @@ describe('pins on the cut faces', () => {
       expect(d.sides).toEqual([{ piece: 1, tear: true, apex: [0, 0, 1] }, { piece: 2, tear: true, apex: [0, 0, 1] }]);
     }
     expect(isSymmetric(s.layout.dowels.map((d) => d.uv), [0, 0], 3)).toBe(false);
-    for (const piece of s.drilled) expect(piece.volume()).toBeCloseTo(120000 - 2 * 372.735, 2);
+    for (const piece of s.drilled) expect(piece.volume()).toBeCloseTo(120000 - 2 * 372.679, 2);
     expect(s.layout.seams).toEqual([expect.objectContaining({ letter: 'A', pieces: [1, 2], joint: 'dowels', patches: 1 })]);
     expect(s.layout.notes).toEqual([]);
   });

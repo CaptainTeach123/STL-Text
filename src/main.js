@@ -52,6 +52,7 @@ let selectedCutId = null; // the cut the arrow keys move (selecting an item lets
 let lastSplitKey = ''; // what the pieces depend on besides the content: the split, the printer and the nozzle
 let lastPieces = null; // the pieces last computed: { key, content, pieces, seams, grid, diameter, notes }
 let measured = null; // the cuts last measured on the model: { key, cuts: Map(id -> { area, islands, joint, crosses }), notes }
+let joined = null; // { key, content, joints: Map(id -> 'dovetail' | 'dowels' | 'none') } the joint each cut got when the split was last worked out
 let splitBounds = null; // { version, key, bounds } of the model and its text from the last measure (text-only work has no other)
 let planNotes = null; // { key, content, notes } of a Fit to my printer that cut nothing
 let loads = 0; // models opened so far: a fit planned for one is never applied to the next
@@ -1016,6 +1017,7 @@ async function showResult(on, { keep = false } = {}) {
     else viewer.setResult(r.display);
     // without pieces a split still has its say: every cut missed, or the model cannot be split
     lastPieces = split ? { key: splitFor, content: requestedFor, pieces: r.pieces ?? [], seams: r.seams ?? [], grid: r.grid, diameter: r.diameter, notes: r.notes.filter(isSplitNote) } : null;
+    if (split) rememberJoints(splitFor, requestedFor, jointsOfSeams(r.seams));
     viewer.showResult(true);
     // pulled apart, the pieces take more room than the model: fit them in view once, then leave the camera to the user
     if (r.pieces && entering) viewer.frame();
@@ -1081,6 +1083,8 @@ async function download() {
   if (!items.length && !modelInfo?.hasModel) return setStatus('Type some text or open a model first.', 'error');
   const name = exportName();
   const split = activeSplit();
+  const splitFor = lastSplitKey;
+  const requestedFor = lastContentKey;
   if (split) setSplitPending(true);
   try {
     if (!(await syncBase())) return setStatus('The model is still being updated – try the download again in a moment.', '');
@@ -1095,6 +1099,9 @@ async function download() {
     const warnings = r.notes.filter((n) => n.level === 'warn');
     const warned = warnings.length ? `\n${warnings.map((n) => n.text).join('\n')}` : '';
     if (r.zip) {
+      // the cut rows say what the download gave each cut: a face no pin fits makes it glue only
+      rememberJoints(splitFor, requestedFor, jointsOfSeams(r.seams));
+      renderCuts();
       // the pieces, the pins, the separately printed parts and the glue sheet come as one file: a browser
       // drops or asks about many downloads from one click
       const zip = save(r.zip, r.zipName, 'application/zip', '');
@@ -1584,7 +1591,30 @@ function cutRow(id) {
   return li;
 }
 
-/** What a cut's row says it cuts, from the last measure: "800 mm² · pins", "misses the model", "through “HELLO”". */
+/**
+ * The joint each cut got in a worked-out split, from its seams: pins when
+ * some face of it takes one (its note tells of those left flat), tabs on a
+ * dovetail cut that had room for them, otherwise none.
+ */
+function jointsOfSeams(seams = []) {
+  const joints = new Map();
+  for (const s of seams) {
+    const got = s.joint === 'dovetail' && s.tabs ? 'dovetail' : s.dowels?.length ? 'dowels' : 'none';
+    if ((joints.get(s.cutId) ?? 'none') === 'none') joints.set(s.cutId, got);
+  }
+  return joints;
+}
+
+/** Keep what a split worked out for `key` and `content` gave the cuts, with what was known of that split already. */
+function rememberJoints(key, content, joints) {
+  const known = joined?.key === key && joined.content === content ? joined.joints : [];
+  joined = { key, content, joints: new Map([...known, ...joints]) };
+}
+
+/**
+ * What a cut's row says it cuts, from the last measure – its joint from the
+ * split once worked out: "800 mm² · pins", "misses the model", "through “HELLO”".
+ */
 function cutMeta(cut, plane) {
   if (!plane) return "isn't straight along X, Y or Z";
   const m = measured?.cuts.get(cut.id);
@@ -1593,7 +1623,9 @@ function cutMeta(cut, plane) {
   if (m.merged) return `in the same place as cut ${cutLetter(m.merged) ?? ''}`.trim();
   if (!m.islands) return 'crosses no material – nothing to join'; // between letters of a sign: the pieces never touch here
   const parts = [`${Math.round(m.area).toLocaleString()} mm²${m.islands > 1 ? ` in ${m.islands} parts` : ''}`];
-  parts.push({ dovetail: 'dovetails', none: 'glue only' }[m.joint] ?? 'pins');
+  // the measure plans pins wherever there are no tabs; once the split is worked out, a cut no pin fits is glue only
+  const got = joined?.key === lastSplitKey && joined.content === lastContentKey ? joined.joints.get(cut.id) : null;
+  parts.push({ dovetail: 'dovetails', none: 'glue only' }[got ?? m.joint] ?? 'pins');
   const through = (m.crosses ?? []).map((itemId) => doc.items.find((i) => i.id === itemId)).filter(Boolean);
   if (through.length) parts.push(`through ${through.map((i) => `“${itemLabel(i)}”`).join(', ')}`);
   return parts.join(' · ');
@@ -1681,7 +1713,11 @@ function renderSplitNotes() {
   renderNotes($('splitNotes'), notes, splitNoteActions);
 }
 
-/** The drag readout by a cut's handle: "A · X = 12 mm · 162 | 138 mm", a side in red when a piece there won't fit. */
+/**
+ * The drag readout by a cut's handle: "A · X = 12 mm · 162 | 138 mm", how
+ * long the pieces either side are (dovetail tabs counted, as in the piece
+ * list), a side in red when a piece there won't fit.
+ */
 function showReadout(id, at, screen) {
   const el = $('cutReadout');
   const cuts = doc.split?.cuts ?? [];
@@ -1700,11 +1736,13 @@ function showReadout(id, at, screen) {
     const lo = Math.max(b.min[axis], ...others.filter((t) => t < at - 1e-6));
     const hi = Math.min(b.max[axis], ...others.filter((t) => t > at + 1e-6));
     const { cells } = cellSizes(b, live);
-    // the pieces either side of this cut: below it, those whose box ends at it; above it, those whose box starts there
-    const side = (end, length) => {
+    // the pieces either side of this cut: below it, those whose box ends at it; above it, those whose box starts there.
+    // Their length is their box's, which counts the tabs of a dovetail cut at either end as the red and the piece list do
+    const side = (end, bare) => {
       const span = document.createElement('span');
-      span.textContent = String(round(length, 1));
-      span.className = cells.some((c) => Math.abs(c[end][axis] - at) < 1e-6 && cellTooBig(c)) ? 'err' : '';
+      const those = cells.filter((c) => Math.abs(c[end][axis] - at) < 1e-6);
+      span.textContent = String(round(those.length ? those[0].size[axis] : bare, 1));
+      span.className = those.some(cellTooBig) ? 'err' : '';
       return span;
     };
     parts.push(side('max', at - lo), ' | ', side('min', hi - at), ' mm');
@@ -1739,12 +1777,21 @@ function offerSplit() {
  * picks and a dovetail when a cut gets one (whatever the Joints setting).
  */
 async function downloadFitTest() {
-  const split = activeSplit() ?? { ...SPLIT_DEFAULTS, ...splitDefaults, cuts: [] };
+  const active = activeSplit();
+  const split = active ?? { ...SPLIT_DEFAULTS, ...splitDefaults, cuts: [] };
+  const splitFor = lastSplitKey;
+  const requestedFor = lastContentKey;
   setSplitPending(true);
   try {
     if (!(await syncBase())) return setStatus('The model is still being updated – try again in a moment.', '');
     const r = await client.fitTest(doc.items, version(), { printing, split, bed: usableBed(bed), name: exportName() });
     if (!r) return;
+    if (active && !r.pins) {
+      // it worked the split out and found no pins in it: the cuts planned to have them have none (nor tabs, with no file)
+      const none = split.cuts.filter((c) => !r.stl || measured?.cuts.get(c.id)?.joint === 'dowels');
+      rememberJoints(splitFor, requestedFor, none.map((c) => [c.id, 'none']));
+      renderCuts();
+    }
     if (!r.stl) {
       // cuts between the letters of a sign cross no material: nothing is joined, not even with glue
       const apart = split.cuts.length > 0 && split.cuts.every((c) => measured?.cuts.get(c.id)?.islands === 0);

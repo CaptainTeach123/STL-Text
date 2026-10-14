@@ -55,11 +55,15 @@ let measured = null; // the cuts last measured on the model: { key, cuts: Map(id
 let joined = null; // { key, content, joints: Map(id -> 'dovetail' | 'dowels' | 'none') } the joint each cut got when the split was last worked out
 let splitBounds = null; // { version, key, bounds } of the model and its text from the last measure (text-only work has no other)
 let planNotes = null; // { key, content, notes } of a Fit to my printer that cut nothing
+let offerPlan = null; // { key, plan } of the last Fit to my printer planned, ahead or on a click: the count the Model card offers
 let loads = 0; // models opened so far: a fit planned for one is never applied to the next
 
 const client = createEngineClient({
   createWorker: () => new Worker(new URL('./worker.js', import.meta.url), { type: 'module' }),
-  onProgress: ({ stage }) => showProgress(stage),
+  onProgress: ({ stage }) => {
+    if (offerBusy && !splitWork) return; // the Model card's offer being planned ahead: nobody is waiting for it
+    showProgress(stage);
+  },
   onState: (state) => {
     document.body.dataset.engine = !booted ? 'starting' : state === 'busy' ? 'busy' : 'idle';
     if (state !== 'busy') showProgress(null);
@@ -252,12 +256,12 @@ function describeModel() {
 
 let tooBigFor = { key: null, note: null };
 /**
- * The "bigger than your printer" note for a model with no cuts yet, with the
- * number of pieces Fit to my printer would make of it (`pieces`, 0 when even
- * 64 would not do), or null when it fits. A thin plate is counted lying flat,
+ * The "bigger than your printer" note for a model with no cuts yet, with a
+ * first guess from its box at the pieces it takes (`pieces`, 0 when even 64
+ * would not do), or null when it fits. A thin plate is counted lying flat,
  * with the dovetail tabs its joints may get: stood on its edge it might fit,
  * but it is never printed that way. Worked out here, not by the engine: it
- * knows no printer.
+ * knows no printer. The number the note offers is the plan's (`offerLabel`).
  */
 function bedTooSmall() {
   if (!modelInfo?.hasModel || !modelInfo.size || splitActive(doc.split)) return null;
@@ -272,15 +276,33 @@ function bedTooSmall() {
   return tooBigFor.note;
 }
 
+const SPLIT_TO_FIT = 'Split to fit'; // the offer while the plan's count is not known
+
+/**
+ * What the "bigger than your printer" note offers: "Split into N pieces"
+ * once Fit to my printer's plan for the model, its text, the printer and
+ * the joints as they are now is known, "Split to fit" until then, and
+ * nothing when there is nothing to offer (64 pieces would not do, or the
+ * model has gaps). Only the plan knows N: the box alone would give a cone
+ * four pieces that stand on a point or an edge, where the plan makes more
+ * that stand on their cut faces, and would count the empty corner of an L.
+ */
+function offerLabel() {
+  const note = bedTooSmall();
+  if (!(note?.pieces > 1) || !canSplit()) return null;
+  if (offerPlan?.key !== planKey()) return SPLIT_TO_FIT;
+  return offerPlan.plan.cuts.length ? `Split into ${offerPlan.plan.pieces.length} pieces` : null;
+}
+
 let modelShown = ''; // what the Model card shows, so a render only rewrites it (and has it read out again) when it changed
 function renderModel() {
   const { text, notes } = describeModel();
-  const usable = canSplit();
-  const shown = JSON.stringify([text, notes.map((n) => [n.text, n.pieces]), usable]); // the joints can change the count alone
+  const offer = offerLabel();
+  const shown = JSON.stringify([text, notes.map((n) => n.text), offer]);
   if (shown === modelShown) return;
   modelShown = shown;
   $('modelInfo').textContent = text;
-  renderNotes($('modelNotes'), notes, { BED_TOO_SMALL: (n) => n.pieces > 1 && usable && { label: `Split into ${n.pieces} pieces`, run: autoSplit } });
+  renderNotes($('modelNotes'), notes, { BED_TOO_SMALL: () => offer && { label: offer, run: autoSplit } });
 }
 
 function renderNotes(el, notes, actions = {}) {
@@ -1207,9 +1229,69 @@ function setSplitPending(on) {
   else $('splitCard').classList.remove('pending');
 }
 
-/** What a fit is planned for: the model and its text, the printer and the split's settings (not its cuts: they are replaced). */
-const planKey = () =>
-  stableKey({ items: doc.items, base: version(), printing, bed: usableBed(bed), split: { ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split, cuts: [] } });
+/** What a fit is planned for besides the text: the model, the printer and the split's settings (not its cuts: they are replaced). */
+const fitSettings = () => ({ base: version(), printing, bed: usableBed(bed), split: { ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split, cuts: [] } });
+
+/** What a fit is planned for: the model and its text, the printer and the split's settings. */
+const planKey = () => stableKey({ items: doc.items, ...fitSettings() });
+
+/** Fit to my printer's plan for the model and its text as they are now (the engine keeps the last one: asked again, it answers at once). */
+const planFit = () =>
+  client.planSplit(doc.items, version(), { printing, split: { ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split }, bed: usableBed(bed), mode: 'fit' });
+
+let offerTimer = 0;
+let offerFor = null; // the plan key the offer's plan is timed for
+let offerAsked = null; // the model, printer and settings (fitSettings) the offer's plan was last asked for
+let offerBusy = false; // the offer's plan is with the engine: unasked, so its progress shows only once a split is asked for
+
+/**
+ * Plan a fit ahead for the Model card's offer, so that it can say how many
+ * pieces Fit to my printer makes (`offerLabel`): for a model opened or
+ * changed, another printer or other joints, once the edits pause and the
+ * engine has nothing else to do. A plan builds the final result and slices
+ * the model, so text being moved or typed is not followed by one – the next
+ * keystroke's preview would wait for it – and neither is a dense model,
+ * where one takes seconds: the offer says "Split to fit" until it is
+ * clicked, or until the printer or the joints change.
+ */
+function scheduleOffer() {
+  const settings = booted && !halted && !modelInfo?.simplifiedView && offerLabel() === SPLIT_TO_FIT ? stableKey(fitSettings()) : null;
+  const key = settings && settings !== offerAsked ? planKey() : null;
+  if (key === offerFor) return; // timed already, or nothing to plan
+  offerFor = key;
+  clearTimeout(offerTimer);
+  if (!key) return;
+  const ask = async () => {
+    if (halted || planKey() !== key) {
+      offerFor = null; // the next render times it again
+      return;
+    }
+    // what was asked meanwhile goes first, and the plan is for the model as it is now
+    if (client.state === 'busy' || basePending || engineVersion !== version()) {
+      offerTimer = setTimeout(ask, 300);
+      return;
+    }
+    offerAsked = settings;
+    offerBusy = true;
+    let r;
+    try {
+      r = await planFit();
+    } catch {
+      return; // not asked again for these settings: Fit to my printer says what is wrong when clicked
+    } finally {
+      offerBusy = false;
+    }
+    if (!r) {
+      // the engine had moved on to a newer model: planned again on the next render
+      offerAsked = null;
+      offerFor = null;
+      return;
+    }
+    offerPlan = { key, plan: r }; // kept even when the text has moved on meanwhile: an undo brings the count back
+    renderModel();
+  };
+  offerTimer = setTimeout(ask, 1000);
+}
 
 /**
  * Fit to my printer: the engine works out the fewest pieces that fit and
@@ -1223,8 +1305,9 @@ async function autoSplit() {
   try {
     if (!(await syncBase())) return;
     const asked = { loads, plan: planKey() };
-    const r = await client.planSplit(doc.items, version(), { printing, split: { ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split }, bed: usableBed(bed), mode: 'fit' });
+    const r = await planFit();
     if (!r) return; // superseded by a newer plan
+    offerPlan = { key: asked.plan, plan: r }; // the count the Model card offers should the cuts be taken away again
     if (planKey() !== asked.plan) {
       // planned for what was there when asked: another model opened since gets none of it, while
       // the same one, turned, retyped or meant for another printer, is planned again as it is now
@@ -2286,6 +2369,7 @@ function render() {
     });
   }
   scheduleMeasure();
+  scheduleOffer();
 }
 
 doc.subscribe(render);

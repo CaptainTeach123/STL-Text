@@ -2157,8 +2157,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     if (result) releaseSplit(result);
   }
 
-  /** What a split keeps on its final result: the frame copy, the plate test, and the cut and drill stages. */
-  const splitState = (final) => (final.split ??= { frame: null, bounds: null, plate: null, cut: null, drill: null });
+  /** What a split keeps on its final result: the frame copy, the plate test, the last fit plan, and the cut and drill stages. */
+  const splitState = (final) => (final.split ??= { frame: null, bounds: null, plate: null, fit: null, cut: null, drill: null });
 
   /**
    * The box the cuts are judged and planned against: the solid's. Unrepaired
@@ -2467,20 +2467,23 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       if (!groups.has(k)) groups.set(k, { d: d.d, depth: d.depth, length: 2 * d.depth, count: 0 });
       groups.get(k).count++;
     }
+    // the size the layout chose first: the filament some narrow faces fell back to never stands in for it
     const pins = [...groups.values()]
-      .sort((p, q) => q.count - p.count || q.d - p.d || q.depth - p.depth)
+      .sort((p, q) => (p.d === layout.diameter ? 0 : 1) - (q.d === layout.diameter ? 0 : 1) || q.count - p.count || q.d - p.d || q.depth - p.depth)
       .map((g) => {
         const own = spec.pins === 'own' || g.d === FILAMENT;
         return { ...g, own, spares: own ? 0 : pinSpares(g.count) };
       });
     const notes = [];
     const main = pins[0];
-    // the summary counts every pin of the main size, and says how many of each length when they differ
+    // the summary counts every pin, and says how many of each size, or of each length of one size, when they differ
     const sized = main ? pins.filter((g) => g.d === main.d) : [];
     const pairs = seams.filter((s) => s.labels?.length === 2).map((s) => `${s.labels[0]} ↔ ${s.labels[1]}`);
     notes.push(splitNote('SPLIT', {
-      pieces: n, dowels: sized.reduce((k, g) => k + g.count, 0), diameter: main?.d ?? null, length: main?.length ?? null,
-      ...(sized.length > 1 ? { lengths: sized.map((g) => ({ length: g.length, count: g.count })) } : {}), dovetails: cut.dovetails.length, pairs,
+      pieces: n, dowels: pins.reduce((k, g) => k + g.count, 0), diameter: main?.d ?? null, length: main?.length ?? null,
+      ...(sized.length > 1 ? { lengths: sized.map((g) => ({ length: g.length, count: g.count })) } : {}),
+      ...(sized.length < pins.length ? { sizes: pins.map((g) => ({ diameter: g.d, length: g.length, count: g.count })) } : {}),
+      dovetails: cut.dovetails.length, pairs,
     }));
     for (const g of pins) {
       // pins that fell back to filament on some faces are told of by that cut's own note
@@ -2657,7 +2660,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * each dovetail cut, which keeps its tabs clear of what stands proud of the
    * plate. While the final result for the text is not built (the text is
    * being edited) a model's cuts are measured on the model and the items' own
-   * solids instead, with no boolean of the two (`estimate: true`).
+   * solids instead, with no boolean of the two (`estimate: true`). A fit plan
+   * is kept with the final result, for the bed, nozzle and joint settings it
+   * was made for: asked again (the Model card's count, then its button), it
+   * comes back at once.
    */
   function planSplitRequest({ items, baseVersion, printing, split = null, bed = null, mode = 'fit' }, progress) {
     if (mode === 'measure' && sketchWill(items, baseVersion)) {
@@ -2670,7 +2676,17 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     if (base.kind !== 'none' && !base.current?.watertight) message = { bounds: null, cuts: [], notes: [splitNote('SPLIT_UNAVAILABLE')] };
     else if (!final.solid) message = { bounds: null, cuts: [], notes: [] };
     else if (mode === 'measure') message = measureCuts(final, items, split, progress);
-    else message = fitCuts(final, items, split, bedOf(bed), printing?.nozzle ?? 0.4, progress);
+    else {
+      // the plan is kept with the result it was made for, so the count the Model card offers and the cuts the offer's
+      // button asks for again come from one plan, worked out once
+      const U = bedOf(bed);
+      const nozzle = printing?.nozzle ?? 0.4;
+      const { spec } = normaliseSplit({ ...(split ?? {}), cuts: [] });
+      const key = stableKey({ U, nozzle, joint: spec.joint, diameter: spec.diameter, depth: spec.depth, clearance: spec.clearance });
+      const state = splitState(final);
+      if (state.fit?.key !== key) state.fit = { key, message: fitCuts(final, items, split, U, nozzle, progress) };
+      message = state.fit.message;
+    }
     return { message, transfer: [] };
   }
 
@@ -2783,8 +2799,12 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * takes in the unrepaired triangles, which go in the end pieces' files,
    * but cuts go only through the solid. Grids come fewest boxes first; the
    * first count for which some grid's pieces all fit is planned, the grid
-   * with the fewest real pieces winning, then the cheapest. When no grid's
-   * pieces can all lie on something flat, they are planned as they fit.
+   * with the fewest real pieces winning, then the cheapest – the support its
+   * pieces need counted in, so a U is cut across its legs into pieces that
+   * stand rather than along its depth into halves that lie on one leg. A
+   * cut through a plate is planned with dovetail tabs only where the pieces
+   * beside it can lie flat on the plate. When no grid's pieces can all lie
+   * on something flat, they are planned as they fit.
    */
   function fitCuts(final, items, split, U, nozzle, progress) {
     progress?.('Planning cuts…');
@@ -2974,21 +2994,22 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
 
   /**
    * A slice of the model for the planner: its area, perimeter and islands
-   * (of 1 mm² or more), and the share of its area on islands with no room
-   * for two pins of the probe's size (smaller than 50 mm², or too narrow
-   * once inset by ρ where the model also runs a hole's reach either side
-   * of the face: `beside` holds the slices there, null past the model's
-   * end). Without that a slanted wall looks roomy: near the end of a round
-   * shell the ring is wide, but a hole square to it breaks out a few mm in.
-   * Borrows the slices.
+   * (of 1 mm² or more), how many of them have room for two pins of the
+   * probe's size, and the share of its area on islands with no such room
+   * (smaller than 50 mm², or too narrow once inset by ρ where the model
+   * also runs a hole's reach either side of the face: `beside` holds the
+   * slices there, null past the model's end). Without that a slanted wall
+   * looks roomy: near the end of a round shell the ring is wide, but a hole
+   * square to it breaks out a few mm in. Borrows the slices.
    */
   function sliceStats(face, pins, beside = null) {
     const temps = scope();
     try {
-      if (face.isEmpty()) return { area: 0, perimeter: 0, islands: 0, noRoom: 0 };
+      if (face.isEmpty()) return { area: 0, perimeter: 0, islands: 0, roomy: 0, noRoom: 0 };
       const area = face.area();
       const perimeter = perimeterOf(polygonsOf(face));
       let islands = 0;
+      let roomy = 0;
       let bare = 0;
       const ends = (beside ?? []).includes(null); // a hole's reach from the model's end: no room anywhere
       let deep = null; // the face where the model runs on either side: made once, when an island is big enough to ask
@@ -3014,12 +3035,13 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
             const inset = temps.add(thin.offset(-pins.rho, 'Round', 2, 16));
             room = !inset.isEmpty() && spreadOf(polygonsOf(inset)) >= pins.sMin;
           }
-          if (!room) bare += a;
+          if (room) roomy++;
+          else bare += a;
         }
       } finally {
         list.forEach((c) => c.delete());
       }
-      return { area, perimeter, islands, noRoom: area > 0 ? Math.min(1, bare / area) : 0 };
+      return { area, perimeter, islands, roomy, noRoom: area > 0 ? Math.min(1, bare / area) : 0 };
     } finally {
       temps.dispose();
     }

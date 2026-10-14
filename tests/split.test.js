@@ -8,7 +8,7 @@ import { createItem, createPart } from '../src/document.js';
 import { manifold } from '../src/manifold.js';
 import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
-import { SPLIT_DEFAULTS, TO_PLANE, cellSizes, cellSupport, fitPieces, isSymmetric, orientationStats, sizesFor } from '../src/split.js';
+import { FILAMENT, SPLIT_DEFAULTS, TO_PLANE, cellSizes, cellSupport, fitPieces, isSymmetric, orientationStats, sizesFor } from '../src/split.js';
 import { clearSplitCaches, dowelHole, halfHole, pinAt, pinSolid } from '../src/splitGeometry.js';
 import { setup, soupOf as soupGeometry } from './helpers.js';
 
@@ -254,6 +254,15 @@ describe('cutting a model into pieces', () => {
     expect(lengths).toEqual([17.8, 17.8, 19, 19]);
     expect(noteOf(ex, 'SPLIT').text).toBe('Cut into 3 pieces with 4 pins Ø6 mm (2 × 19 mm, 2 × 17.8 mm).');
     expect(ex.notes.filter((n) => n.code === 'PINS').map((n) => n.length)).toEqual([19, 17.8]);
+  });
+
+  it('the summary counts every pin, of every size: the filament that narrow faces fall back to never hides the main pins', async () => {
+    // a 40 × 20 bar takes Ø6 pins; three 8 mm rods beside it are too narrow for them and take a filament pin each
+    const rods = [40, 55, 70].map((y) => cube([300, 8, 8], [0, y, 4]));
+    await load(own(wasm.Manifold.union([cube([300, 40, 20], [0, 0, 10]), ...rods])), 'rack');
+    const ex = await exportSplit(S({ labels: false }), { name: 'rack' });
+    expect(dowelsOf(ex).map((d) => d.d).sort((p, q) => q - p)).toEqual([6, 6, FILAMENT, FILAMENT, FILAMENT]);
+    expect(noteOf(ex, 'SPLIT')).toMatchObject({ dowels: 5, diameter: 6, text: 'Cut into 2 pieces with 5 pins (2 × Ø6 × 19 mm, 3 × Ø1.75 × 8 mm).' });
   });
 
   it('the pins file holds one pin per hole pair plus a spare, lying flat', async () => {
@@ -728,10 +737,15 @@ describe('planning pieces that really print', () => {
     // on a round shell every slice has the same area and the ring shrinks towards the ends; near an end the ring is
     // wide too, but a hole square to it breaks out of the slanted wall
     const shell = (R, wall) => own(own(wasm.Manifold.sphere(R, 64)).subtract(own(wasm.Manifold.sphere(R - wall, 64))));
+    // a helmet: an egg-shaped shell open at the neck, with a visor cut out of its front. Every slice through the visor
+    // has two islands, the crown and the chin bar, but neither takes pins: no reason to cut lopsided beside the opening
+    const egg = (r) => own(own(wasm.Manifold.sphere(1, 64)).scale(r));
+    const helmet = own(own(egg([120, 140, 150]).subtract(egg([116, 136, 146]))).subtract(cube([600, 600, 240], [0, 0, -180])).subtract(cube([150, 240, 55], [0, -180, 17.5])));
     for (const [name, solid, counts] of [
       ['globe', shell(115, 3), [1, 1, 1]],
       ['thick globe', shell(130, 8), [1, 1, 1]],
       ['bowl', own(shell(130, 6).subtract(cube([400, 400, 200], [0, 0, 100]))), [1, 1, 0]],
+      ['helmet', helmet, [1, 1, 0]],
     ]) {
       await load(solid, name);
       const p = await plan();
@@ -739,6 +753,45 @@ describe('planning pieces that really print', () => {
       for (const c of p.cuts) expect(Math.abs(c.position[c.normal.indexOf(1)]), name).toBeLessThan(0.5);
       expect(p.pieces.every((x) => x.fits), name).toBe(true);
     }
+  });
+
+  it('a U bracket is cut across its legs into two pieces that stand, held by pins, on a small bed or a big one', async () => {
+    // laid flat on one leg for dovetails, the other leg would print as a roof 142 mm over the bed; halved along y on a
+    // 256 mm printer, each half would lie on one leg with the other over it
+    const U = own(wasm.Manifold.union([cube([150, 50, 8], [75, 25, 4]), cube([8, 50, 300], [4, 25, 150]), cube([8, 50, 300], [146, 25, 150])]));
+    await load(U, 'bracket');
+    for (const bed of [BED, [246, 246, 255]]) {
+      const p = await plan([], bed);
+      expect(p.counts, `${bed}`).toEqual([0, 0, 1]);
+      const r = await resultSplit(planned(p, { labels: false }), { bed });
+      expect(r.seams.map((x) => [x.joint, x.dowels.length]), `${bed}`).toEqual([['dowels', 4]]);
+      expect(r.pieces.map((x) => [x.down, x.fits]), `${bed}`).toEqual([['-z', true], ['-z', true]]);
+    }
+  });
+
+  it('a box with its lid laid beside it is cut through the gap: four pieces, the lid in two', async () => {
+    const body = own(cube([300, 200, 150], [150, 100, 75]).subtract(cube([294, 194, 150], [150, 100, 78])));
+    const lid = own(own(cube([300, 200, 3], [150, 320, 1.5]).add(cube([293.2, 193.2, 8], [150, 320, 7]))).subtract(cube([287.2, 187.2, 10], [150, 320, 7])));
+    await load(own(body.add(lid)), 'box');
+    const p = await plan();
+    expect(p.counts).toEqual([1, 1, 0]);
+    expect(p.pieces).toHaveLength(4);
+    const y = p.cuts.find((c) => c.normal[1] === 1).position[1];
+    expect(y).toBeGreaterThan(200);
+    expect(y).toBeLessThan(220);
+  });
+
+  it('Fit to my printer works its plan out once: asked again, the same plan comes back at once', async () => {
+    await load(cube([400, 40, 20]), 'bar');
+    const first = await plan();
+    stages.length = 0;
+    expect(await plan()).toEqual(first);
+    expect(stages).not.toContain('Planning cuts…');
+    // the settings Fit does not read leave it be; a bed it was not planned for is planned for
+    expect(await plan([], BED, { ...SPLIT_DEFAULTS, labels: false, orient: 'cut' })).toEqual(first);
+    expect(stages).not.toContain('Planning cuts…');
+    await plan([], [180, 180, 180]);
+    expect(stages).toContain('Planning cuts…');
   });
 
   it('a plaque too thick for a plate is still cut into pieces that lie flat, between the words', async () => {

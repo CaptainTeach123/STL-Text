@@ -793,6 +793,11 @@ try {
     };
     /** The split card's notes, one line. */
     const splitNotes = async () => (await page.locator('#splitNotes li').allInnerTexts()).join(' / ');
+    /** What the model's "bigger than your printer" note offers once Fit's plan for it is in ("Split to fit" until then). */
+    const offered = async () => {
+      await page.waitForFunction(() => /^Split into \d+ pieces$/.test(document.querySelector('#modelNotes button')?.textContent ?? ''), null, { timeout: 60000 }).catch(() => null);
+      return (await page.locator('#modelNotes button').allInnerTexts()).join();
+    };
     /** Wait for the cuts to be measured again: that waits for the edits to pause (a second for text). */
     const measured = async () => {
       await idle();
@@ -857,7 +862,8 @@ try {
     const tooBig = (await page.locator('#modelNotes li').allInnerTexts()).find((t) => /bigger than/.test(t)) ?? '';
     check(/bigger than your 220 × 220 × 250 mm printer/.test(tooBig), 'the model notes say it is bigger than the printer', tooBig.replace(/\s+/g, ' '));
 
-    check((await page.locator('#modelNotes button').innerText()) === 'Split into 2 pieces', 'the note offers to split it into 2 pieces', await page.locator('#modelNotes button').innerText());
+    const barOffer = await offered();
+    check(barOffer === 'Split into 2 pieces', 'the note offers to split it into 2 pieces', barOffer);
     await page.click('#modelNotes button');
     await idle();
     await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
@@ -1033,6 +1039,9 @@ try {
       'a fit planned for the model before is not put on one opened while it ran',
       JSON.stringify(raced),
     );
+    // the box round an L is four boxes on this bed, but the corner one holds nothing: the note offers the pieces Fit makes
+    const ellOffer = await offered();
+    check(ellOffer === 'Split into 3 pieces', 'an L is offered the 3 pieces Fit makes of it, not the 4 boxes round it', ellOffer);
 
     // an L-shape cut into four boxes leaves the corner one empty: three pieces, before they are worked out too
     await page.click('#addCutBtn');
@@ -1113,12 +1122,49 @@ try {
     await page.click('#splitClearBtn');
     await idle();
 
+    // a cone's box would take four pieces on this bed, but those would stand on a point or an edge: Fit makes more, each
+    // standing on a cut face, and the model's note offers what Fit makes – and no number at all while the plan is not in
+    const cone = Manifold.cylinder(260, 110, 0, 48);
+    const coneFile = writeFixture('cone.stl', soupOf(cone));
+    cone.delete();
+    await page.evaluate(() => (window.__engine.hold = true));
+    await page.setInputFiles('#stlFile', coneFile);
+    await page.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('cone:'), null, { timeout: 60000 });
+    await page.waitForFunction(() => window.__engine.held.length > 0, null, { timeout: 60000 }).catch(() => null); // the plan is asked a moment after
+    const coneUnknown = (await page.locator('#modelNotes button').allInnerTexts()).join();
+    await releasePlans();
+    await idle();
+    const coneOffer = await offered();
+    await page.click('#modelNotes button');
+    await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
+    await idle();
+    const conePieces = await page.locator('#pieceList li').count();
+    check(
+      coneUnknown === 'Split to fit' && coneOffer === `Split into ${conePieces} pieces` && conePieces > 4,
+      'a cone is offered no number until Fit has planned it, then the pieces Fit makes, not the 4 of its box',
+      `"${coneUnknown}", then "${coneOffer}"; Fit made ${conePieces}`,
+    );
+    await page.click('#splitClearBtn');
+    await idle();
+    const coneAgain = (await page.locator('#modelNotes button').allInnerTexts()).join();
+    check(coneAgain === coneOffer, 'with the split removed the note offers those pieces again at once', coneAgain);
+    // retyping the text plans nothing ahead: a plan builds the whole result, which the next keystroke's preview would wait for
+    await page.click('#itemList li:first-child');
+    await idle();
+    const plansBefore = await page.evaluate(() => window.__engine.fits.size);
+    await setText('Hi');
+    await page.waitForTimeout(2000);
+    await idle();
+    const retyped = { plans: (await page.evaluate(() => window.__engine.fits.size)) - plansBefore, offer: (await page.locator('#modelNotes button').allInnerTexts()).join() };
+    check(retyped.plans === 0 && retyped.offer === 'Split to fit', 'retyping the text starts no plan: the note offers "Split to fit" until clicked', JSON.stringify(retyped));
+    await setText('');
+
     // a thin sign prints lying flat, with dovetail tabs that make its pieces longer: the model's note offers as many pieces as Fit makes
     const sign = Manifold.cube([400, 100, 5], true);
     const signFile = writeFixture('sign.stl', soupOf(sign));
     sign.delete();
     await openStl(signFile, 'sign');
-    const offer = (await page.locator('#modelNotes button').allInnerTexts()).join();
+    const offer = await offered();
     await page.click('#modelNotes button');
     await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
     await idle();

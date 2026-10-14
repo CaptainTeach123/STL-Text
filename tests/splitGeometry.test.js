@@ -5,6 +5,7 @@ import {
   buildSplitDisplay,
   cutPieces,
   dovetailCells,
+  dovetailTabs,
   dowelHole,
   drillPiece,
   fitTestCoupon,
@@ -348,39 +349,73 @@ describe('dovetail tabs through thin plates', () => {
   it('a tab never cuts through another plate at another height', () => {
     // a lower plate, and a narrower upper one 15 mm above it, joined at one end
     const rack = own(wasm.Manifold.union([cube([300, 100, 5], [0, 0, 2.5]), cube([300, 30, 5], [0, 25, 22.5]), cube([10, 100, 25], [-145, 0, 12.5])]));
-    const s = split(rack, [[0, 0]]);
-    expect(s.plan.joints).toEqual({ c1: 'dovetail' });
+    // its pieces cannot lie flat on either plate with the other held over the bed, so the cut takes pins…
+    expect(split(rack, [[0, 0]], { labels: false }).plan.joints).toEqual({ c1: 'dowels' });
+    // …but tabs placed through it all the same never carry a slice of the other plate across
+    const { cuts } = cutsFor(rack, [[0, 0]]);
+    const dove = { ids: ['c1'], w: 2, clearance: 0.15 };
+    const tabs = dovetailTabs(rack, cuts, dove);
+    expect(tabs.seams[0].tabs.length).toBeGreaterThan(0);
+    const cut = cutPieces(rack, cuts, { dove, tabs });
+    cut.pieces.forEach((p) => own(p.solid));
     const lost = (z) => {
-      const slices = s.cut.pieces.map((p) => own(p.solid.slice(z)));
+      const slices = cut.pieces.map((p) => own(p.solid.slice(z)));
       const missing = own(own(rack.slice(z)).subtract(own(wasm.CrossSection.union(slices))));
       // the clearance round a tab is a 0.15 mm kerf: opening by 0.25 mm leaves only a real hole
       return own(own(missing.offset(-0.25, 'Round')).offset(0.25, 'Round')).area();
     };
     expect(lost(2.5)).toBeLessThan(0.01);
     expect(lost(22.5)).toBeLessThan(0.01);
-    expect(s.cut.pieces).toHaveLength(2);
+    expect(cut.pieces).toHaveLength(2);
   });
 
-  it('the two legs of a U cut across both get the same tabs, each wholly inside both legs', () => {
-    // a base 150 × 50 × 8 and two legs 8 × 50 × 300: seen along x the legs cover each other, near the cut
+  it('a U cut across both legs takes pins, its pieces standing; tabs forced through both legs are each wholly inside both', () => {
+    // a base 150 × 50 × 8 and two legs 8 × 50 × 300: laid flat on one leg, the other would be a roof 142 mm over the bed
     const U = own(wasm.Manifold.union([cube([150, 50, 8], [75, 25, 4]), cube([8, 50, 300], [4, 25, 150]), cube([8, 50, 300], [146, 25, 150])]));
-    const s = split(U, [[2, 150]], { labels: false });
-    expect(s.plan.joints).toEqual({ c1: 'dovetail' });
-    expect(s.plan.tabs.seams[0].tabs.map((t) => t.dir)).toEqual([1, -1]);
-    expect(s.plan.notes).toEqual([]);
-    const [A, B] = s.cut.pieces.map((p) => p.solid);
-    for (const p of s.cut.pieces) {
+    const pinned = split(U, [[2, 150]], { labels: false });
+    expect(pinned.plan.joints).toEqual({ c1: 'dowels' });
+    expect(pinned.plan.notes).toEqual([]);
+    expect(pinned.layout.dowels.length).toBeGreaterThanOrEqual(4);
+    expect(pinned.pieces.map((p) => p.stats.allowed.length)).toEqual([6, 6]);
+    expect(pinned.pieces.map((p) => chooseOrientation(p.stats, BED).down)).toEqual(['-z', '-z']);
+    // asked for, tabs are explained away
+    expect(split(U, [[2, 150]], { joint: 'dovetail', labels: false }).plan.notes).toEqual([expect.objectContaining({ code: 'DOVETAIL_NOT_PLATE', lying: true })]);
+    // the same tabs through both legs, placed as they would be: each wholly inside both legs
+    const { cuts } = cutsFor(U, [[2, 150]]);
+    const dove = { ids: ['c1'], w: 0, clearance: 0.15 };
+    const tabs = dovetailTabs(U, cuts, dove);
+    expect(tabs.seams[0].tabs.map((t) => t.dir)).toEqual([1, -1]);
+    const cut = cutPieces(U, cuts, { dove, tabs });
+    const [A, B] = cut.pieces.map((p) => own(p.solid));
+    for (const p of cut.pieces) {
       expect(p.solid.status()).toBe('NoError');
       expect(shells(p.solid)).toHaveLength(p.index === 1 ? 1 : 2);
     }
     // no slice of a leg changes hands: each leg's part above the cut is the upper piece's, tabs and sockets aside
-    const sum = s.cut.pieces.reduce((v, p) => v + p.volume, 0);
-    expect(sum + s.cut.gap).toBeCloseTo(U.volume(), 3);
+    const sum = cut.pieces.reduce((v, p) => v + p.volume, 0);
+    expect(sum + cut.gap).toBeCloseTo(U.volume(), 3);
     // both legs lock: pulled apart the heads bite in each leg, and the pieces slide together along x
     const moved = (x, y, z) => overlap(A, own(B.translate([x, y, z])));
     expect(moved(0, 0, 0)).toBeLessThan(1e-6);
     for (const x of [4, 146]) expect(overlap(own(A.intersect(cube([12, 60, 60], [x, 25, 150]))), own(B.translate([0, 0, 2])))).toBeGreaterThan(10);
     for (const x of [20, 70, 142]) expect(moved(x, 0, 0)).toBeLessThan(1e-6);
+  });
+
+  it('tabs only where every piece beside the cut can lie flat on its plate: a double skin and a sword\'s guard take pins', () => {
+    // two 4 mm skins 30 mm apart, closed at the ends: laid on one skin, the other is a roof over the bed
+    const panel = own(wasm.Manifold.union([cube([420, 150, 4], [0, 0, 2]), cube([420, 150, 4], [0, 0, 32]), cube([10, 150, 34], [-205, 0, 17]), cube([10, 150, 34], [205, 0, 17])]));
+    expect(split(panel, [[0, 0]], { labels: false }).plan.joints).toEqual({ c1: 'dowels' });
+    // a blade with a guard and a round grip: the piece holding them would lie on the grip's curve, the blade in the air
+    const grip = own(own(own(wasm.Manifold.cylinder(180, 15, 15, 48)).rotate([0, -90, 0])).translate([-20, 0, 0]));
+    const sword = own(wasm.Manifold.union([cube([300, 50, 8], [150, 0, 0]), cube([20, 160, 24], [-10, 0, 0]), grip]));
+    const guarded = split(sword, [[0, 100]], { labels: false });
+    expect(guarded.plan.joints).toEqual({ c1: 'dowels' });
+    expect(guarded.plan.plates.c1.reason).toBe('lying');
+    // a tapered tip only a few millimetres over the bed lies flat well enough, and keeps its tabs
+    const tip = own(wasm.Manifold.hull([cube([200, 50, 8], [100, 0, 0]), cube([2, 2, 2], [299, 0, 0])]));
+    const tipped = split(tip, [[0, 150]], { labels: false });
+    expect(tipped.plan.joints).toEqual({ c1: 'dovetail' });
+    expect(tipped.pieces.map((p) => chooseOrientation(p.stats, BED).down[1])).toEqual(['z', 'z']);
   });
 
   it('crossing dovetail cuts never close off a loose corner of a piece', () => {
@@ -533,6 +568,21 @@ describe('cutting into pieces', () => {
     thin.pieces.forEach((p) => own(p.solid));
     expect(thin.notes).toEqual([expect.objectContaining({ code: 'SMALL_PIECE', pieceIndex: 2, cutId: 'c1', letters: ['A'] })]);
     expect(thin.notes[0].thickness).toBeCloseTo(2, 6);
+  });
+
+  it('keep a sealed hollow no cut opens inside its piece: a magnet pocket is not a sliver to throw away', () => {
+    // a 400 × 40 × 12 bar with a sealed 10 × 10 × 3.2 pocket for a magnet dropped in at a pause, cut away from it
+    const bar = own(cube([400, 40, 12], [0, 0, 6]).subtract(cube([10, 10, 3.2], [120, 0, 6])));
+    const { cuts } = cutsFor(bar, [[0, 0]]);
+    const r = cutPieces(bar, cuts);
+    r.pieces.forEach((p) => own(p.solid));
+    expect(r.notes).toEqual([]);
+    expect(r.pieces.map((p) => p.shells)).toEqual([1, 1]);
+    expect(r.pieces.map((p) => p.volume)).toEqual([expect.closeTo(96000, 3), expect.closeTo(96000 - 320, 3)]);
+    expect(r.pieces[1].solid.volume()).toBeCloseTo(96000 - 320, 3);
+    // the pocket is still a closed hollow inside the piece; its roof is bridged over, so the bar still lies as modelled
+    expect(shells(r.pieces[1].solid).map((m) => Math.round(m.volume()))).toEqual([96000, -320]);
+    expect(r.pieces.map((p) => chooseOrientation(p.stats, BED).down)).toEqual(['-z', '-z']);
   });
 });
 

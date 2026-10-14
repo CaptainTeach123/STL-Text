@@ -645,9 +645,12 @@ export const PLAN_WEIGHTS = Object.freeze({
   itemBox: 8, // a word gap is fine; outside the text is better
   ledge: 4, // a ledge or fine detail close by makes a sliver or a weak seam
   neck: 6, // a narrow neck makes a weak joint
-  islands: 2, // each island needs its own pins
+  islands: 2, // each island that takes pins needs its own: one with no room for them is glued either way
   noRoom: 5, // prefer faces that take pins
   perimeter: 1, // seam length: the glue line and how much it shows
+  // per area of the model's broadest side that its pieces need support under, lying the best way they can: a piece
+  // that must lie with a leg held over the bed as a roof costs more than a seam in the wrong place (see `planGrid`)
+  support: 10,
   // per even piece's length a cut moves from its even position: uneven pieces must buy something real. Above the
   // perimeter's pull on purpose: on a round shell every slice has the same area and only the ring shrinks towards
   // the ends, so a weaker pull sends every cut to the end of its room, a sliver beside a piece too big to fit
@@ -696,10 +699,11 @@ function areaAt(profile, t) {
 
 /**
  * The cost of cutting at each sample of one axis's profile (lower is better).
- * @param {{ t: number, area: number, perimeter: number, islands: number, noRoom: number, letters: boolean,
- *   nearLetters?: boolean }[]} profile sorted by t: the slice's area and perimeter, its islands, the share of its area
- *   (0–1) in islands with no room for two pins, whether any letter's solid is cut there, and whether one is within
- *   2 mm (looked at apart from the samples; when it is not given, the samples within 2 mm tell)
+ * @param {{ t: number, area: number, perimeter: number, islands: number, roomy?: number, noRoom: number, letters: boolean,
+ *   nearLetters?: boolean }[]} profile sorted by t: the slice's area and perimeter, its islands and how many of them
+ *   have room for two pins (all of them when not given), the share of its area (0–1) in islands with no room for two
+ *   pins, whether any letter's solid is cut there, and whether one is within 2 mm (looked at apart from the samples;
+ *   when it is not given, the samples within 2 mm tell)
  * @param {{ items?: number[][] }} options `items`: the text items' extents [lo, hi] along this axis
  * @returns {number[]} a cost per sample; a sample with no material costs only the item-box term
  */
@@ -718,7 +722,7 @@ export function planCost(profile, { items = [] } = {}) {
     if (p.nearLetters || letterTs.some((lt) => lt !== t && Math.abs(lt - t) <= 2 + EPS)) cost += W.nearLetters;
     cost += W.ledge * Math.min(2, Math.abs(areaAt(profile, t + 2) - areaAt(profile, t - 2)) / Math.max(p.area, 1));
     if (medianA > 0) cost += W.neck * Math.max(0, 1 - p.area / (0.5 * medianA));
-    cost += W.islands * Math.max(0, (p.islands ?? 1) - 1);
+    cost += W.islands * Math.max(0, (p.roomy ?? p.islands ?? 1) - 1);
     cost += W.noRoom * clamp(Number(p.noRoom), 0, 1, 0);
     if (medianP > 0) cost += (W.perimeter * (p.perimeter || 0)) / medianP;
     return cost;
@@ -801,34 +805,45 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
  * print, tabs counted; if one is too big because another axis's pieces came
  * out longer than even, the axes are planned again against those lengths,
  * and failing that with every piece held to the even one grown alike on
- * every side as far as it fits: a grid whose even pieces fit is never lost.
+ * every side as far as it fits. All of that is first tried with room for
+ * the longest tabs any cut could have; then, as the cuts may well miss the
+ * plates (a gap between a box and its lid laid beside it), with none: a
+ * grid whose even pieces fit is never lost.
  *
  * A dovetail cut keeps its tabs as the cut stage would: not when a cut
  * along the plate's thickness runs through that plate (it would part the
- * tabs into layers), and on each axis only through plates as thick along
- * the same axis as the first. With `support` (what each box holds of the
- * model), boxes that hold nothing are no pieces, and a piece must be able
- * to lie on something flat – one of its cut faces, or a flat side of the
- * model where it ends – unless `stable` is false.
+ * tabs into layers), not when a piece beside it cannot lie flat on the
+ * plate (`liesFlat`: a U's second leg would be held over the bed), and on
+ * each axis only through plates as thick along the same axis as the first.
+ * With `support` (what each box holds of the model), boxes that hold
+ * nothing are no pieces, a piece must be able to lie on something flat –
+ * one of its cut faces, or a flat side of the model where it ends – unless
+ * `stable` is false, and the support the pieces need lying the best way
+ * they fit is added to the cost (`PLAN_WEIGHTS.support`), so of two grids
+ * the one whose pieces stand up wins over one whose pieces lie with a leg
+ * held over the bed.
  * @param {number[]} k cuts per axis
  * @param {{ E: number[], U: number[], bounds: { min: number[], max: number[] }, flat?: number|null, minEnd?: number,
  *   minMid?: number, profileOf: function, support?: function|null, stable?: boolean }} options E the model's extents,
  *   `flat` the axis every piece lies flat on (a thin plate, or a slab planned lying flat) or null; `profileOf(axis, k)`
- *   gives `{ samples, costs, tabs }` for k cuts on that axis, `tabs` per sample `{ below, above, w, span }` when a cut
- *   there would take dovetail tabs (see `chooseOffsets`; `span` the plate's extent along w), else null;
- *   `support(cutsByAxis)` gives `cellSupport`'s map
- * @returns {{ k: number[], offsets: number[][], cost: number, pieces: { cell: number[], size: number[], fits: true }[] }|null}
- *   `pieces` every box that makes a piece, as it will print, tabs counted
+ *   gives `{ samples, costs, tabs }` for k cuts on that axis, `tabs` per sample `{ below, above, w, span, t }` when a
+ *   cut there would take dovetail tabs (see `chooseOffsets`; `span` the plate's extent along w, `t` its thickness),
+ *   else null; `support(cutsByAxis)` gives `cellSupport`'s map
+ * @returns {{ k: number[], offsets: number[][], cost: number, support: number, pieces: { cell: number[], size: number[],
+ *   fits: true }[] }|null} `pieces` every box that makes a piece, as it will print, tabs counted; `support` the area
+ *   (mm²) they need support under, as far as the boxes tell
  */
 export function planGrid(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0, profileOf, support = null, stable = true }) {
   const axes = [0, 1, 2].filter((a) => k[a] > 0);
   const profile = new Map(axes.map((a) => [a, profileOf(a, k[a])]));
   const tabsOf = new Map(axes.map((a) => [a, profile.get(a).tabs]));
-  const grow = [0, 1, 2].map((a) => (k[a] ? Math.max(0, ...tabsOf.get(a).map((x) => (x ? Math.max(x.below, x.above) : 0))) : 0));
+  const reach = [0, 1, 2].map((a) => (k[a] ? Math.max(0, ...tabsOf.get(a).map((x) => (x ? Math.max(x.below, x.above) : 0))) : 0));
   const ws = [...new Set(axes.flatMap((a) => tabsOf.get(a)).filter(Boolean).map((x) => x.w))].sort();
-  const even = evenCell(E, k, grow);
-  // `room`: when given, no piece may be longer on an axis than it says
-  const run = (lengths, room = null) => {
+  const [, e1, e2] = [...E].sort((p, q) => p - q);
+  const broadest = Math.max(e1 * e2, EPS);
+  // `grow` how far the pieces are taken to reach past the cuts of each axis; `room`: when given, no piece may be
+  // longer on an axis than it says
+  const run = (grow, even, lengths, room = null) => {
     const offsets = [[], [], []];
     let cost = 0;
     for (const a of axes) {
@@ -844,18 +859,21 @@ export function planGrid(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0,
     }
     // the pieces as they will print: a tab's length longer past each dovetail cut that keeps its tabs, and flat beside one
     const chosen = axes.flatMap((a) => offsets[a].map((t) => ({ axis: a, at: t, tabs: tabsOf.get(a)[profile.get(a).samples.indexOf(t)] })));
+    const by = axisCuts(chosen);
+    const held = support ? support(by) : null;
     const thickness = [null, null, null];
     const cuts = chosen.map(({ axis, at, tabs }) => {
       // without its span, a plate is taken to run right through the model along w
       const [w0, w1] = tabs?.span ?? [-Infinity, Infinity];
       const through = tabs && chosen.some((c) => c.axis === tabs.w && c.at > w0 + CUT_TOLERANCE && c.at < w1 - CUT_TOLERANCE);
-      const kept = tabs && !through && (thickness[axis] ?? tabs.w) === tabs.w;
+      const lie = tabs && held && tabs.t ? boxesBeside(held, axis, by[axis].indexOf(at), at).every((s) => liesFlat(s, tabs.w, tabs.t)) : true;
+      const kept = tabs && !through && lie && (thickness[axis] ?? tabs.w) === tabs.w;
       if (kept) thickness[axis] = tabs.w;
       return { axis, at, ...(kept ? { reach: [tabs.below, tabs.above], w: tabs.w } : {}) };
     });
     const { cells } = cellSizes(bounds, cuts);
-    const held = support ? support(axisCuts(cuts)) : null;
     const pieces = [];
+    let need = 0;
     for (const c of cells) {
       const s = held?.get(c.cell.join(','));
       if (held && !s?.filled) continue;
@@ -865,26 +883,62 @@ export function planGrid(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0,
       if (ways === null && held && stable) ways = [0, 1, 2].filter((a) => c.cell[a] > 0 || c.cell[a] < k[a] || s.rests[a]);
       if (c.flat === null && flat !== null) ways = ways === null || [].concat(ways).includes(flat) ? flat : [];
       pieces.push({ cell: c.cell, size: c.size, fits: fitsBed(c.size, U, { flat: ways }).fits });
+      if (s?.lying) need += leastSupport(s, c.size, ways, U);
     }
-    return { k, offsets, cost, cells, pieces };
+    return { k, offsets, cost: cost + (PLAN_WEIGHTS.support * need) / broadest, support: need, cells, pieces };
   };
   const fitted = (p) => p && p.pieces.length > 0 && p.pieces.every((x) => x.fits);
-  let plan = run(even);
-  if (plan && !fitted(plan)) {
-    const longest = [0, 1, 2].map((b) => Math.max(...plan.cells.map((c) => c.size[b])));
-    plan = run(longest);
-  }
-  if (!fitted(plan)) {
-    // each axis is planned against the others' even pieces, so all of them may take their room the same way and
-    // leave a corner piece too big for any bed they were planned against. The even pieces fit, so the grid is
-    // planned once more with every piece held to the even one grown alike on every side, as far as that fits
-    const any = sharedRoom(even, U, flat);
-    const room = any && { any, flat: flat === null && ws.length ? sharedRoom(even, U, ws) ?? any : any };
-    if (room) plan = run(even, room);
-  }
-  if (!fitted(plan)) return null;
+  const attempt = (grow) => {
+    const even = evenCell(E, k, grow);
+    let plan = run(grow, even, even);
+    if (plan && !fitted(plan)) {
+      const longest = [0, 1, 2].map((b) => Math.max(...plan.cells.map((c) => c.size[b])));
+      plan = run(grow, even, longest);
+    }
+    if (!fitted(plan)) {
+      // each axis is planned against the others' even pieces, so all of them may take their room the same way and
+      // leave a corner piece too big for any bed they were planned against. The even pieces fit, so the grid is
+      // planned once more with every piece held to the even one grown alike on every side, as far as that fits
+      const any = sharedRoom(even, U, flat);
+      const room = any && { any, flat: flat === null && ws.length ? sharedRoom(even, U, ws) ?? any : any };
+      if (room) plan = run(grow, even, even, room);
+    }
+    return fitted(plan) ? plan : null;
+  };
+  const plan = attempt(reach) ?? (reach.some((v) => v > 0) ? attempt([0, 0, 0]) : null);
+  if (!plan) return null;
   const { cells, ...rest } = plan;
   return rest;
+}
+
+/**
+ * The boxes of `cellSupport`'s map that hold model on either side of the
+ * cut at `at`, the `index`-th on its axis, and reach it: the pieces a
+ * joint across that cut joins.
+ */
+export function boxesBeside(held, axis, index, at) {
+  const out = [];
+  for (const s of held.values()) {
+    if (!s.filled || !s.extent) continue;
+    if (s.cell[axis] === index && s.extent.max[axis] >= at - 0.02) out.push(s);
+    else if (s.cell[axis] === index + 1 && s.extent.min[axis] <= at + 0.02) out.push(s);
+  }
+  return out;
+}
+
+/**
+ * The least support (mm²) a box's model needs lying a way it fits the bed: on the axes it may lie on (`ways`, null
+ * for any), resting on something there when it can.
+ */
+function leastSupport(held, size, ways, U) {
+  const options = [];
+  for (const a of ways === null ? [0, 1, 2] : [].concat(ways)) {
+    if (!fitsBed(size, U, { flat: a }).fits) continue;
+    for (const s of ['-', '+']) options.push(held.lying[`${s}${AXES[a]}`]);
+  }
+  const resting = options.filter((x) => x.bed >= STEADY || x.cut);
+  const list = resting.length ? resting : options;
+  return list.length ? Math.min(...list.map((x) => x.support)) : 0;
 }
 
 /**
@@ -922,8 +976,8 @@ export function flatProbes(at, lo, hi) {
 }
 
 /**
- * Each triangle's box and, for one facing along an axis, which way, its area and where its corner furthest from that
- * end lies, worked out once per mesh.
+ * Each triangle's box and, for one facing within 45° of an axis, which way, whether it faces that way squarely
+ * (`FLAT`), its area and where its corner furthest from that end lies, worked out once per mesh.
  */
 const meshFacts = new WeakMap();
 function factsOf(mesh) {
@@ -932,6 +986,7 @@ function factsOf(mesh) {
   const n = Math.floor(T.length / 3);
   const box = new Float64Array(n * 6);
   const face = new Int8Array(n).fill(-1);
+  const square = new Uint8Array(n);
   const area = new Float64Array(n);
   const pos = new Float64Array(n);
   const min = [Infinity, Infinity, Infinity];
@@ -957,15 +1012,17 @@ function factsOf(mesh) {
     if (!(len > 0)) continue;
     const axis = Math.abs(nx) >= Math.abs(ny) && Math.abs(nx) >= Math.abs(nz) ? 0 : Math.abs(ny) >= Math.abs(nz) ? 1 : 2;
     const along = axis === 0 ? nx : axis === 1 ? ny : nz;
-    if (Math.abs(along) / len <= FLAT) continue;
+    // facing within 45° of the axis: what would need support lying that way, or the bed when it faces it squarely
+    if (!(Math.abs(along) / len > COS45)) continue;
     face[t] = axis * 2 + (along < 0 ? 0 : 1);
+    square[t] = Math.abs(along) / len > FLAT ? 1 : 0;
     area[t] = len / 2;
     // the corner furthest from the bed it would lie on: a facet is bed only when all of it is at the end, as
     // `orientationStats` counts it; the facets round a ball's pole lean a little, so their centres are there and
     // their outer corners are not
     pos[t] = along < 0 ? box[6 * t + 3 + axis] : box[6 * t + axis];
   }
-  const facts = { n, box, face, area, pos, min, max };
+  const facts = { n, box, face, square, area, pos, min, max };
   meshFacts.set(mesh, facts);
   return facts;
 }
@@ -978,21 +1035,32 @@ function factsOf(mesh) {
  * facets facing that way, wholly within 0.1 mm of the furthest the box's
  * material goes, of 25 mm² or more: the bed `orientationStats` counts. A
  * ball's quarter has nothing flat but its cut faces, and a bowl's half
- * cannot stand on the tip of its curve. What is worked out from the
- * mesh alone is kept with it, so trying grid after grid costs little.
+ * cannot stand on the tip of its curve. For a box the surface reaches, it
+ * also tells, for each way down, what the model it holds would rest on
+ * and need under it lying that way (`lying`, as `orientationStats` counts
+ * a piece's, cut faces aside: they rest on the bed or stand upright), and
+ * where that material ends (`extent`). What is worked out from the mesh
+ * alone is kept with it, so trying grid after grid costs little.
  * @param {{ vertProperties: Float32Array|number[], numProp: number, triVerts: Uint32Array|number[] }} mesh
  * @param {number[][]} cutsByAxis sorted positions per axis (`axisCuts`)
- * @returns {Map<string, { cell: number[], filled: boolean, rests: boolean[] }>} by 'i,j,k', every box of the grid
+ * @returns {Map<string, { cell: number[], filled: boolean, rests: boolean[], extent?: { min: number[], max: number[] },
+ *   lying?: Object<string, { bed: number, support: number, volume: number, cut: boolean }> }>} by 'i,j,k', every box
+ *   of the grid; `lying` by direction ('-z' …): `bed` the area on the bed, `support` the area that would need support
+ *   and `volume` that area times its height over the bed, `cut` whether a cut face of the box lies on the bed there
  */
 export function cellSupport(mesh, cutsByAxis) {
-  const { n: count, box, face, area, pos, min, max } = factsOf(mesh);
+  const { n: count, box, face, square, area, pos, min, max } = factsOf(mesh);
   const cuts = [0, 1, 2].map((a) => cutsByAxis[a] ?? []);
   const n = cuts.map((c) => c.length + 1);
   const boxes = n[0] * n[1] * n[2];
   const lo = new Float64Array(boxes * 3).fill(Infinity);
   const hi = new Float64Array(boxes * 3).fill(-Infinity);
   const touched = new Uint8Array(boxes);
-  const facets = new Map(); // `${box}|${dir}` → [position along the axis, area, …]
+  // per box and way (box · 6 + face): the area of every facet facing that way, and that area times its middle along
+  // the axis, for the support under the box and its height; the square facets one by one, for what it rests on
+  const facing = new Float64Array(boxes * 6);
+  const moment = new Float64Array(boxes * 6);
+  const facets = new Map(); // `${box}|${face}` → [position along the axis, area, middle, …] of the square facets
   const edgeLo = (a, c) => (c > 0 ? cuts[a][c - 1] : -Infinity);
   const edgeHi = (a, c) => (c < cuts[a].length ? cuts[a][c] : Infinity);
   const first = (a, v) => {
@@ -1022,17 +1090,23 @@ export function cellSupport(mesh, cutsByAxis) {
             hi[b * 3 + a] = Math.max(hi[b * 3 + a], Math.min(box[6 * t + 3 + a], edgeHi(a, cell[a])));
           }
           if (f < 0) continue;
-          // a facet facing along an axis: what the box could rest on, its area shared between the boxes it spans
+          // a facet facing along an axis: what the box could rest on, or would need support under, its area shared
+          // between the boxes it spans (along its own axis too, when it leans and so spans that axis)
+          const axis = f >> 1;
           let share = 1;
           for (let a = 0; a < 3; a++) {
             const blo = box[6 * t + a];
             const bhi = box[6 * t + 3 + a];
-            if (a === f >> 1 || !(bhi > blo)) continue;
+            if ((a === axis && square[t]) || !(bhi > blo)) continue;
             share *= (Math.min(bhi, edgeHi(a, cell[a])) - Math.max(blo, edgeLo(a, cell[a]))) / (bhi - blo);
           }
+          const mid = (Math.max(box[6 * t + axis], edgeLo(axis, cell[axis])) + Math.min(box[6 * t + 3 + axis], edgeHi(axis, cell[axis]))) / 2;
+          facing[b * 6 + f] += area[t] * share;
+          moment[b * 6 + f] += area[t] * share * mid;
+          if (!square[t]) continue;
           const key = `${b}|${f}`;
           if (!facets.has(key)) facets.set(key, []);
-          facets.get(key).push(pos[t], area[t] * share);
+          facets.get(key).push(pos[t], area[t] * share, mid);
         }
       }
     }
@@ -1048,18 +1122,60 @@ export function cellSupport(mesh, cutsByAxis) {
           const centre = at.map((c, a) => (Math.max(min[a], edgeLo(a, c)) + Math.min(max[a], edgeHi(a, c))) / 2);
           filled = insideMesh(mesh.vertProperties, mesh.numProp, mesh.triVerts, centre);
         }
-        const rests = [0, 1, 2].map((a) => touched[b] === 1 && [0, 1].some((dir) => {
-          const end = dir ? hi[b * 3 + a] : lo[b * 3 + a];
-          const list = facets.get(`${b}|${a * 2 + dir}`) ?? [];
-          let sum = 0;
-          for (let x = 0; x < list.length; x += 2) if (Math.abs(list[x] - end) <= 0.1) sum += list[x + 1];
-          return sum >= STEADY;
-        }));
-        out.set(at.join(','), { cell: at, filled, rests });
+        if (touched[b] !== 1) {
+          out.set(at.join(','), { cell: at, filled, rests: [false, false, false] });
+          continue;
+        }
+        const lying = {};
+        for (let a = 0; a < 3; a++) {
+          for (const dir of [0, 1]) {
+            const end = dir ? hi[b * 3 + a] : lo[b * 3 + a];
+            const list = facets.get(`${b}|${a * 2 + dir}`) ?? [];
+            let bed = 0;
+            let bedMoment = 0;
+            for (let x = 0; x < list.length; x += 3) {
+              if (Math.abs(list[x] - end) > 0.1) continue;
+              bed += list[x + 1];
+              bedMoment += list[x + 1] * list[x + 2];
+            }
+            // what is not on the bed needs support, as high over it as its middle
+            const support = Math.max(0, facing[b * 6 + a * 2 + dir] - bed);
+            const lifted = moment[b * 6 + a * 2 + dir] - bedMoment;
+            const volume = Math.max(0, dir ? end * support - lifted : lifted - end * support);
+            // the box's own cut face on that side, when the model it holds reaches it
+            const cut = dir ? at[a] < cuts[a].length && end >= cuts[a][at[a]] - 0.02 : at[a] > 0 && end <= cuts[a][at[a] - 1] + 0.02;
+            lying[`${dir ? '+' : '-'}${AXES[a]}`] = { bed, support, volume, cut };
+          }
+        }
+        const rests = [0, 1, 2].map((a) => lying[`-${AXES[a]}`].bed >= STEADY || lying[`+${AXES[a]}`].bed >= STEADY);
+        const extent = { min: [0, 1, 2].map((a) => lo[b * 3 + a]), max: [0, 1, 2].map((a) => hi[b * 3 + a]) };
+        out.set(at.join(','), { cell: at, filled, rests, extent, lying });
       }
     }
   }
   return out;
+}
+
+/**
+ * Whether the model a box holds (an entry of `cellSupport`) may lie flat
+ * on axis w, as every piece beside a dovetail cut through a plate as thick
+ * as `thickness` must: one way or the other it rests on the bed (or on a
+ * cut face), and needs little more support than the least it needs any way
+ * down – height counted, at most a quarter of the plate's own volume over
+ * its footprint. A tapered tip a few millimetres over the bed is fine; a
+ * second leg or skin held over the bed, or a round grip that leaves the
+ * plate in the air, is not. A box the surface never reaches is solid
+ * through, and lies any way.
+ */
+export function liesFlat(held, w, thickness) {
+  if (!held?.lying) return true;
+  const least = Math.min(...Object.values(held.lying).map((x) => x.volume));
+  const side = (a) => held.extent.max[a] - held.extent.min[a];
+  const slack = 0.25 * side((w + 1) % 3) * side((w + 2) % 3) * thickness;
+  return ['-', '+'].some((s) => {
+    const way = held.lying[`${s}${AXES[w]}`];
+    return (way.bed >= STEADY || way.cut) && way.volume <= least + slack;
+  });
 }
 
 /** Whether a point lies inside a closed mesh: a ray along +x from it crosses the surface an odd number of times. */
@@ -1708,10 +1824,12 @@ const NOTE_LEVELS = Object.freeze({
 export const SPLIT_NOTE_CODES = Object.freeze(Object.keys(NOTE_LEVELS));
 
 const NOTE_TEXT = {
-  SPLIT: ({ pieces, dowels = 0, diameter, length, lengths = [], dovetails = 0, pairs = [] }) => {
+  SPLIT: ({ pieces, dowels = 0, diameter, length, lengths = [], sizes = [], dovetails = 0, pairs = [] }) => {
     let s = `Cut into ${plural(pieces, 'piece')}`;
-    // one size of pin cut to two lengths (holes made shallower near an end) says how many of each
-    if (dowels > 0 && lengths.length > 1) s += ` with ${plural(dowels, 'pin')} Ø${mm(diameter)} mm (${lengths.map((g) => `${g.count} × ${mm(g.length)} mm`).join(', ')})`;
+    // pins of more than one size (filament where a face is too narrow), or one size cut to two lengths (holes made
+    // shallower near an end), say how many of each
+    if (dowels > 0 && sizes.length > 1) s += ` with ${plural(dowels, 'pin')} (${sizes.map((g) => `${g.count} × Ø${mm(g.diameter)} × ${mm(g.length)} mm`).join(', ')})`;
+    else if (dowels > 0 && lengths.length > 1) s += ` with ${plural(dowels, 'pin')} Ø${mm(diameter)} mm (${lengths.map((g) => `${g.count} × ${mm(g.length)} mm`).join(', ')})`;
     else if (dowels > 0) s += ` with ${plural(dowels, 'pin')} Ø${mm(diameter)} × ${mm(length)} mm`;
     if (dovetails > 0) s += `${dowels > 0 ? ' and' : ' with'} dovetail tabs`;
     s += '.';
@@ -1757,7 +1875,9 @@ const NOTE_TEXT = {
   },
   CUT_THROUGH_TEXT: ({ letter, name, pieces = [] }) => `Cut ${letter} runs through ${quoted(name)} – its letters are split between ${pieces.length > 1 ? `pieces ${listOf(pieces)}` : 'pieces'}.`,
   PART_SPANS_CUT: ({ name, letter }) => `${quoted(name)} prints separately and spans cut ${letter} – glue it on after the pieces.`,
-  DOVETAIL_NOT_PLATE: ({ letter }) => `Cut ${letter} isn't through a thin plate, so it uses pins.`,
+  DOVETAIL_NOT_PLATE: ({ letter, lying = false }) => (lying
+    ? `Cut ${letter} goes through a plate that its pieces can't lie flat on, so it uses pins.`
+    : `Cut ${letter} isn't through a thin plate, so it uses pins.`),
   ORIENT_FALLBACK: ({ pieceIndex, mode, lies }) => `${pieceName(pieceIndex)} can't lie ${mode === 'model' ? 'as modelled' : 'on its cut face'} on your printer – it lies ${lies}.`,
   SPLIT_UNREPAIRED: ({ count }) => `${plural(count, 'triangle')} that couldn't be repaired ${count === 1 ? 'was' : 'were'} cut with the pieces but ${count === 1 ? 'has' : 'have'} no pins or labels.`,
   SPLIT_UNAVAILABLE: () => 'Splitting needs a solid model – this one couldn\'t be repaired.',
@@ -1772,7 +1892,8 @@ const NOTE_TEXT = {
  * A split note `{ level, code, text, …fields }` in the app's voice. The
  * fields each code reads are those of the design's notes table, plus:
  * SPLIT `{ pieces, dowels, diameter, length, lengths: [{ length, count }] (when the pins of that size come in more than
- * one length), dovetails, pairs: ['1A ↔ 2A'] }`;
+ * one length), sizes: [{ diameter, length, count }] (every group, when the pins come in more than one size), dovetails,
+ * pairs: ['1A ↔ 2A'] }` (`dowels` counts every pin, `diameter` and `length` are the main size's);
  * PINS `{ count, spares, diameter, length, own }`; DOVETAIL `{ letter, tabs, pieces }`;
  * CONNECTORS_SHORTER `{ letter, depth }`; CONNECTORS_FILAMENT `{ letter, count, diameter, length }`;
  * CONNECTORS_DROPPED `{ letter, count, total, wall, suggestedDiameter, dovetail }`;
@@ -1780,6 +1901,7 @@ const NOTE_TEXT = {
  * PIECE_TOO_BIG `{ pieceIndex, size, bed }`; SMALL_PIECE `{ pieceIndex, thickness, letters, cutId }`;
  * CUTS_MERGED `{ letters, cutIds }`; SPLIT_CHECK `{ ratio }` (signed, (pieces − model) / model);
  * CUT_THROUGH_TEXT `{ itemId, cutId, letter, name, pieces }`; PART_SPANS_CUT `{ itemId, name, letter }`;
+ * DOVETAIL_NOT_PLATE `{ letter, lying }` (`lying`: through a plate, but a piece beside it can't lie flat on it);
  * ORIENT_FALLBACK `{ pieceIndex, mode, lies }`; PIECE_UNSTABLE `{ pieceIndex }`; PART_TOO_BIG `{ name, size, bed, pins }`
  * (a part printed separately, or with `pins` a single pin, too big for the bed); SPLIT_NOT_NEEDED `{ yaw, down }` (down
  * other than '-z' when it fits only on its side); BED_TOO_SMALL `{ size, bed, pieces }`.

@@ -29,10 +29,13 @@ import {
   TO_WORLD,
   applyMat4,
   axisCuts,
+  boxesBeside,
   cellOf,
   cellOfPoint,
+  cellSupport,
   chooseCentres,
   gridPoints,
+  liesFlat,
   localFrame,
   orientationStats,
   polygonsCentroid,
@@ -743,7 +746,9 @@ function plateStays(slice, islands) {
  * plate, for the planner: how far the piece below the cut (`below`) and the
  * one above it (`above`) may reach past it, the plate's thickness axis w
  * and how far along w the plate's islands go (`span`, world mm: a cut along
- * w inside it would rule the tabs out); null when the cut would take pins.
+ * w inside it would rule the tabs out), and the plate's thickness (`t`, the
+ * thickest island's: what the pieces beside it may need support under is
+ * weighed against it, `liesFlat`); null when the cut would take pins.
  * Either piece may hold a tab, even where an island takes only one (it
  * points the other way when something stands proud on the far side), and
  * tabs that later find no room are counted all the same: the plan must
@@ -751,14 +756,14 @@ function plateStays(slice, islands) {
  * @param {CrossSection} face the cut's face in its plane coordinates (borrowed)
  * @param {{ axis: number, at: number }} cut
  * @param {{ sliceAt?: function|null, probes?: number[] }} options as for `plateTest`: whether the plate stays flat
- * @returns {{ below: number, above: number, w: number, span: number[] }|null}
+ * @returns {{ below: number, above: number, w: number, span: number[], t: number }|null}
  */
 export function tabsAcross(face, cut, { sliceAt = null, probes = [] } = {}) {
   const test = plateTest(face, cut, { sliceAt, probes });
   if (test.joint !== 'dovetail') return null;
   const reach = Math.max(0, ...test.islands.map((island) => dovetailSize(island.long)?.E ?? 0));
   const span = [Math.min(...test.islands.map((i) => i.span[0])), Math.max(...test.islands.map((i) => i.span[1]))];
-  return reach > 0 ? { below: reach, above: reach, w: test.w, span } : null;
+  return reach > 0 ? { below: reach, above: reach, w: test.w, span, t: Math.max(...test.islands.map((i) => i.t)) } : null;
 }
 
 /** The rectangle s0…s1 along the cut axis s by l0…l1 along the plate, in the plane frame of w (as `tabSection`). */
@@ -1058,9 +1063,14 @@ export function dovetailCells(plan, cuts, bounds, clearance = SPLIT_DEFAULTS.cle
  * 'auto' gives plates tabs and everything else pins, 'dovetail' gives
  * plates tabs and says when a cut isn't one, 'dowels' and 'none' skip the
  * test. A plate under 2 mm thick is glued; one whose tabs all fall outside
- * the plate is glued too. The dovetail cuts on one axis share one
- * thickness axis w (their cells are extruded along it); cuts on another
- * axis may go through another plate (the two arms of an L).
+ * the plate is glued too. Tabs make the pieces either side lie flat on the
+ * plate, so a cut takes them only where each of those pieces can
+ * (`liesFlat`, from the model each box of the cuts holds): through the
+ * legs of a U one leg would be held over the bed, and beside a sword's
+ * guard the blade would lie on the round grip; such a cut takes pins. The
+ * dovetail cuts on one axis share one thickness axis w (their cells are
+ * extruded along it); cuts on another axis may go through another plate
+ * (the two arms of an L).
  * @param {Manifold} solid (borrowed)
  * @param {{ id, letter, axis, at }[]} cuts normalised, in canonical order
  * @param {object} spec the normalised settings (`joint`, `clearance`)
@@ -1083,6 +1093,7 @@ export function planDovetails(solid, cuts, spec = {}, { passthrough = false, fra
   const box = boxOf(solid);
   const by = axisCuts(cuts);
   const t = scope();
+  let held = null; // what each box of the cuts holds of the model: made once, when a cut first passes the plate test
   try {
     const wOf = {};
     const axisW = [null, null, null];
@@ -1099,6 +1110,11 @@ export function planDovetails(solid, cuts, spec = {}, { passthrough = false, fra
       } finally {
         face.delete();
       }
+      if (test.joint === 'dovetail') {
+        held ??= cellSupport(solid.getMesh(), by);
+        const thickness = Math.max(...test.islands.map((x) => x.t));
+        if (!boxesBeside(held, cut.axis, i, cut.at).every((s) => liesFlat(s, test.w, thickness))) test = { ...test, joint: 'dowels', reason: 'lying' };
+      }
       plates[cut.id] = test;
       if (test.joint === 'none') {
         joints[cut.id] = 'none';
@@ -1111,7 +1127,9 @@ export function planDovetails(solid, cuts, spec = {}, { passthrough = false, fra
         joints[cut.id] = 'dovetail';
       } else {
         joints[cut.id] = 'dowels';
-        if (mode === 'dovetail' || test.joint === 'dovetail') notes.push(splitNote('DOVETAIL_NOT_PLATE', { letter: cut.letter, cutId: cut.id }));
+        // Auto gives pins wherever tabs would not do, as a matter of course: only asked-for tabs are explained
+        const why = test.reason === 'lying' ? { lying: true } : {};
+        if (mode === 'dovetail' || test.joint === 'dovetail') notes.push(splitNote('DOVETAIL_NOT_PLATE', { letter: cut.letter, cutId: cut.id, ...why }));
       }
     }
     if (!ids.length) return { dove: null, joints, plates, tabs: null, notes };
@@ -1144,12 +1162,22 @@ const wOfCut = (dove, id) => (typeof dove.w === 'number' ? dove.w : dove.w?.[id]
 
 // ---------- cutting into pieces ----------
 
+/** A closed surface turned inside out: a sealed hollow, as `decompose()` gives it, made the solid that fills it. */
+function insideOut(m) {
+  const wasm = manifold();
+  const mesh = m.getMesh();
+  const triVerts = Uint32Array.from(mesh.triVerts);
+  for (let i = 0; i + 2 < triVerts.length; i += 3) [triVerts[i + 1], triVerts[i + 2]] = [triVerts[i + 2], triVerts[i + 1]];
+  return wasm.Manifold.ofMesh(new wasm.Mesh({ numProp: mesh.numProp, vertProperties: mesh.vertProperties, triVerts }));
+}
+
 /**
  * The model cut into one piece per cell, axis by axis (x, y, z). A planar
  * axis is cut by taking away the boxes over every other cell, then the
  * rest; a dovetail axis by taking away everything outside each cell's
  * solid. Shells under 1e-3 mm³ are removed as dust; every other shell goes
- * to the cell its box overlaps most, and a cell's shells make one piece.
+ * to the cell its box overlaps most, and a cell's shells make one piece. A
+ * sealed hollow that no cut opens stays inside the shell around it.
  * Pieces are numbered bottom layer first, then front to back, then left to
  * right. Each comes with its orientation statistics; pieces on a dovetail
  * seam may only lie flat (±w, either plate's where dovetails through two
@@ -1267,14 +1295,28 @@ export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null
     for (const p of parts) {
       const list = p.decompose();
       drop(p);
+      const solids = [];
+      const hollows = [];
       for (const m of list) {
         const v = m.volume();
-        if (v < DUST) {
+        if (Math.abs(v) < DUST) {
           dust += Math.max(0, v);
           dustCount++;
           m.delete();
-        } else shells.push({ m: own(m), v, box: boxOf(m) });
+        } else (v > 0 ? solids : hollows).push({ m: own(m), v, box: boxOf(m), hollows: [] });
       }
+      // a sealed hollow no cut opens (a magnet pocket, a void to save material) is a shell of its own, turned inside
+      // out, which no compose keeps: it goes with the smallest shell of the same part around it, to be taken out again
+      for (const h of hollows) {
+        const around = solids.filter((x) => [0, 1, 2].every((a) => x.box.min[a] <= h.box.min[a] + 1e-6 && x.box.max[a] >= h.box.max[a] - 1e-6));
+        const host = around.sort((x, y) => x.v - y.v)[0];
+        if (host) {
+          host.hollows.push(temps.add(insideOut(h.m)));
+          host.v += h.v;
+        }
+        drop(h.m);
+      }
+      shells.push(...solids);
     }
     if (dustCount) notes.push(splitNote('SLIVER_REMOVED', { count: dustCount }));
 
@@ -1293,16 +1335,24 @@ export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null
         list.forEach((x) => drop(x.m));
       }
       const index = n + 1;
-      const status = m.status();
-      if (status !== 'NoError') throw new SplitError('INTERNAL', `Piece ${index} came out broken (${status}).`, { pieceIndex: index, status });
       const bbox = boxOf(m);
       const reachOf = (c) => (doveCuts.has(c.id) ? Math.max(...doveCuts.get(c.id).tabs.map((tb) => tb.E)) : 0);
       const touching = cuts.filter((c) => c.at >= bbox.min[c.axis] - 0.02 - reachOf(c) && c.at <= bbox.max[c.axis] + 0.02 + reachOf(c));
       // a plate lies flat on its thickness; a piece on a dovetail seam on its plate's
       const flatOn = flat !== null ? [flat] : [...new Set(touching.filter((c) => doveCuts.has(c.id)).map((c) => doveCuts.get(c.id).w ?? plan.w))];
       const allowed = flatOn.length ? flatOn.flatMap((a) => [`-${AXES[a]}`, `+${AXES[a]}`]) : undefined;
+      // how it lies is judged from its outside: a sealed hollow's roof is bridged over, never held up by supports that
+      // could not come out, so a magnet pocket is no reason to stand a bar on its edge
       const mesh = m.getMesh();
       const stats = orientationStats(mesh.vertProperties, mesh.numProp, mesh.triVerts, touching, allowed ? { allowed } : {});
+      const hollow = list.flatMap((x) => x.hollows);
+      if (hollow.length) {
+        const emptied = own(m.subtract(hollow.length > 1 ? temps.add(Manifold.compose(hollow)) : hollow[0]));
+        drop(m);
+        m = emptied;
+      }
+      const status = m.status();
+      if (status !== 'NoError') throw new SplitError('INTERNAL', `Piece ${index} came out broken (${status}).`, { pieceIndex: index, status });
       return { index, cell, solid: m, shells: list.length, volume: list.reduce((s, x) => s + x.v, 0), bbox, cuts: touching.map((c) => c.id), stats };
     });
 

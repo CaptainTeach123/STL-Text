@@ -7,7 +7,7 @@ import {
   dovetailSize, evenCell, explodeOffset, fitsBed, footprintYaw, formatSize, glueFileName, gridCandidates, gridCounts, gridPoints,
   howToGlueText, invertRigid, isSymmetric, letterFor, localFrame, maxCellLength, mulMat4, nextCut, normaliseSplit, offsetAlongRay,
   oppositeDir, orientationStats, partFileName, pieceColorIndex, pieceFileName, pinsFileName, planAllowance, planCost, planGrid,
-  planSamples, plateAxis, polygonsArea, polygonsCentroid, printTransform, safeFileName, cellSupport, fitPieces, flatProbes, statsWithSoup,
+  planSamples, plateAxis, polygonsArea, polygonsCentroid, printTransform, safeFileName, cellSupport, fitPieces, flatProbes, liesFlat, statsWithSoup,
   sizesFor, sizesForRoom, soupCells, splitActive, splitNote, teardropApex, usableBed, yawMat4, zipFileName,
 } from '../src/split.js';
 
@@ -409,6 +409,16 @@ describe('planCost', () => {
     expect(seen[1] - planCost(apart)[1]).toBeCloseTo(W.nearLetters, 9);
   });
 
+  it('charges an extra island only when it takes pins of its own: a helmet\'s chin bar under a visor is glued either way', () => {
+    // two islands where the cut crosses a visor's opening, one beside it; no island has room for pins either way
+    const at = (t, islands, roomy) => ({ t, area: 1000, perimeter: 300, islands, roomy, noRoom: roomy ? 0 : 1, letters: false });
+    const [both, one] = planCost([at(0, 2, 0), at(10, 1, 0), at(20, 1, 0)]);
+    expect(both).toBeCloseTo(one, 9);
+    // two islands that both take pins need two sets
+    const [two, single] = planCost([at(0, 2, 2), at(10, 1, 1), at(20, 1, 1)]);
+    expect(two - single).toBeCloseTo(PLAN_WEIGHTS.islands, 9);
+  });
+
   describe('chooseOffsets', () => {
     const plan = (E, k, extra, items = []) => {
       const lo = -E / 2;
@@ -683,6 +693,60 @@ describe('cells', () => {
     expect(plan.offsets).toEqual([[0], [0], [0]]);
     expect(plan.pieces).toHaveLength(8);
     expect(plan.pieces.every((p) => p.fits)).toBe(true);
+  });
+
+  it('keeps a grid whose cuts miss the plates: a box with its lid laid beside it is four pieces', () => {
+    // a 300 × 200 × 150 box and its 3 mm lid laid 20 mm beside it: a cut across the lid would take 12 mm tabs, but the
+    // even cut runs through the gap and takes none, and the box's halves need not lie flat for the lid's sake
+    const E = [300, 420, 150];
+    const bounds = { min: [0, 0, 0], max: E };
+    const lid = { below: 12, above: 12, w: 2, span: [0, 11], t: 3 };
+    const profileOf = (a, k) => {
+      const samples = planSamples(bounds.min[a], bounds.max[a], k);
+      return { samples, costs: samples.map(() => 0), tabs: samples.map((t) => (a === 1 && t > 220 ? lid : null)) };
+    };
+    const plan = planGrid([1, 1, 0], { E, U, bounds, profileOf });
+    expect(plan.offsets).toEqual([[150], [210], []]);
+    expect(plan.pieces.map((p) => p.size)).toEqual(Array(4).fill([150, 210, 150]));
+  });
+
+  it('a cut through the legs of a U keeps no tabs: laid flat on one leg, the other would be a roof over the bed', () => {
+    // a base 150 × 50 × 8 and two legs 8 × 50 × 300; the cut at z = 150 runs through both legs, 8 mm plates along x
+    const Umesh = meshOf([boxSoup([0, 0, 0], [150, 50, 8]), boxSoup([0, 0, 0], [8, 50, 300]), boxSoup([142, 0, 0], [150, 50, 300])]);
+    const held = cellSupport(Umesh, [[], [], [150]]);
+    expect([0, 1].map((k) => liesFlat(held.get(`0,0,${k}`), 0, 8))).toEqual([false, false]);
+    // the other leg's inner face, all the way down (these boxes overlap)
+    expect([0, 1].map((k) => held.get(`0,0,${k}`).lying['-x'].support)).toEqual([50 * 150, 50 * 150]);
+    // an L's corner lies flat on either arm: what stands on the plate needs nothing under it
+    const L = meshOf([boxSoup([0, 0, 0], [300, 40, 6]), boxSoup([0, 0, 0], [6, 40, 300])]);
+    const corner = cellSupport(L, [[150], [], [150]]).get('0,0,0');
+    expect([liesFlat(corner, 2, 6), liesFlat(corner, 0, 6)]).toEqual([true, true]);
+    const E = [150, 50, 300];
+    const bounds = { min: [0, 0, 0], max: E };
+    const profileOf = (a, k) => {
+      const samples = planSamples(0, E[a], k);
+      return { samples, costs: samples.map(() => 0), tabs: samples.map(() => (a === 2 ? { below: 6, above: 6, w: 0, span: [0, 150], t: 8 } : null)) };
+    };
+    const plan = planGrid([0, 0, 1], { E, U, bounds, profileOf, support: (by) => cellSupport(Umesh, by) });
+    expect(plan.pieces.map((p) => p.size)).toEqual([[150, 50, 150], [150, 50, 150]]);
+  });
+
+  it('of two grids, the one whose pieces stand up costs less than one whose pieces lie with a leg held over the bed', () => {
+    // the U on a 246 × 246 × 255 bed: halved along y, each 300 mm tall half must lie on a leg, the other one over it
+    const Umesh = meshOf([boxSoup([0, 0, 0], [150, 50, 8]), boxSoup([0, 0, 0], [8, 50, 300]), boxSoup([142, 0, 0], [150, 50, 300])]);
+    const E = [150, 50, 300];
+    const options = {
+      E, U: [246, 246, 255], bounds: { min: [0, 0, 0], max: E }, support: (by) => cellSupport(Umesh, by),
+      profileOf: (a, k) => {
+        const samples = planSamples(0, E[a], k);
+        return { samples, costs: samples.map(() => 0), tabs: samples.map(() => null) };
+      },
+    };
+    const along = planGrid([0, 1, 0], options);
+    const across = planGrid([0, 0, 1], options);
+    expect(along.support).toBe(2 * 25 * 300);
+    expect(across.support).toBe(0);
+    expect(across.cost).toBeLessThan(along.cost);
   });
 
   it('looks for a plate staying flat half way along each neighbour and most of the way to its end', () => {
@@ -1123,6 +1187,10 @@ describe('notes', () => {
     // one size in two lengths: never every pin the longer one
     expect(splitNote('SPLIT', { pieces: 3, dowels: 4, diameter: 6, length: 19, lengths: [{ length: 19, count: 2 }, { length: 17.8, count: 2 }] }).text)
       .toBe('Cut into 3 pieces with 4 pins Ø6 mm (2 × 19 mm, 2 × 17.8 mm).');
+    // pins of two sizes, filament where a face is too narrow: every pin counted, each size said
+    const sizes = [{ diameter: 5, length: 16, count: 2 }, { diameter: 1.75, length: 8, count: 6 }];
+    expect(splitNote('SPLIT', { pieces: 5, dowels: 8, diameter: 5, length: 16, sizes }).text).toBe('Cut into 5 pieces with 8 pins (2 × Ø5 × 16 mm, 6 × Ø1.75 × 8 mm).');
+    expect(splitNote('DOVETAIL_NOT_PLATE', { letter: 'A', lying: true }).text).toBe('Cut A goes through a plate that its pieces can\'t lie flat on, so it uses pins.');
     expect(splitNote('PINS', { count: 4, spares: 1, diameter: 6, length: 19 }).text).toBe('Print the pins file (5 pins, one spare) lying flat – or use Ø6 mm wooden dowels cut to 19 mm.');
     expect(splitNote('PINS', { count: 4, diameter: 5, length: 16, own: true }).text).toMatch(/cut 4 Ø5 mm dowels to 16 mm/);
     expect(splitNote('CONNECTORS_SHORTER', { letter: 'B', depth: 3.5 }).text).toBe('Cut B uses 3.5 mm-deep holes – deeper ones would break through the side.');

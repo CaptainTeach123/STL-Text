@@ -7,10 +7,19 @@ import { parseSTL, triangleSoup, writeBinarySTL } from './stl.js';
 import { concatSoups, displayBuffers, manifoldToSoup } from './mesh.js';
 import { ViewCache, passthroughRangesOf } from './view.js';
 import { ATTACH_ROTATIONS, placementMatrix, toMat4 } from './placement.js';
-import { baseMode, fontIds, hasText, isPart, isSpot, itemLabel, placeKey, shapeKey } from './document.js';
+import { baseMode, fontIds, hasText, isPart, isSpot, itemLabel, placeKey, shapeKey, stableKey } from './document.js';
 import { enhanceMesh, extractRegion, isEnhanceActive, regionWeights } from './enhance.js';
 import { baseSurface, crumpleOf, findDetails, refitSpheres } from './details.js';
 import { DECOR_KINDS, buildDecor, decorPartId, normaliseDecorSpec } from './decor.js';
+import { strToU8, zipSync } from 'three/examples/jsm/libs/fflate.module.js';
+import {
+  CUT_TOLERANCE, FILAMENT, SPLIT_KEEP_TRIANGLES, SplitError, TO_PLANE, applyToSoup, assemblySteps, axisCuts, cellOfPoint, chooseOrientation,
+  cutPlane, fitsBed, glueFileName, gridCandidates, howToGlueText, letterFor, normaliseSplit, partFileName, pieceFileName, pinsFileName,
+  planCost, planGrid, planSamples, plateAxis, safeFileName, sizesFor, soupCells, splitActive, splitNote, usableBed, zipFileName,
+} from './split.js';
+import {
+  buildSplitDisplay, clearSplitCaches, cutPieces, drillPiece, fitTestCoupon, layoutSplit, pinAt, pinSheet, pinSpares, planDovetails, tabsAcross,
+} from './splitGeometry.js';
 
 /**
  * The geometry engine: a pure request handler that owns Manifold objects,
@@ -26,12 +35,30 @@ import { DECOR_KINDS, buildDecor, decorPartId, normaliseDecorSpec } from './deco
  *                                                       -> { info, report, display }
  *   base.update { version, transforms, simplify }       -> { info, report, display }
  *   preview     { item, baseVersion, printing }         -> { empty } | { geometry, bounds, stats, notes }
- *   result      { items, baseVersion, printing }        -> { display, notes, info }
- *   export      { items, baseVersion, name, printing }  -> { stl, triangles, notes }
+ *   result      { items, baseVersion, printing, split?, bed? }
+ *                                                       -> { display, notes, info }
+ *                                                          (+ pieces, grid, seams, diameter with a split)
+ *   export      { items, baseVersion, name, printing, split?, bed?, printer?, archive?: 'zip'|'files' }
+ *                                                       -> { stl, triangles, notes, extra }
+ *                                                          (stl null, + files, zip, pieces, seams, assembly with a split)
+ *   split.plan  { items, baseVersion, printing, split, bed, mode: 'fit'|'measure' }
+ *                                                       -> fit: { cuts, counts, pieces, notes }
+ *                                                          measure: { bounds, cuts, notes } (a dovetail cut also has
+ *                                                          tabs, reach [below, above] and w, for `cellSizes`)
+ *   split.fitTest { items?, baseVersion?, split, printing, bed?, name, dovetail? }
+ *                                                       -> { stl, name, triangles, diameter, pins, dovetail }
  *   ping        {}                                      -> { ready: true, caches }
  *
  * `display` = { positions, normals, index, passthroughStart, bvhRoots } —
  * typed arrays ready for a THREE.BufferGeometry plus a serialised MeshBVH.
+ * With a split it also has `ranges` ([triStart, triCount, vertStart,
+ * vertCount] per piece, pin and part) and `parts` (what each range is).
+ *
+ * `split` is the document's split (`{ cuts: [{ id, position, normal }], joint, … }`,
+ * see split.js); no cuts means no split, and the replies are exactly those of
+ * a model that was never split. `bed` is the room a piece may use on the
+ * printer, [x, y, z] mm (`usableBed`); `printer` ({ size, margin }) only
+ * names the printer on the glue sheet.
  *
  * Final geometry has fixed semantics regardless of item order:
  *   union(model, all raised text) minus union(all cut-in text).
@@ -213,7 +240,68 @@ function solveLinear(A, b) {
   return M.map((row, i) => row[n] / row[i]);
 }
 
-export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance = LOD_TOLERANCE }) {
+/**
+ * A cross-section's outlines as point lists, as `toPolygons()` gives them.
+ * manifold-3d 3.5.4's own `toPolygons()` never frees the vectors it reads,
+ * which adds up over the hundreds of slices one plan of the cuts reads; this
+ * frees them (and falls back to the plain call if the binding changes).
+ */
+function polygonsOf(cs) {
+  if (typeof cs._ToPolygons !== 'function') return cs.toPolygons();
+  const vec = cs._ToPolygons();
+  const out = [];
+  try {
+    for (let i = 0, n = vec.size(); i < n; i++) {
+      const ring = vec.get(i);
+      const poly = [];
+      for (let j = 0, m = ring.size(); j < m; j++) {
+        const pt = ring.get(j);
+        poly.push([pt.x, pt.y]);
+      }
+      ring.delete();
+      out.push(poly);
+    }
+  } finally {
+    vec.delete();
+  }
+  return out;
+}
+
+/** The total length of polygons' edges. */
+function perimeterOf(polygons) {
+  let sum = 0;
+  for (const poly of polygons) {
+    for (let i = 0; i < poly.length; i++) {
+      const [x0, y0] = poly[i];
+      const [x1, y1] = poly[(i + 1) % poly.length];
+      sum += Math.hypot(x1 - x0, y1 - y0);
+    }
+  }
+  return sum;
+}
+
+/** The longest distance between two corners of polygons (on at most 64 of them: enough to tell whether two pins fit). */
+function spreadOf(polygons) {
+  const all = polygons.flat();
+  const step = Math.max(1, Math.ceil(all.length / 64));
+  const pts = all.filter((_, i) => i % step === 0);
+  let best = 0;
+  for (let i = 0; i < pts.length; i++) {
+    for (let j = i + 1; j < pts.length; j++) best = Math.max(best, Math.hypot(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1]));
+  }
+  return best;
+}
+
+/** A Manifold's bounding box as plain arrays. */
+function boxOf(m) {
+  const { min, max } = m.boundingBox();
+  return { min: [min[0], min[1], min[2]], max: [max[0], max[1], max[2]] };
+}
+
+/** A bed size from a request: the usable [x, y, z] mm, or the default printer's when it is missing or nonsense. */
+const bedOf = (bed) => (Array.isArray(bed) && bed.length === 3 && bed.every((v) => Number(v) > 0) ? bed.map(Number) : usableBed());
+
+export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance = LOD_TOLERANCE, splitKeepTriangles = SPLIT_KEEP_TRIANGLES }) {
   const { Manifold } = wasm;
   const fonts = new Map(); // fontId -> { font, label, key }
   const parts = new Map(); // partId -> { manifold, info, key }
@@ -278,14 +366,36 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
 
   function clearDerived() {
     conformed.clear();
-    if (result) {
-      result.solid?.delete();
-      result.separate?.forEach((p) => {
-        p.world.delete();
-        p.local.delete();
-      });
-    }
+    disposeResult(result);
     result = null;
+  }
+
+  /**
+   * Deletes everything a final result holds: its solid, the separately
+   * printed parts and every solid of its split. The one place that knows,
+   * so replacing a result and clearing it can never drift apart.
+   */
+  function disposeResult(r) {
+    if (!r) return;
+    r.solid?.delete();
+    r.separate?.forEach((p) => {
+      p.world.delete();
+      p.local.delete();
+    });
+    const s = r.split;
+    if (s) {
+      s.frame?.solid.delete();
+      disposeSplitStage(s.cut);
+      disposeSplitStage(s.drill);
+      r.split = null;
+    }
+  }
+
+  /** Deletes the solids a cut or drill stage of a split holds (kept, or made for one call and not yet used). */
+  function disposeSplitStage(stage) {
+    stage?.solids?.forEach((m) => m.delete());
+    stage?.transient?.forEach((m) => m.delete());
+    if (stage) stage.solids = stage.transient = null;
   }
 
   function disposeCurrent() {
@@ -1780,6 +1890,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const engrave = [];
     const separate = []; // parts joined with pegs: printed on their own
     const raised = []; // raised items and their world solids, to check that each really merged
+    const itemBounds = []; // where each item ended up (plain), for splitting: which cuts run through text
     const temps = scope();
     try {
       // what covering items consume, and what removing spots cut, is taken from the model before anything is added
@@ -1832,6 +1943,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
             });
           }
         }
+        const wb = world.boundingBox();
+        itemBounds.push({ id: item.id, part: isPart(item), separate: pegged, engrave: needsCut, min: [...wb.min], max: [...wb.max] });
         if (pegged) {
           const holes = placed.settle ? temps.add(placed.flat.cutter.translate(0, 0, placed.settle)) : placed.flat.cutter;
           engrave.push(temps.add(holes.transform(toMat4(placed.placement))));
@@ -1908,22 +2021,19 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
 
       const kept = solid ? solid.translate(0, 0, 0) : null; // our own handle, outside the scope
       const owned = separate.map((p) => ({ id: p.id, name: p.name, world: p.world.translate(0, 0, 0), local: p.local.translate(0, 0, 0) }));
-      if (result) {
-        result.solid?.delete();
-        result.separate?.forEach((p) => {
-          p.world.delete();
-          p.local.delete();
-        });
-      }
-      result = { key, solid: kept, notes, skipped, separate: owned, passthrough: b.current.passthrough };
+      disposeResult(result);
+      result = { key, solid: kept, notes, skipped, separate: owned, passthrough: b.current.passthrough, itemBounds, split: null };
       return result;
     } finally {
       temps.dispose();
     }
   }
 
-  function resultDisplay({ items, baseVersion, printing }, progress) {
+  function resultDisplay({ items, baseVersion, printing, split = null, bed = null }, progress) {
     const final = finalFor(items, baseVersion, printing, progress);
+    const parted = splitFor(final, items, { split, bed, printing }, progress);
+    if (parted?.cut) return splitResult(final, parted, progress);
+    releaseSplit(final);
     if (!final.display) {
       // the view of a final result is built once per result: showing it again (after a preview, a selection change,
       // or toggling back to it) reuses the buffers instead of simplifying and shading the whole model again
@@ -1954,13 +2064,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       bvhRoots: [],
     };
     return {
-      message: { display, notes: final.notes, skipped: final.skipped, info: { triangles: d.index.length / 3 } },
+      message: { display, notes: parted ? [...final.notes, ...parted.notes] : final.notes, skipped: final.skipped, info: { triangles: d.index.length / 3 } },
       transfer: [display.positions.buffer, display.normals.buffer, display.index.buffer],
     };
   }
 
-  function exportStl({ items, baseVersion, printing, name = 'model' }, progress) {
+  function exportStl({ items, baseVersion, printing, name = 'model', split = null, bed = null, printer = null, archive = 'zip' }, progress) {
     const final = finalFor(items, baseVersion, printing, progress);
+    const parted = splitFor(final, items, { split, bed, printing }, progress);
+    if (parted?.cut) return splitExport(final, parted, { name, printer, archive }, progress);
+    releaseSplit(final);
     const soup = concatSoups([final.solid ? manifoldToSoup(final.solid) : null, final.passthrough]);
     if (!soup || !soup.length) fail('EMPTY_RESULT', 'There is nothing to export yet. Type some text or load a model.');
     progress?.('Writing STL…');
@@ -1970,9 +2083,720 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       return { name: p.name, stl: writeBinarySTL(partSoup, `STL-Text ${p.name}`), triangles: partSoup.length / 9 };
     });
     return {
-      message: { stl, triangles: soup.length / 9, notes: final.notes, skipped: final.skipped, extra },
+      message: { stl, triangles: soup.length / 9, notes: parted ? [...final.notes, ...parted.notes] : final.notes, skipped: final.skipped, extra },
       transfer: [stl, ...extra.map((e) => e.stl)],
     };
+  }
+
+  /* ---------------------------------------------------- split for printing */
+
+  /**
+   * The final solid turned into a cut axis's plane frame (split.js
+   * `TO_PLANE`), for slicing along that axis. One copy is kept on the result
+   * and made again for another axis: a dense model's copy weighs as much as
+   * the model. Callers slice it at once and never hold on to it.
+   */
+  function frameOf(final, axis) {
+    if (axis === 2) return final.solid;
+    const state = splitState(final);
+    if (state.frame?.axis !== axis) {
+      state.frame?.solid.delete();
+      state.frame = null; // never left pointing at a deleted copy, even if the next line throws
+      state.frame = { axis, solid: final.solid.transform(TO_PLANE[axis]) };
+    }
+    return state.frame.solid;
+  }
+
+  const releaseFrame = (final) => {
+    final.split?.frame?.solid.delete();
+    if (final.split) final.split.frame = null;
+  };
+
+  /** Lets go of a split's solids once the model is asked for whole again (its cuts removed, or all of them missing). */
+  function releaseSplit(final) {
+    const state = final.split;
+    if (!state) return;
+    releaseFrame(final);
+    disposeSplitStage(state.cut);
+    disposeSplitStage(state.drill);
+    state.cut = null;
+    state.drill = null;
+  }
+
+  /** What a split keeps on its final result: the frame copy, the plate test, and the cut and drill stages. */
+  const splitState = (final) => (final.split ??= { frame: null, bounds: null, plate: null, cut: null, drill: null });
+
+  /**
+   * The box the cuts are judged and planned against: the solid's. Unrepaired
+   * triangles go with the piece they fall in (or the nearest) but make no
+   * piece of their own, so a cut that crosses only them cuts nothing.
+   */
+  function splitBounds(final) {
+    const state = splitState(final);
+    if (!state.bounds) {
+      const b = boxOf(final.solid);
+      state.bounds = { min: b.min, max: b.max };
+    }
+    return state.bounds;
+  }
+
+  /** The plate test of every cut (slices only), kept while the cuts and the joint settings stay the same. */
+  function platesFor(final, cuts, spec) {
+    const state = splitState(final);
+    const key = stableKey({ cuts, joint: spec.joint, clearance: spec.clearance });
+    if (state.plate?.key !== key) {
+      const plan = planDovetails(final.solid, cuts, spec, { passthrough: final.passthrough.length > 0, frame: (axis) => frameOf(final, axis) });
+      state.plate = { key, plan };
+    }
+    return state.plate.plan;
+  }
+
+  /** An item's solid where it sits in the model, in a cut axis's plane frame (the caller deletes it). */
+  function itemInPlane(item, axis, temps) {
+    const placed = solidFor(item);
+    const world = temps.add(placed.solid.transform(toMat4(placed.placement)));
+    return axis === 2 ? world : temps.add(world.transform(TO_PLANE[axis]));
+  }
+
+  /** Whether a solid in a cut's plane frame has any material on the cut's plane. */
+  function cutsThrough(inPlane, at) {
+    const face = inPlane.slice(at);
+    const hit = !face.isEmpty() && face.area() > 1e-9;
+    face.delete();
+    return hit;
+  }
+
+  /** The text items (not parts) whose box straddles a cut and whose letters it really cuts, by id. */
+  function textCrossing(final, items, cut, temps) {
+    const ids = [];
+    for (const b of final.itemBounds) {
+      if (b.part || !(b.min[cut.axis] < cut.at && b.max[cut.axis] > cut.at)) continue;
+      const item = items.find((i) => i.id === b.id);
+      if (item && cutsThrough(itemInPlane(item, cut.axis, temps), cut.at)) ids.push(item.id);
+    }
+    return ids;
+  }
+
+  /**
+   * Notes on what the cuts run through: text whose letters end up split
+   * between two pieces, and separately printed parts that span a cut and so
+   * are glued on after the pieces. Exact: each item's own solid is sliced.
+   */
+  function crossingNotes(final, items, cuts, pieces) {
+    const notes = [];
+    const by = axisCuts(cuts);
+    const pieceAt = new Map(pieces.map((p) => [p.cell.join(','), p.index]));
+    const temps = scope();
+    try {
+      for (const cut of cuts) {
+        for (const id of textCrossing(final, items, cut, temps)) {
+          const item = items.find((i) => i.id === id);
+          const b = final.itemBounds.find((x) => x.id === id);
+          const cell = cellOfPoint(b.min.map((v, a) => (v + b.max[a]) / 2), by);
+          const lo = by[cut.axis].indexOf(cut.at);
+          const sides = [lo, lo + 1].map((k) => pieceAt.get(cell.map((c, a) => (a === cut.axis ? k : c)).join(','))).filter(Boolean);
+          notes.push(splitNote('CUT_THROUGH_TEXT', { itemId: id, cutId: cut.id, letter: cut.letter, name: quote(item), pieces: sides }));
+        }
+      }
+      for (const p of final.separate) {
+        const pb = boxOf(p.world);
+        const cut = cuts.find((c) => pb.min[c.axis] < c.at && pb.max[c.axis] > c.at && cutsThrough(c.axis === 2 ? p.world : temps.add(p.world.transform(TO_PLANE[c.axis])), c.at));
+        if (!cut) continue;
+        const item = items.find((i) => i.id === p.id);
+        notes.push(splitNote('PART_SPANS_CUT', { itemId: p.id, name: item ? quote(item) : p.name, letter: cut.letter, cutId: cut.id }));
+      }
+    } finally {
+      temps.dispose();
+    }
+    return notes;
+  }
+
+  /**
+   * The unrepaired triangles cut with the pieces: each fragment goes to the
+   * piece of the cell its centre lies in, or – when that cell has no piece –
+   * to the piece whose box is nearest. World coordinates, by piece number.
+   */
+  function fragmentsFor(final, cuts, pieces) {
+    const out = new Map();
+    if (!final.passthrough.length) return out;
+    const byCell = new Map(pieces.map((p) => [p.cell.join(','), p]));
+    for (const { cell, soup } of soupCells(final.passthrough, cuts)) {
+      let piece = byCell.get(cell.join(','));
+      if (!piece) {
+        const c = [0, 1, 2].map((a) => {
+          let s = 0;
+          for (let i = a; i < soup.length; i += 3) s += soup[i];
+          return s / (soup.length / 3);
+        });
+        const away = (p) => Math.hypot(...c.map((v, a) => Math.max(0, p.bbox.min[a] - v, v - p.bbox.max[a])));
+        piece = pieces.reduce((best, p) => (away(p) < away(best) ? p : best));
+      }
+      out.set(piece.index, concatSoups([out.get(piece.index), soup]));
+    }
+    return out;
+  }
+
+  /**
+   * A split as a request asks for it, through three stages cached on the
+   * final result: the cut (pieces and their orientation statistics; booleans),
+   * how each piece lies (pure, never cached), and the pins, labels and
+   * drilling (booleans, keyed by the cut, the connector settings and each
+   * piece's way up – so a new bed that turns no piece over costs nothing).
+   * Returns null without cuts; `{ notes }` when the model is exported whole
+   * after all (it cannot be split, or every cut missed); else the split.
+   */
+  function splitFor(final, items, { split, bed, printing }, progress) {
+    if (!splitActive(split)) return null;
+    if (base.kind !== 'none' && !base.current?.watertight) return { notes: [splitNote('SPLIT_UNAVAILABLE')] };
+    if (!final.solid) return { notes: [] }; // nothing solid to cut: the unrepaired triangles are exported as they are
+    const { spec, cuts, notes: given } = normaliseSplit(split, splitBounds(final));
+    if (!cuts.length) return { notes: given };
+    // the labels' font is asked for before any work, so a restarted engine gets it back in one round
+    if (spec.labels) requireFonts([{ lines: [{ fontId: 'inter' }] }]);
+    const U = bedOf(bed);
+    const nozzle = printing?.nozzle ?? 0.4;
+    const plan = platesFor(final, cuts, spec);
+    const cut = cutStage(final, items, cuts, plan, progress);
+    progress?.('Choosing how each piece lies…');
+    const lying = cut.pieces.map((p) => chooseOrientation(p.stats, U, spec.orient, { pieceIndex: p.index }));
+    const drill = drillStage(final, cut, { cuts, spec, joints: plan.joints, ups: lying.map((o) => o.up), nozzle }, progress);
+    return summarise({ final, spec, cuts, U, given, plan, cut, lying, drill });
+  }
+
+  /** Stage A: the model cut into one piece per cell, each with its orientation statistics. */
+  function cutStage(final, items, cuts, { dove, tabs }, progress) {
+    const state = splitState(final);
+    // the tabs follow from the model, the cuts and `dove`, so the key needs no more
+    const key = `${final.key}|cut:${stableKey({ cuts, dove })}`;
+    if (state.cut?.key === key) return state.cut;
+    disposeSplitStage(state.drill);
+    disposeSplitStage(state.cut);
+    state.drill = null;
+    state.cut = null;
+    // a dense model's frame copy would be a third copy of it while it is cut
+    if (final.solid.numTri() > splitKeepTriangles) releaseFrame(final);
+    const made = cutPieces(final.solid, cuts, { dove, tabs, bounds: boxOf(final.solid), frame: (axis) => frameOf(final, axis), progress });
+    const solids = made.pieces.map((p) => p.solid);
+    try {
+      const pieces = made.pieces.map(({ solid, ...plain }) => plain);
+      const keep = solids.reduce((n, m) => n + m.numTri(), 0) <= splitKeepTriangles;
+      const notes = [...made.notes, ...crossingNotes(final, items, cuts, pieces)];
+      if (final.passthrough.length) notes.push(splitNote('SPLIT_UNREPAIRED', { count: final.passthrough.length / 9 }));
+      state.cut = {
+        key,
+        cuts,
+        dove,
+        tabs,
+        pieces,
+        grid: made.grid,
+        dovetails: made.dovetails,
+        fragments: fragmentsFor(final, cuts, pieces),
+        notes,
+        solids: keep ? solids : null,
+        transient: keep ? null : solids, // made for this call only: the drill stage takes them
+      };
+    } catch (err) {
+      solids.forEach((m) => m.delete());
+      throw err;
+    }
+    return state.cut;
+  }
+
+  /** The cut stage's piece solids for this call: the kept ones (borrowed), or made again (`owned`: the caller deletes them). */
+  function pieceSolids(final, cut, progress) {
+    if (cut.solids) return { solids: cut.solids, owned: false };
+    if (cut.transient) {
+      const solids = cut.transient;
+      cut.transient = null;
+      return { solids, owned: true };
+    }
+    // a frame copy left by the cuts' measure would be a third copy of a dense model while it is cut again
+    releaseFrame(final);
+    const made = cutPieces(final.solid, cut.cuts, { dove: cut.dove, tabs: cut.tabs, bounds: boxOf(final.solid), frame: (axis) => frameOf(final, axis), progress });
+    const solids = made.pieces.map((p) => p.solid);
+    if (solids.length !== cut.pieces.length) {
+      solids.forEach((m) => m.delete());
+      fail('INTERNAL', 'The pieces came out differently when they were cut again.');
+    }
+    return { solids, owned: true };
+  }
+
+  /** Stage C and D: pins and labels laid out (plain data), and every piece drilled. */
+  function drillStage(final, cut, { cuts, spec, joints, ups, nozzle }, progress) {
+    const state = splitState(final);
+    const { joint, diameter, depth, clearance, count, labels } = spec;
+    const font = labels ? fontFor('inter') : null;
+    const key = `${cut.key}|drill:${stableKey({ joint, diameter, depth, clearance, count, labels, nozzle, ups, font: font?.key ?? null })}`;
+    if (state.drill?.key === key) return state.drill;
+    disposeSplitStage(state.drill);
+    state.drill = null;
+    const layout = layoutSplit(final.solid, cuts, cut.pieces.map((p, i) => ({ index: p.index, cell: p.cell, up: ups[i] })), spec, {
+      nozzle, joints, tabs: cut.tabs, font: font?.font ?? null, bounds: boxOf(final.solid), progress,
+    });
+    const drilled = drillAll(final, cut, layout, font?.font ?? null, progress);
+    const keep = drilled.reduce((n, m) => n + m.numTri(), 0) <= splitKeepTriangles;
+    state.drill = { key, layout, display: null, solids: keep ? drilled : null, transient: keep ? null : drilled };
+    return state.drill;
+  }
+
+  /** Every piece with its own holes and labels taken out (new solids, the caller's). */
+  function drillAll(final, cut, layout, font, progress) {
+    const { solids, owned } = pieceSolids(final, cut, progress);
+    const drilled = [];
+    try {
+      cut.pieces.forEach((p, i) => {
+        progress?.('Drilling pin holes…', { done: i + 1, total: cut.pieces.length });
+        drilled.push(drillPiece(solids[i], layout, p.index, { font }));
+      });
+      return drilled;
+    } catch (err) {
+      drilled.forEach((m) => m.delete());
+      throw err;
+    } finally {
+      if (owned) solids.forEach((m) => m.delete());
+    }
+  }
+
+  /** The drilled pieces for this call: kept (borrowed), or drilled again from the kept layout (`owned`). */
+  function drilledSolids(final, split, progress) {
+    const { cut, drill } = split;
+    if (drill.solids) return { solids: drill.solids, owned: false };
+    if (drill.transient) {
+      const solids = drill.transient;
+      drill.transient = null;
+      return { solids, owned: true };
+    }
+    const font = drill.layout.labels.length ? fontFor('inter').font : null;
+    return { solids: drillAll(final, cut, drill.layout, font, progress), owned: true };
+  }
+
+  /**
+   * The plain description of a split, shared by the pieces view and the
+   * download: the pieces as they print, the seams, the pin groups and every
+   * note, the summary first.
+   */
+  function summarise(split) {
+    const { final, spec, cuts, U, given, plan, cut, lying, drill } = split;
+    const { layout } = drill;
+    const n = cut.pieces.length;
+    const pieces = cut.pieces.map((p, i) => {
+      const o = lying[i];
+      return {
+        index: p.index,
+        name: `piece ${p.index} of ${n}`,
+        cell: p.cell,
+        shells: p.shells,
+        size: o.size,
+        fits: o.fits,
+        lies: o.lies,
+        yaw: o.yaw,
+        down: o.down,
+        up: o.up,
+        dowels: layout.dowels.filter((d) => d.sides.some((s) => s.piece === p.index)).length,
+        unrepaired: (cut.fragments.get(p.index)?.length ?? 0) / 9,
+      };
+    });
+    const tabs = new Map(cut.dovetails.map((x) => [x.cutId, x.tabs]));
+    const seams = layout.seams.map((s) => ({
+      cutId: s.cutId,
+      letter: s.letter,
+      axis: s.axis,
+      at: s.at,
+      pieces: s.pieces,
+      joint: s.joint,
+      labels: s.labels,
+      ...(s.joint === 'dovetail' ? { tabs: tabs.get(s.cutId) ?? 0 } : {}),
+      dowels: s.dowels.map((d) => ({
+        centre: d.centre, axis: d.axis, d: d.d, depth: d.depth, R: d.R, h: d.h, ch: d.ch, cell: d.cell, patch: d.patch, tear: d.sides.map((x) => x.tear), sides: d.sides,
+      })),
+    }));
+    // one group per pin size: the pins file holds each group, with spares
+    const groups = new Map();
+    for (const d of layout.dowels) {
+      const k = `${d.d}|${d.depth}`;
+      if (!groups.has(k)) groups.set(k, { d: d.d, depth: d.depth, length: 2 * d.depth, count: 0 });
+      groups.get(k).count++;
+    }
+    const pins = [...groups.values()]
+      .sort((p, q) => q.count - p.count || q.d - p.d || q.depth - p.depth)
+      .map((g) => {
+        const own = spec.pins === 'own' || g.d === FILAMENT;
+        return { ...g, own, spares: own ? 0 : pinSpares(g.count) };
+      });
+    const notes = [];
+    const main = pins[0];
+    // the summary counts every pin of the main size, and says how many of each length when they differ
+    const sized = main ? pins.filter((g) => g.d === main.d) : [];
+    const pairs = seams.filter((s) => s.labels?.length === 2).map((s) => `${s.labels[0]} ↔ ${s.labels[1]}`);
+    notes.push(splitNote('SPLIT', {
+      pieces: n, dowels: sized.reduce((k, g) => k + g.count, 0), diameter: main?.d ?? null, length: main?.length ?? null,
+      ...(sized.length > 1 ? { lengths: sized.map((g) => ({ length: g.length, count: g.count })) } : {}), dovetails: cut.dovetails.length, pairs,
+    }));
+    for (const g of pins) {
+      // pins that fell back to filament on some faces are told of by that cut's own note
+      if (g.d === FILAMENT && layout.diameter !== FILAMENT) continue;
+      notes.push(splitNote('PINS', { count: g.count, spares: g.spares, diameter: g.d, length: g.length, own: g.own }));
+    }
+    for (const x of cut.dovetails) {
+      const seam = seams.find((s) => s.cutId === x.cutId && s.joint === 'dovetail');
+      notes.push(splitNote('DOVETAIL', { letter: x.letter, cutId: x.cutId, tabs: x.tabs, pieces: seam?.pieces ?? [] }));
+    }
+    notes.push(...given, ...plan.notes, ...cut.notes);
+    lying.forEach((o, i) => {
+      // a piece on a dovetail seam lies flat by design: that it cannot lie on its cut face is no news
+      const flatOnly = cut.pieces[i].stats.allowed.length < 6;
+      notes.push(...o.notes.filter((x) => !(flatOnly && x.code === 'ORIENT_FALLBACK')));
+    });
+    notes.push(...layout.notes);
+    return { ...split, pieces, seams, pins, notes, grid: cut.grid, diameter: layout.diameter };
+  }
+
+  /** The `result` reply with a split: the pieces exploded apart in the viewer, one range per piece, pin and part. */
+  function splitResult(final, split, progress) {
+    const { cut, drill } = split;
+    if (!drill.display) {
+      progress?.('Preparing the view…');
+      const { solids, owned } = drilledSolids(final, split, progress);
+      const temps = scope();
+      try {
+        // a dense split is shown through lighter copies, like a dense model; downloads use the full pieces
+        const dense = solids.reduce((n, m) => n + m.numTri(), 0) > lodTriangles;
+        const shown = solids.map((m) => {
+          if (!dense) return m;
+          const simpler = temps.add(m.simplify(lodTolerance));
+          return simpler.numTri() < m.numTri() ? simpler : m;
+        });
+        const by = axisCuts(split.cuts);
+        const entries = cut.pieces.map((p, i) => ({ solid: shown[i], soup: cut.fragments.get(p.index) ?? null, part: { kind: 'piece', index: p.index } }));
+        for (const d of drill.layout.dowels) entries.push({ solid: temps.add(pinAt(d)), part: { kind: 'pin', cell: d.cell } });
+        for (const p of final.separate) {
+          const b = boxOf(p.world);
+          entries.push({ solid: p.world, part: { kind: 'part', id: p.id, cell: cellOfPoint(b.min.map((v, a) => (v + b.max[a]) / 2), by) } });
+        }
+        drill.display = buildSplitDisplay(entries);
+      } finally {
+        temps.dispose();
+        if (owned) solids.forEach((m) => m.delete());
+      }
+    }
+    const d = drill.display;
+    const display = {
+      positions: d.positions.slice(), // copies: the originals stay with the cached split
+      normals: d.normals.slice(),
+      index: d.index.slice(),
+      passthroughStart: d.passthroughStart,
+      passthroughRanges: d.passthroughRanges,
+      ranges: d.ranges,
+      parts: d.parts,
+      bvhRoots: [],
+    };
+    return {
+      message: {
+        display,
+        pieces: split.pieces,
+        grid: split.grid,
+        seams: split.seams,
+        diameter: split.diameter,
+        notes: [...final.notes, ...split.notes],
+        skipped: final.skipped,
+        info: { triangles: d.index.length / 3, pieces: split.pieces.length },
+      },
+      transfer: [display.positions.buffer, display.normals.buffer, display.index.buffer],
+    };
+  }
+
+  /**
+   * The `export` reply with a split: every piece turned the way it prints,
+   * a pins file per pin size, the separately printed parts and the glue
+   * sheet, packed in one zip (`archive: 'zip'`) or sent as separate files.
+   */
+  function splitExport(final, split, { name, printer, archive }, progress) {
+    const { cut, drill, lying, U, spec } = split;
+    const n = cut.pieces.length;
+    const files = [];
+    const add = (file, soup, extra) => {
+      const stl = writeBinarySTL(soup, `STL-Text ${file}`);
+      files.push({ name: file, file: `${file}.stl`, triangles: soup.length / 9, matrix: null, ...extra, stl });
+    };
+    const { solids, owned } = drilledSolids(final, split, progress);
+    try {
+      cut.pieces.forEach((p, i) => {
+        progress?.('Writing piece files…', { done: i + 1, total: n });
+        const { printMatrix, matrix, size, fits, lies, yaw } = lying[i];
+        const frags = cut.fragments.get(p.index);
+        const soup = concatSoups([applyToSoup(manifoldToSoup(solids[i]), printMatrix), frags ? applyToSoup(frags, printMatrix) : null]);
+        add(pieceFileName(name, p.index, n), soup, { kind: 'piece', index: p.index, size, fits, lies, yaw, matrix });
+      });
+    } finally {
+      if (owned) solids.forEach((m) => m.delete());
+    }
+    for (const g of split.pins) {
+      if (g.own) continue;
+      const sheet = pinSheet({ d: g.d, length: g.length, count: g.count + g.spares }, U);
+      try {
+        const b = boxOf(sheet);
+        const size = b.max.map((v, a) => v - b.min[a]);
+        add(`${safeFileName(name)}-${pinsFileName(g.count + g.spares, g.d, g.length)}`, manifoldToSoup(sheet), {
+          kind: 'pins', d: g.d, length: g.length, count: g.count + g.spares, spares: g.spares, size, fits: fitsBed(size, U).fits,
+        });
+      } finally {
+        sheet.delete();
+      }
+    }
+    final.separate.forEach((p, k) => {
+      const b = boxOf(p.local);
+      const size = b.max.map((v, a) => v - b.min[a]);
+      add(partFileName(name, k + 1, p.name), manifoldToSoup(p.local), { kind: 'part', id: p.id, size, fits: fitsBed(size, U).fits });
+    });
+    const assembly = assemblySteps({ pieces: split.pieces, seams: drill.layout.seams });
+    const text = howToGlueText({
+      name, pieces: split.pieces, seams: drill.layout.seams, pins: split.pins, parts: final.separate.map((p) => ({ name: p.name })),
+      clearance: spec.clearance, bed: U, printer, steps: assembly,
+    });
+    const glue = glueFileName(name);
+    files.push({ name: glue.replace(/\.txt$/, ''), file: glue, kind: 'text', text });
+    const triangles = files.reduce((t, f) => t + (f.triangles ?? 0), 0);
+    const message = {
+      stl: null, triangles, notes: [...final.notes, ...split.notes], skipped: final.skipped, extra: [],
+      pieces: split.pieces, seams: split.seams, assembly: assembly.map((s) => s.text), diameter: split.diameter,
+    };
+    if (archive === 'files') {
+      message.files = files;
+      return { message, transfer: files.filter((f) => f.stl).map((f) => f.stl) };
+    }
+    progress?.('Packing the zip…');
+    const entries = {};
+    let bytes = 0;
+    for (const f of files) {
+      entries[f.file] = f.stl ? new Uint8Array(f.stl) : strToU8(f.text);
+      bytes += entries[f.file].byteLength;
+    }
+    // deflate is worth its time on modest downloads; a huge one is stored as it is
+    const zip = zipSync(entries, { level: bytes > 40 * 1024 * 1024 ? 0 : 1 });
+    message.zip = zip.byteOffset === 0 && zip.byteLength === zip.buffer.byteLength ? zip.buffer : zip.slice().buffer;
+    message.zipName = zipFileName(name, n);
+    message.files = files.map(({ stl, ...rest }) => rest);
+    return { message, transfer: [message.zip] };
+  }
+
+  /**
+   * Fit to my printer (`mode: 'fit'`): the fewest pieces that fit the bed,
+   * and where their cuts go – away from letters, ledges and narrow necks, on
+   * faces with room for pins – from the cost of cutting at each sample of a
+   * profile of slices. `mode: 'measure'`: each cut's face (area, islands),
+   * its joint (and a dovetail cut's tabs) and the text it runs through, for
+   * the card while cuts are edited. Slices, but for one small boolean round
+   * each dovetail cut, which keeps its tabs clear of what stands proud of the
+   * plate.
+   */
+  function planSplitRequest({ items, baseVersion, printing, split = null, bed = null, mode = 'fit' }, progress) {
+    const final = finalFor(items, baseVersion, printing, progress);
+    let message;
+    if (base.kind !== 'none' && !base.current?.watertight) message = { bounds: null, cuts: [], notes: [splitNote('SPLIT_UNAVAILABLE')] };
+    else if (!final.solid) message = { bounds: null, cuts: [], notes: [] };
+    else if (mode === 'measure') message = measureCuts(final, items, split, progress);
+    else message = fitCuts(final, items, split, bedOf(bed), printing?.nozzle ?? 0.4, progress);
+    return { message, transfer: [] };
+  }
+
+  /** Each stored cut measured on the model, in list order (a cut that misses has joint 'miss'). */
+  function measureCuts(final, items, split, progress) {
+    progress?.('Measuring the cuts…');
+    const bounds = splitBounds(final);
+    const { spec, cuts, notes } = normaliseSplit(split, bounds);
+    const plan = platesFor(final, cuts, spec);
+    const temps = scope();
+    try {
+      const measured = (Array.isArray(split?.cuts) ? split.cuts : []).map((stored, i) => {
+        const id = stored?.id ?? `c${i + 1}`;
+        const letter = letterFor(i);
+        const plane = cutPlane(stored);
+        // a cut merged with another in the same place is measured as that one
+        const kept = plane && cuts.find((c) => c.id === id || (c.axis === plane.axis && Math.abs(c.at - plane.at) < CUT_TOLERANCE));
+        if (!kept) return { id, letter, axis: plane?.axis ?? null, at: plane?.at ?? null, area: 0, islands: 0, joint: 'miss', crosses: [] };
+        const face = temps.add(frameOf(final, kept.axis).slice(kept.at));
+        const islands = face.decompose().map((c) => temps.add(c)).filter((c) => c.area() >= 1).length;
+        // a dovetail cut's tabs make the pieces either side longer, and lay them flat: `cellSizes` reads these
+        const tabs = plan.tabs?.seams.find((x) => x.cutId === kept.id)?.tabs ?? [];
+        const reach = (dir) => Math.max(0, ...tabs.filter((tb) => tb.dir === dir).map((tb) => tb.E));
+        return {
+          id, letter, axis: kept.axis, at: plane.at, area: face.area(), islands, joint: plan.joints[kept.id] ?? 'dowels',
+          crosses: textCrossing(final, items, kept, temps), ...(kept.id !== id ? { merged: kept.id } : {}),
+          ...(tabs.length ? { tabs: tabs.length, reach: [reach(1), reach(-1)], w: plan.tabs.w } : {}),
+        };
+      });
+      return { bounds: { min: [...bounds.min], max: [...bounds.max] }, cuts: measured, notes };
+    } finally {
+      temps.dispose();
+    }
+  }
+
+  /**
+   * Fit to my printer: see `planSplitRequest`. Every piece is judged the
+   * way it will really print: a thin plate is planned lying flat, and a cut
+   * through a plate that takes dovetail tabs makes the pieces either side
+   * lie flat and reach a tab's length past it. Grids come fewest pieces
+   * first; the first piece count for which some grid's pieces all fit is
+   * planned, its cheapest grid winning.
+   */
+  function fitCuts(final, items, split, U, nozzle, progress) {
+    progress?.('Planning cuts…');
+    const bounds = splitBounds(final);
+    const { spec } = normaliseSplit({ ...(split ?? {}), cuts: [] });
+    const E = [0, 1, 2].map((a) => bounds.max[a] - bounds.min[a]);
+    const flat = plateAxis(E);
+    const whole = fitsBed(E, U, { flat });
+    if (whole.fits) return { cuts: [], counts: [0, 0, 0], pieces: [{ size: E, fits: true }], notes: [splitNote('SPLIT_NOT_NEEDED', { yaw: whole.yaw })] };
+    // tabs only make pieces longer, so the grids whose plain even cells fit are the only ones worth a profile
+    const candidates = gridCandidates(E, U, { flat }).filter((c) => c.pieces > 1);
+    const tooMany = { cuts: [], counts: null, pieces: [], notes: [splitNote('PLAN_TOO_MANY')] };
+    if (!candidates.length) return tooMany;
+    // the pieces at either end must take a hole and its wall, and middle ones a hole from each side
+    const probe = sizesFor(spec.diameter || 5, spec.clearance, nozzle, spec.depth);
+    const pins = sizesFor(5, spec.clearance, nozzle);
+    const minEnd = probe.reach + 1;
+    const minMid = 2 * probe.reach + 1;
+    const tabsOn = (spec.joint === 'auto' || spec.joint === 'dovetail') && !final.passthrough.length;
+    const text = final.itemBounds.filter((b) => !b.part);
+    const temps = scope();
+    try {
+      const profiles = new Map();
+      const slices = new Map(); // shared by the profiles of one axis: their samples often coincide
+      const progressOf = { done: 0, total: 0 };
+      let letters = null;
+      /** The cost of a cut at each sample of an axis for k cuts on it, and the tabs a cut there would have. */
+      const profileOf = (a, k) => {
+        const key = `${a}|${k}`;
+        if (profiles.has(key)) return profiles.get(key);
+        const samples = planSamples(bounds.min[a], bounds.max[a], k);
+        progressOf.total += samples.length;
+        if (letters?.axis !== a) letters = { axis: a, solids: text.map((b) => ({ b, m: null })) };
+        const profile = samples.map((t) => {
+          progress?.('Planning cuts…', { done: ++progressOf.done, total: progressOf.total });
+          const at = `${a}|${t.toFixed(6)}`;
+          if (!slices.has(at)) {
+            const face = frameOf(final, a).slice(t);
+            const tabs = tabsOn ? tabsAcross(face, { axis: a, at: t }) : null;
+            slices.set(at, { t, ...sliceStats(face, pins), letters: lettersAt(letters, items, a, t, temps), tabs });
+          }
+          return slices.get(at);
+        });
+        const made = { samples, costs: planCost(profile, { items: text.map((b) => [b.min[a], b.max[a]]) }), tabs: profile.map((p) => p.tabs) };
+        profiles.set(key, made);
+        return made;
+      };
+      for (const group of new Set(candidates.map((c) => c.pieces))) {
+        let best = null;
+        for (const { k } of candidates.filter((c) => c.pieces === group)) {
+          const plan = planGrid(k, { E, U, bounds, flat, minEnd, minMid, profileOf });
+          // candidates come fewest axes first, then fewest Z cuts: an equal cost keeps the earlier one
+          if (plan && (!best || plan.cost < best.cost - 1e-9)) best = plan;
+        }
+        if (!best) continue;
+        const centre = bounds.min.map((v, a) => (v + bounds.max[a]) / 2);
+        const cuts = best.offsets.flatMap((list, a) =>
+          list.map((t) => ({ position: centre.map((c, i) => (i === a ? t : c)), normal: [0, 1, 2].map((i) => (i === a ? 1 : 0)) })),
+        );
+        return { cuts, counts: best.k, pieces: best.pieces, notes: [] };
+      }
+      return tooMany;
+    } finally {
+      temps.dispose();
+      releaseFrame(final); // planning is done: the copy would only hold memory
+    }
+  }
+
+  /**
+   * A slice of the model for the planner: its area, perimeter and islands
+   * (of 1 mm² or more), and the share of its area on islands with no room
+   * for two pins of the probe's size (smaller than 50 mm², or too narrow
+   * once inset by ρ). Deletes the slice.
+   */
+  function sliceStats(face, pins) {
+    try {
+      if (face.isEmpty()) return { area: 0, perimeter: 0, islands: 0, noRoom: 0 };
+      const area = face.area();
+      const perimeter = perimeterOf(polygonsOf(face));
+      let islands = 0;
+      let bare = 0;
+      const list = face.decompose();
+      try {
+        for (const island of list) {
+          const a = island.area();
+          if (a < 1) continue;
+          islands++;
+          let room = false;
+          if (a >= 50) {
+            // a dense outline is thinned a little first: insetting thousands of corners takes 50 times longer for
+            // the same answer, and this is only a cost for the planner
+            const thin = island.simplify(0.05);
+            const inset = thin.offset(-pins.rho, 'Round', 2, 16);
+            room = !inset.isEmpty() && spreadOf(polygonsOf(inset)) >= pins.sMin;
+            inset.delete();
+            thin.delete();
+          }
+          if (!room) bare += a;
+        }
+      } finally {
+        list.forEach((c) => c.delete());
+      }
+      return { area, perimeter, islands, noRoom: area > 0 ? Math.min(1, bare / area) : 0 };
+    } finally {
+      face.delete();
+    }
+  }
+
+  /** Whether a cut at t runs through any text item's letters (their solids made once per axis, in the plane frame). */
+  function lettersAt(letters, items, axis, t, temps) {
+    return letters.solids.some((entry) => {
+      if (!(entry.b.min[axis] < t && entry.b.max[axis] > t)) return false;
+      if (!entry.m) {
+        const item = items.find((i) => i.id === entry.b.id);
+        if (!item) return false;
+        entry.m = itemInPlane(item, axis, temps);
+      }
+      return cutsThrough(entry.m, t);
+    });
+  }
+
+  /**
+   * The fit test: a small print to try the joints before printing the
+   * pieces. Given the model (`items`, `baseVersion`) and a split with cuts,
+   * it is made from what that split really uses – the pin size Auto chose,
+   * pin holes only when some seam has pins, a dovetail whenever some seam
+   * has tabs – by working the split out as the pieces view does (cached, so
+   * the download after it costs nothing). Without them the settings say:
+   * the pin size set (5 mm for Auto), a dovetail when Joints is Dovetails.
+   * `dovetail` forces the plates in or out. No pins and no tabs (glue only)
+   * gives no file (`stl: null`).
+   */
+  function fitTest({ items = null, baseVersion = null, split = null, printing = null, bed = null, name = 'model', dovetail = null }, progress) {
+    const { spec } = normaliseSplit({ ...(split ?? {}), cuts: [] });
+    const uses = { pins: spec.joint !== 'none', dovetail: spec.joint === 'dovetail', diameter: spec.diameter || 5 };
+    if (Array.isArray(items) && splitActive(split)) {
+      const final = finalFor(items, baseVersion, printing, progress);
+      const parted = splitFor(final, items, { split, bed, printing }, progress);
+      if (parted?.cut) {
+        uses.pins = parted.seams.some((s) => s.dowels.length > 0);
+        uses.dovetail = parted.cut.dovetails.length > 0;
+        uses.diameter = parted.diameter ?? uses.diameter;
+      }
+    }
+    if (dovetail !== null) uses.dovetail = Boolean(dovetail);
+    const file = `${safeFileName(name)}-fit-test`;
+    if (!uses.pins && !uses.dovetail) return { message: { stl: null, name: file, triangles: 0, diameter: null, pins: false, dovetail: false }, transfer: [] };
+    progress?.('Making the fit test…');
+    const coupon = fitTestCoupon({ ...spec, diameter: uses.diameter }, printing?.nozzle ?? 0.4, { dovetail: uses.dovetail, pins: uses.pins });
+    try {
+      const soup = manifoldToSoup(coupon);
+      const stl = writeBinarySTL(soup, `STL-Text ${file}`);
+      return {
+        message: { stl, name: file, triangles: soup.length / 9, diameter: uses.pins ? uses.diameter : null, pins: uses.pins, dovetail: uses.dovetail },
+        transfer: [stl],
+      };
+    } finally {
+      coupon.delete();
+    }
   }
 
   /* ------------------------------------------------------------- fonts */
@@ -2091,7 +2915,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     ping: () => ({
       message: {
         ready: true,
-        caches: { flat: flat.size, conformed: conformed.size, result: result ? 1 : 0 },
+        caches: { flat: flat.size, conformed: conformed.size, result: result ? 1 : 0, split: result?.split?.cut ? 1 : 0, frame: result?.split?.frame ? 1 : 0 },
         fonts: [...fonts.keys()],
         parts: [...parts.keys()],
         baseVersion: base?.version ?? null,
@@ -2107,6 +2931,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     preview,
     result: resultDisplay,
     export: exportStl,
+    'split.plan': planSplitRequest,
+    'split.fitTest': fitTest,
   };
 
   return {
@@ -2117,7 +2943,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         const { message, transfer } = handler(request, progress);
         return { message: { id: request.id, ok: true, result: message }, transfer: transfer ?? [] };
       } catch (err) {
-        const code = err instanceof EngineError ? err.code : /Not manifold/i.test(err?.message) ? 'NOT_WATERTIGHT' : 'INTERNAL';
+        // a split that cannot be made says why with its own code (SPLIT_INVALID, or INTERNAL for a broken piece)
+        const coded = err instanceof EngineError || err instanceof SplitError;
+        const code = coded ? err.code : /Not manifold/i.test(err?.message) ? 'NOT_WATERTIGHT' : 'INTERNAL';
         return {
           message: { id: request?.id, ok: false, error: { code, message: err?.message ?? String(err), details: err?.details } },
           transfer: [],
@@ -2131,6 +2959,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       fonts.clear();
       for (const p of parts.values()) p.manifold.delete();
       parts.clear();
+      clearSplitCaches();
     },
   };
 }

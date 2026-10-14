@@ -1,5 +1,5 @@
 import { Matrix4, Vector3 } from 'three';
-import { Document, ITEM_DEFAULTS, coversOf, createPart, createSpot, fontIds, frameOf, hasText, isPart, isSpot, itemLabel, maxSize, placeKey, shapeKey, spotsOf, stableKey, modelPlacementKey } from './document.js';
+import { Document, ITEM_DEFAULTS, SPLIT_DEFAULTS, coversOf, createPart, createSpot, fontIds, frameOf, hasText, isPart, isSpot, itemLabel, maxSize, placeKey, shapeKey, spotsOf, stableKey, modelPlacementKey } from './document.js';
 import { planRebuild, removalSpotsFor, specForKind } from './rebuild.js';
 import { DECOR_KINDS, decorPartId, normaliseDecorSpec } from './decor.js';
 import { createEngineClient } from './engineClient.js';
@@ -7,6 +7,10 @@ import { ENHANCE_DEFAULTS, isEnhanceActive } from './enhance.js';
 import { Viewer } from './viewer.js';
 import { SIDES, placementMatrix, snapPartTo } from './placement.js';
 import { BUNDLED_FONTS, canQueryLocalFonts, fetchBundledFont, listLocalFonts, localFontBytes } from './fontCatalog.js';
+import {
+  BED_DEFAULTS, BED_PRESETS, FILAMENT, PIECE_COLORS, SPLIT_LIMITS, SPLIT_NOTE_CODES, axisCuts, bedSize, cellFits, cellSizes, cutPlane, fitsBed, formatSize,
+  gridCounts, letterFor, nextCut, pieceColorIndex, splitActive, splitNote, usableBed,
+} from './split.js';
 
 const $ = (id) => document.getElementById(id);
 const SETTINGS_KEY = 'stltext.settings.v2';
@@ -20,6 +24,10 @@ const partAssets = new Map(); // partId -> { name, info }
 let partCount = 0;
 const printing = { nozzle: 0.4, layerHeight: 0.2 };
 const defaults = { fontId: 'inter', size: 10, mode: 'emboss', depth: 1.5, quality: 'normal', roundCorners: false };
+// the printer the pieces of a split must fit (not in `printing`: that is part of every preview's key)
+const bed = { preset: BED_DEFAULTS.preset, size: [...BED_DEFAULTS.size], margin: BED_DEFAULTS.margin };
+// the split settings used last, which the next model's split starts from
+const splitDefaults = Object.fromEntries(Object.entries(SPLIT_DEFAULTS).filter(([key]) => key !== 'cuts'));
 
 const previewKeys = new Map(); // itemId -> key of the last preview requested
 const previewInfo = new Map(); // itemId -> { size, notes, stats, bounds, matrix }
@@ -38,6 +46,14 @@ let linesSignature = ''; // what the lines editor was last built for
 let fatalCount = 0; // consecutive engine crashes; stops the automatic restarts
 let halted = false;
 const MAX_FATALS = 3;
+
+// split for printing: view state, never in the document
+let selectedCutId = null; // the cut the arrow keys move (selecting an item lets go of it)
+let lastSplitKey = ''; // what the pieces depend on besides the content: the split, the printer and the nozzle
+let lastPieces = null; // the pieces last computed: { key, content, pieces, seams, grid, diameter, notes }
+let measured = null; // the cuts last measured on the model: { key, cuts: Map(id -> { area, islands, joint, crosses }), notes }
+let splitBounds = null; // { version, key, bounds } of the model and its text from the last measure (text-only work has no other)
+let planNotes = null; // { key, content, notes } of a Fit to my printer that cut nothing
 
 const client = createEngineClient({
   createWorker: () => new Worker(new URL('./worker.js', import.meta.url), { type: 'module' }),
@@ -117,6 +133,8 @@ const friendly = (err) => {
     case 'WASM_ABORT':
     case 'WORKER_ERROR':
       return 'The geometry engine crashed. Try again, or use Simplify on very large models.';
+    case 'SPLIT_INVALID':
+      return err.message || 'The split settings are invalid – remove the cuts and try again.';
     default:
       return err?.message ?? String(err);
   }
@@ -128,6 +146,13 @@ function loadSettings() {
     Object.assign(printing, saved.printing ?? {});
     Object.assign(defaults, saved.defaults ?? {});
     if (!BUNDLED_FONTS.some((f) => f.id === defaults.fontId)) defaults.fontId = 'inter';
+    // older saves have no printer or split settings: what they lack keeps its default
+    if (BED_PRESETS[saved.bed?.preset]) bed.preset = saved.bed.preset;
+    if (Array.isArray(saved.bed?.size)) bed.size = bedSize({ preset: 'custom', size: saved.bed.size });
+    if (Number.isFinite(saved.bed?.margin)) bed.margin = Math.min(20, Math.max(0, saved.bed.margin));
+    for (const key of Object.keys(splitDefaults)) {
+      if (typeof saved.splitDefaults?.[key] === typeof splitDefaults[key]) splitDefaults[key] = saved.splitDefaults[key];
+    }
   } catch {
     /* fresh start */
   }
@@ -135,7 +160,7 @@ function loadSettings() {
 
 function saveSettings() {
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ printing, defaults }));
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ printing, defaults, bed, splitDefaults }));
   } catch {
     /* private mode etc. */
   }
@@ -198,7 +223,37 @@ function describeModel() {
         : 'The clean-up spots are not on the model surface yet.',
     });
   }
+  const tooBig = bedTooSmall();
+  if (tooBig) notes.push(tooBig);
   return { text, notes };
+}
+
+let tooBigFor = { key: null, note: null };
+/**
+ * The "bigger than your printer" note for a model with no cuts yet, with the
+ * number of pieces it would take (`pieces`, 0 when even 64 would not do), or
+ * null when it fits. Worked out here, not by the engine: it knows no printer.
+ */
+function bedTooSmall() {
+  if (!modelInfo?.hasModel || !modelInfo.size || splitActive(doc.split)) return null;
+  const U = usableBed(bed);
+  const key = `${modelInfo.size}|${U}|${bedSize(bed)}`;
+  if (tooBigFor.key !== key) {
+    const fits = fitsBed(modelInfo.size, U).fits;
+    tooBigFor = { key, note: fits ? null : splitNote('BED_TOO_SMALL', { size: modelInfo.size, bed: bedSize(bed), pieces: gridCounts(modelInfo.size, U).pieces }) };
+  }
+  return tooBigFor.note;
+}
+
+let modelShown = ''; // what the Model card shows, so a render only rewrites it (and has it read out again) when it changed
+function renderModel() {
+  const { text, notes } = describeModel();
+  const usable = canSplit();
+  const shown = JSON.stringify([text, notes.map((n) => n.text), usable]);
+  if (shown === modelShown) return;
+  modelShown = shown;
+  $('modelInfo').textContent = text;
+  renderNotes($('modelNotes'), notes, { BED_TOO_SMALL: (n) => n.pieces > 1 && usable && { label: `Split into ${n.pieces} pieces`, run: autoSplit } });
 }
 
 function renderNotes(el, notes, actions = {}) {
@@ -253,9 +308,8 @@ function onBase(result, { frame = false } = {}) {
   viewer.setBase(result.display);
   viewer.setHoverEnabled(!!modelInfo.hasModel);
   if (frame) viewer.frame();
-  const { text, notes } = describeModel();
-  $('modelInfo').textContent = text;
-  renderNotes($('modelNotes'), notes);
+  modelShown = '';
+  renderModel();
   renderSuggestions();
   $('legendPass').hidden = !modelInfo.passthroughTriangles;
   previewKeys.clear(); // text follows the surface, so every preview depends on the model
@@ -284,6 +338,7 @@ async function loadModel(kind, { bytes = null, name = 'model' } = {}) {
     const result = await pending;
     if (!result) return; // superseded by a newer load, which renders itself
     onBase(result, { frame: true });
+    if (kind !== 'none') offerSplit();
     if (kind === 'stl') {
       setStatus(
         result.info.watertight
@@ -796,6 +851,10 @@ function nudge(direction, step) {
 }
 
 viewer.onPick = ({ point, normal }) => {
+  if (selectedCutId) {
+    selectCut(null); // a click on the model lets go of the cut; the next one places text
+    return;
+  }
   lastClick = { position: point, normal };
   const sel = doc.selected;
   if (sel) doc.updateItem(sel.id, { position: point, normal });
@@ -803,6 +862,21 @@ viewer.onPick = ({ point, normal }) => {
 };
 
 viewer.onSelectItem = (id) => doc.select(id);
+
+viewer.onSelectCut = (id) => selectCut(id);
+
+// while a handle is dragged only the view moves (the plane, the colours and the readout); the cut lands when dropped
+viewer.onCutDrag = ({ id, at, done, screen }) => {
+  if (!done) {
+    showReadout(id, at, screen);
+    const box = document.querySelector(`[data-cut-at="${CSS.escape(id)}"]`);
+    if (box && box !== document.activeElement) box.value = round(at);
+    return;
+  }
+  $('cutReadout').hidden = true;
+  moveCut(id, at, { coalesce: 'split:drag' });
+  doc.endCoalescing();
+};
 
 viewer.onDrag = ({ itemId, point, normal, done }) => {
   const item = doc.items.find((i) => i.id === itemId);
@@ -886,8 +960,16 @@ function refreshPreviews() {
 
 let resultBusy = false;
 let resultPending = false;
-async function showResult(on) {
-  viewer.showResult(false);
+let piecesTimer = 0;
+/**
+ * Compute and show the final result – the pieces, when the model is split –
+ * or go back to the model. `keep` leaves what is shown on screen (dimmed)
+ * until the new pieces arrive: moving a cut never hides the pieces view.
+ */
+async function showResult(on, { keep = false } = {}) {
+  clearTimeout(piecesTimer);
+  if (!keep) viewer.showResult(false);
+  syncSpread();
   if (!on) return;
   if (resultBusy) {
     resultPending = true; // run again for the new content once this one lands
@@ -895,56 +977,795 @@ async function showResult(on) {
   }
   resultBusy = true;
   const requestedFor = lastContentKey;
+  const splitFor = lastSplitKey;
+  const split = activeSplit();
+  if (split) setSplitPending(true);
   try {
     if (!(await syncBase())) return; // the model is still being re-derived for a newer change, which re-renders
-    const r = await client.result(doc.items, version(), { printing });
-    if (!r || !$('resultToggle').checked || lastContentKey !== requestedFor) return; // stale
-    viewer.setResult(r.display);
+    const r = await client.result(doc.items, version(), { printing, split, bed: usableBed(bed) });
+    if (!r || !$('resultToggle').checked || lastContentKey !== requestedFor || lastSplitKey !== splitFor) return; // stale
+    const entering = viewer.viewMode !== 'pieces';
+    if (r.pieces) viewer.setPieces(r.display, r.pieces, r.grid);
+    else viewer.setResult(r.display);
+    // without pieces a split still has its say: every cut missed, or the model cannot be split
+    lastPieces = split ? { key: splitFor, content: requestedFor, pieces: r.pieces ?? [], seams: r.seams ?? [], grid: r.grid, diameter: r.diameter, notes: r.notes.filter(isSplitNote) } : null;
     viewer.showResult(true);
-    if (r.notes.length) setStatus(r.notes.map((n) => n.text).join('\n'), r.notes.some((n) => n.level === 'warn') ? 'error' : '');
+    // pulled apart, the pieces take more room than the model: fit them in view once, then leave the camera to the user
+    if (r.pieces && entering) viewer.frame();
+    renderSplit();
+    // the split's own notes are in its card; the status line keeps the summary and anything to act on
+    const notes = r.pieces ? r.notes.filter((n) => !isSplitNote(n) || n.code === 'SPLIT' || n.level === 'warn') : r.notes;
+    if (notes.length) setStatus(notes.map((n) => n.text).join('\n'), notes.some((n) => n.level === 'warn') ? 'error' : '');
   } catch (err) {
     $('resultToggle').checked = false;
+    viewer.showResult(false);
+    syncSpread();
     setStatus(friendly(err), 'error');
   } finally {
     resultBusy = false;
+    if (split) setSplitPending(false);
     if (resultPending) {
       resultPending = false;
-      if ($('resultToggle').checked) showResult(true);
+      if ($('resultToggle').checked) showResult(true, { keep: true });
     }
   }
+}
+
+/** The pieces again for changed cuts or split settings, once the edits pause; the old ones stay on screen, dimmed. */
+function requestPieces() {
+  viewer.setPiecesStale(true);
+  clearTimeout(piecesTimer);
+  piecesTimer = setTimeout(() => showResult(true, { keep: true }), 300);
+}
+
+/** Save bytes as a download; returns the file name used and its size in KB. */
+function save(bytes, fileName, type = 'model/stl', ext = '.stl') {
+  const blob = new Blob([bytes], { type });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${fileName.replace(/[^\w.-]+/g, '_')}${ext}`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+  return { name: a.download, kb: (blob.size / 1024).toFixed(0) };
+}
+
+/** The name the downloads start with: the model's, or the texts' when there is no model. */
+function exportName() {
+  const items = doc.items.filter((i) => hasText(i) && !isSpot(i));
+  return modelInfo?.hasModel ? `${modelInfo.name}-text` : items.map((i) => itemLabel(i, '')).filter(Boolean).join('-').slice(0, 40) || 'text';
 }
 
 async function download() {
   const items = doc.items.filter((i) => hasText(i) && !isSpot(i)); // spots change the model, they are not exported geometry
   if (!items.length && !modelInfo?.hasModel) return setStatus('Type some text or open a model first.', 'error');
-  const name = modelInfo?.hasModel ? `${modelInfo.name}-text` : items.map((i) => itemLabel(i, '')).filter(Boolean).join('-').slice(0, 40) || 'text';
+  const name = exportName();
+  const split = activeSplit();
+  if (split) setSplitPending(true);
   try {
     if (!(await syncBase())) return setStatus('The model is still being updated – try the download again in a moment.', '');
-    const r = await client.export(doc.items, version(), name, { printing });
+    const r = await client.export(doc.items, version(), name, {
+      printing,
+      split,
+      bed: usableBed(bed),
+      printer: { size: bedSize(bed), margin: bed.margin }, // names the printer on the glue sheet
+      archive: 'zip',
+    });
     if (!r) return setStatus('The model changed while the download was being prepared – try again.', '');
-    const save = (bytes, fileName) => {
-      const blob = new Blob([bytes], { type: 'model/stl' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `${fileName.replace(/[^\w.-]+/g, '_')}.stl`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
-      return { name: a.download, kb: (blob.size / 1024).toFixed(0) };
-    };
+    const warnings = r.notes.filter((n) => n.level === 'warn');
+    const warned = warnings.length ? `\n${warnings.map((n) => n.text).join('\n')}` : '';
+    if (r.zip) {
+      // the pieces, the pins, the separately printed parts and the glue sheet come as one file: a browser
+      // drops or asks about many downloads from one click
+      const zip = save(r.zip, r.zipName, 'application/zip', '');
+      const pairs = (r.seams ?? []).filter((x) => x.labels?.length === 2).map((x) => `${x.labels[0]} ↔ ${x.labels[1]}`);
+      setStatus(
+        `Downloaded ${zip.name} (${zip.kb} KB): ${zipContents(r.files ?? [])}.${pairs.length ? ` Glue matching letters together: ${pairs.join(', ')}.` : ''}${warned}`,
+        warnings.length ? 'error' : 'ok',
+      );
+      return;
+    }
     const main = save(r.stl, name);
     const extras = (r.extra ?? []).map((e, i) => save(e.stl, `${name}-part-${i + 1}-${e.name}`));
-    const warnings = r.notes.filter((n) => n.level === 'warn');
     setStatus(
       `Downloaded ${main.name} (${main.kb} KB, ${r.triangles.toLocaleString()} triangles)` +
         (extras.length ? ` and ${extras.length} separate part file${extras.length > 1 ? 's' : ''} (${extras.map((e) => e.name).join(', ')}) to print and glue in.` : '.') +
-        (warnings.length ? `\n${warnings.map((n) => n.text).join('\n')}` : ''),
+        warned +
+        (bedTooSmall() && canSplit() ? '\nBigger than your printer – use Split for printing (step 6).' : ''),
       warnings.length ? 'error' : 'ok',
     );
   } catch (err) {
     setStatus(friendly(err), 'error');
+  } finally {
+    if (split) setSplitPending(false);
   }
+}
+
+/** "2 pieces, 3 pins (Ø6 × 19 mm, 1 spare), 1 part and how-to-glue.txt" from a split download's files. */
+function zipContents(files) {
+  const n = (v) => String(Math.round(v * 100) / 100);
+  const count = (k, one, many = `${one}s`) => `${k} ${k === 1 ? one : many}`;
+  const list = [count(files.filter((f) => f.kind === 'piece').length, 'piece')];
+  for (const f of files.filter((x) => x.kind === 'pins')) {
+    list.push(`${count(f.count, 'pin')} (Ø${n(f.d)} × ${n(f.length)} mm${f.spares ? `, ${count(f.spares, 'spare')}` : ''})`);
+  }
+  const parts = files.filter((f) => f.kind === 'part').length;
+  if (parts) list.push(count(parts, 'part'));
+  if (files.some((f) => f.kind === 'text')) list.push('how-to-glue.txt');
+  return list.length > 1 ? `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}` : list[0];
+}
+
+/* ---------------------------------------------------- split for printing */
+
+const isSplitNote = (n) => SPLIT_NOTE_CODES.includes(n.code);
+
+/** The document's split with its defaults filled in, or null when it has no cuts (the model is not split). */
+const activeSplit = () => (splitActive(doc.split) ? { ...SPLIT_DEFAULTS, ...doc.split } : null);
+
+/** Whether there is something to split: a solid model or, with no model, text or parts. */
+function canSplit() {
+  if (modelInfo?.hasModel) return !!modelInfo.watertight;
+  return doc.items.some((i) => hasText(i) && !isSpot(i));
+}
+
+/** The box of the model and its text as the engine last measured it, while the model is the one it measured (after a text edit, until the next measure lands). */
+const measuredBounds = () => (splitBounds && splitBounds.version === version() ? splitBounds.bounds : null);
+
+/** The box cuts are placed in: the measured one, or the model's own until there is one. */
+const cutBounds = () => measuredBounds() ?? (modelInfo?.hasModel ? modelInfo.bounds ?? null : null);
+
+/** Whether the pieces on hand are for the split, the printer and the content as they are now. */
+const piecesCurrent = () => !!lastPieces && lastPieces.key === lastSplitKey && lastPieces.content === lastContentKey;
+
+/** Whether a box between the cuts (from `cellSizes`, dovetail tabs counted) is too big for the printer. */
+const cellTooBig = (cell) => !cellFits(cell, usableBed(bed));
+
+/**
+ * The cuts, each with what the last measure found its dovetail tabs add to
+ * the pieces either side (`reach`) and the side those pieces must lie on
+ * (`w`), for `cellSizes`; a cut moved since keeps them until it is measured again.
+ */
+function cutsWithTabs() {
+  return (doc.split?.cuts ?? []).map((c) => {
+    const m = measured?.cuts.get(c.id);
+    return m?.reach && m.axis === cutPlane(c)?.axis ? { ...c, reach: m.reach, w: m.w } : c;
+  });
+}
+const nudgeStep = () => Number.parseFloat($('nudgeStep').value) || 1;
+const round = (v, digits = 2) => Math.round(v * 10 ** digits) / 10 ** digits;
+
+/** A cut's letter, from its place in the list as on its plane and the glue sheet; null for a cut that is gone. */
+function cutLetter(id) {
+  const i = doc.split?.cuts.findIndex((c) => c.id === id) ?? -1;
+  return i >= 0 ? letterFor(i) : null;
+}
+
+let splitWork = 0;
+let splitPendingTimer = 0;
+/** "working…" on the card while split requests run (only when one takes a moment, so quick ones do not flicker). */
+function setSplitPending(on) {
+  splitWork = Math.max(0, splitWork + (on ? 1 : -1));
+  clearTimeout(splitPendingTimer);
+  if (splitWork) splitPendingTimer = setTimeout(() => $('splitCard').classList.add('pending'), 300);
+  else $('splitCard').classList.remove('pending');
+}
+
+/**
+ * Fit to my printer: the engine works out the fewest pieces that fit and
+ * where their cuts go; they replace any cuts as one undo step, and the
+ * pieces are shown.
+ */
+async function autoSplit() {
+  if (!canSplit()) return;
+  setSplitPending(true);
+  try {
+    if (!(await syncBase())) return;
+    const asked = { key: lastSplitKey, content: lastContentKey };
+    const r = await client.planSplit(doc.items, version(), { printing, split: { ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split }, bed: usableBed(bed), mode: 'fit' });
+    if (!r) return; // superseded by a newer plan
+    if (!r.cuts.length) {
+      // it fits already, or nothing would: the card says which, for this model and text only
+      planNotes = { ...asked, notes: r.notes };
+      renderSplit();
+      const warn = r.notes.find((n) => n.level === 'warn');
+      if (warn) setStatus(warn.text, 'error');
+      return;
+    }
+    // a split already there keeps its settings; a new one starts from those used last
+    doc.setSplit(doc.split ? { cuts: r.cuts } : { ...splitDefaults, cuts: r.cuts });
+    selectedCutId = null;
+    if ($('toastText').textContent === offered) $('toast').hidden = true; // done what it offered
+    $('resultToggle').checked = true;
+    showResult(true, { keep: true });
+  } catch (err) {
+    setStatus(friendly(err), 'error');
+  } finally {
+    setSplitPending(false);
+  }
+}
+
+/** "+ Cut": across the middle of the longest piece, selected so the arrow keys and the handle move it. */
+async function addCut() {
+  if (!canSplit()) return;
+  // with no model only the engine knows where the text is – and it must be the text as it is now
+  const fresh = splitBounds?.key === boundsKey() ? splitBounds.bounds : null;
+  const bounds = fresh ?? (modelInfo?.hasModel ? cutBounds() : await measureBounds());
+  if (!bounds) return;
+  const next = nextCut(bounds, doc.split?.cuts ?? []);
+  if (!next) return setStatus(`A split can have up to ${SPLIT_LIMITS.cuts} cuts and ${SPLIT_LIMITS.cells} pieces.`, 'error');
+  selectCut(doc.addCut(next, { defaults: splitDefaults }));
+}
+
+/** The box of the model and its text, from the engine (for a first cut before anything was measured). */
+async function measureBounds() {
+  try {
+    if (!(await syncBase())) return null;
+    const v = version();
+    const key = boundsKey();
+    const r = await client.planSplit(doc.items, v, { printing, split: null, bed: usableBed(bed), mode: 'measure' });
+    if (r?.bounds) splitBounds = { version: v, key, bounds: r.bounds };
+    return r?.bounds ?? null;
+  } catch (err) {
+    setStatus(friendly(err), 'error');
+    return null;
+  }
+}
+
+/** Select a cut (its plane stands out, the arrow keys move it), or none; the selected item is let go. */
+function selectCut(id) {
+  selectedCutId = id;
+  if (id && doc.state.selectedId) doc.select(null); // re-renders
+  else renderSplit();
+}
+
+/** Move a cut to `at` mm along its own axis. */
+function moveCut(id, at, options) {
+  const cut = doc.split?.cuts.find((c) => c.id === id);
+  const plane = cutPlane(cut);
+  if (!plane || !Number.isFinite(at)) return;
+  const position = [...cut.position];
+  position[plane.axis] = at;
+  doc.updateCut(id, { position }, options);
+}
+
+function nudgeCut(id, step) {
+  const plane = cutPlane(doc.split?.cuts.find((c) => c.id === id));
+  if (plane) moveCut(id, round(plane.at + step, 4), { coalesce: 'split:nudge' });
+}
+
+/** Turn a cut to run across another axis, through the middle of the model. */
+function setCutAxis(id, axis) {
+  const cut = doc.split?.cuts.find((c) => c.id === id);
+  if (!cut) return;
+  const b = cutBounds();
+  const position = b ? b.min.map((v, a) => (v + b.max[a]) / 2) : [...cut.position];
+  doc.updateCut(id, { normal: [0, 1, 2].map((a) => (a === axis ? 1 : 0)), position });
+}
+
+function removeCut(id) {
+  const letter = cutLetter(id);
+  if (!letter) return;
+  doc.removeCut(id);
+  toast(`Removed cut ${letter}.`, { label: 'Undo', run: () => doc.undo() });
+}
+
+/** The settings of the split in force are the ones used last (an undone change is not), and start the next model's split. */
+function rememberSplitSettings(split) {
+  let changed = false;
+  for (const key of Object.keys(splitDefaults)) {
+    if (split[key] === undefined || split[key] === splitDefaults[key]) continue;
+    splitDefaults[key] = split[key];
+    changed = true;
+  }
+  if (changed) saveSettings();
+}
+
+/** Change one split setting: on the split, and remembered for the next model's. */
+function setSplitSetting(key, value, { coalesce = null } = {}) {
+  splitDefaults[key] = value;
+  saveSettings();
+  if (doc.split) doc.setSplit({ [key]: value }, { coalesce });
+  else render();
+}
+
+/** A split control's value as the document keeps it, within its range; null for nonsense typed in a box. */
+function splitValue(el, key) {
+  if (el.type === 'checkbox') return el.checked;
+  if (key === 'joint' || key === 'pins' || key === 'orient') return el.value;
+  const v = Number.parseFloat(el.value);
+  if (Number.isNaN(v)) return null;
+  if (key === 'depth') return v <= 0 ? 0 : Math.min(30, Math.max(3, v));
+  if (key === 'clearance') return Math.min(0.5, Math.max(0, round(v, 3)));
+  if (key === 'count') return Math.min(6, Math.max(0, Math.round(v)));
+  return v; // the diameter, from its list
+}
+
+function openPrinting() {
+  $('printing').open = true;
+  $('bedPreset').focus();
+}
+
+let measureTimer = 0;
+let measureFor = null; // { cuts, content } of the measure last asked for
+/**
+ * What the box the engine measures depends on: the model and what is raised
+ * or cut on it – with no model the text is all there is, and moving the text
+ * decides which cuts run through letters.
+ */
+const boundsKey = () => stableKey({ version: version(), items: doc.items.filter((i) => hasText(i) && !isSpot(i)).map((i) => [shapeKey(i), placeKey(i), !!i.cover]) });
+/** What a measure of the cuts depends on besides that: the cuts and the joint settings. */
+const cutsKey = () => stableKey({ cuts: doc.split?.cuts ?? [], joint: doc.split?.joint, clearance: doc.split?.clearance });
+const measureKey = () => `${cutsKey()}|${boundsKey()}`;
+
+/**
+ * Measure the cuts on the model once the edits pause (slices only, no
+ * boolean): the face each cut makes for its row, and the box the planes span.
+ */
+function scheduleMeasure() {
+  if (!booted || halted || !splitActive(doc.split) || !canSplit()) return;
+  const want = { cuts: cutsKey(), content: boundsKey() };
+  if (want.cuts === measureFor?.cuts && want.content === measureFor?.content) return;
+  // when only the text changed, wait for the typing to stop: on a model a new measure means new booleans
+  const delay = want.cuts === measureFor?.cuts ? 1000 : 300;
+  measureFor = want;
+  const key = measureKey();
+  clearTimeout(measureTimer);
+  measureTimer = setTimeout(async () => {
+    setSplitPending(true);
+    try {
+      if (!(await syncBase())) {
+        if (measureFor === want) measureFor = null; // try again on the next render
+        return;
+      }
+      if (measureKey() !== key) return; // a newer measure is on its way
+      const v = version();
+      const r = await client.planSplit(doc.items, v, { printing, split: { ...SPLIT_DEFAULTS, ...doc.split }, bed: usableBed(bed), mode: 'measure' });
+      if (!r || measureKey() !== key) return;
+      measured = { key, cuts: new Map(r.cuts.map((c) => [c.id, c])), notes: r.notes };
+      if (r.bounds) splitBounds = { version: v, key: want.content, bounds: r.bounds };
+      renderSplit();
+    } catch (err) {
+      measured = { key, cuts: new Map(), notes: [{ level: 'warn', code: err.code, text: friendly(err) }] };
+      renderSplit();
+    } finally {
+      setSplitPending(false);
+    }
+  }, delay);
+}
+
+/** The boxes between the cuts that hold some of the model or its text (an L-shape leaves its corner box empty). */
+function filledBoxes() {
+  const b = cutBounds();
+  if (!b || !splitActive(doc.split)) return [];
+  const { cells } = cellSizes(b, cutsWithTabs());
+  const filled = viewer.filledCells(doc.split.cuts, b); // null: the view can't tell, so every box counts
+  return filled ? cells.filter((c) => filled.has(c.cell.join(','))) : cells;
+}
+
+/** How many pieces a download makes: those computed, or until then one for each box between the cuts with something in it. */
+function piecesToDownload() {
+  if (!splitActive(doc.split)) return 0;
+  if (piecesCurrent()) return lastPieces.pieces.length;
+  return filledBoxes().length;
+}
+
+/** Relabel an element, leaving it alone when the label is the same (this runs on every render). */
+function relabel(el, text) {
+  if (el.textContent !== text) el.textContent = text;
+}
+
+/** The Spread slider goes with the pieces view. */
+function syncSpread() {
+  $('spreadField').hidden = viewer.viewMode !== 'pieces';
+}
+
+/** The split's share of the page and the view: its card, the cut planes and their live colours, the download button. */
+function renderSplit() {
+  fillSplit();
+  const cuts = doc.split?.cuts.length ? doc.split.cuts : null;
+  viewer.setCuts(cuts, { selectedId: selectedCutId, bounds: measuredBounds() });
+  viewer.setCellPreview(cuts && cutsWithTabs(), { tooBig: cellTooBig });
+  viewer.setCutSnap(nudgeStep(), 5 * nudgeStep()); // Shift moves five times as far, as with the arrow keys
+  $('legendCut').hidden = $('legendPieces').hidden = !cuts;
+  const n = piecesToDownload();
+  relabel($('downloadBtn'), n > 1 ? `Download ${n} pieces (.zip)` : 'Download STL');
+  $('downloadBtn').parentElement.classList.toggle('pieces', n > 1); // the longer label takes room from Undo and Redo
+  relabel($('resultLabel'), cuts ? 'Show pieces' : 'Show final result');
+  syncSpread();
+}
+
+/** Settings that mean nothing for a glue-only split: nothing is drilled, socketed or engraved on its faces. */
+const PIN_SETTINGS = new Set(['diameter', 'pins', 'count', 'depth', 'labels', 'clearance']);
+
+/** Fill the split card from the document (with no split yet, from the settings used last), never writing the box being typed in. */
+function fillSplit() {
+  const split = doc.split;
+  const active = splitActive(split);
+  const usable = canSplit();
+  const settings = { ...SPLIT_DEFAULTS, ...splitDefaults, ...(split ?? {}) };
+  const filament = Number(settings.diameter) === FILAMENT;
+  const glueOnly = settings.joint === 'none';
+  filling = true;
+  try {
+    document.querySelectorAll('[data-split]').forEach((el) => {
+      const key = el.dataset.split;
+      const value = key === 'pins' && filament ? 'own' : settings[key]; // filament comes off the spool: there is nothing to print
+      if (el.type === 'radio') el.checked = el.value === String(value);
+      else if (el.type === 'checkbox') el.checked = !!value;
+      else if (el.type === 'number') {
+        if (el !== document.activeElement && Number.parseFloat(el.value) !== value) el.value = value;
+      } else if (el.value !== String(value)) el.value = String(value);
+      el.disabled = !usable || (glueOnly && PIN_SETTINGS.has(key)) || (filament && key === 'pins');
+    });
+  } finally {
+    filling = false;
+  }
+  const chosen = piecesCurrent() && lastPieces.diameter;
+  document.querySelector('[data-split="diameter"] option[value="0"]').textContent = chosen ? `Auto (${chosen} mm)` : 'Auto';
+  $('splitCard').classList.toggle('active', active);
+  const hint = !usable
+    ? modelInfo?.hasModel
+      ? "Splitting needs a solid model – this one couldn't be repaired."
+      : 'Open a model or add raised text to split it.'
+    : active
+      ? ''
+      : 'Too big for your printer? Cut it into pieces that print one by one and glue together on pins.';
+  $('splitHint').textContent = hint;
+  $('splitHint').hidden = !hint;
+  $('splitBedText').textContent = `Your printer: ${formatSize(bedSize(bed))}`;
+  const bounds = cutBounds();
+  $('splitFitBtn').disabled = !usable;
+  $('splitFitTestBtn').disabled = !usable || glueOnly; // nothing to try the fit of
+  $('addCutBtn').disabled = !usable || (!!bounds && !nextCut(bounds, split?.cuts ?? []));
+  $('splitClearBtn').hidden = !active;
+  $('splitSettings').hidden = !active;
+  renderCuts();
+  renderPieces();
+  renderSplitNotes();
+}
+
+let cutsSignature = '';
+/** The cut rows: rebuilt only when cuts come or go, otherwise patched in place so typing in one is never interrupted. */
+function renderCuts() {
+  const list = $('cutList');
+  const cuts = doc.split?.cuts ?? [];
+  const signature = cuts.map((c) => c.id).join(',');
+  if (signature !== cutsSignature) {
+    cutsSignature = signature;
+    const focused = document.activeElement?.dataset?.cutAt; // a rebuild must not swallow the box being typed in
+    list.replaceChildren(...cuts.map((c) => cutRow(c.id)));
+    if (focused) list.querySelector(`[data-cut-at="${CSS.escape(focused)}"]`)?.focus();
+  }
+  const bounds = cutBounds();
+  const usable = canSplit();
+  list.querySelectorAll('li').forEach((li, i) => {
+    const cut = cuts[i];
+    const plane = cutPlane(cut);
+    const letter = letterFor(i);
+    li.classList.toggle('selected', cut.id === selectedCutId);
+    li.querySelector('.badge').textContent = letter;
+    li.querySelectorAll('[data-cut-axis]').forEach((r) => {
+      r.checked = Number(r.value) === plane?.axis;
+      r.disabled = !usable;
+    });
+    const at = li.querySelector('[data-cut-at]');
+    at.disabled = !usable;
+    at.setAttribute('aria-label', `Where cut ${letter} is, in mm`);
+    if (plane) {
+      if (bounds) {
+        at.min = String(Math.floor(bounds.min[plane.axis] * 10) / 10);
+        at.max = String(Math.ceil(bounds.max[plane.axis] * 10) / 10);
+      }
+      if (at !== document.activeElement && Number.parseFloat(at.value) !== round(plane.at)) at.value = round(plane.at);
+    }
+    li.querySelector('.meta').textContent = cutMeta(cut, plane);
+  });
+}
+
+/** One cut's row: letter, the axis it runs across, where it is, ×; what it cuts goes on a line below. */
+function cutRow(id) {
+  const li = document.createElement('li');
+  li.dataset.id = id;
+  li.title = 'Select this cut: drag its handle in the view, or move it with the arrow keys';
+  const badge = document.createElement('span');
+  badge.className = 'badge';
+  const axes = document.createElement('fieldset');
+  axes.className = 'seg';
+  axes.setAttribute('aria-label', 'Cut across');
+  ['X', 'Y', 'Z'].forEach((name, axis) => {
+    const label = document.createElement('label');
+    label.title = `Cut across ${name}`;
+    const radio = document.createElement('input');
+    radio.type = 'radio';
+    radio.name = `cutAxis-${id}`;
+    radio.value = String(axis);
+    radio.dataset.cutAxis = id;
+    radio.addEventListener('change', () => radio.checked && setCutAxis(id, axis));
+    // pressing the row selects the cut for the arrow keys: a segment clicked must not keep them, turning the cut instead
+    radio.addEventListener('focus', () => !radio.matches(':focus-visible') && radio.blur());
+    const span = document.createElement('span');
+    span.textContent = name;
+    label.append(radio, span);
+    axes.append(label);
+  });
+  const where = document.createElement('label');
+  where.className = 'at';
+  const at = document.createElement('input');
+  at.type = 'number';
+  at.step = '0.5';
+  at.dataset.cutAt = id;
+  at.addEventListener('focus', () => selectedCutId !== id && selectCut(id));
+  at.addEventListener('input', () => moveCut(id, Number.parseFloat(at.value), { coalesce: `split:at:${id}` }));
+  at.addEventListener('change', () => doc.endCoalescing());
+  at.addEventListener('blur', () => renderCuts()); // a box left empty shows where the cut is again
+  const unit = document.createElement('span');
+  unit.className = 'unit';
+  unit.textContent = 'mm';
+  where.append(at, unit);
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'btn small ghost cut-remove';
+  remove.textContent = '×';
+  remove.title = 'Remove this cut';
+  remove.setAttribute('aria-label', 'Remove this cut');
+  remove.addEventListener('click', () => removeCut(id));
+  const meta = document.createElement('span');
+  meta.className = 'meta';
+  li.append(badge, axes, where, remove, meta);
+  // selected on press, not on click: re-rendering in the middle of a click on an axis would undo the axis just clicked
+  li.addEventListener('pointerdown', (e) => selectedCutId !== id && !e.target.closest('.cut-remove') && selectCut(id));
+  return li;
+}
+
+/** What a cut's row says it cuts, from the last measure: "800 mm² · pins", "misses the model", "through “HELLO”". */
+function cutMeta(cut, plane) {
+  if (!plane) return "isn't straight along X, Y or Z";
+  const m = measured?.cuts.get(cut.id);
+  if (!m) return '';
+  if (m.joint === 'miss') return "doesn't cross the model – it cuts nothing";
+  if (m.merged) return `in the same place as cut ${cutLetter(m.merged) ?? ''}`.trim();
+  if (!m.islands) return 'crosses no material – nothing to join'; // between letters of a sign: the pieces never touch here
+  const parts = [`${Math.round(m.area).toLocaleString()} mm²${m.islands > 1 ? ` in ${m.islands} parts` : ''}`];
+  parts.push({ dovetail: 'dovetails', none: 'glue only' }[m.joint] ?? 'pins');
+  const through = (m.crosses ?? []).map((itemId) => doc.items.find((i) => i.id === itemId)).filter(Boolean);
+  if (through.length) parts.push(`through ${through.map((i) => `“${itemLabel(i)}”`).join(', ')}`);
+  return parts.join(' · ');
+}
+
+let piecesSignature = '';
+/**
+ * The pieces: as computed (hovering one picks it out in the view), or until
+ * then the boxes between the cuts with whether each would fit.
+ */
+function renderPieces() {
+  const list = $('pieceList');
+  const active = splitActive(doc.split);
+  // pieces for older cuts stay (dimmed) while newer ones are worked out for the view
+  const computed = active && lastPieces?.pieces.length && (piecesCurrent() || $('resultToggle').checked) ? lastPieces : null;
+  let rows = [];
+  if (computed) {
+    rows = computed.pieces.map((p) => ({
+      index: p.index,
+      cell: p.cell,
+      size: p.size,
+      fits: p.fits,
+      lies: `lies ${p.lies}${p.yaw ? `, turned ${p.yaw}°` : ''}`,
+      extra: [p.shells > 1 ? `${p.shells} parts` : '', p.dowels ? `${p.dowels} ${p.dowels === 1 ? 'pin' : 'pins'}` : ''].filter(Boolean),
+    }));
+  } else if (active) {
+    rows = filledBoxes().map((c, i) => ({ index: i + 1, cell: c.cell, size: c.size, fits: !cellTooBig(c), predicted: true }));
+  }
+  list.classList.toggle('stale', !!computed && !piecesCurrent());
+  $('piecesHint').hidden = !rows.length || !rows[0].predicted || $('resultToggle').checked;
+  const signature = JSON.stringify(rows);
+  if (signature === piecesSignature) return;
+  piecesSignature = signature;
+  viewer.setPieceHighlight(null);
+  list.replaceChildren(
+    ...rows.map((row) => {
+      const li = document.createElement('li');
+      li.classList.toggle('predicted', !!row.predicted);
+      const swatch = document.createElement('span');
+      swatch.className = 'swatch';
+      swatch.style.background = `#${PIECE_COLORS[pieceColorIndex(row.cell)].toString(16).padStart(6, '0')}`;
+      const text = document.createElement('span');
+      const fit = document.createElement('span');
+      fit.className = row.fits ? '' : 'err';
+      fit.textContent = row.fits ? 'fits' : 'too big';
+      text.append(`${row.index} · ${formatSize(row.size)} · ${row.lies ? `${row.lies} · ` : ''}`, fit, row.extra?.length ? ` · ${row.extra.join(' · ')}` : '');
+      li.append(swatch, text);
+      if (!row.predicted) {
+        li.addEventListener('mouseenter', () => viewer.setPieceHighlight(row.index));
+        li.addEventListener('mouseleave', () => viewer.setPieceHighlight(null));
+      }
+      return li;
+    }),
+  );
+}
+
+/** What each split note offers to do about it (see the notes in split.js). */
+const splitNoteActions = (() => {
+  const select = (n) => cutLetter(n.cutId) && { label: `Select cut ${cutLetter(n.cutId)}`, run: () => selectCut(n.cutId) };
+  const remove = (n) => cutLetter(n.cutId) && { label: `Remove cut ${cutLetter(n.cutId)}`, run: () => removeCut(n.cutId) };
+  const smaller = (n) => n.suggestedDiameter && { label: `Use Ø${n.suggestedDiameter} mm`, run: () => setSplitSetting('diameter', n.suggestedDiameter) };
+  return {
+    PIECE_TOO_BIG: () => canSplit() && { label: 'Fit to my printer', run: autoSplit },
+    SMALL_PIECE: select,
+    CUT_THROUGH_TEXT: select,
+    CUT_MISSES: remove,
+    CUT_NOT_STRAIGHT: remove,
+    CONNECTORS_DROPPED: smaller,
+    CONNECTORS_FILAMENT: smaller,
+    PLAN_TOO_MANY: () => ({ label: 'Choose a printer', run: openPrinting }),
+  };
+})();
+
+let splitNotesShown = '';
+/** The split's notes: those of the pieces, or until they are worked out those of the last measure; and what a fit found. */
+function renderSplitNotes() {
+  const active = splitActive(doc.split);
+  let notes = [];
+  if (active && lastPieces && (piecesCurrent() || $('resultToggle').checked)) notes = lastPieces.notes;
+  else if (active && measured) notes = measured.notes;
+  if (planNotes?.key === lastSplitKey && planNotes.content === lastContentKey) notes = [...planNotes.notes, ...notes];
+  const shown = JSON.stringify(notes.map((n) => [n.code, n.text]));
+  if (shown === splitNotesShown) return;
+  splitNotesShown = shown;
+  renderNotes($('splitNotes'), notes, splitNoteActions);
+}
+
+/** The drag readout by a cut's handle: "A · X = 12 mm · 162 | 138 mm", a side in red when a piece there won't fit. */
+function showReadout(id, at, screen) {
+  const el = $('cutReadout');
+  const cuts = doc.split?.cuts ?? [];
+  const i = cuts.findIndex((c) => c.id === id);
+  const plane = cutPlane(cuts[i]);
+  if (!plane || !screen) {
+    el.hidden = true;
+    return;
+  }
+  const axis = plane.axis;
+  const parts = [`${letterFor(i)} · ${'XYZ'[axis]} = ${round(at, 1)} mm · `];
+  const b = cutBounds();
+  if (b && at > b.min[axis] && at < b.max[axis]) {
+    const live = cutsWithTabs().map((c) => (c.id === id ? { ...c, position: c.position.map((v, a) => (a === axis ? at : v)) } : c));
+    const others = axisCuts(live, b)[axis];
+    const lo = Math.max(b.min[axis], ...others.filter((t) => t < at - 1e-6));
+    const hi = Math.min(b.max[axis], ...others.filter((t) => t > at + 1e-6));
+    const { cells } = cellSizes(b, live);
+    // the pieces either side of this cut: below it, those whose box ends at it; above it, those whose box starts there
+    const side = (end, length) => {
+      const span = document.createElement('span');
+      span.textContent = String(round(length, 1));
+      span.className = cells.some((c) => Math.abs(c[end][axis] - at) < 1e-6 && cellTooBig(c)) ? 'err' : '';
+      return span;
+    };
+    parts.push(side('max', at - lo), ' | ', side('min', hi - at), ' mm');
+  } else {
+    parts.push("misses the model");
+  }
+  el.replaceChildren(...parts);
+  el.hidden = false;
+  // by the handle, on whichever side has room
+  const right = screen[0] > $('stage').clientWidth - 240;
+  el.style.left = `${screen[0]}px`;
+  el.style.top = `${screen[1]}px`;
+  el.style.transform = right ? 'translate(calc(-100% - 30px), -50%)' : '';
+}
+
+let offered = null; // the text of the toast that offers to split the model just loaded
+/** Once for each model loaded: one bigger than the printer gets a toast that splits it. */
+function offerSplit() {
+  const note = bedTooSmall();
+  if (!note) return;
+  const [x, y] = bedSize(bed);
+  offered = `This model won't fit your ${x} × ${y} mm bed.`;
+  toast(offered, note.pieces > 1 && canSplit() ? { label: 'Split it', run: autoSplit } : null);
+}
+
+/**
+ * A small print to try the joints before printing the pieces: the engine
+ * works out the split as it stands, so the coupon has the pin size Auto
+ * picks and a dovetail when a cut gets one (whatever the Joints setting).
+ */
+async function downloadFitTest() {
+  const split = activeSplit() ?? { ...SPLIT_DEFAULTS, ...splitDefaults, cuts: [] };
+  setSplitPending(true);
+  try {
+    if (!(await syncBase())) return setStatus('The model is still being updated – try again in a moment.', '');
+    const r = await client.fitTest(doc.items, version(), { printing, split, bed: usableBed(bed), name: exportName() });
+    if (!r) return;
+    if (!r.stl) return setStatus('Nothing to try: these cuts get no pins or tabs, only glue.', '');
+    const file = save(r.stl, r.name);
+    const own = split.pins === 'own';
+    const checks = [];
+    if (r.pins) {
+      const d = `Ø${r.diameter} mm`;
+      checks.push(`${r.diameter === FILAMENT ? 'a piece of filament slides' : own ? `your ${d} dowels slide` : `the ${d} pin slides`} into both holes`);
+    }
+    if (r.dovetail) checks.push('the tab drops into its socket');
+    setStatus(`Downloaded ${file.name} (${file.kb} KB). Print it and check that ${checks.join(' and that ')} by hand – too tight: raise Clearance by 0.05 mm.`, 'ok');
+  } catch (err) {
+    setStatus(friendly(err), 'error');
+  } finally {
+    setSplitPending(false);
+  }
+}
+
+/** The split card's controls and the printer's bed (wired like the enhancement: heavy, so applied on release). */
+function bindSplit() {
+  document.querySelectorAll('[data-split]').forEach((el) => {
+    const key = el.dataset.split;
+    el.addEventListener('change', () => {
+      if (filling) return;
+      if (el.type === 'radio' && !el.checked) return;
+      const value = splitValue(el, key);
+      if (value === null) return fillSplit(); // nonsense typed: show the value in force again
+      setSplitSetting(key, value, el.type === 'number' ? { coalesce: `split:${key}` } : {});
+    });
+    if (el.type === 'number') {
+      // the spinner's clicks on one box are one undo step; leaving the box ends it and shows the value kept
+      el.addEventListener('blur', () => {
+        doc.endCoalescing();
+        fillSplit();
+      });
+    }
+  });
+  $('splitFitBtn').addEventListener('click', autoSplit);
+  $('addCutBtn').addEventListener('click', addCut);
+  $('splitClearBtn').addEventListener('click', () => {
+    doc.setSplit(null);
+    toast('Removed the split.', { label: 'Undo', run: () => doc.undo() });
+  });
+  $('splitFitTestBtn').addEventListener('click', downloadFitTest);
+  $('showPiecesBtn').addEventListener('click', () => {
+    $('resultToggle').checked = true;
+    showResult(true);
+  });
+  $('splitBedLink').addEventListener('click', (e) => {
+    e.preventDefault();
+    openPrinting();
+  });
+  $('spreadRange').addEventListener('input', () => viewer.setSpread(Number.parseFloat($('spreadRange').value)));
+
+  const preset = $('bedPreset');
+  preset.replaceChildren(...Object.entries(BED_PRESETS).map(([id, p]) => new Option(p.label, id)));
+  const fillBed = () => {
+    preset.value = bed.preset;
+    bedSize(bed).forEach((v, a) => ($(['bedX', 'bedY', 'bedZ'][a]).value = v));
+    $('bedMargin').value = bed.margin;
+  };
+  const bedChanged = () => {
+    fillBed();
+    saveSettings();
+    render(); // the model's "too big" note, the card, the preview's red cells and the pieces follow the printer
+  };
+  fillBed();
+  preset.addEventListener('change', () => {
+    if (!BED_PRESETS[preset.value]) return;
+    if (preset.value === 'custom') bed.size = bedSize(bed); // start from the printer chosen before
+    bed.preset = preset.value;
+    bedChanged();
+  });
+  ['bedX', 'bedY', 'bedZ'].forEach((id, a) =>
+    $(id).addEventListener('change', () => {
+      const v = Number.parseFloat($(id).value);
+      if (!(v > 0)) return fillBed();
+      if (v === bedSize(bed)[a]) return;
+      // a printer of its own: the other sides stay as they were
+      bed.size = bedSize(bed);
+      bed.size[a] = Math.min(10000, v);
+      bed.preset = 'custom';
+      bedChanged();
+    }),
+  );
+  $('bedMargin').addEventListener('change', () => {
+    const v = Number.parseFloat($('bedMargin').value);
+    if (!(v >= 0)) return fillBed();
+    bed.margin = Math.min(20, v);
+    bedChanged();
+  });
 }
 
 /* ----------------------------------------------------------------- render */
@@ -1277,6 +2098,13 @@ function render() {
   const contentKey = stableKey({ items: doc.items, base: doc.state.baseVersion, printing });
   const contentChanged = contentKey !== lastContentKey;
   lastContentKey = contentKey;
+  // the pieces also depend on the split, the printer and the nozzle – none of which is content the previews depend on
+  const splitKey = stableKey({ split: activeSplit(), bed: usableBed(bed), nozzle: printing.nozzle });
+  const splitChanged = splitKey !== lastSplitKey;
+  lastSplitKey = splitKey;
+  // selecting an item lets go of the cut, and an undo can take the cut away
+  if (sel || !doc.split?.cuts.some((c) => c.id === selectedCutId)) selectedCutId = null;
+  if (doc.split) rememberSplitSettings(doc.split);
 
   renderItems();
   fillPanel(sel);
@@ -1318,16 +2146,23 @@ function render() {
     ? '<b>Click the model</b> to put the text there, or drag the text. Drag empty space to orbit, right-drag to pan, scroll to zoom.'
     : 'No model loaded, so there is nothing to place on – the text is exported on its own. Open an STL or use the sample plaque.';
   $('downloadBtn').disabled = !hasModel && !doc.items.some((i) => hasText(i) && !isSpot(i));
-
+  if (modelInfo) renderModel(); // the "too big for your printer" note comes and goes with the cuts
+  // new content takes the result down before the split card is drawn, so the card shows the boxes between the cuts again, not the old pieces
   if (contentChanged && $('resultToggle').checked && booted) {
     $('resultToggle').checked = false;
+    clearTimeout(piecesTimer);
     viewer.showResult(false);
+  }
+  renderSplit();
+  if (splitChanged && $('resultToggle').checked && booted) {
+    requestPieces(); // moving a cut keeps the pieces view: the old pieces dim until the new ones arrive
   }
   if (booted && !halted) {
     syncBase().then((ok) => {
       if (ok) refreshPreviews(); // a superseded sync leaves the previews to the sync that follows it
     });
   }
+  scheduleMeasure();
 }
 
 doc.subscribe(render);
@@ -1484,6 +2319,7 @@ function bindControls() {
   );
   document.querySelectorAll('[data-fix]').forEach((btn) => btn.addEventListener('click', () => applyFix(btn.dataset.fix)));
   bindEnhance();
+  bindSplit();
   $('scaleBtn').addEventListener('click', () => applyFix('scale'));
   $('simplifyBtn').addEventListener('click', () => applyFix('simplify'));
 
@@ -1555,6 +2391,24 @@ function bindControls() {
     }
     if (typing || mod) return;
     const step = (e.shiftKey ? 5 : 1) * Number.parseFloat($('nudgeStep').value);
+    // a selected cut has the arrow keys, Delete and Escape; with an item selected they are the item's
+    if (selectedCutId && !doc.selected) {
+      const dir = { ArrowLeft: -1, ArrowDown: -1, ArrowRight: 1, ArrowUp: 1 }[e.key];
+      if (dir) {
+        e.preventDefault();
+        nudgeCut(selectedCutId, dir * step);
+        return;
+      }
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
+        removeCut(selectedCutId);
+        return;
+      }
+      if (e.key === 'Escape') {
+        selectCut(null);
+        return;
+      }
+    }
     const arrows = { ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down' };
     if (arrows[e.key] && doc.selected) {
       e.preventDefault();
@@ -1567,7 +2421,7 @@ function bindControls() {
     }
   });
   window.addEventListener('keyup', (e) => {
-    if (/^Arrow|^[[\]]$/.test(e.key)) doc.endCoalescing(); // nudge / rotate runs
+    if (/^Arrow|^[[\]]$/.test(e.key)) doc.endCoalescing(); // nudge / rotate runs (items and cuts)
   });
 
   // drag & drop an .stl or a font file anywhere on the page

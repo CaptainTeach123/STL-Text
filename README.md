@@ -22,6 +22,7 @@ Everything runs in your browser. Your models and fonts are never uploaded anywhe
 - **Follows curves.** Text is laid on the surface like a sticker: it wraps round mugs, canes, domes, wavy banners and the inside of rings as far as it is long, with every letter its true size along the surface, standing square on it at a constant height or depth – no flat slab, no letters stretched or floating off where the surface turns away. On a lumpy, sculpted surface the line stays straight as seen from where you clicked, and bumps smaller than about a quarter of the letters' height are laid over rather than followed, so the text neither wanders nor shrinks. Run at a slant across a cane or a mug, it is laid like tape – along the spiral the line really follows, every letter upright on it, rather than fanning out – and over a rounded edge or fillet it carries on across instead of stopping. It stays on the surface you clicked where something else lies in line with it (the back of a thin ribbon bending towards you, a tail folded behind it, a scroll curling over it), crosses ledges and slots, and carries on level where the surface ends. The app says when the text hangs over an edge (and leaves out of the download any letter that would print loose), runs into a floor or wall, runs under an overhang with no room for its letters, would wrap further than about 120° round the back of a curve, or has to stretch on a surface curved two ways (a small sphere).
 - **Raised or cut in**, with height / depth, letter height or overall width in mm, letter and line spacing, alignment, boldness, mirror (for stamps) and printer-friendly corner rounding.
 - **Printing checks** based on your nozzle and layer height: strokes too thin to print, gaps that will fill in, engraving that would cut through a thin wall, text hanging over an edge or crossing a step, text that doesn't touch the model, raised text shallower than two layers – each with a one-click fix where possible.
+- **Split for printing.** A model bigger than your printer is cut into pieces that each fit, with pin holes on both faces of every cut so the pieces line up exactly and glue together easily. The app says when a model won't fit the printer you chose and offers **Split into N pieces**: the fewest pieces that fit – lying any side down, turned across the bed's diagonal if that is what it takes – with the cuts kept away from letters, ledges and thin necks. Cuts are straight across X, Y or Z, and you can add, drag, type or nudge them yourself. Each piece gets printed pins (or holes for your own dowels), matching engraved labels (*1A* ↔ *2A*) and is saved turned the way it prints best; signs and other thin plates get dovetail tabs instead of pins. The download is one zip: the pieces, a sheet of pins with a spare, and a `how-to-glue.txt` with the print list and the glue order.
 - **Model tools:** convert inches to millimetres, stand a Y-up model upright, rotate, centre on the build plate, simplify huge meshes. The app suggests these when a file looks like it needs them.
 - **Clean solids.** Text and parts are merged with real boolean operations ([Manifold](https://github.com/elalish/manifold)), so the result is one watertight body – not overlapping shells. The heavy work runs in a background thread; the view stays responsive even with large models, and models above ~400k triangles are shown through a lighter preview while downloads keep the full detail.
 - **Built for big models.** Every step of the model's derivation (transforms, simplification, enhancement, each clean-up state) is cached, the view is refit rather than rebuilt when only vertices move, and the solid for downloads is built only when needed, so nudging a slider costs one short re-derivation instead of several seconds. Enhancement and clean-up amounts apply when a slider is released (the model dims and the card says *applying…* while the worker catches up). On a dense model the lighter preview is cleaned up alongside the full model, so a spot's effect shows immediately; the download is always computed on the full-detail model.
@@ -33,7 +34,8 @@ Everything runs in your browser. Your models and fonts are never uploaded anywhe
 3. **Text & fonts** – one row per line: its wording, font and letter height in mm. *Add line* (or Enter) adds a line below the current one; uploaded fonts apply to the current line. *Text width* scales all lines together.
 4. **Raised or cut** – choose *Raised* or *Cut in* and the height / depth; optionally a *Backing plate* (plaque or banner) with its thickness and margin. Warnings about printability appear here. For a part this card offers *Add* or *Cut out*, and the *Part* card its scale, attach side, tilt, sink depth and connection (fused, fused + fillet, pegs & holes).
 5. **Placement** – click the model where the text should go, or drag it. The green ring shows where a click would land.
-6. **Show final result** (top right of the 3D view) computes the real merged model; **Download STL** saves it.
+6. **Split for printing** – only for a model bigger than your printer, or one you want in parts: *Fit to my printer* cuts it into the fewest pieces that fit, *+ Cut* adds a cut of your own. See [Splitting into pieces](#splitting-into-pieces).
+7. **Show final result** (top right of the 3D view; *Show pieces* once the model is split) computes the real merged model; **Download STL** saves it – **Download N pieces (.zip)** for a split model.
 
 The final model is always *model + everything raised or fused − everything cut*, whatever order you added them in, so cut-in text always cuts through raised text. Parts connected with pegs are not merged: they are downloaded as separate files.
 
@@ -44,6 +46,30 @@ The final model is always *model + everything raised or fused − everything cut
 - **Pegs & holes** is for parts printed separately (another colour, another orientation): pegs on the part, holes in the model with a clearance (0.15 mm is a good start for a snug fit after printing), glued on assembly. Pegs are only placed where a whole peg fits under the part (one under each foot of a bridge-shaped part), and the part file is saved lying on its face with the pegs pointing up, ready to print. Pegs need a watertight model to make holes in; on a model with gaps the part is fused instead.
 - **Tilt** pivots the part about the point you clicked: one edge goes into the surface, the other lifts off it. The app warns when the lifted edge leaves a gap, which a bigger sink or the fillet closes.
 - **Cut out** (a part used as a cutter) removes the part's shape from the model; its *Cut depth* is how far it sinks in. A cutter has no connection options.
+
+### Splitting into pieces
+
+- **Your printer.** Choose it under *Printing* – a generic 220 × 220 × 250 mm printer (Ender-3 class) to start with, a few Bambu Lab and Prusa printers, or type the bed's size – with the margin to keep clear round the edge of the bed for a brim or the purge line. A model bigger than that says so in its notes and in a toast, and a plain download of it points you to step 6 if it can be split.
+- **Fit to my printer** (or *Split into N pieces* in the model's notes) works out the fewest pieces that fit and where to cut: where the cut crosses little and the face has room for pins, away from letters, ledges and thin necks. Its cuts replace any you had, in one undo step.
+- **Cuts of your own.** *+ Cut* adds one across the middle of the longest piece. Every cut has a letter – on its plane in the view, in its row in the card and on the glue sheet. Change its axis or type its position in its row, drag the handle beside its plane in the view (a readout shows the two sides, red when one won't fit your printer), or select it and nudge it with the arrow keys (Shift for five steps); Delete removes it, Escape lets go of it. Meanwhile the model is coloured by piece, and a piece too big for the printer turns red. Up to 12 cuts and 64 pieces.
+- **Show pieces** works out the real pieces and pulls them apart along the cuts (*Spread* sets how far), with the pins in the gaps. Each is listed with its size, how it lies in its file, whether it fits and how many pins it has; hover a row to pick out its piece.
+- **Pins.** Every face where a cut meets the model gets blind holes in both pieces – at least two where there is room, in a pattern that fits only one way round – kept a wall's width from the sides, from engraving and pockets, and from the holes of every other cut. The pins are octagons printed lying on a flat: strong, no supports, and the flats leave room for glue and air. The holes have a chamfered mouth for squeezed-out glue and a pointed end, and are teardrop-shaped where the piece prints them lying down, so no hole needs supports either. *Auto* picks one pin size for the whole model, the largest of 8, 6, 5, 4 and 3 mm that fits; a face too narrow for it takes shorter pins, then 1.75 mm filament, then glue alone, and the notes say which. *My own dowels* drills the same holes and leaves out the pin file, for wooden or steel dowels.
+- **Dovetails through thin plates.** A cut through a plate 2–10 mm thick (a sign, a plaque) has no room for pins, so *Auto* gives it dovetail tabs through the thickness: both pieces print flat and go together by lowering one onto the other. A plate thinner than 2 mm is a flat glue joint.
+- **Matching labels.** The same label – the piece's number and the cut's letter, *1A* on one face and *2A* on the other – is engraved 0.6 mm deep in the same spot on both faces of every joint with pins, reading upright from outside: put each label on its match. Dovetail and glue-only joints get no labels.
+- **The download** is one zip: a file for each piece, turned the way it prints best and standing on the bed; the pins, with a spare for every four pins or part of four (`…-pins-3x-6x19mm.stl`); any part connected with pegs; and `…-how-to-glue.txt` with the print list, a dry-fit check and the glue order, cut by cut. Text crossing a cut is split with the model (a note says so); triangles that couldn't be repaired are cut with their piece but get no pins or labels. Raised text on its own, with no model, can be split as well.
+
+| Setting | Default | |
+| --- | --- | --- |
+| Joints | Auto | Pins; dovetail tabs through thin plates. *Pins*, *Dovetails* (pins where a cut is not through a plate) or *Glue only* |
+| Pin size | Auto | One size for the whole model; *Pin size* shows the one chosen |
+| Pins | Print the pins | Or *My own dowels*: holes only |
+| Matching labels | on | |
+| Depth per side | 0 (auto) | 1.6 × the pin size to the nearest 0.5 mm, so a Ø6 mm pin is 19 mm long; shallower next to another cut |
+| Clearance per side | 0.15 mm | Room round each pin, on the holes and dovetail sockets only – the pins are the size they say |
+| Pins per face | 0 (auto) | Two to six, more on a bigger face, as far as there is room |
+| Lay pieces | Best side down | The side that needs the least support down, so a long piece lies flat rather than standing on end; or *Cut face down*, *As modelled* |
+
+The clearance suits PLA; try 0.20 mm for PETG, 0.08 mm for resin prints and 0.10 mm for wooden dowels. Not sure? **Download fit test** (in the split's settings) saves a small print of the joints your cuts get, with the same settings: where they have pins, a block with an upright hole and one with a hole lying down, of the size the pieces use (the one *Auto* picks), with a pin unless you use your own dowels; where they have dovetails, two small plates with a tab and its socket. Print it first: the pin should slide into both holes and the tab drop into its socket by hand. Too tight, raise the clearance by 0.05 mm; too loose, lower it.
 
 ### Tips for printing
 
@@ -58,6 +84,7 @@ The final model is always *model + everything raised or fused − everything cut
 - Cutting text into a model needs a watertight solid. Repair fixes most files; parts that stay open are kept in your download but can only have text raised on them.
 - The built-in fonts contain Latin characters only. For other scripts, upload a font that has them.
 - Text placed on another text item is positioned relative to the model surface, not the other text. On a surface curved two ways (a sphere) a long line of text keeps its letters' size along its middle, and letters far above or below it are stretched or squeezed a little – the app warns when that becomes noticeable.
+- Splitting cuts only straight across X, Y or Z, never at an angle. It needs a solid model: a model that couldn't be repaired at all can't be split, and on one with some triangles left unrepaired those triangles get no pins or labels and no cut gets dovetails. Dovetails only go through thin plates; everywhere else *Dovetails* uses pins.
 - Very large models (millions of triangles) need a lot of memory. Use **Simplify** in *Fix model* first – the app suggests it above a million triangles.
 
 ## Publishing on GitHub Pages
@@ -74,7 +101,7 @@ Don't use the "Jekyll" starter workflow GitHub suggests: this app has to be *bui
 ```bash
 npm ci
 npm run dev      # local dev server with hot reload
-npm test         # unit tests: text → geometry, mesh repair, surface conforming, engine protocol, document model
+npm test         # unit tests: text → geometry, mesh repair, surface conforming, splitting, engine protocol, document model
 npm run build    # production build into dist/
 npm run e2e      # builds the app and drives it in headless Chromium
 ```
@@ -85,18 +112,20 @@ npm run e2e      # builds the app and drives it in headless Chromium
 
 | File | Role |
 | --- | --- |
-| `src/engine.js` | The geometry engine: a pure request handler (runs in the Web Worker, or in Node for tests). Loads and repairs models and parts, parses fonts, builds text / plate / part solids and their joins (fillet skirts, pegs and holes), computes the final geometry, exports STL (plus separate part files), prepares display buffers – simplified for very dense models – with normals and a serialised BVH for picking |
+| `src/engine.js` | The geometry engine: a pure request handler (runs in the Web Worker, or in Node for tests). Loads and repairs models and parts, parses fonts, builds text / plate / part solids and their joins (fillet skirts, pegs and holes), computes the final geometry, splits it into pieces for printing, exports STL (plus separate part files, or one zip of pieces), prepares display buffers – simplified for very dense models – with normals and a serialised BVH for picking |
 | `src/worker.js` | 20-line Web Worker shim around the engine, owns the Manifold WASM instance |
 | `src/engineClient.js` | Main-thread side: request scheduling (fast typing never queues stale previews), rehydration of fonts and model after a worker restart, error codes |
-| `src/document.js` | Plain-data document: model transforms, text items, selection, undo / redo |
+| `src/document.js` | Plain-data document: model transforms, text items, the split's cuts and settings, selection, undo / redo |
 | `src/textGeometry.js` | Lines (each with its own font and size) → glyph outlines → polygons → Manifold `CrossSection` (non-zero union, boldness offset, clamped corner rounding) → extruded solid; curved lines (each line bent round its own concentric arc, the plate with them); thin-stroke and gap checks |
 | `src/conform.js` | Lays text on the model by walking a grid over its surface from the clicked point (arc length along the surface, landing past edges and slots), and warps the text solid onto it along the surface normal; parts use a projection; wall thickness, room, overhang, wrap and curvature statistics behind the warnings |
 | `src/surfaceNormal.js` | The way the surface faces around a click: the mean normal over a small disc, robust to leaning triangles and kept exact next to edges |
 | `src/repair.js` | Triangle soup → watertight Manifold: degenerate removal, exact and tolerant welding (gated so thin sheets are never welded shut), winding fix, hole filling, shell classification (cavities kept), passthrough of what cannot be repaired |
+| `src/split.js` | Splitting without geometry: printer presets and fitting the bed (turned across the diagonal if need be), the fit-to-my-printer planner, exact axis frames, pin and hole sizes, where the pins go on a face, how each piece lies in its file, piece colours, file names and the glue sheet |
+| `src/splitGeometry.js` | Splitting with Manifold: cutting into pieces, the plate test and dovetail tabs, the room for pins on each cut face, holes (teardrop where printed lying down), octagonal pins and their sheet, engraved labels, drilling, the fit test and the pieces' display buffers |
 | `src/mesh.js` | Conversions between triangle soups, Manifold and three.js buffers; display buffers; BVH building |
 | `src/placement.js` | Surface normal + rotation → text transform (text stands upright on walls) |
 | `src/stl.js` | STL parsing (via three.js) and the binary STL writer |
-| `src/viewer.js` | three.js scene: orbit camera (Z-up), BVH picking, one overlay mesh per text, click-to-select / click-to-move / drag |
+| `src/viewer.js` | three.js scene: orbit camera (Z-up), BVH picking, one overlay mesh per text, click-to-select / click-to-move / drag; cut planes with drag handles, the model coloured by piece, the pieces pulled apart |
 | `src/fontParse.js`, `src/fontCatalog.js` | Font parsing (worker) and the bundled / installed font sources (browser) |
 | `src/main.js` | UI wiring |
 

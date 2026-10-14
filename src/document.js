@@ -3,8 +3,9 @@ import { ENHANCE_DEFAULTS } from './enhance.js';
 
 /**
  * The document: which model is loaded and how it was transformed, the text
- * items on it, the selection, and an undo history. Plain data, no geometry —
- * the worker derives everything heavy from it on request.
+ * items on it, how it is split into pieces for printing, the selection, and
+ * an undo history. Plain data, no geometry — the worker derives everything
+ * heavy from it on request.
  */
 
 /** One line of a text item: its own wording, font and letter height (cap height, mm). */
@@ -54,6 +55,24 @@ export const ITEM_DEFAULTS = Object.freeze({
   position: [0, 0, 0],
   normal: [0, 0, 1],
   spin: 0,
+});
+
+/**
+ * Splitting the finished model into pieces that fit the printer. Each cut is
+ * a full plane through a point, kept like an item's placement so it moves with
+ * the model; the engine snaps it to the nearest axis. The settings apply to
+ * every seam.
+ */
+export const SPLIT_DEFAULTS = Object.freeze({
+  cuts: Object.freeze([]), // [{ id: 'c1', position: [x, y, z], normal: [1, 0, 0] }], model mm
+  joint: 'auto', // 'auto' | 'dowels' | 'dovetail' | 'none'
+  diameter: 0, // mm: 0 = automatic | 1.75 (filament) | 3 | 4 | 5 | 6 | 8 | 10
+  depth: 0, // mm into each piece: 0 = automatic | 3–30
+  clearance: 0.15, // mm per side, on the holes and dovetail sockets only
+  count: 0, // dowels per contact patch: 0 = automatic | 1–6
+  pins: 'print', // 'print' (a sheet of pins to print) | 'own' (holes only); 1.75 means 'own'
+  orient: 'auto', // 'auto' | 'cut' (a cut face down) | 'model' (as modelled)
+  labels: true, // engrave matching <piece><letter> labels on the dowel faces
 });
 
 const SHAPE_KEYS = [
@@ -190,15 +209,43 @@ export function transformItems(items, matrix) {
   }));
 }
 
+const cutNumber = (id) => Number(/^c(\d+)$/.exec(String(id))?.[1] ?? 0);
+
+/** One past the highest cut id in use, so a new cut never takes the id of one still listed. */
+const nextCutId = (cuts) => `c${1 + Math.max(0, ...cuts.map((c) => cutNumber(c.id)))}`;
+
+const copyCut = ({ id, position, normal }) => ({ id, position: [...position], normal: [...normal] });
+
+/**
+ * The split after `patch` (null switches it off): settings merged over the
+ * current ones and the defaults, each cut copied, and a fresh id for any cut
+ * without its own (a planned split arrives without ids).
+ */
+function mergeSplit(current, patch) {
+  if (!patch) return null;
+  const next = { ...SPLIT_DEFAULTS, ...(current ?? {}), ...patch };
+  const given = next.cuts ?? [];
+  let top = Math.max(0, ...given.map((c) => cutNumber(c.id)));
+  const seen = new Set();
+  next.cuts = given.map((cut) => {
+    const id = cut.id != null && !seen.has(cut.id) ? cut.id : `c${++top}`;
+    seen.add(id);
+    return copyCut({ ...cut, id });
+  });
+  return next;
+}
+
 const clone = (state) => ({
   ...state,
   base: state.base && { ...state.base, transforms: state.base.transforms.map((t) => [...t]), enhance: state.base.enhance ? { ...state.base.enhance } : null },
   items: state.items.map((i) => ({ ...i, lines: i.lines.map((l) => ({ ...l })), position: [...i.position], normal: [...i.normal] })),
+  // copied down to the cut arrays: a cut moved in place would otherwise move in the undo history as well
+  split: state.split && { ...state.split, cuts: state.split.cuts.map((c) => ({ ...c, position: [...c.position], normal: [...c.normal] })) },
 });
 
 export class Document {
   constructor() {
-    this.state = { base: null, baseVersion: 0, items: [], selectedId: null };
+    this.state = { base: null, baseVersion: 0, items: [], selectedId: null, split: null };
     this.history = [];
     this.future = [];
     this.coalesceKey = null;
@@ -213,6 +260,10 @@ export class Document {
 
   get base() {
     return this.state.base;
+  }
+
+  get split() {
+    return this.state.split;
   }
 
   get selected() {
@@ -282,19 +333,21 @@ export class Document {
 
   /**
    * A new model was loaded (`kind`: 'stl' | 'sample' | 'none'). Items are
-   * kept — they are re-placed by clicking — but their transforms reset.
+   * kept — they are re-placed by clicking — but their transforms reset, and
+   * the split goes: its cuts were placed for the previous model.
    */
   setBase(kind, name = 'model') {
     this.commit((s) => {
       s.base = kind === 'none' ? null : { kind, name, loaded: s.baseVersion + 1, transforms: [], simplify: null, enhance: null };
       s.baseVersion += 1;
+      s.split = null;
     });
     // a new model starts a new history: the previous model's bytes are gone
     this.history = [];
     this.future = [];
   }
 
-  /** Apply a 4x4 transform (16 numbers, column-major) to the model and carry the items along. */
+  /** Apply a 4x4 transform (16 numbers, column-major) to the model and carry the items and cuts along. */
   transformBase(matrix) {
     if (!this.state.base) return;
     const array = matrix instanceof Matrix4 ? matrix.toArray() : [...matrix];
@@ -302,6 +355,7 @@ export class Document {
       s.base.transforms.push(array);
       s.baseVersion += 1;
       s.items = transformItems(s.items, array);
+      if (s.split) s.split = { ...s.split, cuts: transformItems(s.split.cuts, array) };
     });
   }
 
@@ -332,7 +386,7 @@ export class Document {
     );
   }
 
-  /** Back to the model as loaded (undo all transforms / simplify / enhancement). */
+  /** Back to the model as loaded (undo all transforms / simplify / enhancement); items and cuts move back with it. */
   resetBase() {
     if (!this.state.base) return;
     // the engine composes M = T_n · … · T_1, so undo it with M⁻¹ as a whole
@@ -344,6 +398,63 @@ export class Document {
       s.base.enhance = null;
       s.baseVersion += 1;
       s.items = transformItems(s.items, inverse);
+      if (s.split) s.split = { ...s.split, cuts: transformItems(s.split.cuts, inverse) };
+    });
+  }
+
+  /* --------------------------------------------------------- the split */
+
+  /**
+   * Change the split settings or replace its cuts (`patch.cuts`; a cut
+   * without an id gets one); `patch` null removes the split. It works with
+   * no model too (a text-only sign), and never changes the model version:
+   * the pieces are cut from the finished model, which stays as it is.
+   */
+  setSplit(patch, { coalesce = null } = {}) {
+    // committing the split already in force (a box changed back to its value) is not a change to undo
+    const next = mergeSplit(this.state.split, patch);
+    if (JSON.stringify(next) === JSON.stringify(this.state.split ?? null)) return;
+    this.commit(
+      (s) => {
+        s.split = mergeSplit(s.split, patch);
+      },
+      { coalesce },
+    );
+  }
+
+  /**
+   * Add a cut (a plane through `position`, square to `normal`) and return
+   * its id. With no split yet, one starts from `defaults` (the last-used
+   * settings) over SPLIT_DEFAULTS.
+   */
+  addCut({ position, normal }, { defaults = null } = {}) {
+    const id = nextCutId(this.state.split?.cuts ?? []);
+    this.commit((s) => {
+      s.split ??= mergeSplit(null, { ...defaults, cuts: [] });
+      s.split.cuts.push(copyCut({ id, position, normal }));
+    });
+    return id;
+  }
+
+  /** Move a cut or turn it to another axis (`patch`: `position` and/or `normal`). Handle drags coalesce. */
+  updateCut(id, patch, { coalesce = null } = {}) {
+    const cut = this.state.split?.cuts.find((c) => c.id === id);
+    if (!cut) return;
+    const moved = (c) => copyCut({ id, position: patch.position ?? c.position, normal: patch.normal ?? c.normal });
+    if (JSON.stringify(moved(cut)) === JSON.stringify(cut)) return;
+    this.commit(
+      (s) => {
+        s.split.cuts = s.split.cuts.map((c) => (c.id === id ? moved(c) : c));
+      },
+      { coalesce },
+    );
+  }
+
+  /** Remove one cut; the split keeps its settings (with no cuts left it cuts nothing). */
+  removeCut(id) {
+    if (!this.state.split?.cuts.some((c) => c.id === id)) return;
+    this.commit((s) => {
+      s.split.cuts = s.split.cuts.filter((c) => c.id !== id);
     });
   }
 

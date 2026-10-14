@@ -1,8 +1,8 @@
 /**
  * Main-thread side of the worker protocol.
  *
- * - One logical "channel" per kind of work (preview, result, export, base,
- *   font). A channel has at most one request in flight and one waiting; a
+ * - One logical "channel" per kind of work (preview, result, export, split,
+ *   base, font). A channel has at most one request in flight and one waiting; a
  *   newer request replaces the waiting one, so typing fast never queues up
  *   stale previews (superseded requests resolve to `undefined`).
  * - The worker keeps only derived state. If it answers FONT_MISSING or
@@ -12,7 +12,7 @@
  *   reports it, and a fresh worker is spawned lazily on the next request.
  */
 
-export const CHANNELS = ['font', 'base', 'preview', 'result', 'export', 'misc'];
+export const CHANNELS = ['font', 'base', 'preview', 'result', 'export', 'split', 'misc'];
 
 export class EngineError extends Error {
   constructor({ code = 'INTERNAL', message = 'Unknown error', details } = {}) {
@@ -259,9 +259,27 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
       return request('result', 'result', { items, baseVersion, ...options });
     },
 
-    /** Binary STL of the final result. */
+    /** Binary STL of the final result (with a split: its pieces, in a zip or as separate files). */
     export(items, baseVersion, name, options = {}) {
       return request('export', 'export', { items, baseVersion, name, ...options });
+    },
+
+    /**
+     * Fit to my printer (`mode: 'fit'`) or measure the cuts (`'measure'`),
+     * on a channel of its own: a plan never supersedes a waiting download,
+     * and a newer plan replaces one still waiting.
+     */
+    planSplit(items, baseVersion, options = {}) {
+      return request('split', 'split.plan', { items, baseVersion, ...options });
+    },
+
+    /**
+     * The fit test for a split (`{ printing, split, bed, name }`): made from
+     * the pin size and joints the split really uses, so it needs the model.
+     * On the misc channel, so a measure never supersedes it.
+     */
+    fitTest(items, baseVersion, options = {}) {
+      return request('misc', 'split.fitTest', { items, baseVersion, ...options });
     },
 
     /** Any other request (tests, diagnostics). */

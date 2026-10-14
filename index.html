@@ -415,12 +415,97 @@
           </details>
         </section>
 
+        <!-- ============================================================ split -->
+        <section class="card" aria-labelledby="h-split" id="splitCard">
+          <h2 id="h-split"><span class="step">6</span> Split for printing <span class="deriving-note" aria-live="polite">working…</span></h2>
+          <p class="hint" id="splitHint">Too big for your printer? Cut it into pieces that print one by one and glue together on pins.</p>
+          <p class="hint" id="splitBedHint"><span id="splitBedText">Your printer: 220 × 220 × 250 mm</span> · <a href="#printing" id="splitBedLink">change</a></p>
+          <div class="row">
+            <button type="button" id="splitFitBtn" class="btn accent" title="Cut into the fewest pieces that fit your printer, away from letters and thin spots">Fit to my printer</button>
+            <button type="button" id="addCutBtn" class="btn" title="Add a cut across the middle of the longest piece">+ Cut</button>
+            <button type="button" id="splitClearBtn" class="btn small ghost" hidden>Remove split</button>
+          </div>
+          <ul class="plan" id="cutList" aria-label="Cuts"></ul>
+          <div class="split-settings" id="splitSettings" hidden>
+            <span class="label">Joints</span>
+            <fieldset class="seg wide" aria-label="Joints">
+              <label title="Auto: printed pins; dovetail tabs through thin plates"><input type="radio" name="splitJoint" data-split="joint" value="auto" checked /><span>Auto</span></label>
+              <label title="Pins in matching holes on both faces of every cut"><input type="radio" name="splitJoint" data-split="joint" value="dowels" /><span>Pins</span></label>
+              <label title="Tabs through thin plates, so the pieces lock as they are laid together (pins where a cut is not through a plate)"><input type="radio" name="splitJoint" data-split="joint" value="dovetail" /><span>Dovetails</span></label>
+              <label title="Flat faces with nothing to line them up"><input type="radio" name="splitJoint" data-split="joint" value="none" /><span>Glue only</span></label>
+            </fieldset>
+            <label class="field inline" title="One pin size for the whole model. Auto picks the largest that fits every face; 1.75 mm is a piece of filament.">
+              <span>Pin size</span>
+              <select data-split="diameter">
+                <option value="0">Auto</option>
+                <option value="1.75">1.75 mm (filament)</option>
+                <option value="3">3 mm</option>
+                <option value="4">4 mm</option>
+                <option value="5">5 mm</option>
+                <option value="6">6 mm</option>
+                <option value="8">8 mm</option>
+                <option value="10">10 mm</option>
+              </select>
+            </label>
+            <fieldset class="seg wide" aria-label="Pins">
+              <label title="A file of pins to print with the pieces"><input type="radio" name="splitPins" data-split="pins" value="print" checked /><span>Print the pins</span></label>
+              <label title="Holes only: use wooden or steel dowels, or filament"><input type="radio" name="splitPins" data-split="pins" value="own" /><span>My own dowels</span></label>
+            </fieldset>
+            <label class="check" title="Engrave the same label on both faces of each joint with pins – put each one on its match. Dovetail and glue-only joints get none."><input type="checkbox" data-split="labels" checked /> Matching labels <small>1A ↔ 2A</small></label>
+            <details class="disclosure">
+              <summary>Fine-tune</summary>
+              <div class="grid2">
+                <label class="field num" title="How deep each hole goes into each piece. 0 picks a depth from the pin size and keeps the holes clear of the sides.">
+                  <span>Depth per side <small>mm · 0 = auto</small></span>
+                  <input type="number" data-split="depth" min="0" max="30" step="0.5" value="0" />
+                </label>
+                <label class="field num" title="Room around each pin, per side, so it slides in after printing. Applied to the holes and dovetail sockets only.">
+                  <span>Clearance per side <small>mm</small></span>
+                  <input type="number" data-split="clearance" min="0" max="0.5" step="0.05" value="0.15" />
+                </label>
+                <label class="field num" title="Pins on each face where the cut meets the model. 0 places two to six, more on a bigger face, as far as there is room.">
+                  <span>Pins per face <small>0 = auto</small></span>
+                  <input type="number" data-split="count" min="0" max="6" step="1" value="0" />
+                </label>
+                <label class="field" title="How each piece is turned in its file: the side that needs the least support down, a cut face down, or as it is in the model">
+                  <span>Lay pieces</span>
+                  <select data-split="orient">
+                    <option value="auto">Best side down</option>
+                    <option value="cut">Cut face down</option>
+                    <option value="model">As modelled</option>
+                  </select>
+                </label>
+              </div>
+              <p class="hint">Clearance: PLA 0.15 · PETG 0.20 · resin 0.08 · wood 0.10</p>
+            </details>
+            <div class="row spread">
+              <span class="hint">Not sure of the fit?</span>
+              <button type="button" id="splitFitTestBtn" class="btn small" title="A small print of the joints these cuts get – holes and a pin of the size the pieces use, a dovetail where a cut has one – to try before printing the pieces">Download fit test</button>
+            </div>
+          </div>
+          <ul class="plan" id="pieceList" aria-label="Pieces"></ul>
+          <div class="row spread" id="piecesHint" hidden>
+            <span class="hint">Sizes of the boxes between the cuts.</span>
+            <button type="button" id="showPiecesBtn" class="btn small" title="Work out the real pieces, their pins and how each one lies">Show the pieces</button>
+          </div>
+          <ul class="notes" id="splitNotes" aria-live="polite"></ul>
+        </section>
+
         <!-- =========================================================== printing -->
         <details class="card disclosure" id="printing">
-          <summary><b>Printing</b> <small>– used for the warnings</small></summary>
+          <summary><b>Printing</b> <small>– used for the warnings and for splitting</small></summary>
           <div class="grid2">
             <label class="field inline"><span>Nozzle</span><input type="number" id="nozzle" min="0.1" max="2" step="0.05" value="0.4" /><span class="unit">mm</span></label>
             <label class="field inline"><span>Layer</span><input type="number" id="layerHeight" min="0.04" max="1" step="0.02" value="0.2" /><span class="unit">mm</span></label>
+          </div>
+          <div class="tools">
+            <label class="field inline" title="The printer the pieces of a split must fit"><span>Printer</span><select id="bedPreset"></select></label>
+            <div class="grid3" title="The printer's build volume; changing it switches to Custom">
+              <label class="field"><span>Bed X <small>mm</small></span><input type="number" id="bedX" min="20" max="2000" step="1" value="220" /></label>
+              <label class="field"><span>Bed Y <small>mm</small></span><input type="number" id="bedY" min="20" max="2000" step="1" value="220" /></label>
+              <label class="field"><span>Height <small>mm</small></span><input type="number" id="bedZ" min="20" max="2000" step="1" value="250" /></label>
+            </div>
+            <label class="field inline" title="Kept clear on every side of the bed, for a brim, the purge line or clips"><span>Margin</span><input type="number" id="bedMargin" min="0" max="20" step="1" value="5" /><span class="unit">mm</span></label>
           </div>
         </details>
 
@@ -442,11 +527,15 @@
           <span><i class="dot emboss"></i> raised text</span>
           <span><i class="dot engrave"></i> cut text</span>
           <span id="legendPass" hidden><i class="dot pass"></i> unrepaired</span>
+          <span id="legendCut" hidden><i class="dot cut"></i> cut</span>
+          <span id="legendPieces" hidden><i class="dot pieces"></i> pieces</span>
         </div>
         <div class="stage-tools">
-          <label class="check pill" title="Compute the real merged result (takes a moment on big models)"><input type="checkbox" id="resultToggle" /> Show final result</label>
+          <label class="check pill" id="spreadField" title="How far apart the pieces are drawn" hidden>Spread <input type="range" id="spreadRange" min="0" max="2" step="0.05" value="1" aria-label="Spread the pieces apart" /></label>
+          <label class="check pill" title="Compute the real merged result (takes a moment on big models)"><input type="checkbox" id="resultToggle" /> <span id="resultLabel">Show final result</span></label>
           <button type="button" id="frameBtn" class="btn small">Reset view</button>
         </div>
+        <div id="cutReadout" class="cut-readout" hidden></div>
         <div id="progress" class="progress" hidden><div class="spinner"></div><span id="progressText">Working…</span></div>
         <div id="toast" class="toast" hidden><span id="toastText"></span><button type="button" id="toastAction" class="btn small">Undo</button></div>
         <div id="dropHint" class="drop" hidden>Drop an STL or font file</div>

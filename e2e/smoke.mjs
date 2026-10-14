@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build, preview } from 'vite';
 import { chromium } from 'playwright-core';
+import { unzipSync, strFromU8 } from 'three/examples/jsm/libs/fflate.module.js';
 import { initManifold, manifold } from '../src/manifold.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold, manifoldToSoup } from '../src/mesh.js';
@@ -651,6 +652,323 @@ try {
     await idle();
   }
 
+  console.log('\nsplit a model for a small printer');
+  {
+    const splitOut = path.join(out, 'split');
+    fs.mkdirSync(splitOut, { recursive: true });
+    /** Download the pieces as one zip and unpack it into e2e/out/split: each STL inspected (and its file kept), each text read. */
+    const downloadZip = async () => {
+      const [dl] = await Promise.all([page.waitForEvent('download'), page.click('#downloadBtn')]);
+      const name = dl.suggestedFilename();
+      const file = path.join(splitOut, name);
+      await dl.saveAs(file);
+      await idle();
+      const entries = {};
+      for (const [entry, bytes] of Object.entries(unzipSync(new Uint8Array(fs.readFileSync(file))))) {
+        const target = path.join(splitOut, entry);
+        fs.writeFileSync(target, bytes);
+        entries[entry] = entry.endsWith('.stl') ? { ...inspectStl(target), file: target } : strFromU8(bytes);
+      }
+      return { name, entries };
+    };
+    /** How many separate bodies an STL file holds. */
+    const shellCount = (file) => {
+      const buf = fs.readFileSync(file);
+      const m = geometryToManifold(parseSTL(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)));
+      const shells = m.decompose();
+      shells.forEach((s) => s.delete());
+      m.delete();
+      return shells.length;
+    };
+    /** Strongly coloured pixels in the view by hue: cool (the blue piece) and warm (the orchid one next to it). */
+    const pieceHues = () =>
+      page.evaluate(() => {
+        const c = document.querySelector('#stage canvas');
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        let cool = 0;
+        let warm = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          const [r, g, b] = [d[i], d[i + 1], d[i + 2]];
+          const max = Math.max(r, g, b);
+          const span = max - Math.min(r, g, b);
+          // shading means the exact colours never reach the screen, so go by hue; greys (the grid, the pins) don't count
+          if (span < 64) continue;
+          const h = ((max === r ? (g - b) / span : max === g ? (b - r) / span + 2 : (r - g) / span + 4) * 60 + 360) % 360;
+          if (h >= 190 && h <= 250) cool++;
+          else if ((h >= 300 && h <= 345) || (h >= 8 && h <= 50)) warm++;
+        }
+        return { cool, warm };
+      });
+
+    /** The split card's notes, one line. */
+    const splitNotes = async () => (await page.locator('#splitNotes li').allInnerTexts()).join(' / ');
+    /** Wait for the cuts to be measured again: that waits for the edits to pause (a second for text). */
+    const measured = async () => {
+      await idle();
+      await page.waitForTimeout(1400);
+      await idle();
+    };
+    /** The cut row's axis (0, 1, 2) and position. */
+    const cutState = async (n = 0) => [
+      Number(await page.locator(`#cutList li >> nth=${n} >> input[data-cut-axis]:checked`).getAttribute('value')),
+      await page.inputValue(`#cutList li >> nth=${n} >> input[data-cut-at]`),
+    ];
+    /** A fit test downloaded: its status line and how many separate bodies it holds, with their sizes. */
+    const fitTest = async (name) => {
+      const [dl] = await Promise.all([page.waitForEvent('download', { timeout: 60000 }).catch(() => null), page.click('#splitFitTestBtn')]);
+      if (!dl) return { status: await status(), shells: [] }; // nothing saved: the status line says why
+      const file = path.join(splitOut, name);
+      await dl.saveAs(file);
+      await idle();
+      const buf = fs.readFileSync(file);
+      const m = geometryToManifold(parseSTL(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)));
+      const shells = m.decompose().map((x) => {
+        const b = x.boundingBox();
+        x.delete();
+        return [0, 1, 2].map((a) => b.max[a] - b.min[a]).sort((p, q) => p - q);
+      });
+      m.delete();
+      return { status: await status(), shells };
+    };
+
+    await setText(''); // nothing raised on the bar, so the planned cut is not pulled away from the middle
+    // the model before this one fits the printer: Fit says so, for that model only
+    await page.click('#splitFitBtn');
+    await idle();
+    check(/already fits your printer/.test(await splitNotes()), 'Fit to my printer on a model that fits says so', await splitNotes());
+
+    // a model that couldn't be repaired at all can't be split, so its download doesn't send you to step 6
+    const sheetFile = path.join(splitOut, 'sheet.stl');
+    {
+      const tri = Buffer.alloc(84 + 50);
+      tri.writeUInt32LE(1, 80);
+      [0, 0, 1, -200, -20, 0, 200, -20, 0, 0, 20, 0].forEach((v, i) => tri.writeFloatLE(v, 84 + i * 4)); // one 400 mm triangle
+      fs.writeFileSync(sheetFile, tri);
+    }
+    await openStl(sheetFile, 'sheet');
+    check(!/already fits/.test(await splitNotes()), 'loading another model drops the "already fits" note', await splitNotes());
+    check(/needs a solid model/.test(await page.locator('#splitHint').innerText()) && (await page.isDisabled('#splitFitBtn')), 'a model that could not be repaired cannot be split', await page.locator('#splitHint').innerText());
+    await download('sheet-whole.stl');
+    check(/^Downloaded/.test(await status()) && !/Split for printing/.test(await status()), 'and its download does not point to step 6', (await status()).replace(/\n/g, ' | '));
+
+    // a bar longer than the default 220 mm bed, centred so the cut positions are world x
+    const longBar = Manifold.cube([300, 40, 20], true);
+    const longBarFile = writeFixture('long-bar.stl', soupOf(longBar));
+    longBar.delete();
+    await page.waitForTimeout(1000); // Chromium lets a page start about ten downloads a second
+    await openStl(longBarFile, 'long-bar');
+    check(/won't fit your 220 × 220 mm bed/.test(await page.locator('#toastText').innerText()) && !(await page.locator('#toast').isHidden()), 'loading a model too big for the printer says so in a toast', await page.locator('#toastText').innerText());
+    await page.evaluate(() => (document.querySelector('#bedPreset').closest('details').open = true));
+    await page.selectOption('#bedPreset', 'generic');
+    await idle();
+    const whole = await download('long-bar-whole.stl');
+    check(Math.abs(whole.volume - 240000) < 1 && /use Split for printing \(step 6\)\.$/.test(await status()), 'the whole bar still downloads as one STL, with a pointer to step 6', (await status()).split('\n').pop());
+    const tooBig = (await page.locator('#modelNotes li').allInnerTexts()).find((t) => /bigger than/.test(t)) ?? '';
+    check(/bigger than your 220 × 220 × 250 mm printer/.test(tooBig), 'the model notes say it is bigger than the printer', tooBig.replace(/\s+/g, ' '));
+
+    check((await page.locator('#modelNotes button').innerText()) === 'Split into 2 pieces', 'the note offers to split it into 2 pieces', await page.locator('#modelNotes button').innerText());
+    await page.click('#modelNotes button');
+    await idle();
+    await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
+    await idle();
+    const cutAt = Number(await page.inputValue('#cutList input[data-cut-at]'));
+    check((await page.locator('#cutList li').count()) === 1 && Math.abs(cutAt) < 0.01, '"Split into 2 pieces" makes one cut across the middle', `${await page.locator('#cutList li').count()} cut at ${cutAt}`);
+    const rows = await page.locator('#pieceList li').allInnerTexts();
+    check(rows.length === 2 && rows.every((r) => /fits/.test(r)), 'two pieces, both fitting the printer', rows.join(' / '));
+    check((await page.locator('#downloadBtn').innerText()) === 'Download 2 pieces (.zip)', 'the download button counts the pieces', await page.locator('#downloadBtn').innerText());
+    const labelLines = await page.evaluate(() => {
+      const btn = document.querySelector('#downloadBtn');
+      const range = document.createRange();
+      range.selectNodeContents(btn);
+      return { lines: new Set([...range.getClientRects()].map((r) => Math.round(r.top))).size, fits: btn.scrollWidth <= btn.clientWidth };
+    });
+    check(labelLines.lines === 1 && labelLines.fits, 'its label fits on one line', JSON.stringify(labelLines));
+    check(await page.isChecked('#resultToggle'), 'the pieces are shown');
+    await page.screenshot({ path: path.join(out, '8-split.png') });
+    const { cool, warm } = await pieceHues();
+    check(cool > 500 && warm > 500, 'the pieces are drawn in contrasting colours', `${cool} cool / ${warm} warm pixels`);
+
+    const zip = await downloadZip();
+    check(zip.name === 'long-bar-text-2-pieces.zip', 'one zip named after its pieces', zip.name);
+    const names = Object.keys(zip.entries).sort();
+    check(
+      names.join() === 'long-bar-text-how-to-glue.txt,long-bar-text-piece-1-of-2.stl,long-bar-text-piece-2-of-2.stl,long-bar-text-pins-3x-6x19mm.stl',
+      'the zip holds the two pieces, a sheet of pins and the glue sheet',
+      names.join(', '),
+    );
+    const pieces = names.filter((n) => /piece-\d+-of-2\.stl$/.test(n)).map((n) => zip.entries[n]);
+    const extent = (s, a) => s.max[a] - s.min[a];
+    check(
+      pieces.length === 2 && pieces.every((s) => s.volume !== null && s.sizeOk && Math.abs(s.min[2]) < 0.01 && extent(s, 0) <= 210.01 && extent(s, 1) <= 210.01 && extent(s, 2) <= 249.01),
+      'each piece is a watertight STL on the build plate that fits the bed less its margins (210 × 210 × 249 mm)',
+      pieces.map((s) => [0, 1, 2].map((a) => extent(s, a).toFixed(1)).join(' × ')).join(' / '),
+    );
+    check(pieces.every((s) => Math.abs(extent(s, 2) - 20) < 0.01), 'the pieces of a bar lie flat, 20 mm high');
+    // two Ø6 teardrop holes (372.7 mm³ each) in each cut face, plus two labels engraved 0.6 mm deep
+    const removed = whole.volume - pieces.reduce((sum, s) => sum + (s.volume ?? 0), 0);
+    check(removed >= 4 * 372.7 && removed <= 4 * 372.7 + 150, 'the pieces add up to the bar less the pin holes and labels', `${removed.toFixed(1)} mm³ removed`);
+    const pins = zip.entries['long-bar-text-pins-3x-6x19mm.stl'];
+    const pinCount = pins ? shellCount(pins.file) : 0;
+    check(pinCount === 3 && Math.abs(extent(pins, 2) - 5.54) < 0.05, 'the pin sheet holds 3 pins (one spare) lying on a flat', pins && `${pinCount} pins, ${extent(pins, 2).toFixed(3)} mm high`);
+    check(zip.entries['long-bar-text-how-to-glue.txt']?.includes('1A ↔ 2A'), 'the glue sheet pairs the matching labels');
+    check(/^Downloaded long-bar-text-2-pieces\.zip .*: 2 pieces, 3 pins/.test(await status()), 'the status line says what the zip holds', await status());
+
+    await page.fill('#cutList input[data-cut-at]', '40');
+    await page.dispatchEvent('#cutList input[data-cut-at]', 'change');
+    await idle();
+    // the old pieces stay listed (dimmed) until the new ones arrive
+    await page.waitForFunction(() => /190/.test(document.querySelector('#pieceList').innerText) && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 60000 });
+    await idle();
+    const moved = (await page.locator('#pieceList li').allInnerTexts()).join(' / ');
+    check(/190 × 40 × 20 mm/.test(moved) && /110 × 40 × 20 mm/.test(moved), 'typing a new position moves the cut: the pieces become 190 and 110 mm', moved);
+    await page.locator('#splitCard').scrollIntoViewIfNeeded();
+    await page.screenshot({ path: path.join(out, '8-split-card.png') });
+
+    // new text takes the pieces down: the card goes back to the boxes between the cuts, at once
+    await page.click('#itemList li:first-child');
+    await idle();
+    await page.click('[data-side="top"]');
+    await idle();
+    await page.fill('#lineList .line-text >> nth=0', 'O');
+    await page.waitForTimeout(150);
+    const boxes = await page.locator('#pieceList li.predicted').count();
+    check(
+      !(await page.isChecked('#resultToggle')) && boxes === 2 && (await page.locator('#pieceList li').count()) === 2 && !(await page.locator('#piecesHint').isHidden()),
+      'editing the text puts the boxes between the cuts and "Show the pieces" back in the card',
+      `${boxes} boxes, hint ${(await page.locator('#piecesHint').isHidden()) ? 'hidden' : 'shown'}`,
+    );
+    await page.dispatchEvent('#lineList .line-text >> nth=0', 'change');
+    // the cut rows follow the text: which cut runs through it
+    await page.evaluate(() => (document.querySelector('#posX').closest('details').open = true));
+    await page.fill('#posX', '40');
+    await page.dispatchEvent('#posX', 'change');
+    await measured();
+    check(/through “O”/.test(await page.locator('#cutList .meta').innerText()), 'moving the text onto a cut names it in the cut\'s row', await page.locator('#cutList .meta').innerText());
+    await page.fill('#posX', '0');
+    await page.dispatchEvent('#posX', 'change');
+    await measured();
+    check(!/through/.test(await page.locator('#cutList .meta').innerText()), 'and moving it off drops it', await page.locator('#cutList .meta').innerText());
+
+    // pressing the row anywhere selects the cut for the arrow keys, its axis segment included
+    await page.click('#cutList li:first-child .seg label:has-text("X")');
+    await page.keyboard.press('ArrowRight');
+    await idle();
+    check(JSON.stringify(await cutState()) === '[0,"41"]', 'a cut selected by its axis segment moves with the arrow keys', JSON.stringify(await cutState()));
+    await page.keyboard.press('Control+z');
+    await idle();
+    check(JSON.stringify(await cutState()) === '[0,"40"]', 'and Ctrl+Z undoes the move', JSON.stringify(await cutState()));
+    await page.click('#cutList li:first-child .seg label:has-text("Y")');
+    await idle();
+    check((await cutState())[0] === 1, 'clicking another axis still turns the cut', JSON.stringify(await cutState()));
+    await page.keyboard.press('Control+z');
+    await idle();
+    check(JSON.stringify(await cutState()) === '[0,"40"]', 'and Ctrl+Z turns it back', JSON.stringify(await cutState()));
+    // a position box left empty shows where the cut is again
+    await page.fill('#cutList input[data-cut-at]', '');
+    await page.keyboard.press('Tab');
+    await idle();
+    check((await page.inputValue('#cutList input[data-cut-at]')) === '40', 'a cut position cleared and left shows the position again', JSON.stringify(await page.inputValue('#cutList input[data-cut-at]')));
+
+    // the fit test is made from the split as it stands: the pin size Auto picks for a 20 mm bar
+    await page.waitForTimeout(1000);
+    const pinTest = await fitTest('long-bar-fit-test.stl');
+    const pinShell = pinTest.shells.filter((e) => Math.abs(e[0] - 5.54) < 0.05 && Math.abs(e[1] - 5.54) < 0.05);
+    check(/the Ø6 mm pin slides into both holes/.test(pinTest.status) && !/tab/.test(pinTest.status) && pinShell.length === 1, 'the fit test has the Ø6 pin the pieces use, not a Ø5 one', `${pinTest.shells.map((e) => e.map((v) => v.toFixed(1)).join('×')).join(', ')} | ${pinTest.status}`);
+    // Glue only: nothing is drilled or engraved, so what is about holes and labels is off
+    await page.click('#splitSettings label:has(input[data-split="joint"][value="none"])');
+    await idle();
+    const glueOff = await page.evaluate(() => ['labels', 'clearance', 'diameter'].map((k) => document.querySelector(`[data-split="${k}"]`).disabled).concat(document.querySelector('#splitFitTestBtn').disabled));
+    check(glueOff.every(Boolean), 'Glue only turns off the labels, the clearance and the fit test', String(glueOff));
+    await page.click('#splitSettings label:has(input[data-split="joint"][value="auto"])');
+    await idle();
+    await page.click('#itemList li:first-child');
+    await idle();
+    await setText(''); // the bar alone again, for the download without the split
+
+    await page.waitForTimeout(1000); // Chromium lets a page start about ten downloads a second
+    await page.click('#splitClearBtn');
+    await idle();
+    check((await page.locator('#cutList li').count()) === 0 && (await page.locator('#downloadBtn').innerText()) === 'Download STL', '"Remove split" takes the cuts away');
+    const again = await download('long-bar-unsplit.stl');
+    check(Math.abs(again.volume - 240000) < 1 && again.sizeOk, 'without the split the bar downloads whole again', `${again.volume?.toFixed(1)} mm³`);
+    // typing in the cut's position box selected the cut, which let go of the text: pick the text again
+    await page.click('#itemList li:first-child');
+    await idle();
+
+    // an L-shape cut into four boxes leaves the corner one empty: three pieces, before they are worked out too
+    const ell = Manifold.union(Manifold.cube([300, 40, 10]), Manifold.cube([40, 300, 10]));
+    const ellFile = writeFixture('ell.stl', soupOf(ell));
+    ell.delete();
+    await openStl(ellFile, 'ell');
+    await page.click('#addCutBtn');
+    await idle();
+    await page.click('#addCutBtn');
+    await measured();
+    const ellRows = await page.locator('#pieceList li.predicted').allInnerTexts();
+    check(
+      (await page.locator('#downloadBtn').innerText()) === 'Download 3 pieces (.zip)' && ellRows.length === 3,
+      'an L cut into four boxes counts the three with something in them',
+      `${await page.locator('#downloadBtn').innerText()} / ${ellRows.join(' / ')}`,
+    );
+    await page.click('#splitClearBtn');
+    await idle();
+
+    // a thin plate is joined with dovetails (Joints: Auto), with an O cut right through it whose middle falls out
+    const plate = Manifold.cube([120, 40, 2], true);
+    const plateFile = writeFixture('plate.stl', soupOf(plate));
+    plate.delete();
+    await openStl(plateFile, 'plate');
+    await page.click('#itemList li:first-child');
+    await idle();
+    await setText('O');
+    const sizeBefore = await page.inputValue('#lineList .line-size >> nth=0');
+    await setLineSize(0, 4);
+    await page.check('input[name="mode"][value="engrave"]');
+    await idle();
+    await setNumber('depth', 3);
+    await page.click('[data-side="top"]');
+    await idle();
+    await page.fill('#posX', '30');
+    await page.dispatchEvent('#posX', 'change');
+    await idle();
+    await page.click('#addCutBtn');
+    await measured();
+    const lengthsOf = async () => (await page.locator('#pieceList li').allInnerTexts()).map((r) => Number(r.match(/· ([\d.]+) ×/)?.[1]));
+    const predicted = await lengthsOf();
+    await page.check('#resultToggle');
+    await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
+    await idle();
+    const computed = await lengthsOf();
+    check(
+      predicted.length === 2 && computed.length === 2 && predicted.every((v, i) => Math.abs(v - computed[i]) < 0.5) && Math.max(...computed) > 61,
+      'before the pieces are worked out, their boxes already count the dovetail tabs',
+      `${predicted.join(' + ')} mm predicted, ${computed.join(' + ')} mm worked out`,
+    );
+    // the loose middle is the text's business, not the split's: it stays on the status line
+    check(
+      !/loose fragments/.test(await splitNotes()) && /Removed 1 tiny loose fragments/.test(await status()),
+      "the note about the O's loose middle stays on the status line, out of the split's card",
+      `card: ${await splitNotes()} | status: ${(await status()).replace(/\n/g, ' | ')}`,
+    );
+    await page.waitForTimeout(1000);
+    const tabTest = await fitTest('plate-fit-test.stl');
+    check(/the tab drops into its socket/.test(tabTest.status) && !/pin/.test(tabTest.status), 'its fit test is a dovetail, with no pin the pieces do not use', tabTest.status);
+    await page.uncheck('#resultToggle');
+    await page.click('#splitClearBtn');
+    await idle();
+    await page.click('#itemList li:first-child');
+    await idle();
+    await page.check('input[name="mode"][value="emboss"]');
+    await idle();
+    await setLineSize(0, sizeBefore);
+    await setText('');
+  }
+
   console.log('\nno model');
   await page.click('#clearBtn');
   await idle();
@@ -667,6 +985,49 @@ try {
   check(Math.abs(partAlone.min[2]) < 1e-3 && partAlone.volume > 300, 'a part without a model sits on the build plate', `z from ${partAlone.min[2]}`);
   await page.click('#deleteBtn');
   await idle();
+  {
+    // a sign of raised text alone, too long for the printer: the cuts go between the letters, and follow the text as it changes
+    const measured = async () => {
+      await idle();
+      await page.waitForTimeout(1400); // a text edit is measured once the typing stops
+      await idle();
+    };
+    const lengths = async () => (await page.locator('#pieceList li').allInnerTexts()).map((r) => Number(r.match(/· ([\d.]+) ×/)?.[1]));
+    await page.click('#itemList li:first-child');
+    await idle();
+    const sizeBefore = await page.inputValue('#lineList .line-size >> nth=0');
+    await lineFont(0).selectOption('inter');
+    await idle();
+    await setText('HELLO');
+    await setLineSize(0, 80);
+    await page.click('#splitFitBtn');
+    await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
+    await measured();
+    const meta = await page.locator('#cutList .meta').innerText();
+    check(/nothing to join/.test(meta) && !/pins/.test(meta), 'a cut between the letters of a sign says there is nothing to join, not pins', meta);
+    const maxBefore = Number(await page.locator('#cutList input[data-cut-at]').getAttribute('max'));
+    await page.click('#itemList li:first-child');
+    await idle();
+    await setText('HELLO WORLD');
+    await measured();
+    const maxAfter = Number(await page.locator('#cutList input[data-cut-at]').getAttribute('max'));
+    const longer = await lengths();
+    check(
+      maxAfter > maxBefore + 100 && longer.length === 2 && longer[0] + longer[1] > 600,
+      'longer text moves the bounds of the cuts and the sizes of the pieces with it',
+      `cut box max ${maxBefore} → ${maxAfter}, pieces ${longer.join(' + ')} mm`,
+    );
+    await page.click('#addCutBtn');
+    await measured();
+    const halved = await lengths();
+    check(halved.length === 3 && Math.min(...halved) > 150, '"+ Cut" then halves the longest piece of the new text', `${halved.join(' / ')} mm`);
+    await page.click('#splitClearBtn');
+    await idle();
+    await page.click('#itemList li:first-child');
+    await idle();
+    await setLineSize(0, sizeBefore);
+    await setText('ALONE');
+  }
 
   console.log('\nresponsiveness while loading a large model');
   const bigFile = writeFixture('big.stl', soupOf(Manifold.sphere(30, 600)));

@@ -10,6 +10,7 @@
   --accent-soft: #fff0e3;
   --ok: #0f9d7a;
   --err: #d6294b;
+  --cut: #8b5cf6; /* the violet of the cut planes in the view */
   --stage-top: #eef2fa;
   --stage-bottom: #cfd8e8;
   --radius: 10px;
@@ -323,6 +324,13 @@ input[type='range'] {
   grid-template-columns: 1.3fr 0.7fr 1.3fr;
   gap: 8px;
 }
+/* "Download 12 pieces (.zip)" on one line: Undo and Redo give up the room */
+.actions.pieces {
+  grid-template-columns: auto auto 1fr;
+}
+.actions.pieces #downloadBtn {
+  white-space: nowrap;
+}
 
 .status {
   margin: 0;
@@ -630,6 +638,11 @@ input[type='range'] {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* on its own in a column of tools a tiny hint wraps: centred on one line it ran off both sides of the panel */
+.tools > .hint.tiny {
+  align-self: stretch;
+  white-space: normal;
+}
 .nudge {
   display: inline-flex;
   gap: 4px;
@@ -825,4 +838,143 @@ ul.plan li.skipped .meta {
 ul.plan li select {
   font: inherit;
   font-size: 0.82rem;
+}
+
+/* ---------- split for printing ---------- */
+/* the card has its own "working…": the model's re-derivation is not about it */
+#splitCard .deriving-note {
+  display: none;
+}
+#splitCard.pending .deriving-note {
+  display: inline;
+  animation: deriving-pulse 1.2s ease-in-out infinite;
+}
+#splitCard.active {
+  border-color: color-mix(in srgb, var(--cut) 45%, var(--border));
+}
+#splitBedHint a {
+  color: inherit;
+}
+.split-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.split-settings .seg span {
+  padding: 6px 4px;
+  white-space: nowrap;
+}
+.split-settings .field.inline {
+  gap: 8px;
+}
+.split-settings .field.inline select {
+  width: auto;
+  flex: 1;
+}
+#splitCard .badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 5px;
+  border-radius: 6px;
+  background: var(--cut);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+/* one row per cut: its letter, the axis it is across, where it is, remove; what it cuts on a line below */
+#cutList li {
+  grid-template-columns: auto auto 1fr auto;
+  cursor: pointer;
+}
+#cutList li.selected {
+  background: color-mix(in srgb, var(--cut) 12%, var(--panel));
+}
+#cutList .seg span {
+  padding: 2px 9px;
+}
+#cutList .at {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+#cutList .at input {
+  width: 100%;
+  max-width: 96px;
+  padding: 3px 6px;
+}
+#cutList .cut-remove {
+  width: 28px;
+  padding: 2px 0;
+}
+#cutList li .meta {
+  grid-column: 2 / -1;
+}
+
+/* one row per piece: its colour in the view, then what it is */
+#pieceList li {
+  grid-template-columns: auto 1fr;
+}
+#pieceList .swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+}
+#pieceList li.predicted,
+#pieceList.stale li {
+  color: var(--muted);
+}
+#pieceList .err {
+  color: var(--err);
+  font-weight: 600;
+}
+
+/* where a dragged cut is and how long the pieces either side of it are, next to its handle */
+.cut-readout {
+  position: absolute;
+  transform: translate(30px, -50%);
+  padding: 4px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--cut);
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  font-size: 12.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.cut-readout .err {
+  color: var(--err);
+}
+#spreadField input {
+  width: 90px;
+}
+
+.dot.cut {
+  background: var(--cut);
+}
+.dot.pieces {
+  background: conic-gradient(#4f8fe6 0 33%, #e88d67 0 66%, #5aa469 0);
+}
+/* small screens: the legend and the view's tools share the top of the view instead of covering each other */
+@media (max-width: 820px) {
+  .legend {
+    flex-wrap: wrap;
+    gap: 2px 10px;
+    max-width: calc(45% - 12px);
+  }
+  .stage-tools {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    max-width: calc(55% - 12px);
+  }
+  .stage-tools .pill {
+    white-space: nowrap;
+  }
+  #spreadField input {
+    width: 60px;
+  }
 }

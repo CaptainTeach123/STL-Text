@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Matrix4 } from 'three';
-import { Document, coversKey, coversOf, createItem, createPart, createSpot, fontIds, frameOf, hasText, isSpot, itemLabel, itemText, linesOf, maxSize, modelPlacementKey, placeKey, shapeKey, spotsKey, stableKey, transformItems } from '../src/document.js';
+import { Document, SPLIT_DEFAULTS, coversKey, coversOf, createItem, createPart, createSpot, fontIds, frameOf, hasText, isSpot, itemLabel, itemText, linesOf, maxSize, modelPlacementKey, placeKey, shapeKey, spotsKey, stableKey, transformItems } from '../src/document.js';
 
 describe('keys', () => {
   it('stableKey ignores key order and slider jitter', () => {
@@ -311,5 +311,183 @@ describe('covering items', () => {
     doc.setBase('sample', 'plaque');
     expect(modelPlacementKey(doc.base)).not.toBe(k0); // a model loaded again is another model
     expect(modelPlacementKey(doc.base)).not.toBe(k1);
+  });
+});
+
+describe('split for printing', () => {
+  const X = [1, 0, 0];
+  const Y = [0, 1, 0];
+  // rounded, with -0 turned into 0 so toEqual can compare it
+  const r = (v) => v.map((x) => Math.round(x * 1e6) / 1e6 + 0);
+
+  it('setSplit and the cut edits never change the model version or where the model lies', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'bar');
+    const v0 = doc.state.baseVersion;
+    const k0 = modelPlacementKey(doc.base);
+    const a = doc.addCut({ position: [0, 0, 0], normal: X });
+    expect(a).toBe('c1');
+    expect(doc.split).toEqual({ ...SPLIT_DEFAULTS, cuts: [{ id: 'c1', position: [0, 0, 0], normal: X }] });
+    doc.setSplit({ joint: 'dowels', diameter: 6 });
+    doc.updateCut(a, { position: [12, 0, 0] });
+    const b = doc.addCut({ position: [0, 5, 0], normal: Y });
+    doc.removeCut(a);
+    expect(doc.split.cuts).toEqual([{ id: b, position: [0, 5, 0], normal: Y }]);
+    expect(doc.split).toMatchObject({ joint: 'dowels', diameter: 6, clearance: 0.15, labels: true }); // the rest stays at the defaults
+    expect(doc.history).toHaveLength(5);
+    doc.setSplit(null);
+    expect(doc.split).toBeNull();
+    expect(doc.state.baseVersion).toBe(v0);
+    expect(modelPlacementKey(doc.base)).toBe(k0);
+    // with spots and covering items on the model the split still leaves its version alone
+    doc.addItem(createSpot({ remove: true, position: [0, 0, 4], normal: [0, 0, 1] }));
+    const v1 = doc.state.baseVersion;
+    doc.addCut({ position: [1, 0, 0], normal: X });
+    doc.setSplit({ clearance: 0.2 });
+    expect(doc.state.baseVersion).toBe(v1);
+  });
+
+  it('gives each cut an id one past the highest in use, and ids to planned cuts that have none', () => {
+    const doc = new Document();
+    doc.addCut({ position: [0, 0, 0], normal: X });
+    doc.addCut({ position: [10, 0, 0], normal: X });
+    doc.removeCut('c1');
+    expect(doc.addCut({ position: [20, 0, 0], normal: X })).toBe('c3');
+    // a planned split arrives without ids; given ids are kept, repeats renumbered
+    doc.setSplit({ cuts: [{ position: [-83.333, 0, 0], normal: X }, { position: [83.333, 0, 0], normal: X }] });
+    expect(doc.split.cuts.map((c) => c.id)).toEqual(['c1', 'c2']);
+    doc.setSplit({ cuts: [{ position: [0, 0, 0], normal: X }, { id: 'c4', position: [0, 0, 0], normal: Y }, { id: 'c4', position: [0, 0, 5], normal: [0, 0, 1] }] });
+    expect(doc.split.cuts.map((c) => c.id)).toEqual(['c5', 'c4', 'c6']);
+    // a cut keeps only what a cut is
+    doc.setSplit({ cuts: [{ id: 'c1', letter: 'A', axis: 'x', at: 3, position: [3, 0, 0], normal: X }] });
+    expect(doc.split.cuts).toEqual([{ id: 'c1', position: [3, 0, 0], normal: X }]);
+  });
+
+  it('undo and redo restore the cuts; a drag is one step; committing the same value adds none', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'bar');
+    const id = doc.addCut({ position: [0, 0, 0], normal: X });
+    for (const x of [5, 10, 15]) doc.updateCut(id, { position: [x, 0, 0] }, { coalesce: 'split:drag' });
+    doc.endCoalescing();
+    expect(doc.history).toHaveLength(2); // the add and the whole drag
+    doc.updateCut(id, { position: [15, 0, 0] }); // released where it was
+    doc.updateCut(id, { position: [15, 0, 0], normal: X });
+    doc.setSplit({ joint: 'auto' }); // already in force
+    doc.setSplit({ cuts: [{ position: [15, 0, 0], id, normal: X }] }); // the same cut, keys in another order
+    doc.updateCut('c9', { position: [1, 0, 0] }); // no such cut
+    doc.removeCut('c9');
+    expect(doc.history).toHaveLength(2);
+    doc.setSplit({ clearance: 0.2 }, { coalesce: 'split:clearance' });
+    doc.setSplit({ clearance: 0.25 }, { coalesce: 'split:clearance' });
+    doc.endCoalescing();
+    expect(doc.history).toHaveLength(3);
+    expect(doc.undo()).toBe(true);
+    expect(doc.split.clearance).toBe(0.15);
+    expect(doc.undo()).toBe(true);
+    expect(doc.split.cuts[0].position).toEqual([0, 0, 0]);
+    expect(doc.undo()).toBe(true);
+    expect(doc.split).toBeNull();
+    expect(doc.canUndo).toBe(false);
+    expect(doc.redo()).toBe(true);
+    expect(doc.redo()).toBe(true);
+    expect(doc.split.cuts).toEqual([{ id, position: [15, 0, 0], normal: X }]);
+    doc.removeCut(id);
+    expect(doc.split.cuts).toEqual([]); // the settings stay; with no cuts nothing is split
+    expect(doc.undo()).toBe(true);
+    expect(doc.split.cuts).toHaveLength(1);
+  });
+
+  it('history snapshots are independent copies of the cuts', () => {
+    const doc = new Document();
+    doc.setSplit({ cuts: [{ position: [1, 2, 3], normal: [0, 0, 1] }] });
+    doc.commit((s) => {
+      s.split.cuts[0].position[2] = 9;
+      s.split.cuts[0].normal[0] = 1;
+    });
+    expect(doc.split.cuts[0].position).toEqual([1, 2, 9]);
+    expect(doc.undo()).toBe(true);
+    expect(doc.split.cuts[0]).toEqual({ id: 'c1', position: [1, 2, 3], normal: [0, 0, 1] });
+    expect(doc.redo()).toBe(true);
+    expect(doc.split.cuts[0].position).toEqual([1, 2, 9]);
+    // adding a cut to the copy leaves the step before it as it was
+    doc.addCut({ position: [0, 0, 0], normal: X });
+    expect(doc.undo()).toBe(true);
+    expect(doc.split.cuts).toHaveLength(1);
+    // the arrays handed in are copied, not kept
+    const given = { position: [4, 5, 6], normal: [...X] };
+    doc.setSplit({ cuts: [given] });
+    given.position[0] = 99;
+    expect(doc.split.cuts[0].position).toEqual([4, 5, 6]);
+    expect(given.id).toBeUndefined();
+    const more = { position: [7, 0, 0], normal: [...X] };
+    doc.addCut(more);
+    more.normal[1] = 1;
+    expect(doc.split.cuts[1].normal).toEqual(X);
+    expect(SPLIT_DEFAULTS.cuts).toEqual([]);
+  });
+
+  it('a new split starts from the given defaults; an existing one keeps its settings', () => {
+    const doc = new Document();
+    const id = doc.addCut({ position: [0, 0, 0], normal: [0, 0, 1] }, { defaults: { joint: 'none', labels: false, cuts: [{ position: [9, 9, 9], normal: X }] } });
+    expect(doc.split).toEqual({ ...SPLIT_DEFAULTS, joint: 'none', labels: false, cuts: [{ id, position: [0, 0, 0], normal: [0, 0, 1] }] });
+    doc.addCut({ position: [0, 0, 5], normal: [0, 0, 1] }, { defaults: { joint: 'dowels' } });
+    expect(doc.split.joint).toBe('none');
+    expect(doc.split.cuts).toHaveLength(2);
+    expect(Object.isFrozen(SPLIT_DEFAULTS) && Object.isFrozen(SPLIT_DEFAULTS.cuts)).toBe(true);
+  });
+
+  it('cuts move with the model: transforms carry them, reset brings them back', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'bar');
+    doc.addCut({ position: [10, 0, 0], normal: X });
+    doc.addCut({ position: [2, 0, 0], normal: X });
+    const v0 = doc.state.baseVersion;
+    doc.transformBase(new Matrix4().makeRotationZ(Math.PI / 2));
+    expect(doc.state.baseVersion).toBe(v0 + 1); // the transform's own step, nothing more
+    expect(r(doc.split.cuts[0].position)).toEqual([0, 10, 0]);
+    expect(r(doc.split.cuts[0].normal)).toEqual(Y);
+    expect(doc.split.cuts[0].id).toBe('c1');
+    doc.resetBase();
+    expect(r(doc.split.cuts[0].position)).toEqual([10, 0, 0]);
+    expect(r(doc.split.cuts[0].normal)).toEqual(X);
+    // millimetres from inches
+    doc.transformBase(new Matrix4().makeScale(25.4, 25.4, 25.4));
+    expect(doc.split.cuts[1].position[0]).toBeCloseTo(50.8, 9);
+    expect(r(doc.split.cuts[1].normal)).toEqual(X);
+    expect(doc.undo()).toBe(true);
+    expect(doc.split.cuts[1].position).toEqual([2, 0, 0]);
+    // a model with no split transforms as before
+    doc.setSplit(null);
+    doc.transformBase(new Matrix4().makeRotationX(Math.PI / 2));
+    expect(doc.split).toBeNull();
+  });
+
+  it('loading a model or clearing it removes the split', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'bar');
+    doc.addCut({ position: [0, 0, 0], normal: X });
+    doc.setBase('stl', 'other');
+    expect(doc.split).toBeNull();
+    doc.addCut({ position: [0, 0, 0], normal: X });
+    doc.setBase('none');
+    expect(doc.split).toBeNull();
+    expect(doc.canUndo).toBe(false);
+  });
+
+  it('a text-only sign (no model) can be split', () => {
+    const doc = new Document();
+    doc.setBase('none');
+    doc.addItem({ text: 'HELLO WORLD', position: [0, 0, 0], normal: [0, 0, 1] });
+    doc.setSplit({ cuts: [{ position: [0, 0, 0], normal: X }] });
+    expect(doc.base).toBeNull();
+    expect(doc.split.cuts).toEqual([{ id: 'c1', position: [0, 0, 0], normal: X }]);
+    const v0 = doc.state.baseVersion;
+    doc.updateCut('c1', { position: [4, 0, 0] }, { coalesce: 'split:at:c1' });
+    doc.addCut({ position: [0, 0, 0], normal: Y });
+    expect(doc.split.cuts).toHaveLength(2);
+    doc.transformBase(new Matrix4().makeScale(2, 2, 2)); // nothing to transform
+    expect(doc.split.cuts[0].position).toEqual([4, 0, 0]);
+    expect(doc.state.baseVersion).toBe(v0);
+    expect(modelPlacementKey(doc.base)).toBe(modelPlacementKey(null));
   });
 });

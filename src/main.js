@@ -8,8 +8,8 @@ import { Viewer } from './viewer.js';
 import { SIDES, placementMatrix, snapPartTo } from './placement.js';
 import { BUNDLED_FONTS, canQueryLocalFonts, fetchBundledFont, listLocalFonts, localFontBytes } from './fontCatalog.js';
 import {
-  BED_DEFAULTS, BED_PRESETS, FILAMENT, PIECE_COLORS, SPLIT_LIMITS, SPLIT_NOTE_CODES, axisCuts, bedSize, cellFits, cellSizes, cutPlane, fitsBed, formatSize,
-  gridCounts, letterFor, nextCut, pieceColorIndex, splitActive, splitNote, usableBed,
+  BED_DEFAULTS, BED_PRESETS, FILAMENT, PIECE_COLORS, SPLIT_LIMITS, SPLIT_NOTE_CODES, axisCuts, bedSize, cellFits, cellSizes, cutPlane, fitPieces, formatSize,
+  letterFor, nextCut, pieceColorIndex, splitActive, splitNote, usableBed,
 } from './split.js';
 
 const $ = (id) => document.getElementById(id);
@@ -54,6 +54,7 @@ let lastPieces = null; // the pieces last computed: { key, content, pieces, seam
 let measured = null; // the cuts last measured on the model: { key, cuts: Map(id -> { area, islands, joint, crosses }), notes }
 let splitBounds = null; // { version, key, bounds } of the model and its text from the last measure (text-only work has no other)
 let planNotes = null; // { key, content, notes } of a Fit to my printer that cut nothing
+let loads = 0; // models opened so far: a fit planned for one is never applied to the next
 
 const client = createEngineClient({
   createWorker: () => new Worker(new URL('./worker.js', import.meta.url), { type: 'module' }),
@@ -107,6 +108,7 @@ function showProgress(stage) {
 }
 
 let toastTimer = 0;
+let toastStep = null; // the undo step an Undo toast takes back
 function toast(text, action = null) {
   const el = $('toast');
   $('toastText').textContent = text;
@@ -117,9 +119,28 @@ function toast(text, action = null) {
     action?.run();
     el.hidden = true;
   };
+  toastStep = action?.step ?? null;
   el.hidden = false;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => (el.hidden = true), 6000);
+}
+
+/**
+ * A toast whose Undo takes back the edit just made. It stays only while
+ * that edit is the latest: after another one its Undo would take back that
+ * one instead, so it goes (the toolbar's Undo steps back through both).
+ */
+function undoToast(text) {
+  const step = doc.history.at(-1);
+  toast(text, { label: 'Undo', step, run: () => doc.history.at(-1) === step && doc.undo() });
+}
+
+/** Called on every change of the document: an Undo toast goes once its edit is no longer the latest. */
+function dropStaleToast() {
+  if (toastStep && doc.history.at(-1) !== toastStep) {
+    $('toast').hidden = true;
+    toastStep = null;
+  }
 }
 
 const friendly = (err) => {
@@ -231,16 +252,21 @@ function describeModel() {
 let tooBigFor = { key: null, note: null };
 /**
  * The "bigger than your printer" note for a model with no cuts yet, with the
- * number of pieces it would take (`pieces`, 0 when even 64 would not do), or
- * null when it fits. Worked out here, not by the engine: it knows no printer.
+ * number of pieces Fit to my printer would make of it (`pieces`, 0 when even
+ * 64 would not do), or null when it fits. A thin plate is counted lying flat,
+ * with the dovetail tabs its joints may get: stood on its edge it might fit,
+ * but it is never printed that way. Worked out here, not by the engine: it
+ * knows no printer.
  */
 function bedTooSmall() {
   if (!modelInfo?.hasModel || !modelInfo.size || splitActive(doc.split)) return null;
   const U = usableBed(bed);
-  const key = `${modelInfo.size}|${U}|${bedSize(bed)}`;
+  const spec = { ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split }; // the joints decide whether a plate's pieces grow tabs
+  const passthrough = (modelInfo.passthroughTriangles ?? 0) > 0; // unrepaired triangles rule dovetails out
+  const key = `${modelInfo.size}|${U}|${bedSize(bed)}|${spec.joint}|${passthrough}`;
   if (tooBigFor.key !== key) {
-    const fits = fitsBed(modelInfo.size, U).fits;
-    tooBigFor = { key, note: fits ? null : splitNote('BED_TOO_SMALL', { size: modelInfo.size, bed: bedSize(bed), pieces: gridCounts(modelInfo.size, U).pieces }) };
+    const fit = fitPieces(modelInfo.size, U, spec, { passthrough });
+    tooBigFor = { key, note: fit.fits ? null : splitNote('BED_TOO_SMALL', { size: modelInfo.size, bed: bedSize(bed), pieces: fit.pieces }) };
   }
   return tooBigFor.note;
 }
@@ -249,7 +275,7 @@ let modelShown = ''; // what the Model card shows, so a render only rewrites it 
 function renderModel() {
   const { text, notes } = describeModel();
   const usable = canSplit();
-  const shown = JSON.stringify([text, notes.map((n) => n.text), usable]);
+  const shown = JSON.stringify([text, notes.map((n) => [n.text, n.pieces]), usable]); // the joints can change the count alone
   if (shown === modelShown) return;
   modelShown = shown;
   $('modelInfo').textContent = text;
@@ -322,6 +348,7 @@ async function loadModel(kind, { bytes = null, name = 'model' } = {}) {
   // version first so syncBase() does not post a pointless update of the
   // previous model ahead of this load
   sentVersion = doc.state.baseVersion + 1;
+  loads += 1;
   doc.setBase(kind, name);
   if (kind === 'none') {
     // nothing to cut into or sit on: texts become raised and drop onto the build plate
@@ -995,7 +1022,12 @@ async function showResult(on, { keep = false } = {}) {
     renderSplit();
     // the split's own notes are in its card; the status line keeps the summary and anything to act on
     const notes = r.pieces ? r.notes.filter((n) => !isSplitNote(n) || n.code === 'SPLIT' || n.level === 'warn') : r.notes;
-    if (notes.length) setStatus(notes.map((n) => n.text).join('\n'), notes.some((n) => n.level === 'warn') ? 'error' : '');
+    if (notes.length) {
+      setStatus(notes.map((n) => n.text).join('\n'), notes.some((n) => n.level === 'warn') ? 'error' : '');
+      piecesStatus = split ? { text: $('status').textContent, key: splitFor, content: requestedFor } : null;
+    } else {
+      dropPiecesStatus();
+    }
   } catch (err) {
     $('resultToggle').checked = false;
     viewer.showResult(false);
@@ -1009,6 +1041,13 @@ async function showResult(on, { keep = false } = {}) {
       if ($('resultToggle').checked) showResult(true, { keep: true });
     }
   }
+}
+
+let piecesStatus = null; // { text, key, content } of the pieces' summary on the status line ("Cut into 2 pieces with…")
+/** Take the pieces' summary off the status line, if it is still there: the split or the model it was about has changed. */
+function dropPiecesStatus() {
+  if (piecesStatus && $('status').textContent === piecesStatus.text) setStatus('');
+  piecesStatus = null;
 }
 
 /** The pieces again for changed cuts or split settings, once the edits pause; the old ones stay on screen, dimmed. */
@@ -1087,8 +1126,18 @@ function zipContents(files) {
   const n = (v) => String(Math.round(v * 100) / 100);
   const count = (k, one, many = `${one}s`) => `${k} ${k === 1 ? one : many}`;
   const list = [count(files.filter((f) => f.kind === 'piece').length, 'piece')];
+  // pins of one size come on several sheets when the bed can't take them all: counted together
+  const sizes = new Map();
   for (const f of files.filter((x) => x.kind === 'pins')) {
-    list.push(`${count(f.count, 'pin')} (Ø${n(f.d)} × ${n(f.length)} mm${f.spares ? `, ${count(f.spares, 'spare')}` : ''})`);
+    const key = `${f.d}|${f.length}`;
+    const g = sizes.get(key) ?? { d: f.d, length: f.length, count: 0, spares: 0, sheets: 0 };
+    g.count += f.count;
+    g.spares += f.spares ?? 0;
+    g.sheets += 1;
+    sizes.set(key, g);
+  }
+  for (const g of sizes.values()) {
+    list.push(`${count(g.count, 'pin')} (Ø${n(g.d)} × ${n(g.length)} mm${g.spares ? `, ${count(g.spares, 'spare')}` : ''}${g.sheets > 1 ? `, on ${g.sheets} sheets` : ''})`);
   }
   const parts = files.filter((f) => f.kind === 'part').length;
   if (parts) list.push(count(parts, 'part'));
@@ -1151,22 +1200,34 @@ function setSplitPending(on) {
   else $('splitCard').classList.remove('pending');
 }
 
+/** What a fit is planned for: the model and its text, the printer and the split's settings (not its cuts: they are replaced). */
+const planKey = () =>
+  stableKey({ items: doc.items, base: version(), printing, bed: usableBed(bed), split: { ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split, cuts: [] } });
+
 /**
  * Fit to my printer: the engine works out the fewest pieces that fit and
  * where their cuts go; they replace any cuts as one undo step, and the
- * pieces are shown.
+ * pieces are shown. A model that fits already loses its cuts the same way.
  */
 async function autoSplit() {
   if (!canSplit()) return;
+  let again = false;
   setSplitPending(true);
   try {
     if (!(await syncBase())) return;
-    const asked = { key: lastSplitKey, content: lastContentKey };
+    const asked = { loads, plan: planKey() };
     const r = await client.planSplit(doc.items, version(), { printing, split: { ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split }, bed: usableBed(bed), mode: 'fit' });
     if (!r) return; // superseded by a newer plan
+    if (planKey() !== asked.plan) {
+      // planned for what was there when asked: another model opened since gets none of it, while
+      // the same one, turned, retyped or meant for another printer, is planned again as it is now
+      again = loads === asked.loads && canSplit();
+      return;
+    }
     if (!r.cuts.length) {
-      // it fits already, or nothing would: the card says which, for this model and text only
-      planNotes = { ...asked, notes: r.notes };
+      // it fits already – any cuts go, as one undo step – or nothing would, and they stay: the card says which
+      if (splitActive(doc.split) && r.notes.some((n) => n.code === 'SPLIT_NOT_NEEDED')) doc.setSplit({ cuts: [] });
+      planNotes = { key: lastSplitKey, content: lastContentKey, notes: r.notes };
       renderSplit();
       const warn = r.notes.find((n) => n.level === 'warn');
       if (warn) setStatus(warn.text, 'error');
@@ -1182,6 +1243,7 @@ async function autoSplit() {
     setStatus(friendly(err), 'error');
   } finally {
     setSplitPending(false);
+    if (again) autoSplit();
   }
 }
 
@@ -1247,7 +1309,7 @@ function removeCut(id) {
   const letter = cutLetter(id);
   if (!letter) return;
   doc.removeCut(id);
-  toast(`Removed cut ${letter}.`, { label: 'Undo', run: () => doc.undo() });
+  undoToast(`Removed cut ${letter}.`);
 }
 
 /** The settings of the split in force are the ones used last (an undone change is not), and start the next model's split. */
@@ -1299,14 +1361,18 @@ const cutsKey = () => stableKey({ cuts: doc.split?.cuts ?? [], joint: doc.split?
 const measureKey = () => `${cutsKey()}|${boundsKey()}`;
 
 /**
- * Measure the cuts on the model once the edits pause (slices only, no
- * boolean): the face each cut makes for its row, and the box the planes span.
+ * Measure the cuts on the model once the edits pause: the face each cut
+ * makes for its row, and the box the planes span. It is cheap: after a text
+ * edit the engine measures on the model and each item's own letters rather
+ * than build the final result, so a pause in typing does not hold up the
+ * next keystroke's preview.
  */
 function scheduleMeasure() {
   if (!booted || halted || !splitActive(doc.split) || !canSplit()) return;
   const want = { cuts: cutsKey(), content: boundsKey() };
   if (want.cuts === measureFor?.cuts && want.content === measureFor?.content) return;
-  // when only the text changed, wait for the typing to stop: on a model a new measure means new booleans
+  // when only the text changed, wait for the typing to stop: the worker would otherwise measure between keystrokes,
+  // and each preview waits for it
   const delay = want.cuts === measureFor?.cuts ? 1000 : 300;
   measureFor = want;
   const key = measureKey();
@@ -1658,7 +1724,10 @@ let offered = null; // the text of the toast that offers to split the model just
 /** Once for each model loaded: one bigger than the printer gets a toast that splits it. */
 function offerSplit() {
   const note = bedTooSmall();
-  if (!note) return;
+  if (!note) {
+    if ($('toastText').textContent === offered) $('toast').hidden = true; // about the model before, which didn't fit
+    return;
+  }
   const [x, y] = bedSize(bed);
   offered = `This model won't fit your ${x} × ${y} mm bed.`;
   toast(offered, note.pieces > 1 && canSplit() ? { label: 'Split it', run: autoSplit } : null);
@@ -1676,7 +1745,11 @@ async function downloadFitTest() {
     if (!(await syncBase())) return setStatus('The model is still being updated – try again in a moment.', '');
     const r = await client.fitTest(doc.items, version(), { printing, split, bed: usableBed(bed), name: exportName() });
     if (!r) return;
-    if (!r.stl) return setStatus('Nothing to try: these cuts get no pins or tabs, only glue.', '');
+    if (!r.stl) {
+      // cuts between the letters of a sign cross no material: nothing is joined, not even with glue
+      const apart = split.cuts.length > 0 && split.cuts.every((c) => measured?.cuts.get(c.id)?.islands === 0);
+      return setStatus(apart ? 'Nothing to try: these cuts cross no material, so nothing is joined.' : 'Nothing to try: these cuts get no pins or tabs, only glue.', '');
+    }
     const file = save(r.stl, r.name);
     const own = split.pins === 'own';
     const checks = [];
@@ -1716,7 +1789,7 @@ function bindSplit() {
   $('addCutBtn').addEventListener('click', addCut);
   $('splitClearBtn').addEventListener('click', () => {
     doc.setSplit(null);
-    toast('Removed the split.', { label: 'Undo', run: () => doc.undo() });
+    undoToast('Removed the split.');
   });
   $('splitFitTestBtn').addEventListener('click', downloadFitTest);
   $('showPiecesBtn').addEventListener('click', () => {
@@ -2105,6 +2178,9 @@ function render() {
   // selecting an item lets go of the cut, and an undo can take the cut away
   if (sel || !doc.split?.cuts.some((c) => c.id === selectedCutId)) selectedCutId = null;
   if (doc.split) rememberSplitSettings(doc.split);
+  dropStaleToast();
+  // undone, removed, moved or retyped: the summary of the pieces describes a split no longer in force (new pieces bring theirs)
+  if (piecesStatus && (piecesStatus.key !== splitKey || piecesStatus.content !== contentKey)) dropPiecesStatus();
 
   renderItems();
   fillPanel(sel);
@@ -2453,7 +2529,7 @@ function deleteSelected() {
   if (!sel) return;
   const label = itemLabel(sel);
   doc.deleteItem(sel.id);
-  toast(`Deleted “${label}”.`, { label: 'Undo', run: () => doc.undo() });
+  undoToast(`Deleted “${label}”.`);
 }
 
 /* --------------------------------------------------------------------- boot */

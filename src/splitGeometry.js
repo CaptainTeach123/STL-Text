@@ -21,6 +21,7 @@ import {
   FILAMENT,
   HOLE_SEGMENTS,
   POLYGON_K,
+  PLATE_THICKNESS,
   SPLIT_DEFAULTS,
   SPLIT_LIMITS,
   SplitError,
@@ -36,6 +37,7 @@ import {
   orientationStats,
   polygonsCentroid,
   dovetailSize,
+  flatProbes,
   sizesFor,
   sizesForRoom,
   splitNote,
@@ -419,11 +421,38 @@ function rowOf(shells, gap) {
   }
 }
 
+/** The box of one pin as the pins file lays it. */
+function lyingPinBox(d, length) {
+  const one = lyingPin({ r: d / 2, L: length, e: Math.min(0.4, 0.1 * d) });
+  try {
+    return boxOf(one);
+  } finally {
+    one.delete();
+  }
+}
+
+/**
+ * How many pins of Ø d × length one pins file can hold so that it fits the
+ * bed lying as laid out: rows wrapped to the bed's width, as many rows as
+ * its depth takes (at least one pin, even one too long for the bed).
+ * @param {{ d: number, length: number }} group
+ * @param {number[]} U the usable bed
+ * @returns {{ perSheet: number, size: number[] }} `size` one pin's box as laid
+ */
+export function pinsPerSheet({ d, length }, U) {
+  const b = lyingPinBox(d, length);
+  const size = b.max.map((v, a) => v - b.min[a]);
+  const perRow = Math.max(1, Math.floor((U[0] + PIN_GAP) / (size[0] + PIN_GAP)));
+  const rows = Math.max(1, Math.floor((U[1] + PIN_GAP) / (size[1] + PIN_GAP)));
+  return { perSheet: perRow * rows, size };
+}
+
 /**
  * The pins file: `count` pins of Ø d × length, each lying on a flat (no
  * supports, strongest across the layers), end to end along x with 3 mm
  * gaps, in rows wrapped to the bed's width. Centred on x = y = 0, standing
- * on z = 0. Put spares in `count` (`pinSpares`).
+ * on z = 0. Put spares in `count` (`pinSpares`); more than the bed takes
+ * (`pinsPerSheet`) go in more than one file.
  * @param {{ d: number, length: number, count: number }} group
  * @param {number[]|null} U the usable bed (only its x is used)
  * @returns {Manifold}
@@ -586,62 +615,146 @@ export function labelSolid({ text, size, font = null, cs = null, centre, outward
 /** The slice of the solid at a cut, in the cut's plane coordinates. */
 const faceOf = (frames, cut) => frames.get(cut.axis).slice(cut.at);
 
+/** A rectangle lo…hi along the plane coordinates u and v (`[u, v]` pairs). */
+function rectSection(lo, hi) {
+  const { CrossSection } = manifold();
+  const square = CrossSection.square([hi[0] - lo[0], hi[1] - lo[1]]);
+  try {
+    return square.translate(lo);
+  } finally {
+    square.delete();
+  }
+}
+
 /**
- * Whether a cut runs through a thin plate, from its face: every island
- * (≥ 1 mm²) a solid strip (area ≥ 0.6 of its box) at least 4 times as
- * long as it is thick, 2–10 mm thick, all thin along the same world axis w,
- * no cut along w and no unrepaired triangles. Thinner than 2 mm is glued.
+ * Whether a cut runs through a thin plate, from its face. Every island
+ * (≥ 1 mm²) must be a solid strip at least 4 times as long as it is thick
+ * and 2–10 mm thick, all thin along the same world axis w. The plate's own
+ * thickness is taken where most of the island has it (`plateBand`), so a
+ * letter or a boss standing on it where the cut crosses does not count:
+ * the strip is solid when at least 0.6 of that band is material and what
+ * stands outside it is no more than half as much again (a U or a ring is
+ * not a plate). Then no cut along w may run through the plate (its tabs
+ * would come apart in layers), there may be no unrepaired triangles, and
+ * the plate must stay where it is across the pieces either side (each of
+ * `probes`, positions along the cut's axis sliced by `sliceAt`, must pass
+ * `plateStays`), or the pieces of a curved panel would have to lie on their
+ * curve. Thinner than 2 mm is glued.
  * @param {CrossSection} face the cut's face in its plane coordinates (borrowed)
  * @param {{ axis: number, at: number }} cut
- * @param {{ cuts?: object[], passthrough?: boolean }} options every cut of the split; whether there are unrepaired triangles
+ * @param {{ cuts?: object[], passthrough?: boolean, sliceAt?: function|null, probes?: number[] }} options every cut of
+ *   the split; whether there are unrepaired triangles; `sliceAt(t)` lends the solid's slice at t on the cut's axis,
+ *   in the same plane coordinates, and `probes` where to look (`flatProbes`)
  * @returns {{ joint: 'dovetail'|'dowels'|'none', w: number|null, islands: object[], reason: string|null }}
- *   islands `{ area, axes: [uAxis, vAxis], min: [u, v], max: [u, v], t, long, w }`
+ *   islands `{ area, axes: [uAxis, vAxis], min: [u, v], max: [u, v], t, long, w, band, l, span }`: `band` the plate's
+ *   own extent along w and `l` the island's along the plate, `span` everything the island holds along w (plane mm)
  */
-export function plateTest(face, cut, { cuts = [], passthrough = false } = {}) {
+export function plateTest(face, cut, { cuts = [], passthrough = false, sliceAt = null, probes = [] } = {}) {
   const axes = planeAxes(cut.axis);
   const islands = [];
   const parts = face.decompose();
+  const t = scope();
+  let block = false;
   try {
     for (const p of parts) {
       const area = p.area();
       if (area < MIN_ISLAND) continue;
       const { min, max } = p.bounds();
-      const su = max[0] - min[0];
-      const sv = max[1] - min[1];
-      const t = Math.min(su, sv);
-      const long = Math.max(su, sv);
-      islands.push({ area, axes, min: [min[0], min[1]], max: [max[0], max[1]], t, long, w: su <= sv ? axes[0] : axes[1], strip: area >= 0.6 * su * sv && long >= 4 * t });
+      const kw = max[0] - min[0] <= max[1] - min[1] ? 0 : 1;
+      const kl = 1 - kw;
+      const l = [min[kl], max[kl]];
+      // a strip has at most 1.5 times a 10 mm band's area: anything more is a block, told without tracing its outline
+      if (area > 1.5 * (l[1] - l[0]) * PLATE_THICKNESS.max) {
+        block = true;
+        break;
+      }
+      const band = plateBand(polygonsOf(p), kl, kw, l[0], l[1]) ?? [min[kw], max[kw]];
+      const thick = band[1] - band[0];
+      const long = l[1] - l[0];
+      let inBand = 0;
+      if (thick > 0) {
+        const lo = [0, 0];
+        const hi = [0, 0];
+        [lo[kl], hi[kl], lo[kw], hi[kw]] = [l[0] - 1, l[1] + 1, band[0], band[1]];
+        inBand = t.add(p.intersect(t.add(rectSection(lo, hi)))).area();
+      }
+      const strip = thick > 0 && inBand >= 0.6 * long * thick && area - inBand <= 0.5 * inBand && long >= 4 * thick;
+      islands.push({
+        area, axes, min: [min[0], min[1]], max: [max[0], max[1]], t: thick, long, w: axes[kw], strip, band, l, span: [min[kw], max[kw]], kl, kw,
+      });
     }
   } finally {
     parts.forEach((p) => p.delete());
+    t.dispose();
   }
+  if (block) return { joint: 'dowels', w: null, islands, reason: 'shape' };
   if (!islands.length) return { joint: 'dowels', w: null, islands, reason: 'empty' };
   const w = islands[0].w;
   if (!islands.every((i) => i.strip && i.t <= 10 && i.w === w)) return { joint: 'dowels', w: null, islands, reason: 'shape' };
   // thinner than 2 mm takes neither tabs nor pins
   if (islands.some((i) => i.t < 2)) return { joint: 'none', w, islands, reason: 'thin' };
-  if (cuts.some((c) => c.axis === w)) return { joint: 'dowels', w, islands, reason: 'cut along the thickness' };
+  // only a cut through the plate itself matters: a cut along w elsewhere in the model (the other arm of an L) does not
+  const through = (c) => c.axis === w && islands.some((i) => c.at > i.span[0] + CUT_TOLERANCE && c.at < i.span[1] - CUT_TOLERANCE);
+  if (cuts.some(through)) return { joint: 'dowels', w, islands, reason: 'cut along the thickness' };
   if (passthrough) return { joint: 'dowels', w, islands, reason: 'unrepaired triangles' };
+  if (sliceAt && !probes.every((at) => plateStays(sliceAt(at), islands))) return { joint: 'dowels', w, islands, reason: 'curved' };
   return { joint: 'dovetail', w, islands, reason: null };
+}
+
+/**
+ * Whether a slice elsewhere along the cut's axis (borrowed) still has each
+ * island's plate where it was. Over the island's length, either most of the
+ * material there lies in the plate's band (a plate with a hole through it,
+ * or a disc, shorter away from its middle), or the band is mostly filled
+ * over the stretch where there is material (a wall the plate runs into
+ * fills it, and more): at least 0.6 either way. A curved panel has moved
+ * off its band.
+ */
+function plateStays(slice, islands) {
+  if (!slice || slice.isEmpty()) return true; // nothing there to lie on either way: no evidence of a curve
+  const t = scope();
+  try {
+    const { min, max } = slice.bounds();
+    return islands.every((i) => {
+      const lo = [0, 0];
+      const hi = [0, 0];
+      [lo[i.kl], hi[i.kl], lo[i.kw], hi[i.kw]] = [i.l[0], i.l[1], min[i.kw] - 1, max[i.kw] + 1];
+      const there = t.add(slice.intersect(t.add(rectSection(lo, hi))));
+      if (there.isEmpty()) return true;
+      [lo[i.kw], hi[i.kw]] = i.band;
+      if (t.add(there.intersect(t.add(rectSection(lo, hi)))).area() >= 0.6 * there.area()) return true;
+      const reach = there.bounds();
+      [lo[i.kl], hi[i.kl]] = [reach.min[i.kl], reach.max[i.kl]];
+      if (!(hi[i.kl] > lo[i.kl])) return true;
+      const rect = t.add(rectSection(lo, hi));
+      return t.add(there.intersect(rect)).area() >= 0.6 * rect.area();
+    });
+  } finally {
+    t.dispose();
+  }
 }
 
 /**
  * The dovetail tabs a cut at this face would get if it runs through a thin
  * plate, for the planner: how far the piece below the cut (`below`) and the
- * one above it (`above`) may reach past it, and the plate's thickness axis
- * w; null when the cut would take pins. Either piece may hold a tab, even
- * where an island takes only one (it points the other way when something
- * stands proud on the far side), and tabs that later find no room are
- * counted all the same: the plan must never be smaller than the pieces.
+ * one above it (`above`) may reach past it, the plate's thickness axis w
+ * and how far along w the plate's islands go (`span`, world mm: a cut along
+ * w inside it would rule the tabs out); null when the cut would take pins.
+ * Either piece may hold a tab, even where an island takes only one (it
+ * points the other way when something stands proud on the far side), and
+ * tabs that later find no room are counted all the same: the plan must
+ * never be smaller than the pieces.
  * @param {CrossSection} face the cut's face in its plane coordinates (borrowed)
  * @param {{ axis: number, at: number }} cut
- * @returns {{ below: number, above: number, w: number }|null}
+ * @param {{ sliceAt?: function|null, probes?: number[] }} options as for `plateTest`: whether the plate stays flat
+ * @returns {{ below: number, above: number, w: number, span: number[] }|null}
  */
-export function tabsAcross(face, cut) {
-  const test = plateTest(face, cut);
+export function tabsAcross(face, cut, { sliceAt = null, probes = [] } = {}) {
+  const test = plateTest(face, cut, { sliceAt, probes });
   if (test.joint !== 'dovetail') return null;
   const reach = Math.max(0, ...test.islands.map((island) => dovetailSize(island.long)?.E ?? 0));
-  return reach > 0 ? { below: reach, above: reach, w: test.w } : null;
+  const span = [Math.min(...test.islands.map((i) => i.span[0])), Math.max(...test.islands.map((i) => i.span[1]))];
+  return reach > 0 ? { below: reach, above: reach, w: test.w, span } : null;
 }
 
 /** The rectangle s0…s1 along the cut axis s by l0…l1 along the plate, in the plane frame of w (as `tabSection`). */
@@ -724,26 +837,28 @@ function plateBand(polygons, kl, kw, l0, l1) {
  * to the nearest free one; the cut must be N + 2 from parallel ones.
  * @param {Manifold} solid (borrowed)
  * @param {{ id, letter, axis, at }[]} cuts every cut, normalised
- * @param {{ ids: string[], w: number }} dove the dovetail cuts and the plate's thickness axis
+ * @param {{ ids: string[], w: number|Object<string, number> }} dove the dovetail cuts and the plates' thickness axis
+ *   (one for all, or each cut's by id)
  * @param {{ frame?: function }} options `frame(axis)` lends the solid in that axis's plane frame
- * @returns {{ w: number, seams: { cutId, letter, axis, at, tabs: { l, dir, N, H, E }[] }[] }} l along the plate, in world mm
+ * @returns {{ w: number|null, seams: { cutId, letter, axis, at, w, tabs: { l, dir, N, H, E }[] }[] }} l along the plate,
+ *   in world mm; `w` each seam's plate thickness axis (the top-level one when they all share it)
  */
 export function dovetailTabs(solid, cuts, dove, { frame = null } = {}) {
   const { Manifold } = manifold();
   const frames = planeFrames(solid, frame);
   const outlines = new Map();
-  const w = dove.w;
   const box = boxOf(solid);
   const t = scope();
   try {
-    const outlineAt = (wMid) => {
-      const key = wMid.toFixed(6);
+    const outlineAt = (w, wMid) => {
+      const key = `${w}|${wMid.toFixed(6)}`;
       if (!outlines.has(key)) outlines.set(key, t.add(frames.get(w).slice(wMid)));
       return outlines.get(key);
     };
     // every dovetail cut's plate islands first: a crossing one's tabs must be known to reach before any are placed
     const plates = cuts.filter((c) => dove.ids.includes(c.id)).map((cut) => {
       const s = cut.axis;
+      const w = wOfCut(dove, cut.id);
       const l = 3 - s - w;
       const [kl, kw] = [l, w].map((axis) => planeAxes(s).indexOf(axis));
       const face = faceOf(frames, cut);
@@ -761,11 +876,11 @@ export function dovetailTabs(solid, cuts, dove, { frame = null } = {}) {
       } finally {
         face.delete();
       }
-      return { cut, s, l, islands, reach: Math.max(0, ...islands.map((i) => i.size?.E ?? 0)) };
+      return { cut, s, w, l, islands, reach: Math.max(0, ...islands.map((i) => i.size?.E ?? 0)) };
     });
     const reachOf = new Map(plates.map((x) => [x.cut.id, x.reach]));
     const seams = [];
-    for (const { cut, s, l, islands, reach } of plates) {
+    for (const { cut, s, w, l, islands, reach } of plates) {
       const parallel = cuts.filter((c) => c.axis === s && c.id !== cut.id);
       const crossing = cuts.filter((c) => c.axis === l).map((c) => ({ at: c.at, keep: reachOf.get(c.id) ?? 0 }));
       // the model within a tab's reach of the cut, once for the cut: what stands proud of each island is taken from it
@@ -786,7 +901,7 @@ export function dovetailTabs(solid, cuts, dove, { frame = null } = {}) {
         if (!size || parallel.some((c) => Math.abs(c.at - cut.at) < size.N + 2)) continue;
         const { N, H, E, count: m, span } = size;
         const [pw0, pw1] = island.band;
-        const outline = outlineAt((pw0 + pw1) / 2);
+        const outline = outlineAt(w, (pw0 + pw1) / 2);
         // anything standing proud of this island's plate near the cut, seen along w
         const size2 = box.max.map((v, k) => v - box.min[k] + 4);
         const centre = box.min.map((v, k) => (v + box.max[k]) / 2);
@@ -837,9 +952,10 @@ export function dovetailTabs(solid, cuts, dove, { frame = null } = {}) {
         }
         tabs.push(...placed);
       }
-      seams.push({ cutId: cut.id, letter: cut.letter, axis: s, at: cut.at, tabs });
+      seams.push({ cutId: cut.id, letter: cut.letter, axis: s, at: cut.at, w, tabs });
     }
-    return { w, seams };
+    const ws = new Set(seams.map((x) => x.w));
+    return { w: ws.size === 1 ? [...ws][0] : null, seams };
   } finally {
     t.dispose();
     frames.dispose();
@@ -851,8 +967,9 @@ export function dovetailTabs(solid, cuts, dove, { frame = null } = {}) {
  * slab between its cuts, plus its own tabs shrunk by c/2, minus the
  * neighbours' tabs grown by c/2, every corner rounded by 0.8 mm, extruded
  * through the whole model along w. Flat parts of a seam butt with no gap;
- * the tab flanks get the clearance c. The cells are disjoint.
- * @param {{ w: number, seams: object[] }} plan from `dovetailTabs`
+ * the tab flanks get the clearance c. The cells are disjoint. Each axis's
+ * cells are extruded along the thickness axis its seams share.
+ * @param {{ w: number|null, seams: object[] }} plan from `dovetailTabs` (a seam without its own `w` takes the plan's)
  * @param {{ id, axis, at }[]} cuts every cut (the planar ones on the same axis bound cells too)
  * @param {{ min: number[], max: number[] }} bounds the solid's
  * @param {number} clearance per side (mm)
@@ -861,10 +978,10 @@ export function dovetailTabs(solid, cuts, dove, { frame = null } = {}) {
  */
 export function dovetailCells(plan, cuts, bounds, clearance = SPLIT_DEFAULTS.clearance) {
   const { CrossSection, Manifold } = manifold();
-  const w = plan.w;
   const out = [];
   try {
     for (const s of [...new Set(plan.seams.map((x) => x.axis))].sort((p, q) => p - q)) {
+      const w = plan.seams.find((x) => x.axis === s).w ?? plan.w;
       const l = 3 - s - w;
       const onAxis = cuts.filter((c) => c.axis === s).sort((p, q) => p.at - q.at);
       const tabsOf = new Map(plan.seams.filter((x) => x.axis === s).map((x) => [x.cutId, x.tabs]));
@@ -918,14 +1035,17 @@ export function dovetailCells(plan, cuts, bounds, clearance = SPLIT_DEFAULTS.cle
  * 'auto' gives plates tabs and everything else pins, 'dovetail' gives
  * plates tabs and says when a cut isn't one, 'dowels' and 'none' skip the
  * test. A plate under 2 mm thick is glued; one whose tabs all fall outside
- * the plate is glued too. All dovetail cuts share one thickness axis w.
+ * the plate is glued too. The dovetail cuts on one axis share one
+ * thickness axis w (their cells are extruded along it); cuts on another
+ * axis may go through another plate (the two arms of an L).
  * @param {Manifold} solid (borrowed)
  * @param {{ id, letter, axis, at }[]} cuts normalised, in canonical order
  * @param {object} spec the normalised settings (`joint`, `clearance`)
  * @param {{ passthrough?: boolean, frame?: function }} options whether there are unrepaired triangles;
  *   `frame(axis)` lends the solid in that axis's plane frame
- * @returns {{ dove: { ids: string[], w: number, clearance: number }|null, joints: Object<string, 'dowels'|'dovetail'|'none'>,
- *   plates: Object<string, object>, tabs: object|null, notes: object[] }} `dove` is what the cut stage's key holds
+ * @returns {{ dove: { ids: string[], w: number|Object<string, number>, clearance: number }|null,
+ *   joints: Object<string, 'dowels'|'dovetail'|'none'>, plates: Object<string, object>, tabs: object|null, notes: object[] }}
+ *   `dove` is what the cut stage's key holds: `w` the plates' thickness axis, or each cut's by id when they differ
  */
 export function planDovetails(solid, cuts, spec = {}, { passthrough = false, frame = null } = {}) {
   const mode = spec.joint ?? SPLIT_DEFAULTS.joint;
@@ -937,14 +1057,22 @@ export function planDovetails(solid, cuts, spec = {}, { passthrough = false, fra
     return { dove: null, joints, plates, tabs: null, notes };
   }
   const frames = planeFrames(solid, frame);
+  const box = boxOf(solid);
+  const by = axisCuts(cuts);
+  const t = scope();
   try {
-    let w = null;
+    const wOf = {};
+    const axisW = [null, null, null];
     const ids = [];
     for (const cut of cuts) {
       const face = faceOf(frames, cut);
+      // the plate must stay flat out to the next cuts either side, or the model's ends
+      const along = by[cut.axis];
+      const i = along.indexOf(cut.at);
+      const probes = flatProbes(cut.at, i > 0 ? along[i - 1] : box.min[cut.axis], i < along.length - 1 ? along[i + 1] : box.max[cut.axis]);
       let test;
       try {
-        test = plateTest(face, cut, { cuts, passthrough });
+        test = plateTest(face, cut, { cuts, passthrough, sliceAt: (at) => t.add(frames.get(cut.axis).slice(at)), probes });
       } finally {
         face.delete();
       }
@@ -953,8 +1081,9 @@ export function planDovetails(solid, cuts, spec = {}, { passthrough = false, fra
         joints[cut.id] = 'none';
         const n = test.islands.length;
         notes.push(splitNote('CONNECTORS_DROPPED', { letter: cut.letter, cutId: cut.id, count: n, total: n, wall: 2 }));
-      } else if (test.joint === 'dovetail' && (w === null || w === test.w)) {
-        w = test.w;
+      } else if (test.joint === 'dovetail' && (axisW[cut.axis] === null || axisW[cut.axis] === test.w)) {
+        axisW[cut.axis] = test.w;
+        wOf[cut.id] = test.w;
         ids.push(cut.id);
         joints[cut.id] = 'dovetail';
       } else {
@@ -963,6 +1092,8 @@ export function planDovetails(solid, cuts, spec = {}, { passthrough = false, fra
       }
     }
     if (!ids.length) return { dove: null, joints, plates, tabs: null, notes };
+    const shared = new Set(Object.values(wOf)).size === 1;
+    const w = shared ? wOf[ids[0]] : wOf;
     const tabs = dovetailTabs(solid, cuts, { ids, w }, { frame: (axis) => frames.get(axis) });
     const kept = [];
     for (const seam of tabs.seams) {
@@ -975,11 +1106,18 @@ export function planDovetails(solid, cuts, spec = {}, { passthrough = false, fra
     }
     tabs.seams = tabs.seams.filter((x) => x.tabs.length);
     const clearance = Number.isFinite(spec.clearance) ? spec.clearance : SPLIT_DEFAULTS.clearance;
-    return { dove: kept.length ? { ids: kept, w, clearance } : null, joints, plates, tabs: kept.length ? tabs : null, notes };
+    const keptW = new Set(kept.map((id) => wOf[id]));
+    tabs.w = keptW.size === 1 ? [...keptW][0] : null;
+    const dove = kept.length ? { ids: kept, w: keptW.size === 1 ? [...keptW][0] : Object.fromEntries(kept.map((id) => [id, wOf[id]])), clearance } : null;
+    return { dove, joints, plates, tabs: kept.length ? tabs : null, notes };
   } finally {
+    t.dispose();
     frames.dispose();
   }
 }
+
+/** A dovetail cut's plate thickness axis, from `dove.w` (one axis for all, or one per cut id). */
+const wOfCut = (dove, id) => (typeof dove.w === 'number' ? dove.w : dove.w?.[id] ?? null);
 
 // ---------- cutting into pieces ----------
 
@@ -991,18 +1129,21 @@ export function planDovetails(solid, cuts, spec = {}, { passthrough = false, fra
  * to the cell its box overlaps most, and a cell's shells make one piece.
  * Pieces are numbered bottom layer first, then front to back, then left to
  * right. Each comes with its orientation statistics; pieces on a dovetail
- * seam may only lie flat (±w).
+ * seam may only lie flat (±w, either plate's where dovetails through two
+ * plates meet at a piece), and every piece of a thin plate (`flat`) lies
+ * flat on it.
  * @param {Manifold} solid the model (borrowed, never deleted)
  * @param {{ id, letter, axis, at }[]} cuts normalised
- * @param {{ dove?: { ids: string[], w: number, clearance: number }|null, tabs?: object|null, bounds?: object, frame?: function,
- *   progress?: function }} options `tabs` the tabs `planDovetails` placed for `dove` (worked out again when missing)
+ * @param {{ dove?: { ids: string[], w: number|object, clearance: number }|null, tabs?: object|null, bounds?: object,
+ *   flat?: number|null, frame?: function, progress?: function }} options `tabs` the tabs `planDovetails` placed for
+ *   `dove` (worked out again when missing); `flat` the thickness axis when the whole model is a thin plate (`plateAxis`)
  * @returns {{ pieces: { index: number, cell: number[], solid: Manifold, shells: number, volume: number,
  *   bbox: { min: number[], max: number[] }, cuts: string[], stats: object }[], grid: number[],
  *   dovetails: { cutId, letter, axis, at, w, tabs: number }[], notes: object[], dust: number, gap: number, volume: number }}
  *   the piece solids belong to the caller; `gap` is the volume the dovetail clearances took, `dust` the slivers removed
  * @throws {SplitError} `INTERNAL` when a piece comes out broken
  */
-export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null, frame = null, progress = null } = {}) {
+export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null, flat = null, frame = null, progress = null } = {}) {
   const { Manifold } = manifold();
   const box = bounds ?? boxOf(solid);
   const by = axisCuts(cuts);
@@ -1122,7 +1263,6 @@ export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null
       groups.get(key).list.push(sh);
     }
     const ordered = [...groups.values()].sort((p, q) => p.cell[2] - q.cell[2] || p.cell[1] - q.cell[1] || p.cell[0] - q.cell[0]);
-    const doveW = plan ? plan.w : null;
     const pieces = ordered.map(({ cell, list }, n) => {
       let m = list[0].m;
       if (list.length > 1) {
@@ -1135,8 +1275,9 @@ export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null
       const bbox = boxOf(m);
       const reachOf = (c) => (doveCuts.has(c.id) ? Math.max(...doveCuts.get(c.id).tabs.map((tb) => tb.E)) : 0);
       const touching = cuts.filter((c) => c.at >= bbox.min[c.axis] - 0.02 - reachOf(c) && c.at <= bbox.max[c.axis] + 0.02 + reachOf(c));
-      const onDovetail = touching.some((c) => doveCuts.has(c.id));
-      const allowed = onDovetail ? [`-${AXES[doveW]}`, `+${AXES[doveW]}`] : undefined;
+      // a plate lies flat on its thickness; a piece on a dovetail seam on its plate's
+      const flatOn = flat !== null ? [flat] : [...new Set(touching.filter((c) => doveCuts.has(c.id)).map((c) => doveCuts.get(c.id).w ?? plan.w))];
+      const allowed = flatOn.length ? flatOn.flatMap((a) => [`-${AXES[a]}`, `+${AXES[a]}`]) : undefined;
       const mesh = m.getMesh();
       const stats = orientationStats(mesh.vertProperties, mesh.numProp, mesh.triVerts, touching, allowed ? { allowed } : {});
       return { index, cell, solid: m, shells: list.length, volume: list.reduce((s, x) => s + x.v, 0), bbox, cuts: touching.map((c) => c.id), stats };
@@ -1159,7 +1300,7 @@ export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null
     const sum = pieces.reduce((s, p) => s + p.volume, 0);
     const ratio = volume > 0 ? (sum + dust + gap - volume) / volume : 0;
     if (Math.abs(ratio) > 1e-4) notes.push(splitNote('SPLIT_CHECK', { ratio }));
-    const dovetails = (plan?.seams ?? []).map((x) => ({ cutId: x.cutId, letter: x.letter, axis: x.axis, at: x.at, w: plan.w, tabs: x.tabs.length }));
+    const dovetails = (plan?.seams ?? []).map((x) => ({ cutId: x.cutId, letter: x.letter, axis: x.axis, at: x.at, w: x.w ?? plan.w, tabs: x.tabs.length }));
     for (const p of pieces) owned.delete(p.solid);
     return { pieces, grid: by.map((l) => l.length), dovetails, notes, dust, gap, volume };
   } finally {
@@ -1289,11 +1430,11 @@ export function shadowFor(band, cut, reach, { obstacles = [], air = true } = {})
  */
 function socketsOf(plan, cuts, bounds, clearance) {
   const { Manifold } = manifold();
-  const w = plan.w;
   const t = scope();
   try {
     const columns = [];
     for (const seam of plan.seams) {
+      const w = seam.w ?? plan.w;
       for (const tab of seam.tabs) {
         const section = t.add(tabSection(tab, seam.at, seam.axis, w, clearance / 2 + TAB_ROUND, 'Round'));
         const prism = t.add(t.add(extrudeSection(section, bounds.max[w] - bounds.min[w] + 2)).translate([0, 0, bounds.min[w] - 1]));
@@ -1451,8 +1592,9 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     const suggest = (d) => {
       if (d) suggested = Math.max(suggested ?? 0, d);
     };
-    let thinWalls = false;
-    const minWall = Math.ceil(2 * sizesFor(FILAMENT, c, nozzle).rho);
+    // the thinnest wall filament fits in: twice its inset from the edge, a teardrop's when the holes lie on their side
+    let thinWalls = 0;
+    const fil = sizesFor(FILAMENT, c, nozzle);
     ctx.patches.forEach((patch, patchIndex) => {
       if (patch.skip || patch.capped || !patch.alloc) return;
       total++;
@@ -1478,7 +1620,8 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
           dropped++;
           // what to say about it: slivers are glued and need no explaining
           if (patch.area >= SIZING_PATCH) {
-            if (!thinWalls && 2 * largestInset(patch.cs, minWall / 2) < minWall) thinWalls = true;
+            const need = 2 * (patch.apex.some(Boolean) ? fil.rhoTear : fil.rho);
+            if (2 * largestInset(patch.cs, need / 2 + 0.05) < need) thinWalls = Math.max(thinWalls, Math.ceil(need * 10 - 1e-6) / 10);
             suggest(smallerFit(ctx, patch, D, need, t));
           }
           return;
@@ -1519,7 +1662,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     if (shorter !== null) notes.push(splitNote('CONNECTORS_SHORTER', { ...base, depth: shorter }));
     if (filament) notes.push(splitNote('CONNECTORS_FILAMENT', { ...base, count: filament.count, diameter: D, length: filament.length, ...(suggested ? { suggestedDiameter: suggested } : {}) }));
     if (dropped) {
-      notes.push(splitNote('CONNECTORS_DROPPED', { ...base, count: dropped, total, ...(thinWalls ? { wall: minWall } : {}), ...(suggested && !filament ? { suggestedDiameter: suggested } : {}) }));
+      notes.push(splitNote('CONNECTORS_DROPPED', { ...base, count: dropped, total, ...(thinWalls ? { wall: thinWalls } : {}), ...(suggested && !filament ? { suggestedDiameter: suggested } : {}) }));
     }
     if (one) notes.push(splitNote('ONE_CONNECTOR', base));
   }

@@ -15,6 +15,7 @@ import {
   pinSheet,
   pinSolid,
   pinSpares,
+  pinsPerSheet,
   planDovetails,
 } from '../src/splitGeometry.js';
 import { inter, setup } from './helpers.js';
@@ -125,6 +126,19 @@ describe('holes and pins', () => {
     expect(many.size[0]).toBeLessThanOrEqual(BED[0]);
     expect(many.size[1]).toBeGreaterThan(3 * 4.619);
     expect([1, 2, 4, 5, 8, 9].map(pinSpares)).toEqual([1, 1, 1, 2, 2, 3]);
+  });
+
+  it('a pins file holds no more pins than the bed takes lying as they are laid out', () => {
+    // 60 Ø8 pins on a 110 mm bed (a 120 mm printer): rows of three, as many rows as the depth takes
+    const U = [110, 110, 119];
+    const { perSheet, size } = pinsPerSheet({ d: 8, length: 26 }, U);
+    expect(size.map((v) => +v.toFixed(3))).toEqual([26, 7.391, 7.391]);
+    expect(perSheet).toBe(3 * 10);
+    const full = boxOf(own(pinSheet({ d: 8, length: 26, count: perSheet }, U)));
+    expect(full.size[0]).toBeLessThanOrEqual(U[0]);
+    expect(full.size[1]).toBeLessThanOrEqual(U[1]);
+    // one more would need another row: the bed has no room for it
+    expect(boxOf(own(pinSheet({ d: 8, length: 26, count: perSheet + 1 }, U))).size[1]).toBeGreaterThan(U[1]);
   });
 
   for (const tear of [false, true]) {
@@ -357,6 +371,58 @@ describe('dovetail tabs through thin plates', () => {
     }
   });
 
+  it('both arms of an L of thin plates get tabs, each through its own plate', () => {
+    // the base is thin along z, the upright along x; a cut along z elsewhere does not rule out the base's tabs
+    const L = own(wasm.Manifold.union([cube([120, 30, 6], [60, 15, 3]), cube([6, 30, 120], [3, 15, 60])]));
+    const s = split(L, [[0, 60], [2, 60]], { labels: false });
+    expect(s.plan.joints).toEqual({ c1: 'dovetail', c2: 'dovetail' });
+    expect(s.plan.dove.w).toEqual({ c1: 2, c2: 0 });
+    expect(s.cut.dovetails.map((d) => [d.cutId, d.w, d.tabs])).toEqual([['c1', 2, 1], ['c2', 0, 1]]);
+    expect(s.cut.pieces).toHaveLength(3);
+    for (const p of s.cut.pieces) {
+      expect(p.solid.status()).toBe('NoError');
+      expect(shells(p.solid)).toHaveLength(1);
+    }
+    // the corner piece holds a socket or tab of each: it may lie on either plate
+    expect(s.cut.pieces[0].stats.allowed).toEqual(['-z', '+z', '-x', '+x']);
+    expect(s.cut.pieces[1].stats.allowed).toEqual(['-z', '+z']);
+    expect(s.cut.pieces[2].stats.allowed).toEqual(['-x', '+x']);
+    const sum = s.cut.pieces.reduce((v, p) => v + p.volume, 0);
+    expect(sum + s.cut.gap).toBeCloseTo(L.volume(), 3);
+    expect(s.layout.seams.map((x) => x.joint)).toEqual(['dovetail', 'dovetail']);
+  });
+
+  it('a letter standing on the plate where the cut crosses it does not make the plate a block', () => {
+    // a 3 mm sign with one stroke 8 mm wide and 3 mm tall running across the cut: the strip is the plate's own 3 mm
+    const sign = own(wasm.Manifold.union([cube([300, 100, 3], [0, 0, 1.5]), cube([40, 8, 3], [0, 0, 4.5])]));
+    const s = split(sign, [[0, 0]], { labels: false });
+    expect(s.plan.joints).toEqual({ c1: 'dovetail' });
+    expect(s.plan.plates.c1.islands[0]).toMatchObject({ t: 3, band: [0, 3] });
+    expect(s.cut.dovetails[0].tabs).toBe(2);
+    // the tabs keep clear of the stroke
+    for (const tab of s.plan.tabs.seams[0].tabs) expect(Math.abs(tab.l) - tab.H / 2).toBeGreaterThanOrEqual(4 - 1e-9);
+    // a U is still not a plate
+    const channel = own(wasm.Manifold.union([cube([300, 40, 2], [0, 0, 1]), cube([300, 2, 20], [0, -19, 10]), cube([300, 2, 20], [0, 19, 10])]));
+    expect(split(channel, [[0, 0]], { joint: 'dovetail', labels: false }).plan.joints).toEqual({ c1: 'dowels' });
+  });
+
+  it('a curved panel takes no tabs: its pieces would have to lie on their curve', () => {
+    // a 5 mm slice of a tube of radius 600, 400 wide and 100 tall, bowing out along y
+    const tube = own(own(wasm.Manifold.cylinder(100, 600, 600, 256)).subtract(own(wasm.Manifold.cylinder(102, 595, 595, 256).translate([0, 0, -1]))));
+    const panel = own(tube.intersect(cube([400, 60, 100], [0, 580, 50])));
+    const curved = split(panel, [[0, 0]], { labels: false });
+    expect(curved.plan.joints).toEqual({ c1: 'dowels' });
+    expect(curved.plan.plates.c1.reason).toBe('curved');
+    expect(curved.pieces.map((p) => p.stats.allowed.length)).toEqual([6, 6]);
+    // flat, the same panel takes them; and a disc, which is only shorter away from its middle
+    expect(split(cube([400, 5, 100]), [[0, 0]], { labels: false }).plan.joints).toEqual({ c1: 'dovetail' });
+    const disc = own(wasm.Manifold.cylinder(4, 200, 200, 96));
+    expect(split(disc, [[0, -66.7], [0, 66.7]], { labels: false }).plan.joints).toEqual({ c1: 'dovetail', c2: 'dovetail' });
+    // nor does a big hole where the plate is looked at make it a curve
+    const holed = own(cube([400, 100, 5], [0, 0, 2.5]).subtract(cube([60, 60, 10], [100, 0, 2.5])));
+    expect(split(holed, [[0, 0]], { labels: false }).plan.joints).toEqual({ c1: 'dovetail' });
+  });
+
   it('use pins instead where the cut is not through a plate, there are unrepaired triangles, or a tab has no room; glue under 2 mm', () => {
     const sign = cube([300, 80, 5], [0, 0, 2.5]);
     let { plan } = split(sign, [[0, 0]], {}, { passthrough: true });
@@ -479,9 +545,24 @@ describe('pins on the cut faces', () => {
     expectHolesInside(tube(8), s.layout);
     s = split(tube(3), [[2, 0]]);
     expect(s.layout.dowels).toHaveLength(0);
-    expect(s.layout.notes).toEqual([expect.objectContaining({ code: 'CONNECTORS_DROPPED', level: 'warn', count: 1, total: 1, wall: 6 })]);
+    // standing on their cut faces the holes are round: filament needs walls of twice its 2.53 mm inset
+    expect(s.layout.notes).toEqual([expect.objectContaining({ code: 'CONNECTORS_DROPPED', level: 'warn', count: 1, total: 1, wall: 5.1 })]);
     expect(s.layout.seams[0].joint).toBe('none');
     for (const piece of s.drilled) expect(piece.status()).toBe('NoError');
+  });
+
+  it('says how thick walls must be for filament: 6.2 mm where the holes lie on their side', () => {
+    // bar halves lying flat take horizontal (teardrop) holes: filament needs 2 × 3.08 mm round each
+    const bar = (t) => split(cube([300, 40, t]), [[0, 0]], { joint: 'dowels', labels: false });
+    for (const t of [6, 6.1]) {
+      const s = bar(t);
+      expect(s.layout.dowels).toHaveLength(0);
+      expect(s.layout.notes).toEqual([expect.objectContaining({ code: 'CONNECTORS_DROPPED', wall: 6.2 })]);
+      expect(s.layout.notes[0].text).toContain('(walls under 6.2 mm)');
+    }
+    const thick = bar(6.3);
+    expect(thick.layout.dowels.map((d) => d.d)).toEqual([1.75, 1.75]);
+    expect(thick.layout.notes.map((n) => n.code)).toEqual(['CONNECTORS_FILAMENT']);
   });
 
   it('holes keep clear of a hidden pocket behind the face and of a cone\'s slanted side', () => {

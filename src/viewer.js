@@ -25,6 +25,7 @@ import {
   Plane,
   PlaneGeometry,
   Quaternion,
+  Ray,
   Raycaster,
   RingGeometry,
   Scene,
@@ -129,6 +130,41 @@ function markCells(seen, geometry, byAxis, grid, matrix = null) {
     for (let k = slot(lo[2], byAxis[2]); k <= k1; k++) {
       for (let j = slot(lo[1], byAxis[1]); j <= j1; j++) {
         for (let i = slot(lo[0], byAxis[0]); i <= i1; i++) seen[(k * grid[1] + j) * grid[0] + i] = 1;
+      }
+    }
+  }
+}
+
+/** Rays askew of the axes, so that none runs along a face or through an edge of a box-shaped model. */
+const PROBE_RAYS = [new Vector3(1, 0.31, 0.17), new Vector3(-0.23, 1, 0.41), new Vector3(0.37, -0.29, 1)].map((v) => v.normalize());
+
+/**
+ * Mark the slots that lie wholly inside the model. A slot no triangle
+ * reaches is all inside or all outside, so one point of it tells which: an
+ * odd number of crossings of the model's surface (its unrepaired triangles,
+ * material group 1, left out), as most of three rays find. A slot on the
+ * outside of the grid runs on to infinity past its last cut, so it is
+ * outside and is never tested.
+ */
+function markEnclosed(seen, geometry, byAxis, grid) {
+  const bvh = geometry.boundsTree;
+  if (!bvh || grid.some((n) => n < 3)) return;
+  const sides = geometry.groups.length ? [DoubleSide, DoubleSide] : DoubleSide;
+  const ray = new Ray();
+  for (let k = 1; k < grid[2] - 1; k++) {
+    for (let j = 1; j < grid[1] - 1; j++) {
+      for (let i = 1; i < grid[0] - 1; i++) {
+        const s = (k * grid[1] + j) * grid[0] + i;
+        if (seen[s]) continue;
+        const cell = [i, j, k];
+        ray.origin.fromArray(cell.map((c, a) => (byAxis[a][c - 1] + byAxis[a][c]) / 2));
+        let votes = 0;
+        for (const dir of PROBE_RAYS) {
+          ray.direction.copy(dir);
+          const crossings = bvh.raycast(ray, sides).filter((hit) => hit.face.materialIndex !== 1).length;
+          votes += crossings % 2;
+        }
+        if (votes >= 2) seen[s] = 1;
       }
     }
   }
@@ -839,6 +875,8 @@ export class Viewer {
     if (grid[0] * grid[1] * grid[2] > CELL_SCAN_MAX) return;
     const filled = markedCells(this.#modelSlots(byAxis, grid), grid);
     if (filled.length > CELL_PREVIEW_MAX) return;
+    // the model's unrepaired triangles (its material group 1) stay amber in every cell: text can only be raised there
+    const loose = geometry.groups.some((g) => g.materialIndex === 1);
     for (const cell of filled) {
       const bounds = [];
       for (let a = 0; a < 3; a++) {
@@ -846,14 +884,18 @@ export class Viewer {
         if (cell[a] > 0) bounds.push({ plane: new Plane(AXIS_VECTORS[a].clone(), 0), axis: a, index: cell[a] - 1, upper: false });
         if (cell[a] < byAxis[a].length) bounds.push({ plane: new Plane(AXIS_VECTORS[a].clone().negate(), 0), axis: a, index: cell[a], upper: true });
       }
+      const clippingPlanes = bounds.map((b) => b.plane);
       const material = new MeshStandardMaterial({
         color: PIECE_COLORS[pieceColorIndex(cell)],
         roughness: 0.55,
         metalness: 0.05,
         side: DoubleSide, // the open cut shows the inside, in the piece's colour
-        clippingPlanes: bounds.map((b) => b.plane),
+        clippingPlanes,
       });
-      const mesh = new Mesh(geometry, material);
+      const mesh = new Mesh(
+        geometry,
+        loose ? [material, new MeshStandardMaterial({ color: COLORS.passthrough, roughness: 0.6, metalness: 0.05, side: DoubleSide, clippingPlanes })] : material,
+      );
       mesh.raycast = () => {}; // clicks go to the (hidden) model itself
       this.cellGroup.add(mesh);
       this.cellMeshes.set(cell.join(','), { mesh, cell, bounds });
@@ -862,13 +904,19 @@ export class Viewer {
     this.#styleCells();
   }
 
-  /** The slots of the grid the model reaches (see `markCells`): scanned once for each model and set of cut positions. */
+  /**
+   * The slots of the grid the model fills: those its surface reaches (see
+   * `markCells`) and those wholly inside it, such as the middle box of a
+   * solid cube cut in three every way. Scanned once for each model and set
+   * of cut positions.
+   */
   #modelSlots(byAxis, grid) {
     const geometry = this.baseMesh.geometry;
     const key = `${geometry.uuid}|${JSON.stringify(byAxis)}`;
     if (this.modelSlotsFor?.key !== key) {
       const seen = new Uint8Array(grid[0] * grid[1] * grid[2]);
       markCells(seen, geometry, byAxis, grid);
+      markEnclosed(seen, geometry, byAxis, grid);
       this.modelSlotsFor = { key, seen };
     }
     return this.modelSlotsFor.seen;
@@ -914,17 +962,19 @@ export class Viewer {
     if (tooBig) for (const c of cellSizes(boxArrays(this.#cutBounds()), this.cellSpec.cuts).cells) boxes.set(c.cell.join(','), c);
     for (const [key, e] of this.cellMeshes) {
       const box = boxes.get(key);
-      const m = e.mesh.material;
-      m.emissive.setHex(box && tooBig(box) ? TOO_BIG_COLOR : 0);
-      m.transparent = this.baseDimmed;
-      m.opacity = this.baseDimmed ? 0.75 : 1;
+      const materials = [e.mesh.material].flat();
+      materials[0].emissive.setHex(box && tooBig(box) ? TOO_BIG_COLOR : 0); // the piece's colour only, as in the pieces view
+      for (const m of materials) {
+        m.transparent = this.baseDimmed;
+        m.opacity = this.baseDimmed ? 0.75 : 1;
+      }
     }
   }
 
   #clearCells() {
     for (const e of this.cellMeshes.values()) {
       this.cellGroup.remove(e.mesh);
-      e.mesh.material.dispose(); // the geometry is the model's own, freed with it
+      for (const m of [e.mesh.material].flat()) m.dispose(); // the geometry is the model's own, freed with it
     }
     this.cellMeshes.clear();
     this.cellKey = null;

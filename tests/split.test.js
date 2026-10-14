@@ -619,6 +619,135 @@ describe('checking and planning cuts', () => {
     expect(boxOf(pieceSolid(file)).min[2]).toBeCloseTo(0, 4);
     const r = await resultSplit(S({ labels: false }), { items: [part] });
     expect(r.display.parts.at(-1)).toEqual({ kind: 'part', id: part.id, cell: [1, 0, 0] });
+    expect(codes(ex)).not.toContain('PART_TOO_BIG');
+    // on a printer too small for it the part, which is never cut, is told of
+    const small = await exportSplit(S({ labels: false }), { items: [part], bed: [15, 15, 50] });
+    expect(noteOf(small, 'PART_TOO_BIG')).toMatchObject({ level: 'warn', itemId: part.id, name: 'bar' });
+    expect(small.files.find((f) => f.kind === 'part').fits).toBe(false);
+  });
+
+  it('pins go in as many files as the bed needs, each fitting lying as it is laid out', async () => {
+    await load(cube([120, 40, 30]));
+    // three Ø5 × 16 pins (one spare) on a bed with room for two side by side and one row
+    const ex = await exportSplit(S({ diameter: 5, depth: 8, count: 2, labels: false }), { bed: [40, 12, 100] });
+    const pins = ex.files.filter((f) => f.kind === 'pins');
+    expect(pins.map((f) => [f.name, f.count, f.fits])).toEqual([['box-pins-2x-5x16mm-1-of-2', 2, true], ['box-pins-1x-5x16mm-2-of-2', 1, true]]);
+    expect(codes(ex)).not.toContain('PART_TOO_BIG');
+    // with room for one row of many, one file as before
+    expect(ex.files.filter((f) => f.kind === 'pins')).toHaveLength(2);
+    const roomy = await exportSplit(S({ diameter: 5, depth: 8, count: 2, labels: false }));
+    expect(roomy.files.filter((f) => f.kind === 'pins').map((f) => [f.name, f.count])).toEqual([['box-pins-3x-5x16mm', 3]]);
+  });
+});
+
+describe('planning pieces that really print', () => {
+  const plan = (items = [], bed = BED, split = SPLIT_DEFAULTS) => client.planSplit(items, version, { printing, split, bed, mode: 'fit' });
+  const planned = (p, patch = {}) => ({ ...SPLIT_DEFAULTS, ...patch, cuts: p.cuts.map((c, i) => ({ id: `c${i + 1}`, ...c })) });
+  const L = (t, arm) => own(wasm.Manifold.union([cube([arm, 40, t], [arm / 2, 20, t / 2]), cube([t, 40, arm], [t / 2, 20, arm / 2])]));
+
+  it('an L bracket is cut across both arms into three pieces, and a thin one gets tabs on both', async () => {
+    // cutting it lengthwise makes four boxes of four pieces; across both arms, one box is empty
+    await load(L(12, 260), 'bracket');
+    let p = await plan();
+    expect(p.counts).toEqual([1, 0, 1]);
+    expect(p.pieces).toHaveLength(3);
+    let r = await resultSplit(planned(p, { labels: false }));
+    expect(r.pieces.map((x) => [x.down, x.fits])).toEqual([['-z', true], ['-z', true], ['-x', true]]);
+    // 6 mm arms: each cut runs through its own plate, so each gets its tabs
+    await load(L(6, 300), 'shelf');
+    p = await plan();
+    expect(p.counts).toEqual([1, 0, 1]);
+    r = await resultSplit(planned(p));
+    expect(r.seams.map((x) => [x.letter, x.joint, x.tabs])).toEqual([['A', 'dovetail', 1], ['B', 'dovetail', 1]]);
+    expect(r.notes.filter((n) => n.level === 'warn')).toEqual([]);
+  });
+
+  it('a square plate twice the bed is tiled flat in its own plane, never cut into layers', async () => {
+    await load(cube([400, 400, 4]), 'plaque');
+    const p = await plan();
+    expect(p.counts).toEqual([2, 2, 0]);
+    const r = await resultSplit(planned(p));
+    expect(r.pieces).toHaveLength(9);
+    expect(r.pieces.every((x) => x.down === '-z' && x.fits)).toBe(true);
+    expect(new Set(r.seams.map((x) => x.joint))).toEqual(new Set(['dovetail']));
+    expect(r.notes.filter((n) => n.level === 'warn')).toEqual([]);
+  });
+
+  it('a long rail takes as many cuts along it as it needs', async () => {
+    await load(cube([2400, 40, 20]), 'rail');
+    const p = await plan();
+    expect(p.counts).toEqual([8, 0, 0]);
+    expect(p.pieces).toHaveLength(9);
+    expect(p.pieces.every((x) => x.fits)).toBe(true);
+  });
+
+  it('a ball is cut so that every piece lies on a cut face, never standing on its pole', async () => {
+    await load(own(wasm.Manifold.sphere(60, 48)), 'ball');
+    const bed = [105, 105, 124];
+    const p = await plan([], bed);
+    expect(p.counts).toEqual([1, 1, 1]);
+    // quarters cut by hand fit only standing on the pole: said so
+    const r = await resultSplit(S({ cuts: [cutAt(0, 0, 'c1'), cutAt(1, 0, 'c2')], joint: 'none', labels: false }), { bed });
+    expect(r.pieces.map((x) => [x.lies, x.fits])).toEqual(Array(4).fill(['on a curve', true]));
+    expect(r.notes.filter((n) => n.code === 'PIECE_UNSTABLE').map((n) => n.pieceIndex)).toEqual([1, 2, 3, 4]);
+  });
+
+  it('a thin plate cut by hand lies flat whatever its joint, and says when it is then too big', async () => {
+    for (const [t, joint] of [[1.6, 'auto'], [4, 'dowels'], [4, 'none']]) {
+      await load(cube([400, 100, t]), 'plate');
+      const r = await resultSplit(S({ cuts: [cutAt(0, -60)], joint, labels: false }));
+      expect(r.pieces.map((x) => [x.down, x.fits])).toEqual([['-z', true], ['-z', false]]);
+      expect(noteOf(r, 'PIECE_TOO_BIG')).toMatchObject({ pieceIndex: 2 });
+    }
+  });
+
+  it('a model that fits only stood on its side says how it must lie', async () => {
+    await load(cube([240, 100, 200]), 'box');
+    const p = await plan();
+    expect(p.cuts).toEqual([]);
+    expect(noteOf(p, 'SPLIT_NOT_NEEDED')).toMatchObject({ down: '-x', yaw: 0 });
+    expect(noteOf(p, 'SPLIT_NOT_NEEDED').text).toMatch(/lying on its −X side.*turn it that way in your slicer/);
+  });
+
+  it('unrepaired triangles past the solid’s end are planned for, and a piece’s file is as long as it says', async () => {
+    // an open flap 25 mm past the end of a 400 mm bar goes in the end piece's file
+    const flap = [200, -20, 10, 225, -20, 10, 225, 20, 10, 200, -20, 10, 225, 20, 10, 200, 20, 10];
+    const soup = soupOf(cube([400, 40, 20]));
+    const both = new Float32Array(soup.length + flap.length);
+    both.set(soup);
+    both.set(flap, soup.length);
+    await loadSoup(both, 'flap');
+    const p = await plan();
+    const ex = await exportSplit(planned(p, { labels: false }), { name: 'flap' });
+    expect(codes(ex)).toContain('SPLIT_UNREPAIRED');
+    expect(codes(ex)).not.toContain('PIECE_TOO_BIG');
+    for (const f of piecesOf(ex)) {
+      // the file as it is saved, turned the way it prints, lies within the bed, flap and all
+      const pts = parseSTL(f.stl).attributes.position.array;
+      const side = (a) => {
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (let i = a; i < pts.length; i += 3) {
+          lo = Math.min(lo, pts[i]);
+          hi = Math.max(hi, pts[i]);
+        }
+        return hi - lo;
+      };
+      expect(f.fits).toBe(true);
+      expect(side(0)).toBeLessThanOrEqual(BED[0] + 1e-3);
+      expect(side(1)).toBeLessThanOrEqual(BED[1] + 1e-3);
+    }
+  });
+
+  it('on a long sign the cuts keep 2 mm clear of the raised letters', async () => {
+    await load(cube([620, 120, 4]), 'sign');
+    const words = createItem({ text: 'WELCOME TO OUR LITTLE HOUSE', fontId: 'inter', size: 36, position: [0, 0, 2], normal: [0, 0, 1] });
+    const p = await plan([words]);
+    expect(p.cuts.length).toBeGreaterThan(1);
+    // a plane 1.9 mm either side of each cut runs through no letter
+    const beside = p.cuts.flatMap((c, i) => [-1.9, 1.9].map((d) => cutAt(0, c.position[0] + d, `c${i}${d > 0 ? 'b' : 'a'}`)));
+    const m = await client.planSplit([words], version, { printing, split: S({ cuts: beside }), bed: BED, mode: 'measure' });
+    expect(m.cuts.map((c) => c.crosses)).toEqual(beside.map(() => []));
   });
 });
 
@@ -652,6 +781,46 @@ describe('the engine around a split', () => {
     expect((await client.call('ping', {})).caches.split).toBe(1);
     await client.loadBase({ kind: 'sample', version: ++version });
     expect((await client.call('ping', {})).caches.split).toBe(0);
+  });
+
+  it('measuring the cuts while the text is edited builds no booleans, and follows the text', async () => {
+    await load(cube([300, 40, 20]), 'bar');
+    const split = S({ cuts: [cutAt(0, 0, 'c1'), cutAt(0, 100, 'c2')], labels: false });
+    // the booleans that merge text into the model are the static union and difference
+    const counted = { union: 0, difference: 0 };
+    const wrapped = Object.keys(counted).map((key) => {
+      const fn = wasm.Manifold[key];
+      wasm.Manifold[key] = (...args) => {
+        counted[key]++;
+        return fn(...args);
+      };
+      return () => {
+        wasm.Manifold[key] = fn;
+      };
+    });
+    try {
+      const measure = (items) => client.planSplit(items, version, { printing, split, bed: BED, mode: 'measure' });
+      const hello = createItem({ text: 'HELLO', fontId: 'inter', size: 12, position: [0, 0, 10], normal: [0, 0, 1] });
+      let m = await measure([hello]);
+      expect(m.estimate).toBe(true);
+      expect(m.cuts.map((c) => [c.letter, c.joint, c.crosses])).toEqual([['A', 'dowels', [hello.id]], ['B', 'dowels', []]]);
+      expect(m.cuts[0].area).toBeCloseTo(800, 6); // the model's face alone
+      expect(m.bounds.max[2]).toBeGreaterThan(10.5); // the raised letters stand on the bar's top at z = 10
+      // the text moved over the second cut: the measure follows it, still without a boolean
+      const moved = { ...hello, position: [100, 0, 10] };
+      m = await measure([moved]);
+      expect(m.cuts.map((c) => c.crosses)).toEqual([[], [hello.id]]);
+      expect(counted).toEqual({ union: 0, difference: 0 });
+      // once the final result is built for that text, the measure is taken from it; one turned copy of the model at a time
+      expect((await client.call('ping', {})).caches.frame).toBe(1);
+      await resultSplit(split, { items: [moved] });
+      m = await measure([moved]);
+      expect(m.estimate).toBeUndefined();
+      expect(m.cuts[1].crosses).toEqual([hello.id]);
+      expect((await client.call('ping', {})).caches.frame).toBe(1);
+    } finally {
+      wrapped.forEach((restore) => restore());
+    }
   });
 
   it('splitting again and again leaves no solids behind', async () => {

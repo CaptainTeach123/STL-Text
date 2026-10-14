@@ -7,7 +7,7 @@ import {
   dovetailSize, evenCell, explodeOffset, fitsBed, footprintYaw, formatSize, glueFileName, gridCandidates, gridCounts, gridPoints,
   howToGlueText, invertRigid, isSymmetric, letterFor, localFrame, maxCellLength, mulMat4, nextCut, normaliseSplit, offsetAlongRay,
   oppositeDir, orientationStats, partFileName, pieceColorIndex, pieceFileName, pinsFileName, planAllowance, planCost, planGrid,
-  planSamples, plateAxis, polygonsArea, polygonsCentroid, printTransform, safeFileName,
+  planSamples, plateAxis, polygonsArea, polygonsCentroid, printTransform, safeFileName, cellSupport, fitPieces, flatProbes, statsWithSoup,
   sizesFor, sizesForRoom, soupCells, splitActive, splitNote, teardropApex, usableBed, yawMat4, zipFileName,
 } from '../src/split.js';
 
@@ -319,6 +319,26 @@ describe('thin plates', () => {
     expect(gridCounts([480, 480, 5], U, planAllowance([480, 480, 5]))).toEqual({ pieces: 9, candidates: [[2, 2, 0]] });
     expect(gridCandidates([300, 40, 20], U).map((c) => c.pieces).slice(0, 3)).toEqual([2, 3, 4]);
   });
+
+  it('never cuts a plate through its thickness: a 400 mm square sign is 3 × 3 flat pieces, not 8 glued layers', () => {
+    // two ways across would make 212 mm halves with their tabs; a cut through the 4 mm would let them drop the tabs
+    expect(gridCandidates([400, 400, 4], U, { flat: 2 }).every((c) => c.k[2] === 0)).toBe(true);
+    expect(gridCounts([400, 400, 4], U, planAllowance([400, 400, 4]))).toEqual({ pieces: 9, candidates: [[2, 2, 0]] });
+    expect(fitPieces([400, 400, 4], U)).toEqual({ fits: false, pieces: 9, down: null, yaw: null });
+  });
+
+  it('counts what Fit will plan, from the box alone: plates flat with their tabs, and how a model that fits must lie', () => {
+    expect(fitPieces([400, 100, 5], U)).toMatchObject({ fits: false, pieces: 3 });
+    expect(fitPieces([400, 100, 5], U, { joint: 'dowels' })).toMatchObject({ fits: false, pieces: 2 });
+    expect(fitPieces([400, 100, 5], U, {}, { passthrough: true })).toMatchObject({ fits: false, pieces: 2 });
+    expect(fitPieces([260, 100, 4], U)).toMatchObject({ fits: false, pieces: 2 }); // fits only stood on its edge
+    expect(fitPieces([150, 100, 4], U)).toEqual({ fits: true, pieces: 1, down: '-z', yaw: 0 });
+    // too long to lie as modelled, but it stands on its end: the note says so
+    expect(fitPieces([240, 100, 200], U)).toEqual({ fits: true, pieces: 1, down: '-x', yaw: 0 });
+    expect(splitNote('SPLIT_NOT_NEEDED', { down: '-x', yaw: 0 }).text)
+      .toBe('This model already fits your printer lying on its −X side – no need to split, but turn it that way in your slicer.');
+    expect(splitNote('SPLIT_NOT_NEEDED', { down: '-z', yaw: 40 }).text).toBe('This model already fits your printer (turned 40° on the bed) – no need to split.');
+  });
 });
 
 describe('gridCounts', () => {
@@ -332,6 +352,14 @@ describe('gridCounts', () => {
   it('a 500 mm bar halves: each 250 mm half fits turned 44°', () => {
     expect(gridCounts([500, 40, 20], U)).toEqual({ pieces: 2, candidates: [[1, 0, 0]] });
     expect(fitsBed([250, 40, 20], U)).toMatchObject({ fits: true, down: '-z', height: 20, yaw: 44 });
+  });
+
+  it('a long model may take up to 12 cuts on one axis', () => {
+    // 2.4 m of rail is 9 pieces of 267 mm, each fitting across the diagonal
+    expect(gridCounts([2400, 40, 20], U)).toEqual({ pieces: 9, candidates: [[8, 0, 0]] });
+    expect(fitPieces([2000, 200, 6], U).pieces).toBe(11);
+    expect(fitPieces([2400, 100, 5], U).pieces).toBe(13);
+    expect(gridCandidates([2400, 100, 5], U, planAllowance([2400, 100, 5]))[0]).toEqual({ k: [12, 0, 0], pieces: 13 });
   });
 
   it('no split needed, or none possible', () => {
@@ -375,6 +403,10 @@ describe('planCost', () => {
     expect(c[4]).toBe(W.itemBox); // no material: only the item-box term
     expect(c[3]).toBeGreaterThan(W.neck * 0.4 + W.islands * 2 + W.noRoom * 0.5); // median 800, 200/400 → neck 0.5
     expect(c[5]).toBeLessThan(c[3]);
+    // samples 3 mm apart cannot see a letter 1 mm away: one looked for on its own still counts
+    const apart = [0, 3, 6].map((t) => ({ t, area: 800, perimeter: 120, islands: 1, noRoom: 0, letters: t === 6 }));
+    const seen = planCost(apart.map((p, i) => (i === 1 ? { ...p, nearLetters: true } : p)));
+    expect(seen[1] - planCost(apart)[1]).toBeCloseTo(W.nearLetters, 9);
   });
 
   describe('chooseOffsets', () => {
@@ -466,6 +498,37 @@ describe('planCost', () => {
   });
 });
 
+/** A box as a triangle soup (9 numbers per triangle, outward winding). */
+function boxSoup(lo, hi) {
+  const c = [0, 1, 2, 3, 4, 5, 6, 7].map((i) => [0, 1, 2].map((a) => (i & (1 << a) ? hi[a] : lo[a])));
+  const quads = [[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4], [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]];
+  return quads.flatMap(([p, q, r, t]) => [...c[p], ...c[q], ...c[r], ...c[p], ...c[r], ...c[t]]);
+}
+
+/** A ball of radius r round the origin as a triangle soup, in rings of latitude. */
+function sphereSoup(r, rings, segments) {
+  const at = (i, j) => {
+    const th = (Math.PI * i) / rings;
+    const ph = (2 * Math.PI * j) / segments;
+    return [r * Math.sin(th) * Math.cos(ph), r * Math.sin(th) * Math.sin(ph), -r * Math.cos(th)];
+  };
+  const out = [];
+  for (let i = 0; i < rings; i++) {
+    for (let j = 0; j < segments; j++) {
+      const [a, b, c, d] = [at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1)];
+      if (i > 0) out.push(...a, ...c, ...d);
+      if (i < rings - 1) out.push(...a, ...b, ...c);
+    }
+  }
+  return out;
+}
+
+/** Soups as one mesh, the way `Manifold.getMesh()` gives it. */
+function meshOf(soups) {
+  const all = soups.flat();
+  return { vertProperties: Float32Array.from(all), numProp: 3, triVerts: Uint32Array.from({ length: all.length / 3 }, (_, i) => i) };
+}
+
 describe('cells', () => {
   it('a shell pushed 9.6 mm over the line by a tab stays in its own cell', () => {
     expect(cellOf({ min: [-9.6, -20, 0], max: [150, 20, 20] }, [[0], [], []])).toEqual([1, 0, 0]);
@@ -482,14 +545,15 @@ describe('cells', () => {
   });
 
   it('counts the dovetail tabs a cut lends the cells either side, and lays those cells flat', () => {
-    const bounds = { min: [-200, -50, 0], max: [200, 50, 4] };
+    // a plate with something standing on it (too thick overall to be a thin plate): only the cells beside the tabs lie flat
+    const bounds = { min: [-200, -50, 0], max: [200, 50, 30] };
     const cuts = [{ axis: 0, at: -60, reach: [12, 12], w: 2 }, { axis: 0, at: 60 }];
     const { cells } = cellSizes(bounds, cuts);
     expect(cells.map((c) => [c.size[0], c.flat])).toEqual([[140 + 12, 2], [120 + 12, 2], [140, null]]);
     expect(cellFits({ size: [212, 100, 4], flat: 2 }, U)).toBe(false);
     expect(cellFits({ size: [212, 100, 4], flat: null }, U)).toBe(true); // stood on its edge
     // stored cuts without tabs are boxed as before
-    expect(cellSizes(bounds, [{ position: [0, 0, 0], normal: [1, 0, 0] }]).cells.map((c) => c.size)).toEqual([[200, 100, 4], [200, 100, 4]]);
+    expect(cellSizes(bounds, [{ position: [0, 0, 0], normal: [1, 0, 0] }]).cells.map((c) => c.size)).toEqual([[200, 100, 30], [200, 100, 30]]);
   });
 
   it('plans a thin sign lying flat with its tabs counted, and only grids whose pieces all fit', () => {
@@ -517,6 +581,83 @@ describe('cells', () => {
       return { samples, costs: samples.map(() => 0), tabs: samples.map(() => null) };
     } };
     expect(planGrid([1, 0, 0], bar)).toMatchObject({ offsets: [[0], [], []], pieces: [{ size: [150, 40, 20], fits: true }, { size: [150, 40, 20], fits: true }] });
+  });
+
+  it('every box of a thin plate lies flat, joints or not: a sign cut by hand is too big rather than stood on its edge', () => {
+    // 'HELLO WORLD' at 60 mm with no model, cut in the middle: no tabs (letters 1.5 mm thick are glued)
+    const sign = { min: [-294.15, -30.8, 0], max: [294.15, 30.8, 1.5] };
+    const { cells } = cellSizes(sign, [{ position: [0, 0, 0], normal: [1, 0, 0] }]);
+    expect(cells.map((c) => c.flat)).toEqual([2, 2]);
+    expect(cells.map((c) => cellFits(c, U))).toEqual([false, false]);
+    // a plate 4 mm thick held by pins: the same
+    expect(cellSizes({ min: [-200, -50, 0], max: [200, 50, 4] }, [{ axis: 0, at: -60 }]).cells.map((c) => [c.flat, cellFits(c, U)])).toEqual([[2, true], [2, false]]);
+    // a block is free to stand any way
+    expect(cellSizes(bounds300, [{ axis: 0, at: 0 }]).cells.map((c) => c.flat)).toEqual([null, null]);
+  });
+
+  it('keeps the tabs of a plate that a cut along its thickness does not run through: both arms of an L', () => {
+    // an L of two 6 mm plates 300 mm long: its base (thin along z, z 0…6) cut across x, its upright (thin along x) across z
+    const E = [300, 40, 300];
+    const bounds = { min: [0, 0, 0], max: E };
+    const tabsAt = { 0: { below: 6, above: 6, w: 2, span: [0, 6] }, 2: { below: 6, above: 6, w: 0, span: [0, 6] } };
+    const profileOf = (a, k) => {
+      const samples = planSamples(0, 300, k);
+      return { samples, costs: samples.map(() => 0), tabs: samples.map(() => tabsAt[a] ?? null) };
+    };
+    const plan = planGrid([1, 0, 1], { E, U, bounds, profileOf });
+    expect(plan.offsets).toEqual([[150], [], [150]]);
+    // each arm's tabs make the pieces either side 6 mm longer
+    expect(plan.pieces.map((p) => p.size)).toEqual([[156, 40, 156], [156, 40, 156], [156, 40, 156], [156, 40, 156]]);
+    // a cut along z inside the base's thickness would part its tabs into layers: those go (on a printer big enough
+    // for the 297 mm upright)
+    const low = { ...tabsAt, 2: null };
+    const through = planGrid([1, 0, 1], {
+      E, U: [400, 400, 400], bounds,
+      profileOf: (a, k) => {
+        const samples = a === 2 ? [3] : planSamples(0, 300, k);
+        return { samples, costs: samples.map(() => 0), tabs: samples.map(() => low[a] ?? null) };
+      },
+    });
+    expect(through.pieces.map((p) => p.size[0])).toEqual([150, 150, 150, 150]);
+  });
+
+  it('counts only the boxes that hold some of the model, and each piece must lie on something flat', () => {
+    // the same L as two boxes: the box over the corner holds nothing
+    const L = meshOf([boxSoup([0, 0, 0], [300, 40, 6]), boxSoup([0, 0, 6], [6, 40, 300])]);
+    const held = cellSupport(L, [[150], [], [150]]);
+    expect([...held.values()].map((c) => [c.cell.join(''), c.filled])).toEqual([['000', true], ['100', true], ['001', true], ['101', false]]);
+    // the base's half rests on its flat underside, the upright's top on its flat end
+    expect(held.get('1,0,0').rests).toEqual([true, true, true]);
+    expect(held.get('0,0,1').rests[2]).toBe(true);
+    // a box wholly inside the model touches none of its surface, and is a piece all the same
+    const cube = meshOf([boxSoup([0, 0, 0], [30, 30, 30])]);
+    expect(cellSupport(cube, [[10, 20], [10, 20], [10, 20]]).get('1,1,1')).toEqual({ cell: [1, 1, 1], filled: true, rests: [false, false, false] });
+    // a ball's quarter has nothing flat but its cut faces: it may not stand on its pole
+    const ball = meshOf([sphereSoup(60, 24, 48)]);
+    const quarter = cellSupport(ball, [[0], [0], []]).get('0,0,0');
+    expect(quarter).toMatchObject({ filled: true, rests: [false, false, false] });
+    const bed = [105, 105, 124];
+    const profileOf = (a, k) => {
+      const samples = planSamples(-60, 60, k);
+      return { samples, costs: samples.map(() => 0), tabs: samples.map(() => null) };
+    };
+    const options = { E: [120, 120, 120], U: bed, bounds: { min: [-60, -60, -60], max: [60, 60, 60] }, profileOf, support: (by) => cellSupport(ball, by) };
+    // quarters 120 tall fit only standing on the pole; eighths lie on a cut face
+    expect(planGrid([1, 1, 0], options)).toBeNull();
+    expect(planGrid([1, 1, 0], { ...options, stable: false }).pieces).toHaveLength(4);
+    expect(planGrid([1, 1, 1], options).pieces).toHaveLength(8);
+    // the L: three pieces, not four
+    const lPlan = planGrid([1, 0, 1], { E: [300, 40, 300], U, bounds: { min: [0, 0, 0], max: [300, 40, 300] }, support: (by) => cellSupport(L, by),
+      profileOf: (a, k) => {
+        const samples = planSamples(0, 300, k);
+        return { samples, costs: samples.map(() => 0), tabs: samples.map(() => null) };
+      } });
+    expect(lPlan.pieces.map((p) => p.cell)).toEqual([[0, 0, 0], [1, 0, 0], [0, 0, 1]]);
+  });
+
+  it('looks for a plate staying flat half way along each neighbour and most of the way to its end', () => {
+    expect(flatProbes(0, -100, 60)).toEqual([-50, -90, 30, 54]);
+    expect(flatProbes(0, -5, 60)).toEqual([30, 54]); // a side under 10 mm is not looked at
   });
 
   it('+ Cut halves the longest piece across its longest side', () => {
@@ -656,6 +797,29 @@ describe('chooseOrientation', () => {
     expect(r).toMatchObject({ fits: false, down: '-z', yaw: 0 });
     expect(r.notes).toEqual([expect.objectContaining({ level: 'warn', code: 'PIECE_TOO_BIG', pieceIndex: 2, size: [300, 40, 20] })]);
     expect(r.notes[0].text).toBe('Piece 2 (300 × 40 × 20 mm) doesn\'t fit your printer in any position – it has room for 210 × 210 × 249 mm.');
+  });
+
+  it('says when a piece fits only resting on a point of a curve', () => {
+    // a ball's quarter: nothing flat but its two cut faces, which are too long to lie on
+    const none = Object.fromEntries(Object.keys(DIRECTIONS).map((d) => [d, { bed: 0, support: 7000 }]));
+    const quarter = boxStats([120, 120, 240], ['+x', '+y'], { ...none, '+x': { bed: 14000, support: 0 }, '+y': { bed: 14000, support: 0 } });
+    const r = chooseOrientation(quarter, U, 'auto', { pieceIndex: 3 });
+    expect(r).toMatchObject({ fits: true, down: '-z', lies: 'on a curve' });
+    expect(r.notes).toEqual([expect.objectContaining({ level: 'warn', code: 'PIECE_UNSTABLE', pieceIndex: 3 })]);
+    expect(r.notes[0].text).toBe('Piece 3 has nothing flat to stand on where it fits your printer – it rests on a curve or an edge and needs supports. Another cut through it gives it a flat face to lie on.');
+  });
+
+  it('judges a piece with the loose triangles that go in its file', () => {
+    // a 200 mm bar half with a flap of unrepaired triangles 25 mm past its end: 225 mm will not lie straight
+    const half = boxStats([200, 40, 20], ['-x']);
+    const flap = [200, 0, 10, 225, 0, 10, 225, 40, 10];
+    const withFlap = statsWithSoup(half, flap);
+    expect(withFlap.dims).toEqual([225, 40, 20]);
+    expect(withFlap.dirs['-z'].extent).toBe(20);
+    expect(withFlap.dirs['+x'].extent).toBe(225);
+    expect(chooseOrientation(half, U)).toMatchObject({ yaw: 0, size: [200, 40, 20] });
+    expect(chooseOrientation(withFlap, U)).toMatchObject({ fits: true, yaw: 34, size: [225, 40, 20] });
+    expect(statsWithSoup(half, null)).toBe(half);
   });
 
   it('prints from the model’s own extremes, whatever the piece’s position', () => {
@@ -890,6 +1054,22 @@ describe('files and the glue sheet', () => {
     expect(text).toContain('“Logo” – prints separately; glue it on after the pieces');
     expect(text).toContain('GLUE – in this order');
     expect(text).toContain('1. Cut A: glue 2 pins into piece 1, a thin film on the face, push piece 2 on. Hold 1 minute.');
+  });
+});
+
+describe('the glue sheet with nothing to glue', () => {
+  it('cuts that run only between letters join nothing: no dry fit, no glue steps', () => {
+    const text = howToGlueText({
+      name: 'sign',
+      pieces: [1, 2, 3].map((index) => ({ index, cell: [index - 1, 0, 0], size: [190, 61.6, 1.5], lies: 'flat as modelled', yaw: 0, fits: true, shells: 4 })),
+      seams: [],
+      bed: [210, 210, 249],
+    });
+    expect(text).not.toContain('DRY-FIT');
+    expect(text).not.toContain('GLUE –');
+    expect(text).not.toContain('fit test');
+    expect(text).toContain('NOTHING TO GLUE');
+    expect(text.trimEnd().split('\n').at(-1)).toBe('  The cuts run through gaps, so no two pieces touch. Lay them out as in the model – on a backing board to keep them together.');
   });
 });
 

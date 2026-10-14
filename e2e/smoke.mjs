@@ -99,7 +99,38 @@ try {
       if (type === 'webgl' || type === 'webgl2') attrs = { ...attrs, preserveDrawingBuffer: true };
       return getContext.call(this, type, attrs);
     };
+    // Let the test see how the engine measured the cuts (window.__engine.measures: whether each measure was
+    // an estimate, made without building the final result), and hold back the answers to "Fit to my printer"
+    // plans (window.__engine.hold) so that it can open another model while one is being planned.
+    const Native = window.Worker;
+    const engine = (window.__engine = { fits: new Set(), measures: new Map(), hold: false, held: [] });
+    window.Worker = class extends Native {
+      postMessage(message, transfer) {
+        if (message?.type === 'split.plan' && message.mode === 'fit') engine.fits.add(message.id);
+        if (message?.type === 'split.plan' && message.mode === 'measure') engine.measures.set(message.id, null);
+        return super.postMessage(message, transfer);
+      }
+      set onmessage(listener) {
+        super.onmessage =
+          listener &&
+          ((event) => {
+            const { id, type, result } = event.data ?? {};
+            if (engine.measures.has(id) && type !== 'progress') engine.measures.set(id, { estimate: result?.estimate === true });
+            if (engine.hold && engine.fits.has(id) && type !== 'progress') engine.held.push(() => listener.call(this, event));
+            else listener.call(this, event);
+          });
+      }
+      get onmessage() {
+        return super.onmessage;
+      }
+    };
   });
+  /** Hand the page the plans held back, in order. */
+  const releasePlans = () =>
+    page.evaluate(() => {
+      window.__engine.hold = false;
+      window.__engine.held.splice(0).forEach((deliver) => deliver());
+    });
   const problems = [];
   page.on('pageerror', (e) => problems.push(`pageerror: ${e.message}`));
   page.on('console', (m) => m.type() === 'error' && problems.push(`console: ${m.text()}`));
@@ -705,6 +736,28 @@ try {
         return { cool, warm };
       });
 
+    /** Pixels of the view in the amber of unrepaired triangles (lit, so by hue; not the salmon or khaki pieces). */
+    const amberPixels = () =>
+      page.evaluate(() => {
+        const c = document.querySelector('#stage canvas');
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        let n = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          const [r, g, b] = [d[i], d[i + 1], d[i + 2]];
+          const max = Math.max(r, g, b);
+          const span = max - Math.min(r, g, b);
+          if (max < 60 || span < 0.5 * max) continue; // dark or greyish
+          const h = ((max === r ? (g - b) / span : max === g ? (b - r) / span + 2 : (r - g) / span + 4) * 60 + 360) % 360;
+          if (h >= 32 && h <= 48 && r > b + 80) n++;
+        }
+        return n;
+      });
+
     /** The split card's notes, one line. */
     const splitNotes = async () => (await page.locator('#splitNotes li').allInnerTexts()).join(' / ');
     /** Wait for the cuts to be measured again: that waits for the edits to pause (a second for text). */
@@ -818,6 +871,33 @@ try {
     check(zip.entries['long-bar-text-how-to-glue.txt']?.includes('1A ↔ 2A'), 'the glue sheet pairs the matching labels');
     check(/^Downloaded long-bar-text-2-pieces\.zip .*: 2 pieces, 3 pins/.test(await status()), 'the status line says what the zip holds', await status());
 
+    // on a bigger printer the bar fits whole: Fit to my printer takes the cut away again, as one undo step
+    await page.selectOption('#bedPreset', 'coreonel');
+    await idle();
+    await page.waitForFunction(() => !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 60000 });
+    await idle();
+    check(/^Cut into 2 pieces/.test(await status()), 'the status line sums up the pieces', (await status()).split('\n')[0]);
+    await page.click('#splitFitBtn');
+    await idle();
+    await page.waitForTimeout(400); // the result of the whole bar, which says nothing
+    await idle();
+    const fitsWhole = { cuts: await page.locator('#cutList li').count(), notes: await splitNotes(), label: await page.locator('#downloadBtn').innerText() };
+    check(
+      fitsWhole.cuts === 0 && /already fits your printer/.test(fitsWhole.notes) && fitsWhole.label === 'Download STL',
+      'Fit to my printer on a bigger printer takes the cut away: the bar fits whole',
+      JSON.stringify(fitsWhole),
+    );
+    check(!/Cut into|Glue matching/.test(await status()), 'and the status line no longer describes pieces', (await status()).replace(/\n/g, ' | '));
+    await page.click('#undoBtn');
+    await idle();
+    check(
+      (await page.locator('#cutList li').count()) === 1 && Math.abs(Number(await page.inputValue('#cutList input[data-cut-at]'))) < 0.01,
+      'one Undo brings the cut back',
+      `${await page.locator('#cutList li').count()} cuts`,
+    );
+    await page.selectOption('#bedPreset', 'generic');
+    await idle();
+
     await page.fill('#cutList input[data-cut-at]', '40');
     await page.dispatchEvent('#cutList input[data-cut-at]', 'change');
     await idle();
@@ -849,6 +929,9 @@ try {
     await page.dispatchEvent('#posX', 'change');
     await measured();
     check(/through “O”/.test(await page.locator('#cutList .meta').innerText()), 'moving the text onto a cut names it in the cut\'s row', await page.locator('#cutList .meta').innerText());
+    // the measure after a text edit is cheap: it never builds the final result, which would hold up the next keystroke's preview
+    const lastMeasure = await page.evaluate(() => [...window.__engine.measures.values()].filter(Boolean).at(-1));
+    check(lastMeasure?.estimate === true, 'the cuts are measured after a text edit without building the final result', JSON.stringify(lastMeasure));
     await page.fill('#posX', '0');
     await page.dispatchEvent('#posX', 'change');
     await measured();
@@ -900,11 +983,25 @@ try {
     await page.click('#itemList li:first-child');
     await idle();
 
-    // an L-shape cut into four boxes leaves the corner one empty: three pieces, before they are worked out too
+    // a fit still being planned when another model is opened was for the model before: the new one gets none of it
     const ell = Manifold.union(Manifold.cube([300, 40, 10]), Manifold.cube([40, 300, 10]));
     const ellFile = writeFixture('ell.stl', soupOf(ell));
     ell.delete();
-    await openStl(ellFile, 'ell');
+    await page.evaluate(() => (window.__engine.hold = true));
+    await page.click('#splitFitBtn');
+    await page.waitForFunction(() => window.__engine.held.length > 0, null, { timeout: 60000 });
+    await page.setInputFiles('#stlFile', ellFile);
+    await page.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('ell:'), null, { timeout: 60000 });
+    await releasePlans();
+    await idle();
+    const raced = { cuts: await page.locator('#cutList li').count(), shown: await page.isChecked('#resultToggle'), label: await page.locator('#downloadBtn').innerText() };
+    check(
+      raced.cuts === 0 && !raced.shown && raced.label === 'Download STL',
+      'a fit planned for the model before is not put on one opened while it ran',
+      JSON.stringify(raced),
+    );
+
+    // an L-shape cut into four boxes leaves the corner one empty: three pieces, before they are worked out too
     await page.click('#addCutBtn');
     await idle();
     await page.click('#addCutBtn');
@@ -915,6 +1012,86 @@ try {
       'an L cut into four boxes counts the three with something in them',
       `${await page.locator('#downloadBtn').innerText()} / ${ellRows.join(' / ')}`,
     );
+
+    // the toast's Undo takes back the removal it names, and goes once something else is changed (its Undo would take that back instead)
+    const cutCount = () => page.locator('#cutList li').count();
+    await page.click('#cutList li:nth-child(2) .cut-remove');
+    await idle();
+    check(/Removed cut B/.test(await page.locator('#toastText').innerText()) && !(await page.locator('#toast').isHidden()), 'removing a cut offers to undo it in a toast');
+    await page.click('#toastAction');
+    await idle();
+    check((await cutCount()) === 2, "the toast's Undo brings the cut back", `${await cutCount()} cuts`);
+    await page.click('#cutList li:nth-child(2) .cut-remove');
+    await idle();
+    const atBefore = await page.inputValue('#cutList input[data-cut-at]');
+    await page.click('#cutList li:first-child .badge');
+    await page.keyboard.press('ArrowRight');
+    await idle();
+    check(
+      (await page.locator('#toast').isHidden()) && (await page.inputValue('#cutList input[data-cut-at]')) !== atBefore,
+      'moving the other cut takes the "Removed cut B" toast away',
+      `toast ${(await page.locator('#toast').isHidden()) ? 'hidden' : `shown: ${await page.locator('#toastText').innerText()}`}`,
+    );
+    await page.keyboard.press('Control+z');
+    await page.keyboard.press('Control+z');
+    await idle();
+    check((await cutCount()) === 2 && (await page.inputValue('#cutList input[data-cut-at]')) === atBefore, 'and Ctrl+Z twice undoes the move, then the removal', `${await cutCount()} cuts`);
+    await page.click('#splitClearBtn');
+    await idle();
+
+    // a solid cube cut in three every way has a box in its middle that no surface reaches: it is a piece all the same
+    const cube = Manifold.cube([60, 60, 60], true);
+    const cubeFile = writeFixture('cube.stl', soupOf(cube));
+    cube.delete();
+    await openStl(cubeFile, 'cube');
+    for (let i = 0; i < 6; i++) {
+      await page.click('#addCutBtn');
+      await idle();
+    }
+    await measured();
+    const cubeRows = await page.locator('#pieceList li.predicted').count();
+    check(
+      (await page.locator('#downloadBtn').innerText()) === 'Download 27 pieces (.zip)' && cubeRows === 27,
+      'a cube cut in three every way counts its middle box too: 27 pieces',
+      `${await page.locator('#downloadBtn').innerText()} / ${cubeRows} boxes`,
+    );
+    await page.click('#splitClearBtn');
+    await idle();
+
+    // a model with unrepaired triangles (two open sheets over a bar) keeps them amber in the coloured preview of the pieces
+    const amberBar = Manifold.cube([160, 40, 10], true);
+    const sheets = [];
+    for (const x0 of [-75, 35]) sheets.push(x0, -15, 7, x0 + 40, -15, 7, x0 + 40, 15, 7, x0, -15, 7, x0 + 40, 15, 7, x0, 15, 7);
+    const amberFile = writeFixture('unrepaired.stl', new Float32Array([...soupOf(amberBar), ...sheets]));
+    amberBar.delete();
+    await openStl(amberFile, 'unrepaired');
+    const amberWhole = await amberPixels();
+    await page.click('#addCutBtn');
+    await idle();
+    await page.keyboard.press('Escape'); // let go of the cut: only its plane stays on screen
+    await idle();
+    const amberCut = await amberPixels();
+    await page.screenshot({ path: path.join(out, '8-split-unrepaired.png') });
+    check(
+      !(await page.locator('#legendPass').isHidden()) && amberWhole > 2000 && amberCut > amberWhole / 2,
+      'unrepaired triangles stay amber once the model is cut',
+      `${amberWhole} amber pixels whole, ${amberCut} cut`,
+    );
+    await page.click('#splitClearBtn');
+    await idle();
+
+    // a thin sign prints lying flat, with dovetail tabs that make its pieces longer: the model's note offers as many pieces as Fit makes
+    const sign = Manifold.cube([400, 100, 5], true);
+    const signFile = writeFixture('sign.stl', soupOf(sign));
+    sign.delete();
+    await openStl(signFile, 'sign');
+    const offer = (await page.locator('#modelNotes button').allInnerTexts()).join();
+    await page.click('#modelNotes button');
+    await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
+    await idle();
+    const signPieces = await page.locator('#pieceList li').count();
+    check(offer === `Split into ${signPieces} pieces` && signPieces === 3, 'a thin sign is offered the pieces Fit makes of it lying flat', `offered "${offer}", Fit made ${signPieces}`);
+    await page.uncheck('#resultToggle');
     await page.click('#splitClearBtn');
     await idle();
 
@@ -1005,6 +1182,10 @@ try {
     await measured();
     const meta = await page.locator('#cutList .meta').innerText();
     check(/nothing to join/.test(meta) && !/pins/.test(meta), 'a cut between the letters of a sign says there is nothing to join, not pins', meta);
+    const statusBefore = await status();
+    await page.click('#splitFitTestBtn');
+    await page.waitForFunction((was) => document.querySelector('#status').innerText !== was, statusBefore, { timeout: 60000 });
+    check(/nothing is joined/.test(await status()), 'and its fit test says there is nothing to try: nothing is joined', await status());
     const maxBefore = Number(await page.locator('#cutList input[data-cut-at]').getAttribute('max'));
     await page.click('#itemList li:first-child');
     await idle();

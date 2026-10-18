@@ -10,7 +10,7 @@ import { unzipSync, strFromU8 } from 'three/examples/jsm/libs/fflate.module.js';
 import { initManifold, manifold } from '../src/manifold.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold, manifoldToSoup } from '../src/mesh.js';
-import { lanternSolid } from '../tests/lanternFixture.js';
+import { box as boxAt, lanternSolid } from '../tests/lanternFixture.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const out = path.join(root, 'e2e', 'out');
@@ -1627,10 +1627,17 @@ try {
       await page.click('#cutList li:first-child label.cut-apart');
       await measured();
       const ticked = await apartRow();
+      const holdChoices = await page.evaluate(() => [...document.querySelectorAll('#cutList li:first-child .cut-hold label')].map((l) => [l.textContent, l.title]));
       check(
-        ticked.apart && ticked.ticked && ticked.holds && ticked.hold === 'snap' && /^1,728 mm² · comes apart$/.test(ticked.meta),
-        'ticking Comes apart: the row turns teal, Clicks on is chosen and the row says the cut comes apart',
-        JSON.stringify(ticked),
+        ticked.apart && ticked.ticked && ticked.holds && ticked.hold === 'lock' && /^1,728 mm² · comes apart$/.test(ticked.meta) &&
+          JSON.stringify(holdChoices) === JSON.stringify([
+            ['Locks', 'Holds firmly – comes off only with a firm pull'],
+            ['Clicks on', 'Holds when carried – pulls off by hand'],
+            ['Light click', 'A gentle click'],
+            ['Lifts off', 'No clips – just sits on'],
+          ]),
+        'ticking Comes apart: the row turns teal, Locks – first of the holds, each with its tooltip – is chosen and the row says the cut comes apart',
+        `${JSON.stringify(ticked)} ${JSON.stringify(holdChoices)}`,
       );
       const teal = await cutColours();
       const legend = { apart: !(await page.locator('#legendApart').isHidden()), cut: !(await page.locator('#legendCut').isHidden()) };
@@ -1657,8 +1664,8 @@ try {
       await idle();
       const redone = await apartRow();
       check(
-        !undone.apart && !undone.ticked && !undone.holds && redone.apart && redone.ticked && redone.hold === 'snap',
-        'Ctrl+Z unticks it and Ctrl+Y ticks it again',
+        !undone.apart && !undone.ticked && !undone.holds && redone.apart && redone.ticked && redone.hold === 'lock',
+        'Ctrl+Z unticks it and Ctrl+Y ticks it again, locking',
         `${JSON.stringify(undone)} / ${JSON.stringify(redone)}`,
       );
       // its handle in the view lights up under the pointer in a lighter teal, as a glued cut's does in a lighter violet
@@ -1718,11 +1725,12 @@ try {
       );
       check(
         /Cut A comes apart – don't glue it\./.test(await splitNotes()) &&
-          (await splitNotes()).includes('Cut A comes apart: the top (piece 2) clicks onto a 6 mm lip on piece 1 – 4 clips hold it, and it pulls off again by hand.'),
-        'the notes say the top clicks onto a 6 mm lip with 4 clips, and not to glue it',
+          (await splitNotes()).includes('Cut A comes apart: the top (piece 2) locks onto a 6 mm lip – 4 clips hold it firmly. Press it on until it clicks; to take it off, pull hard.') &&
+          !/may not hold up|lever|gap/.test(await splitNotes()),
+        'the notes say the top locks onto a 6 mm lip with 4 clips, that a hard pull takes it off (nothing to lever at), and not to glue it',
         await splitNotes(),
       );
-      check(/· comes apart: clicks on \(4 clips\)$/.test((await apartRow()).meta), 'the row says how it holds once the pieces are worked out', (await apartRow()).meta);
+      check(/· comes apart: locks \(4 clips\)$/.test((await apartRow()).meta), 'the row says how it holds once the pieces are worked out', (await apartRow()).meta);
       // the lid lifted well off the lip, for the screenshot, with the offer made when the lantern was opened out of the way
       await page.fill('#spreadRange', '2');
       await page.dispatchEvent('#spreadRange', 'input');
@@ -1743,9 +1751,37 @@ try {
         lidNames.join(', '),
       );
       check(
-        sheet.includes('Do not glue cut A: it comes apart. Press the top on until it clicks.') && /PUT TOGETHER/.test(sheet) && !/GLUE –/.test(sheet),
-        'the sheet says not to glue cut A but press the top on until it clicks, with nothing glued',
-        sheet.split('\n').filter((l) => /PUT TOGETHER|Do not glue|GLUE/.test(l)).join(' | '),
+        sheet.includes('Do not glue cut A: it comes apart. Press the top on until it clicks – it locks; pull hard to open it. It goes on one way round only – turn it until it drops onto the lip.') &&
+          sheet.includes('Clips are 30 mm bridges over a slot') && /PUT TOGETHER/.test(sheet) && !/GLUE –|lever/.test(sheet),
+        'the sheet says not to glue cut A but press the top on until it locks and pull hard to open it, with nothing glued',
+        sheet.split('\n').filter((l) => /PUT TOGETHER|Do not glue|GLUE|bridges/.test(l)).join(' | '),
+      );
+      await page.waitForTimeout(1000); // Chromium lets a page start about ten downloads a second
+      const lockTest = await fitTest('lantern-lock-fit-test.stl');
+      check(
+        lockTest.shells.length === 2 &&
+          /Print it: the lid should lock onto the box and come off only with a firm pull – too stiff to open, raise the clearance by 0\.05 mm; too loose, lower it\.$/.test(lockTest.status),
+        "its fit test's lid locks on, and the status says it should take a firm pull to come off",
+        lockTest.status,
+      );
+
+      // Clicks on instead, and back with Ctrl+Z
+      await page.click('#cutList li:first-child .cut-hold label:has-text("Clicks on")');
+      await piecesAgain();
+      const clicking = { row: await apartRow(), notes: await splitNotes() };
+      await page.keyboard.press('Control+z');
+      await piecesAgain();
+      const relocked = await apartRow();
+      await page.keyboard.press('Control+y');
+      await piecesAgain();
+      const reclicked = await apartRow();
+      check(
+        clicking.row.hold === 'snap' && /· comes apart: clicks on \(4 clips\)$/.test(clicking.row.meta) &&
+          clicking.notes.includes('Cut A comes apart: the top (piece 2) clicks onto a 6 mm lip on piece 1 – 4 clips hold it, and it pulls off again by hand.') &&
+          relocked.hold === 'lock' && /· comes apart: locks \(4 clips\)$/.test(relocked.meta) &&
+          reclicked.hold === 'snap' && /· comes apart: clicks on \(4 clips\)$/.test(reclicked.meta),
+        'Clicks on: the row and the notes say the top clicks on and pulls off by hand; Ctrl+Z locks it again, Ctrl+Y clicks it on',
+        `${JSON.stringify(clicking.row)} / ${relocked.meta} / ${reclicked.meta}`,
       );
 
       // 2 mm higher the roof leaves room for a 4.5 mm lip only, with no clips: the note offers to move the cut back
@@ -1907,6 +1943,49 @@ try {
         'a glued cut with one that comes apart in the same place: its row says it comes apart, not pins',
         JSON.stringify(merged),
       );
+      await page.click('#splitClearBtn');
+      await idle();
+
+      // a lantern with a solid base, about 650 g below the cut: Clicks on may not hold it up, and the note's button sets
+      // the cut to Locks, which does
+      const base = boxAt([-46, -46, 3], [46, 46, 40]);
+      const plain = lanternSolid();
+      const weighted = plain.add(base);
+      const heavyFile = writeFixture('lantern-heavy.stl', soupOf(weighted));
+      [base, plain, weighted].forEach((m) => m.delete());
+      await page.waitForTimeout(1000);
+      await openStl(heavyFile, 'lantern-heavy');
+      await page.click('#addCutBtn');
+      await idle();
+      await page.fill('#cutList input[data-cut-at]', '190');
+      await page.dispatchEvent('#cutList input[data-cut-at]', 'change');
+      await measured();
+      await page.click('#cutList li:first-child label.cut-apart');
+      await measured();
+      await page.check('#resultToggle');
+      await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
+      await piecesAgain();
+      const lockedHeavy = { row: await apartRow(), notes: await splitNotes() };
+      await page.click('#cutList li:first-child .cut-hold label:has-text("Clicks on")');
+      await piecesAgain();
+      const tooHeavy = page.locator('#splitNotes li', { hasText: 'may not hold up' });
+      const tooHeavyText = (await tooHeavy.count()) ? await tooHeavy.locator('.text').innerText() : await splitNotes();
+      const tooHeavyLabel = (await tooHeavy.locator('button').count()) ? await tooHeavy.locator('button').innerText() : '';
+      check(
+        lockedHeavy.row.hold === 'lock' && !/may not hold up/.test(lockedHeavy.notes) &&
+          /^Cut A's clips may not hold up what hangs below it \(about 650 g\) – carry the model by its base, not its top\.$/.test(tooHeavyText) &&
+          tooHeavyLabel === 'Use Locks',
+        'with a heavy base Locks holds it up, but Clicks on may not, and its note offers Locks',
+        `${lockedHeavy.row.hold} | ${tooHeavyText} [${tooHeavyLabel}]`,
+      );
+      if (tooHeavyLabel) await tooHeavy.locator('button').click();
+      await piecesAgain();
+      check(
+        (await apartRow()).hold === 'lock' && /· comes apart: locks \(4 clips\)$/.test((await apartRow()).meta) && !/may not hold up/.test(await splitNotes()),
+        'its button sets the cut to Locks, and the warning goes',
+        `${(await apartRow()).hold} · ${(await apartRow()).meta} | ${await splitNotes()}`,
+      );
+      await page.uncheck('#resultToggle');
       await page.click('#splitClearBtn');
       await idle();
 

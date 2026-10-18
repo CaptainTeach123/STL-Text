@@ -17,7 +17,7 @@ import {
   cutPlane, fitsBed, glueFileName, gridCandidates, howToGlueText, layPieces, letterFor, normaliseSplit, partFileName, pieceFileName, pinsFileName,
   planCost, planGrid, planSamples, plateAxis, safeFileName, slabAxis, sizesFor, smallPieceNotes, soupCells, splitActive, splitNote, usableBed,
   zipFileName, cellSupport, flatProbes, outlineColumns, textNotes, baseAxis, modelPlates, layGrown, pegAllowance, pegMales, pegSizeOf, pegSizesFor,
-  pegSides, cellFits, uprightPegNotes, apartMales, cellSizes, clipHold, lipSides, APART_HOLDS, LIP_ALLOWANCE,
+  pegSides, cellFits, uprightPegNotes, apartMales, cellSizes, clipHold, clipShape, lipSides, APART_HOLDS, LIP_ALLOWANCE,
 } from './split.js';
 import {
   buildSplitDisplay, clearSplitCaches, cutPieces, drillPiece, fitTestCoupon, layoutSplit, partedSolids, pinAt, pinSheet, pinSpares, pinsPerSheet,
@@ -2518,7 +2518,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * An `APART_HEAVY` note for each Z cut whose clips may not hold up what
    * hangs below it when the model is carried by its top: their hold
    * (`clipHold`, a weak print's) under twice the weight of every piece below
-   * the cut, in PLA. Worked out, not measured, as the hold is.
+   * the cut, in PLA. Worked out, not measured, as the hold is. `firmer` the
+   * gentlest firmer hold whose clips would hold it, where one would.
    */
   function heavyNotes(cuts, lips, laid) {
     const notes = [];
@@ -2527,11 +2528,19 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       if (!c.apart || c.axis !== 2) continue;
       const clipped = lips.filter((l) => l.cutId === c.id && l.clips > 0 && l.i > 0);
       if (!clipped.length) continue;
-      const hold = clipped.reduce((sum, l) => sum + clipHold(l.clips, { t: l.t, i: l.i }), 0);
+      // each lip's own clips, as `clipShape` makes them on its tongue: a lock's are stiffer bridges with a steeper catch,
+      // and a wide nozzle's are thinned to a 0.4 mm nozzle's
+      const holdOf = (hold) => clipped.reduce((sum, l) => sum + clipHold(l.clips, clipShape(hold, l.c, l.t) ?? {}), 0);
+      const hold = clipped.reduce((sum, l) => sum + clipHold(l.clips, { ...clipShape(l.hold, l.c, l.t), i: l.i }), 0);
       const below = along.indexOf(c.at);
       const grams = laid.filter((p) => p.cell[2] <= below).reduce((sum, p) => sum + (p.volume ?? 0), 0) * PLA_DENSITY;
-      if (hold < 2 * (grams / 1000) * GRAVITY) {
-        notes.push(splitNote('APART_HEAVY', { letter: c.letter, cutId: c.id, weight: Math.round(grams), hold: Math.round(hold * 10) / 10 }));
+      const needs = 2 * (grams / 1000) * GRAVITY;
+      if (hold < needs) {
+        // the holds firmer than this one, gentlest first: Clicks on for a light click where that is enough, else Locks
+        const firmer = APART_HOLDS.slice(0, Math.max(0, APART_HOLDS.indexOf(c.apart.hold))).reverse().find((h) => holdOf(h) >= needs);
+        notes.push(splitNote('APART_HEAVY', {
+          letter: c.letter, cutId: c.id, weight: Math.round(grams), hold: Math.round(hold * 10) / 10, ...(firmer ? { firmer } : {}),
+        }));
       }
     }
     return notes;
@@ -2785,9 +2794,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       add(partFileName(name, k + 1, p.name), manifoldToSoup(p.local), { kind: 'part', id: p.id, size, fits: fitsBed(size, U, { flat: 2 }).fits });
     });
     const assembly = assemblySteps({ pieces: split.pieces, seams: drill.layout.seams });
+    // the clips' bridges as built: a wide nozzle's lock has longer ones
+    const bridges = [...new Set((drill.layout.lips ?? []).filter((l) => l.clips > 0 && l.i > 0).map((l) => clipShape(l.hold, l.c, l.t).span))];
     const text = howToGlueText({
       name, pieces: split.pieces, seams: drill.layout.seams, pins: split.pins, parts: final.separate.map((p) => ({ name: p.name })),
-      clearance: spec.clearance, bed: U, printer, steps: assembly,
+      clearance: spec.clearance, bed: U, printer, steps: assembly, ...(bridges.length ? { bridges } : {}),
     });
     const glue = glueFileName(name);
     files.push({ name: glue.replace(/\.txt$/, ''), file: glue, kind: 'text', text });

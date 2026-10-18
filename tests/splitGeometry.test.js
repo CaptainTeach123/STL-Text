@@ -1,7 +1,8 @@
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
 import {
-  AXES, FILAMENT, PIN_DIAMETERS, TO_PLANE, apartMales, applyMat4, chooseOrientation, isSymmetric, normaliseSplit, pegMales, pegSizesFor, sizesFor,
+  AXES, CLIP, FILAMENT, LIP, PIN_DIAMETERS, TO_PLANE, apartMales, applyMat4, chooseOrientation, clipHold, clipShape, isSymmetric, normaliseSplit, pegMales,
+  pegSizesFor, sizesFor,
 } from '../src/split.js';
 import {
   bandFor,
@@ -1166,7 +1167,7 @@ describe('the pieces view', () => {
  * lie on `bed`, and the piece that carries each lip is split.js's choice (`apartMales`), or the one on side `male` (0
  * the one below the cut) when asked. `pairs` are what the layout asked about, with both sides' lips.
  */
-function apartSplit(solid, list, { hold = 'snap', clearance = 0.15, joint = 'auto', orient = null, male = null, bed = BED, labels = false, progress = null } = {}) {
+function apartSplit(solid, list, { hold = 'snap', clearance = 0.15, joint = 'auto', orient = null, male = null, bed = BED, labels = false, progress = null, nozzle = 0.4 } = {}) {
   const stored = list.map(([axis, at, apart = true], i) => {
     const position = [0, 0, 0];
     const normal = [0, 0, 0];
@@ -1187,6 +1188,7 @@ function apartSplit(solid, list, { hold = 'snap', clearance = 0.15, joint = 'aut
   const chooser = apartMales(pieces, bed, spec.orient);
   const side = (pair, k) => ({ male: k, piece: k === 0 ? pair.lo : pair.hi, down: `${k === 0 ? '-' : '+'}${AXES[pair.axis]}` });
   const layout = layoutSplit(solid, cuts, pieces, spec, {
+    nozzle,
     joints: plan.joints,
     tabs: plan.tabs,
     font: labels ? font : null,
@@ -1540,6 +1542,293 @@ describe('take-apart lips', () => {
     expect(near(lift(parts[k], lid, [0, 0, 0.25]), 0.103, 0.01)).toBe(true);
     // with pins too, they come first in the row
     expect(shells(own(fitTestCoupon({ clearance: 0.15 }, 0.4, { apart: 'lift' })))).toHaveLength(5);
+  });
+});
+
+/**
+ * The faces of a solid that look down steeper than 45° from vertical as it prints (+z up, those on the bed left out),
+ * from its facets: coplanar facets that share an edge joined into one face, each with how far it reaches out over
+ * the air – its extent along the way it looks (its normal's level part), or across a flat ceiling its narrowest width.
+ */
+function downFaces(solid) {
+  const { vertProperties: P, numProp: n, triVerts: T } = solid.getMesh();
+  const at = (i) => [P[i * n], P[i * n + 1], P[i * n + 2]];
+  let bed = Infinity;
+  for (let i = 0; i < P.length / n; i++) bed = Math.min(bed, P[i * n + 2]);
+  const tris = [];
+  for (let t = 0; t < T.length; t += 3) {
+    const pts = [T[t], T[t + 1], T[t + 2]].map(at);
+    const u = pts[1].map((x, k) => x - pts[0][k]);
+    const w = pts[2].map((x, k) => x - pts[0][k]);
+    const nn = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+    const len = Math.hypot(...nn);
+    if (!(len > 1e-12) || nn[2] / len > -Math.SQRT1_2 - 1e-6 || Math.max(...pts.map((q) => q[2])) <= bed + 1e-4) continue;
+    tris.push({ n: nn.map((x) => x / len), pts });
+  }
+  const parent = tris.map((_, i) => i);
+  const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  const key = (q) => q.map((x) => x.toFixed(5)).join(',');
+  const edges = new Map();
+  tris.forEach((t, i) => {
+    for (let k = 0; k < 3; k++) {
+      const e = [key(t.pts[k]), key(t.pts[(k + 1) % 3])].sort().join('|');
+      edges.set(e, [...(edges.get(e) ?? []), i]);
+    }
+  });
+  for (const list of edges.values()) {
+    for (const a of list) for (const b of list) if (a < b && tris[a].n.every((q, k) => Math.abs(q - tris[b].n[k]) < 1e-6)) parent[find(a)] = find(b);
+  }
+  const groups = new Map();
+  tris.forEach((t, i) => {
+    const g = groups.get(find(i)) ?? { n: t.n, pts: [] };
+    g.pts.push(...t.pts);
+    groups.set(find(i), g);
+  });
+  const extent = (pts, d) => {
+    const s = pts.map((q) => q[0] * d[0] + q[1] * d[1]);
+    return Math.max(...s) - Math.min(...s);
+  };
+  return [...groups.values()].map((g) => {
+    const h = Math.hypot(g.n[0], g.n[1]);
+    const flat = !(h > 1e-6);
+    const reach = flat
+      ? Math.min(...Array.from({ length: 180 }, (_, deg) => extent(g.pts, [Math.cos((deg * Math.PI) / 180), Math.sin((deg * Math.PI) / 180)])))
+      : extent(g.pts, [g.n[0] / h, g.n[1] / h]);
+    const z = g.pts.map((q) => q[2]);
+    return { tilt: +((Math.acos(-g.n[2]) * 180) / Math.PI).toFixed(2), reach: +reach.toFixed(4), z: [+Math.min(...z).toFixed(3), +Math.max(...z).toFixed(3)], flat };
+  });
+}
+
+/**
+ * The faces of `b` that look down steeper than 45° and that `a` hasn't (`downFaces`), told apart by their tilt, height
+ * and reach: the same face cut up into other facets is still the same face.
+ */
+function moreDownFaces(a, b) {
+  const k = (f) => JSON.stringify([f.tilt, f.reach, f.z]);
+  const had = new Map();
+  for (const f of downFaces(a)) had.set(k(f), (had.get(k(f)) ?? 0) + 1);
+  return downFaces(b).filter((f) => {
+    const n = had.get(k(f)) ?? 0;
+    had.set(k(f), n - 1);
+    return n <= 0;
+  });
+}
+
+/** A clip's section 8 mm from its catch, from the built tongue (plane frame): its second moment for bending in and its farthest fibre from where it bends. */
+function clipSection(tongue, w) {
+  const { p: m, dir, out } = w.chord;
+  const q = [m[0] - 8 * dir[0], m[1] - 8 * dir[1]];
+  const slab = own(tongue.intersect(own(own(own(wasm.Manifold.cube([0.01, 12, 30], true)).rotate([0, 0, (Math.atan2(dir[1], dir[0]) * 180) / Math.PI])).translate([q[0], q[1], 3]))));
+  let A = 0;
+  let S = 0;
+  let I0 = 0;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (let z = 0.005; z < 6; z += 0.01) {
+    const across = own(slab.slice(z)).toPolygons().flat().map(([x, y]) => (x - q[0]) * out[0] + (y - q[1]) * out[1]);
+    if (!across.length) continue;
+    const [o0, o1] = [Math.min(...across), Math.max(...across)];
+    A += (o1 - o0) * 0.01;
+    S += ((o1 * o1 - o0 * o0) / 2) * 0.01;
+    I0 += ((o1 ** 3 - o0 ** 3) / 3) * 0.01;
+    lo = Math.min(lo, o0);
+    hi = Math.max(hi, o1);
+  }
+  const oc = S / A;
+  return { I: I0 - A * oc * oc, y: Math.max(hi - oc, oc - lo) };
+}
+
+describe('take-apart lips that lock', () => {
+  it('the lantern\'s top locks onto the same lip: clean pieces, seated, held much harder than Clicks on holds, and still let go', () => {
+    const r = apartSplit(own(lanternSolid()), [[2, 190]], { hold: 'lock' });
+    const snap = apartSplit(own(lanternSolid()), [[2, 190]]);
+    const [lip] = r.layout.lips;
+    const [plain] = snap.layout.lips;
+    expect(lip).toMatchObject({ kind: 'opening', H: 6, clips: 4, male: 0, dir: 1, down: '-z', hold: 'lock', p: 0.4, i: 0.25, zTop: 8.15, why: [] });
+    // the lip, its groove, its windows and its key are Clicks on's: only the clips differ
+    for (const k of ['T', 'Tc', 'A', 'key', 'area']) expect(lip[k]).toEqual(plain[k]);
+    expect(lip.windows.map((w) => [w.s0, w.s1])).toEqual(plain.windows.map((w) => [w.s0, w.s1]));
+
+    const [body, lid] = r.drilled;
+    expect([body.genus(), lid.genus()]).toEqual([12, 1]);
+    for (const piece of [body, lid]) {
+      expect(piece.status()).toBe('NoError');
+      expect(positiveShells(piece)).toBe(1);
+      expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+    }
+    const b = nearCut(body, 2, 190, 2, 10);
+    const l = nearCut(lid, 2, 190, 2, 14);
+    const sb = nearCut(snap.drilled[0], 2, 190, 2, 10);
+    const sl = nearCut(snap.drilled[1], 2, 190, 2, 14);
+    // seated: touching nowhere, the clearance all round, no room to slide
+    expect(lift(b, l)).toBeLessThan(1e-9);
+    expect(lipParts(lip).tongue.minGap(lid, 1)).toBeGreaterThanOrEqual(0.149);
+    expect(lift(b, l, [0.14, 0, 0])).toBeLessThan(1e-6);
+    expect(lift(b, l, [0.16, 0, 0])).toBeGreaterThan(1);
+    // held: lifted, the catches meet their recesses sooner and far more than Clicks on's – the steep flank leaves
+    // c / sin 60° of play, not c √2, and the catch is 8 mm long, not 6
+    const [l25, l50] = [lift(b, l, [0, 0, 0.25]), lift(b, l, [0, 0, 0.5])];
+    const [s25, s50] = [lift(sb, sl, [0, 0, 0.25]), lift(sb, sl, [0, 0, 0.5])];
+    expect(near(s25, 0.206, 0.01) && near(s50, 1.569, 0.03)).toBe(true);
+    expect(near(l25, 0.572, 0.01) && near(l50, 2.435, 0.03)).toBe(true);
+    expect(l25).toBeGreaterThan(2.5 * s25);
+    expect(l50).toBeGreaterThan(1.5 * s50);
+    expect(near(freePlay(b, l, [0, 0, 1]), 0.17, 0.01)).toBe(true);
+    // released: with the clips bowed in by the interference and a little, it lifts all the way off, and each whole clip
+    // has room to bow in that far
+    expect(release(r.layout.lips, lid, lip.i + 0.05)).toBeLessThan(1e-6);
+    expect(near(deflection(r.layout.lips, lid), 0.25, 0.01)).toBe(true);
+    expect(bowed(lip, l)).toBeLessThan(1e-6);
+    // the key still lets the top on one way round only
+    for (const turn of [90, 180, 270]) expect(lift(b, own(l.rotate([0, 0, turn])))).toBeGreaterThan(40);
+    // the body prints its four clips as 30 mm bridges over their slots, where Clicks on's are 40 mm
+    const bridges = (m) => overhangList(m, 190.1, 198, 190).filter((o) => o.width > 1);
+    expect(bridges(body)).toHaveLength(4);
+    for (const o of bridges(body)) expect(near(o.width, 1.6, 0.05) && near(o.long, 29.6, 0.2) && near(o.z, 3.1, 1e-6)).toBe(true);
+    expect(bridges(snap.drilled[0]).map((o) => o.long)).toEqual([39.6, 39.6, 39.6, 39.6]);
+  });
+
+  it('its steep flank overhangs at most half a millimetre, as each piece prints: the body standing, the lid on its cut face or upside down', () => {
+    const r = apartSplit(own(lanternSolid()), [[2, 190]], { hold: 'lock' });
+    const snap = apartSplit(own(lanternSolid()), [[2, 190]]);
+    // the body stands as modelled and the lid lies on its cut face: as the pieces lie in their files
+    expect(r.pieces.map((p) => p.lying.down)).toEqual(['-z', '-z']);
+    const flip = (m) => own(m.rotate([180, 0, 0]));
+    // the body: the four catches' undersides, 30° off level, each reaching out 0.4 mm (the catch's height)
+    const body = moreDownFaces(snap.drilled[0], r.drilled[0]);
+    expect(body).toHaveLength(4);
+    for (const f of body) expect(f.flat === false && near(f.tilt, 30, 1e-6) && f.reach <= 0.5 + 1e-6 && near(f.reach, 0.4, 1e-6)).toBe(true);
+    // the lid on its cut face: the recesses' tops lean only 30° from upright, so nothing looks down steeper than Clicks
+    // on's; upside down (as a box's lid that carries the lip would leave the box) the recesses' steep sides reach 0.4
+    expect(moreDownFaces(snap.drilled[1], r.drilled[1])).toEqual([]);
+    const over = moreDownFaces(flip(snap.drilled[1]), flip(r.drilled[1])).filter((f) => !f.flat);
+    expect(over.length).toBeGreaterThan(0);
+    for (const f of over) expect(f.reach).toBeLessThanOrEqual(0.5 + 1e-6);
+    // at a looser clearance the catch stands further out: up to half a millimetre it keeps its steep flank, past that it
+    // is a plain ramp, and nothing overhangs further
+    for (const [c, steep] of [[0.4, true], [0.45, false]]) {
+      const loose = apartSplit(own(lanternSolid()), [[2, 190]], { hold: 'lock', clearance: c });
+      const plainer = apartSplit(own(lanternSolid()), [[2, 190]], { clearance: c });
+      const more = moreDownFaces(plainer.drilled[0], loose.drilled[0]).filter((f) => !f.flat);
+      expect(more.length > 0).toBe(steep);
+      for (const f of more) expect(f.reach).toBeLessThanOrEqual(0.5 + 1e-6);
+      expect(moreDownFaces(flip(plainer.drilled[1]), flip(loose.drilled[1])).filter((f) => !f.flat && f.reach > 0.5 + 1e-6)).toEqual([]);
+      expect(release(loose.layout.lips, loose.drilled[1], loose.layout.lips[0].i + 0.05)).toBeLessThan(1e-6);
+    }
+  });
+
+  it('its clip, measured as built: a 30 mm bridge that bends 0.55 % to let go, well under the 1.5 % PLA takes again and again', () => {
+    const r = apartSplit(own(lanternSolid()), [[2, 190]], { hold: 'lock' });
+    const [lip] = r.layout.lips;
+    const s = lipSolids(lip);
+    [s.tongue, s.cutters, ...s.catches, ...s.recesses].forEach(own);
+    for (const w of lip.windows) {
+      // the slot's length along the clip, and the clip's section
+      const along = w.slot.flat().map(([x, y]) => x * w.chord.dir[0] + y * w.chord.dir[1]);
+      const L = Math.max(...along) - Math.min(...along);
+      expect(L).toBeCloseTo(30, 6);
+      const { I, y } = clipSection(s.tongue, w);
+      expect(near(I, 0.937, 0.005) && near(y, 0.83, 0.005)).toBe(true);
+      // bent by the deflection it takes to let go, as a bridge held at both ends
+      const strain = (24 * deflection(r.layout.lips, r.drilled[1]) * y) / L ** 2;
+      expect(near(strain, 0.0055, 0.0002)).toBe(true);
+      expect(strain).toBeLessThanOrEqual(0.015);
+      break; // the four clips are alike
+    }
+  });
+
+  it('the fit test of a cut that locks is the small box and its lid with the locking clips', () => {
+    const coupon = own(fitTestCoupon({ clearance: 0.15 }, 0.4, { pins: false, apart: 'lock' }));
+    const snap = own(fitTestCoupon({ clearance: 0.15 }, 0.4, { pins: false, apart: 'snap' }));
+    const pair = (m) => {
+      const parts = shells(m);
+      const k = parts.findIndex((p) => boxOf(p).size[2] > 15);
+      return [parts[k], parts[1 - k], parts];
+    };
+    const [box, top, parts] = pair(coupon);
+    expect(parts).toHaveLength(2);
+    expect(boxOf(box).size.map((v) => +v.toFixed(2))).toEqual([60, 30, 18]);
+    expect(boxOf(top).size.map((v) => +v.toFixed(2))).toEqual([60, 30, 12]);
+    for (const p of parts) {
+      expect(p.status()).toBe('NoError');
+      expect(stlCheck(p)).toEqual({ degenerate: 0, open: 0 });
+    }
+    const put = (b, t) => own(t.translate([boxOf(b).min[0] - boxOf(t).min[0], 0, 12]));
+    const lid = put(box, top);
+    const [sbox, stop] = pair(snap);
+    const slid = put(sbox, stop);
+    // seated, and held harder than the Clicks on coupon's lid
+    expect(lift(box, lid)).toBeLessThan(1e-9);
+    expect(near(lift(sbox, slid, [0, 0, 0.25]), 0.103, 0.01)).toBe(true);
+    expect(lift(box, lid, [0, 0, 0.25])).toBeGreaterThan(2.5 * lift(sbox, slid, [0, 0, 0.25]));
+    // its clips are the shorter bridges
+    expect(overhangList(box, 12.1, 20, 12).filter((o) => o.width > 1).map((o) => o.long)).toEqual([29.6, 29.6]);
+  });
+
+  it('on a wider nozzle the thicker tongue is thinned along each bridge: built, the clip is a 0.4 mm nozzle\'s, so it holds and bends alike', () => {
+    // an open box 100 × 100 × 200 with 7 mm walls cut at 150: a 0.6 mm nozzle's tongue is 2.4 mm thick, a 0.8 mm one's 3.2
+    for (const [nozzle, t] of [[0.6, 2.4], [0.8, 3.2]]) {
+      for (const hold of ['lock', 'snap']) {
+        const r = apartSplit(tray([100, 100, 200], 7), [[2, 150]], { hold, nozzle });
+        const [lip] = r.layout.lips;
+        expect(lip).toMatchObject({ t, clips: 4, H: 6 });
+        const s = lipSolids(lip);
+        [s.tongue, s.cutters, ...s.catches, ...s.recesses].forEach(own);
+        const w = lip.windows[0];
+        const along = w.slot.flat().map(([x, y]) => x * w.chord.dir[0] + y * w.chord.dir[1]);
+        const L = Math.max(...along) - Math.min(...along);
+        expect(L).toBeCloseTo(hold === 'lock' ? 30 : 40, 6);
+        // the section a 1.6 mm tongue's clip has (0.937 mm⁴), not the whole tongue's (3.22 at 0.6, 7.73 at 0.8)
+        const { I, y } = clipSection(s.tongue, w);
+        expect(near(I, 0.937, 0.005) && near(y, 0.83, 0.005)).toBe(true);
+        // bent to let go as far as on a 0.4 mm nozzle: 0.55 % for a lock, 0.31 % for Clicks on
+        const bend = deflection(r.layout.lips, r.drilled[1]);
+        expect(near(bend, 0.25, 0.01)).toBe(true);
+        expect(near((24 * bend * y) / L ** 2, hold === 'lock' ? 0.0055 : 0.0031, 0.0002)).toBe(true);
+        // and the hold worked out for it is the 0.4 mm nozzle's
+        expect(clipHold(4, { ...clipShape(hold, 0.15, lip.t), i: lip.i })).toBeCloseTo(hold === 'lock' ? 49.2 : 10.5, 1);
+        for (const piece of r.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+        expect(lift(r.drilled[0], r.drilled[1])).toBeLessThan(1e-6);
+        expect(release(r.layout.lips, r.drilled[1], lip.i + 0.05, { step: 0.5 })).toBeLessThan(1e-6);
+        expect(bowed(lip, r.drilled[1])).toBeLessThan(1e-6);
+      }
+    }
+  });
+
+  it('a lock\'s catch, foot and all, stays on its clip\'s band below the tongue\'s lead-in at every clearance, so its pieces stay clean', () => {
+    // a solid post 60 × 60 × 100 cut at 50: past a 0.4 mm clearance the catch stood up into the lead-in's steps and left
+    // slivers there in the saved file
+    for (let k = 0; k <= 10; k++) {
+      const c = k * 0.05;
+      const r = apartSplit(own(boxAt([-30, -30, 0], [30, 30, 100])), [[2, 50]], { hold: 'lock', clearance: c });
+      const [lip] = r.layout.lips;
+      expect(lip.clips).toBe(4);
+      const s = lipSolids(lip);
+      [s.tongue, s.cutters, ...s.catches, ...s.recesses].forEach(own);
+      for (const m of s.catches) {
+        const b = boxOf(m);
+        expect(b.min[2]).toBeGreaterThanOrEqual(CLIP.slot + 0.15);
+        expect(b.max[2]).toBeLessThanOrEqual(lip.H - LIP.lead - 0.15);
+      }
+      for (const piece of r.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+      // with no clearance at all the pieces touch, as Clicks on's do
+      if (c > 0) expect(lift(r.drilled[0], r.drilled[1])).toBeLessThan(1e-6);
+    }
+  });
+
+  it('the fit test on a wider nozzle has walls ten lines thick and a lid tall enough for the full lip, so it has the locking clips too', () => {
+    const pair = (m) => shells(m).map((p) => boxOf(p).size.map((v) => +v.toFixed(2))).sort((p, q) => q[2] - p[2]);
+    // where it had a 4.5 mm lip with no clips (0.5 and 0.6) or none at all (0.8); at 0.4 it is as it was, at any clearance
+    for (const [nozzle, c, sizes] of [
+      [0.4, 0.5, [[60, 30, 18], [60, 30, 12]]], [0.5, 0.15, [[62, 32, 18], [62, 32, 13]]], [0.6, 0.15, [[64, 34, 18], [64, 34, 14]]], [0.8, 0.15, [[68, 38, 18], [68, 38, 15]]],
+    ]) {
+      const lock = own(fitTestCoupon({ clearance: c }, nozzle, { pins: false, apart: 'lock' }));
+      const lifts = own(fitTestCoupon({ clearance: c }, nozzle, { pins: false, apart: 'lift' }));
+      expect(pair(lock)).toEqual(sizes);
+      expect(pair(lifts)).toEqual(sizes);
+      expect(Math.abs(lock.volume() - lifts.volume())).toBeGreaterThan(100); // its slots and catches
+      for (const p of shells(lock)) expect(stlCheck(p)).toEqual({ degenerate: 0, open: 0 });
+    }
   });
 });
 
@@ -1939,6 +2228,34 @@ describe('take-apart lips over a sweep of outlines', () => {
       expect(lipParts(r.layout.lips[0]).tongue.minGap(lid, 1)).toBeGreaterThanOrEqual(c - 0.005);
     });
     expect(built).toBeGreaterThanOrEqual(70);
+  });
+
+  it('every lip that locks, over the same outlines and clearances, is as clean, seated and clear, and its clips still let go', () => {
+    const models = sweepModels();
+    let built = 0;
+    let clipped = 0;
+    models.forEach((m, k) => {
+      const c = [0.1, 0.15, 0.2][k % 3];
+      const r = apartSplit(m, [[2, 30]], { clearance: c, hold: 'lock' });
+      if (!r.layout.lips.length) {
+        expect(r.notes.map((n) => [n.code, n.why])).toEqual([['APART_FLAT', 'thin']]);
+        return;
+      }
+      built++;
+      const [body, lid] = r.drilled;
+      for (const piece of [body, lid]) {
+        expect(piece.status()).toBe('NoError');
+        expect(positiveShells(piece)).toBe(1);
+        expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+      }
+      expect(lift(body, lid)).toBeLessThan(1e-6);
+      expect(lipParts(r.layout.lips[0]).tongue.minGap(lid, 1)).toBeGreaterThanOrEqual(c - 0.005);
+      if (!r.layout.lips[0].clips) return;
+      clipped++;
+      expect(release(r.layout.lips, lid, r.layout.lips[0].i + 0.05, { step: 0.5 })).toBeLessThan(1e-6);
+    });
+    expect(built).toBeGreaterThanOrEqual(70);
+    expect(clipped).toBeGreaterThanOrEqual(45); // 48: the round ones and the narrow ones have no straight stretch for a clip
   });
 });
 

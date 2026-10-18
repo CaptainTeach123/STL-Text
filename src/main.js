@@ -1429,12 +1429,12 @@ function removeCut(id) {
   undoToast(`Removed cut ${letter}.`);
 }
 
-/** Make a cut one that comes apart (with the hold it had, Clicks on at first), or a glued one again. */
+/** Make a cut one that comes apart (with the hold it had, Locks at first), or a glued one again. */
 function setCutApart(id, on) {
   doc.setCutJoint(id, on ? {} : null);
 }
 
-/** How a cut that comes apart holds: 'snap' (Clicks on), 'light' (Light click) or 'lift' (Lifts off). */
+/** How a cut that comes apart holds: 'lock' (Locks), 'snap' (Clicks on), 'light' (Light click) or 'lift' (Lifts off). */
 function setCutHold(id, hold) {
   doc.setCutJoint(id, { hold });
 }
@@ -1718,11 +1718,12 @@ function renderCuts() {
   });
 }
 
-/** How a cut that comes apart holds, as its row offers it: the value, its name and what it means. */
+/** How a cut that comes apart holds, as its row offers it, firmest first: the value, its name and what it means. */
 const CUT_HOLD_CHOICES = [
-  ['snap', 'Clicks on', 'Spring clips click the top on: it stays on when the model is carried by its top, and pulls off by hand'],
-  ['light', 'Light click', 'Smaller catches: it clicks on lightly and comes off more easily – for a top that is taken off often'],
-  ['lift', 'Lifts off', 'No clips: the top sits on its lip, one way round, and lifts straight off'],
+  ['lock', 'Locks', 'Holds firmly – comes off only with a firm pull'],
+  ['snap', 'Clicks on', 'Holds when carried – pulls off by hand'],
+  ['light', 'Light click', 'A gentle click'],
+  ['lift', 'Lifts off', 'No clips – just sits on'],
 ];
 
 /** A row's control that only switches what the cut is: a press keeps the arrow keys for the cut, not the control. */
@@ -1822,9 +1823,9 @@ function cutRow(id) {
  * The joint each cut got in a worked-out split, from its seams: pins or
  * built-in pegs when some face of it takes one (its note tells of those left
  * flat), tabs on a dovetail cut that had room for them, otherwise none. A cut
- * that comes apart says how it holds, every face of it counted: "clicks on
- * (4 clips)", "light click (4 clips)", "lifts off" (a lip with no clips), or
- * tabs or none.
+ * that comes apart says how it holds, every face of it counted: "locks (4
+ * clips)", "clicks on (4 clips)", "light click (4 clips)", "lifts off" (a lip
+ * with no clips), or tabs or none.
  */
 function jointsOfSeams(seams = []) {
   const joints = new Map();
@@ -1843,7 +1844,8 @@ function jointsOfSeams(seams = []) {
   }
   for (const [cutId, l] of lips) {
     const clips = `${l.clips} ${l.clips === 1 ? 'clip' : 'clips'}`;
-    const held = l.clips > 0 && l.hold !== 'lift' ? `${l.hold === 'light' ? 'light click' : 'clicks on'} (${clips})` : 'lifts off';
+    const how = { lock: 'locks', light: 'light click' }[l.hold] ?? 'clicks on';
+    const held = l.clips > 0 && l.hold !== 'lift' ? `${how} (${clips})` : 'lifts off';
     joints.set(cutId, l.lip ? held : l.tabs ? 'dovetail' : 'none');
   }
   return joints;
@@ -1859,7 +1861,7 @@ function rememberJoints(key, content, joints) {
  * What a cut's row says it cuts, from the last measure – its joint from the
  * split once worked out: "800 mm² · pins", "misses the model", "through “HELLO”";
  * a cut that comes apart says so, and once worked out how it holds:
- * "1,728 mm² · comes apart: clicks on (4 clips)".
+ * "1,728 mm² · comes apart: locks (4 clips)".
  */
 function cutMeta(cut, plane) {
   if (!plane) return "isn't straight along X, Y or Z";
@@ -1956,8 +1958,11 @@ const splitNoteActions = (() => {
     Number.isFinite(n.suggestedAt) && cutLetter(n.cutId)
       ? { label: `Move cut ${cutLetter(n.cutId)} to ${round(n.suggestedAt)} mm`, run: () => moveCut(n.cutId, n.suggestedAt) }
       : select(n);
-  // clips too light for what hangs below them: the full click holds more
-  const firmer = (n) => doc.split?.cuts.find((c) => c.id === n.cutId)?.hold === 'light' && { label: 'Use Clicks on', run: () => setCutHold(n.cutId, 'snap') };
+  // clips too light for what hangs below them: the gentlest firmer hold that holds it up, as the engine worked it out
+  const firmer = (n) => {
+    const name = CUT_HOLD_CHOICES.find(([hold]) => hold === n.firmer)?.[1];
+    return name && cutLetter(n.cutId) && { label: `Use ${name}`, run: () => setCutHold(n.cutId, n.firmer) };
+  };
   return {
     APART_NO_CLIPS: moveTo,
     APART_FLAT: moveTo,
@@ -2097,14 +2102,18 @@ async function downloadFitTest() {
     }
     if (r.pegs) checks.push(`the ${r.pegSize} mm peg pushes into its socket`);
     if (r.dovetail) checks.push('the tab drops into its socket');
-    // the box and lid of a cut that comes apart: clips that click (lightly), or none
+    // the box and lid of a cut that comes apart: clips that click (lightly), or none; a lock takes a firm pull, so it
+    // is tried on its own
     const clicks = r.apart === 'snap' || r.apart === 'light';
     if (clicks) checks.push(`the lid clicks${r.apart === 'light' ? ' lightly' : ''} onto the box and pulls off again`);
-    else if (r.apart) checks.push('the lid drops onto the box and lifts off freely');
-    setStatus(
-      `Downloaded ${file.name} (${file.kb} KB). Print it and check that ${checks.join(' and that ')} by hand – too tight: raise Clearance by 0.05 mm${clicks ? '; no click or too loose: lower it by 0.05 mm' : ''}.`,
-      'ok',
-    );
+    else if (r.apart && r.apart !== 'lock') checks.push('the lid drops onto the box and lifts off freely');
+    const tried = checks.length
+      ? ` Print it and check that ${checks.join(' and that ')} by hand – too tight: raise Clearance by 0.05 mm${clicks ? '; no click or too loose: lower it by 0.05 mm' : ''}.`
+      : ' Print it:';
+    const lock = r.apart === 'lock'
+      ? `${checks.length ? ' The lid' : ' the lid'} should lock onto the box and come off only with a firm pull – too stiff to open, raise the clearance by 0.05 mm; too loose, lower it.`
+      : '';
+    setStatus(`Downloaded ${file.name} (${file.kb} KB).${tried}${lock}`, 'ok');
   } catch (err) {
     setStatus(friendly(err), 'error');
   } finally {

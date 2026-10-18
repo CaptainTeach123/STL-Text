@@ -11,7 +11,7 @@ import {
   sizesFor, sizesForRoom, soupCells, splitActive, splitNote, teardropApex, usableBed, yawMat4, zipFileName, triangleInBox, baseAxis,
   outlineColumns, pieceHolding, textNotes, AUTO_PEGS, SMALLEST_PEG, layPegged, pegAllowance, pegMales, pegSides, pegSizeOf, pegSizesFor,
   pegSizesForRoom, statsWithPegs, uprightPegNotes, APART_COLOR, APART_HOLDS, CLIP, LIP, LIP_ALLOWANCE, apartMales, catchSizes,
-  clipHold, layGrown, lipReach, lipSides, lipSizesFor, statsWithLip,
+  clipHold, clipPush, clipShape, layGrown, lipReach, lipSides, lipSizesFor, statsWithLip,
 } from '../src/split.js';
 
 const U = [210, 210, 249]; // the default printer's usable bed
@@ -1918,13 +1918,17 @@ describe('cuts that come apart', () => {
     // a normalised cut is read alike
     expect(normaliseSplit({ cuts: [{ id: 'c1', axis: 2, at: 190, apart: { hold: 'lift' } }, { id: 'c2', axis: 0, at: 0 }] }, bounds).cuts)
       .toEqual([{ id: 'c2', letter: 'B', axis: 0, at: 0 }, { id: 'c1', letter: 'A', axis: 2, at: 190, apart: { hold: 'lift' } }]);
+    // a cut that locks keeps its hold, stored or normalised
+    expect(normaliseSplit({ cuts: [cut('c1', 190, { joint: 'apart', hold: 'lock' })] }, bounds).cuts).toEqual([{ id: 'c1', letter: 'A', axis: 2, at: 190, apart: { hold: 'lock' } }]);
+    expect(normaliseSplit({ cuts: [{ id: 'c1', axis: 2, at: 190, apart: { hold: 'lock' } }] }, bounds).cuts[0].apart).toEqual({ hold: 'lock' });
   });
 
   it('the lip\'s sizes: the catch stands a fixed way out, so Clearance tunes how hard it clicks', () => {
-    expect(APART_HOLDS).toEqual(['snap', 'light', 'lift']);
+    expect(APART_HOLDS).toEqual(['lock', 'snap', 'light', 'lift']);
     expect(LIP).toMatchObject({ t: 1.6, tMin: 1.2, skirt: 1.6, wall: 1.2, g0: 0.1, into: 0.5, step: 0.2, lead: 0.6, mouth: 0.4, heights: [6, 4.5, 3], opening: 0.25, minPiece: 25, root: 0.5, faceTolerance: 0.02, eps: 0.001 });
     expect(CLIP).toMatchObject({ span: 40, margin: 3, turn: 20, corner: 15, cornerReach: 1.5, length: 6, flat: 0.4, sink: 0.2, every: 95, most: 8, key: 6, slot: 3, snap: { P: 0.4, floor: 0.1 }, light: { P: 0.25, floor: 0.05 } });
-    expect(Object.isFrozen(LIP.heights) && Object.isFrozen(CLIP.snap)).toBe(true);
+    expect(CLIP.lock).toEqual({ P: 0.4, floor: 0.1, bridge: 30, length: 8, retention: 60, lead: 30, overhang: 0.5 });
+    expect(Object.isFrozen(LIP.heights) && Object.isFrozen(CLIP.snap) && Object.isFrozen(CLIP.lock)).toBe(true);
     expect(LIP_ALLOWANCE).toBe(6);
     expect(APART_COLOR).toBe(0x0d9488);
     // the interference is what the catch stands out past the clearance, never under a floor
@@ -1942,6 +1946,97 @@ describe('cuts that come apart', () => {
     expect(lipReach(6, 'opening', 0.15, 0, true).reach).toBe(9.35);
     expect(lipReach(6, 'channel').reach).toBe(7.35);
     expect(lipReach(6, 'opening', 0.5, catchSizes('snap', 0.5).i, true).reach).toBe(10.3); // the most any band reaches
+  });
+
+  it('a lock\'s catch stands out as far as Clicks on\'s, so its lip takes the same room; its clip is a shorter bridge with a longer catch, steep where it holds', () => {
+    // the catch at the three clearances: Clicks on's, so the groove, the room to bow in and every reach are the same
+    expect([0.05, 0.15, 0.3].map((c) => catchSizes('lock', c))).toEqual([{ p: 0.4, i: 0.35 }, { p: 0.4, i: 0.25 }, { p: 0.4, i: 0.1 }]);
+    expect([0.05, 0.15, 0.3, 0.45].map((c) => catchSizes('lock', c))).toEqual([0.05, 0.15, 0.3, 0.45].map((c) => catchSizes('snap', c)));
+    expect(lipSizesFor(0.15, 0.4, 'lock')).toEqual({ ...lipSizesFor(0.15, 0.4, 'snap'), hold: 'lock' });
+    expect(lipReach(6, 'opening', 0.15, catchSizes('lock', 0.15).i, true)).toEqual(lipReach(6, 'opening', 0.15, catchSizes('snap', 0.15).i, true));
+    // the clip whole: 1.6 mm thick, a 30 mm bridge, an 8 mm catch, 60° where it holds and 30° where the top goes on
+    // over it
+    expect([0.05, 0.15, 0.3].map((c) => clipShape('lock', c))).toEqual([
+      { p: 0.4, i: 0.35, t: 1.6, span: 30, length: 8, retention: 60, lead: 30 },
+      { p: 0.4, i: 0.25, t: 1.6, span: 30, length: 8, retention: 60, lead: 30 },
+      { p: 0.4, i: 0.1, t: 1.6, span: 30, length: 8, retention: 60, lead: 30 },
+    ]);
+    // standing out more than half a millimetre (a clearance over 0.4) the steep flank would overhang further than a
+    // printer draws out over the air, and the shallow one reach up into the tongue's lead-in: a plain catch there
+    expect([0.4, 0.45, 0.5].map((c) => [clipShape('lock', c).p, clipShape('lock', c).retention, clipShape('lock', c).lead]))
+      .toEqual([[0.5, 60, 30], [0.55, 45, 45], [0.6, 45, 45]]);
+    expect(clipShape('snap', 0.15)).toEqual({ p: 0.4, i: 0.25, t: 1.6, span: 40, length: 6, retention: 45, lead: 45 });
+    expect(clipShape('light', 0.15)).toEqual({ p: 0.25, i: 0.1, t: 1.6, span: 40, length: 6, retention: 45, lead: 45 });
+    expect(clipShape('lift', 0.15)).toBeNull();
+  });
+
+  it('a lock holds about 5 kg on four clips, and presses on with under a third of that; Clicks on and Light click hold as they did', () => {
+    const lock = clipShape('lock', 0.15);
+    // pulled off: 40–70 N for a weak print, at most 130 N for a stiff one
+    const pull = clipHold(4, lock);
+    expect(pull).toBeGreaterThanOrEqual(40);
+    expect(pull).toBeLessThanOrEqual(70);
+    expect(pull).toBeCloseTo(49.2, 1);
+    const stiff = clipHold(4, { ...lock, conservative: false });
+    expect(stiff).toBeLessThanOrEqual(130);
+    expect(stiff).toBeCloseTo(98.6, 1);
+    // pressed on over the shallow flank: at most half the pull either way
+    expect(clipPush(4, lock)).toBeCloseTo(14.6, 1);
+    expect(clipPush(4, lock)).toBeLessThanOrEqual(pull / 2);
+    expect(clipPush(4, { ...lock, conservative: false })).toBeLessThanOrEqual(stiff / 2);
+    // past a 0.4 mm clearance the catch is a plain ramp both ways: it holds, and goes on, as hard as its 45° flanks and
+    // stiffer bridge make it
+    expect(clipHold(4, clipShape('lock', 0.45))).toBeCloseTo(10.0, 1);
+    expect(clipPush(4, clipShape('lock', 0.45))).toBe(clipHold(4, clipShape('lock', 0.45)));
+    // the plain catches: the same numbers from their shape as from the interference alone, and as hard on as off
+    for (const [hold, want, wantStiff] of [['snap', 10.5, 18.3], ['light', 4.2, 7.3]]) {
+      const shape = clipShape(hold, 0.15);
+      expect(clipHold(4, shape)).toBe(clipHold(4, { i: shape.i }));
+      expect(clipHold(4, { ...shape, conservative: false })).toBe(clipHold(4, { i: shape.i, conservative: false }));
+      expect(clipHold(4, shape)).toBeCloseTo(want, 1);
+      expect(clipHold(4, { ...shape, conservative: false })).toBeCloseTo(wantStiff, 1);
+      expect(clipPush(4, shape)).toBe(clipHold(4, shape));
+    }
+    expect(clipPush(4, { i: 0 })).toBe(0);
+  });
+
+  it('a wider nozzle\'s thicker tongue has clips as thin as a 0.4 mm nozzle\'s, so they hold as hard: 49 N for four that lock, not 166 at 0.6 or 394 at 0.8', () => {
+    // the tongue is four lines thick; its clips are 1.6 mm – a 0.8 mm nozzle's two lines – and two lines past that, a
+    // lock's bridge then as much longer, up to 40 mm
+    const at = (hold, nozzle, c = 0.15) => clipShape(hold, c, lipSizesFor(c, nozzle, hold).t);
+    expect([0.4, 0.5, 0.6, 0.8, 1, 1.2].map((n) => lipSizesFor(0.15, n, 'lock').t)).toEqual([1.6, 2, 2.4, 3.2, 4, 4.8]);
+    expect([0.4, 0.5, 0.6, 0.8, 1, 1.2].map((n) => [at('lock', n).t, at('lock', n).span])).toEqual([[1.6, 30], [1.6, 30], [1.6, 30], [1.6, 30], [2, 37.5], [2.4, 40]]);
+    expect([0.4, 0.6, 0.8, 1].map((n) => [at('snap', n).t, at('snap', n).span])).toEqual([[1.6, 40], [1.6, 40], [1.6, 40], [2, 40]]);
+    // so the hold, and the push to put it on, are the 0.4 mm nozzle's up to 1 mm for a lock and 0.8 mm for the others
+    for (const n of [0.5, 0.6, 0.8, 1]) {
+      expect(clipHold(4, at('lock', n))).toBeCloseTo(49.2, 1);
+      expect(clipHold(4, { ...at('lock', n), conservative: false })).toBeCloseTo(98.6, 1);
+      expect(clipPush(4, at('lock', n))).toBeCloseTo(14.6, 1);
+    }
+    for (const n of [0.6, 0.8]) expect(clipHold(4, at('snap', n))).toBeCloseTo(10.5, 1);
+    // as the tongue alone would make them: three and a half and eight times as hard
+    expect(clipHold(4, { ...at('lock', 0.6), t: 2.4 })).toBeCloseTo(166.2, 1);
+    expect(clipHold(4, { ...at('lock', 0.8), t: 3.2 })).toBeCloseTo(393.9, 1);
+    // and bent no further to let go, at any clearance: 24·i·y/L², y the clip's farthest fibre (0.83 on a 1.6 mm clip)
+    for (const n of [0.6, 0.8, 1]) {
+      for (let k = 0; k <= 10; k++) {
+        const s = at('lock', n, k * 0.05);
+        expect((24 * s.i * 0.83 * (s.t / 1.6)) / s.span ** 2).toBeLessThanOrEqual(0.009);
+      }
+    }
+  });
+
+  it('no clip bends more than 1.5 % to let go, at any clearance: a lock\'s shorter bridge bends more, still under 0.9 %', () => {
+    // a bridge held at both ends, its middle pushed in by i: 24·i·y/L² at its ends and middle, y the clip's farthest
+    // fibre from where it bends, 0.83 mm on a 1.6 mm tongue with its lead-in (measured from the built clip)
+    const strain = (hold, c) => {
+      const s = clipShape(hold, c);
+      return s ? (24 * s.i * 0.83) / s.span ** 2 : 0;
+    };
+    // every hold at c = 0.05, 0.15 and 0.30 (%)
+    expect(APART_HOLDS.map((h) => [0.05, 0.15, 0.3].map((c) => +(strain(h, c) * 100).toFixed(2)))).toEqual([[0.77, 0.55, 0.22], [0.44, 0.31, 0.12], [0.25, 0.12, 0.06], [0, 0, 0]]);
+    // and every clearance Clearance allows, 0 to 0.5
+    for (let k = 0; k <= 10; k++) for (const h of APART_HOLDS) expect(strain(h, k * 0.05)).toBeLessThanOrEqual(0.009);
   });
 
   it('how hard the clips hold, worked out from the clip\'s section: about 10.5 N for four that click on', () => {
@@ -2256,6 +2351,28 @@ describe('cuts that come apart', () => {
     expect(splitNote('DOVETAIL', { letter: 'A', tabs: 2, pieces: [1, 2] }).text).toBe('Cut A goes through a thin plate, so it has 2 dovetail tabs instead of pins – lay both pieces flat and lower piece 2 onto piece 1.');
   });
 
+  it('a cut that locks: its note says the top locks on firmly and comes off with a hard pull – the seated top hides its key\'s gap, so there is no lever', () => {
+    const note = (fields) => splitNote('APART', { letter: 'A', cutId: 'c1', hold: 'lock', height: 6, ...fields });
+    expect(note({ axis: 2, male: 1, female: 2, clips: 4, faces: 1, flat: 0 })).toMatchObject({
+      level: 'info', code: 'APART', hold: 'lock',
+      text: 'Cut A comes apart: the top (piece 2) locks onto a 6 mm lip – 4 clips hold it firmly. Press it on until it clicks; to take it off, pull hard.',
+    });
+    // the lip on the top locks into the piece below
+    expect(note({ axis: 2, above: true, male: 2, female: 1, clips: 4 }).text)
+      .toBe('Cut A comes apart: the top (piece 2) locks into piece 1 on a 6 mm lip – 4 clips hold it firmly. Press it on until it clicks; to take it off, pull hard.');
+    // across X several pieces lock on together; across Y one clip, on one side
+    expect(note({ letter: 'B', axis: 0, male: [1, 3], female: [2, 4], clips: 3, faces: 2 }).text)
+      .toBe('Cut B comes apart: pieces 2 and 4 lock onto a 6 mm lip – 3 clips hold them firmly. Press them on until they click; to take them off, pull hard.');
+    expect(note({ axis: 1, male: 1, female: 2, clips: 1 }).text)
+      .toBe('Cut A comes apart: piece 2 locks onto a 6 mm lip – 1 clip holds it firmly, on one side only. Press it on until it clicks; to take it off, pull hard.');
+    // small faces rest as for any hold
+    expect(note({ axis: 2, male: 1, female: 2, clips: 4, flat: 2 }).text)
+      .toBe('Cut A comes apart: the top (piece 2) locks onto a 6 mm lip – 4 clips hold it firmly. Press it on until it clicks; to take it off, pull hard. 2 small faces beside it just rest on each other.');
+    expect(note({ axis: 2, male: 1, female: 2, clips: 4 }).text).not.toMatch(/lever|gap/);
+    // a lip with no clips just lifts off, as any hold's
+    expect(note({ axis: 2, male: 1, female: 2, clips: 0, height: 4.5 }).text).toBe('Cut A comes apart: the top (piece 2) sits on a 4.5 mm lip on piece 1 and lifts straight off.');
+  });
+
   describe('steps and the glue sheet', () => {
     const apart = (fields = {}) => ({ hold: 'snap', lip: true, clips: 4, height: 6, key: true, faces: 1, flat: 0, ...fields });
     const lipSeam = (fields = {}) => ({ letter: 'A', axis: 2, at: 190, pieces: [1, 2], joint: 'lip', dowels: [], pegs: [], male: 1, labels: null, apart: apart(), ...fields });
@@ -2279,6 +2396,27 @@ describe('cuts that come apart', () => {
         .toBe('Do not glue cut A: it comes apart. Lay pieces 1 and 2 flat and lower piece 2\'s tabs into piece 1; lift it out to take it apart.');
       // the steps of glued cuts carry no flag
       expect(assemblySteps({ pieces: two, seams: [{ letter: 'A', axis: 2, at: 190, pieces: [1, 2], joint: 'none', dowels: 0, labels: null }] })[0]).not.toHaveProperty('apart');
+    });
+
+    it('a cut that locks is pressed on until it clicks and opened with a hard pull – nothing to lever at – and goes on one way round only', () => {
+      const locks = (fields = {}) => apart({ hold: 'lock', ...fields });
+      const [step] = assemblySteps({ pieces: two, seams: [lipSeam({ apart: locks() })] });
+      expect(step).toMatchObject({ letter: 'A', pieces: [1], joins: [2], apart: true });
+      expect(step.text).toBe('Do not glue cut A: it comes apart. Press the top on until it clicks – it locks; pull hard to open it. It goes on one way round only – turn it until it drops onto the lip.');
+      expect(text([lipSeam({ male: 2, apart: locks() })])).toBe(step.text); // the lip on the top: it locks on all the same
+      // across X; and two pieces beyond it, which lock on together
+      expect(text([lipSeam({ axis: 0, at: 0, apart: locks() })], [{ index: 1, cell: [0, 0, 0] }, { index: 2, cell: [1, 0, 0] }]))
+        .toBe('Do not glue cut A: it comes apart. Press piece 2 onto piece 1 until it clicks – it locks; pull hard to open it. It goes on one way round only – turn it until it drops onto the lip.');
+      const shells = [{ index: 1, cell: [0, 0, 0] }, { index: 2, cell: [1, 0, 0] }, { index: 3, cell: [1, 0, 0] }];
+      expect(assemblySteps({ pieces: shells, seams: [lipSeam({ axis: 0, at: 0, pieces: [1, 2], apart: locks() }), lipSeam({ axis: 0, at: 0, pieces: [1, 3], apart: locks() })] })[0].text)
+        .toBe('Do not glue cut A: it comes apart. Press pieces 2 and 3 onto piece 1 until they click – they lock; pull hard to open it. They go on one way round only – turn them until they drop onto the lip.');
+      // the top of two pieces
+      const four = [{ index: 1, cell: [0, 0, 0] }, { index: 2, cell: [1, 0, 0] }, { index: 3, cell: [0, 0, 1] }, { index: 4, cell: [1, 0, 1] }];
+      expect(assemblySteps({ pieces: four, seams: [lipSeam({ pieces: [1, 3], apart: locks() }), lipSeam({ pieces: [2, 4], male: 2, apart: locks() })] })[0].text)
+        .toBe('Do not glue cut A: it comes apart. Press the top (pieces 3 and 4) on until it clicks – it locks; pull hard to open it. It goes on one way round only – turn it until it drops onto the lip.');
+      expect(step.text).not.toMatch(/lever|gap/);
+      // a lip too short for clips sits on, whatever the hold
+      expect(text([lipSeam({ apart: locks({ clips: 0, height: 4.5 }) })])).toBe('Do not glue cut A: it comes apart. Set the top on its lip – it goes on one way round only – and lift it off to open it.');
     });
 
     it('it goes on last, after every glued cut, whichever axis it is on', () => {
@@ -2353,6 +2491,31 @@ describe('cuts that come apart', () => {
       const lidded = howToGlueText({ name: 'box', pieces: two, seams: [lipSeam({ male: 2 })] });
       expect(lidded).toMatch(/piece 1 of 2 .* fits\n/);
       expect(lidded).toMatch(/piece 2 of 2 .* fits, lip for cut A, comes off at cut A\n/);
+    });
+
+    it('the glue sheet of a cut that locks: its clips are 30 mm bridges, the dry fit takes a firm pull, and the step says to pull hard', () => {
+      const sheet = howToGlueText({ name: 'lantern', pieces: two, seams: [lipSeam({ apart: apart({ hold: 'lock' }) })], clearance: 0.15 });
+      const lines = sheet.split('\n');
+      expect(lines).toContain('PRINT (each file is already turned the way to print it; lips and clips need no supports)');
+      expect(lines).toContain('  Clips are 30 mm bridges over a slot: print with bridging on (the default) and no supports.');
+      expect(lines).toContain('  The top of cut A should lock onto its lip and come off only with a firm pull. Too stiff to open: raise Clearance by 0.05 mm (or set the cut to Clicks on); too loose: lower it by 0.05 mm, and download again.');
+      expect(sheet).not.toContain('pull off again by hand');
+      expect(sheet.trimEnd().split('\n').slice(-2)).toEqual([
+        'PUT TOGETHER – nothing is glued',
+        '  1. Do not glue cut A: it comes apart. Press the top on until it clicks – it locks; pull hard to open it. It goes on one way round only – turn it until it drops onto the lip.',
+      ]);
+      // a wide nozzle's longer bridges, as built
+      expect(howToGlueText({ name: 'lantern', pieces: two, seams: [lipSeam({ apart: apart({ hold: 'lock' }) })], bridges: [37.5] }))
+        .toContain('  Clips are 37.5 mm bridges over a slot: print with bridging on (the default) and no supports.');
+      // a cut that locks beside one that clicks on: both lengths of bridge, and each cut's own dry fit
+      const three = [
+        { index: 1, cell: [0, 0, 0], size: [100, 100, 100], lies: 'flat as modelled' }, { index: 2, cell: [0, 0, 1], size: [100, 100, 96], lies: 'flat as modelled' },
+        { index: 3, cell: [0, 0, 2], size: [110, 110, 101], lies: 'on a cut face' },
+      ];
+      const mixed = howToGlueText({ name: 'l', pieces: three, seams: [lipSeam({ letter: 'A', at: 100, pieces: [1, 2], apart: apart({ hold: 'lock' }) }), lipSeam({ letter: 'B', at: 196, pieces: [2, 3], male: 2 })] });
+      expect(mixed).toContain('  Clips are 30 and 40 mm bridges over a slot: print with bridging on (the default) and no supports.');
+      expect(mixed).toContain('  The top of cut A should lock onto its lip and come off only with a firm pull.');
+      expect(mixed).toContain('  The top of cut B should click onto its lip and pull off again by hand.');
     });
 
     it('with glued cuts too, they come first and the cut that comes apart last, numbered on', () => {

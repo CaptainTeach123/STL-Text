@@ -533,10 +533,11 @@ export function pegAllowance(spec = {}, face = null) {
 // ---------- cuts that come apart ----------
 
 /**
- * How a cut that comes apart holds (the document's `CUT_HOLDS`): its top
- * clicks on (`snap`), clicks on lightly (`light`), or just lifts off (`lift`).
+ * How a cut that comes apart holds (the document's `CUT_HOLDS`), firmest
+ * first: its top locks on (`lock`), clicks on (`snap`), clicks on lightly
+ * (`light`), or just lifts off (`lift`).
  */
-export const APART_HOLDS = Object.freeze(['snap', 'light', 'lift']);
+export const APART_HOLDS = Object.freeze(['lock', 'snap', 'light', 'lift']);
 
 /**
  * The lip of a cut that comes apart (mm): a tongue standing out of one piece
@@ -565,8 +566,18 @@ export const LIP = Object.freeze({
  * The spring clips of a lip that clicks on (mm, degrees): each a stretch of
  * the tongue `span` long over a slot `slot` high, so a bridge held at both
  * ends, with a catch on its outside that clicks into a recess in the other
- * piece. `snap` and `light` give each hold's catch: `P` how far it stands out
- * of the clip, at least `floor` more than the clearance.
+ * piece. `lock`, `snap` and `light` give each hold's catch: `P` how far it
+ * stands out of the clip, at least `floor` more than the clearance. A lock's
+ * catch stands out as far as Clicks on's, so its lip takes the same room,
+ * but it holds far harder: its slot is a shorter bridge (`bridge`), so the
+ * clip is stiffer, its catch is longer (`length`), and its flank that holds
+ * is steeper (`retention`, from the way the top is pulled off) while the one
+ * the top is pressed on over is shallower (`lead`) – it goes on with a click
+ * and takes a firm pull to come off. The steep flank looks down as it prints,
+ * so it stays steep only while the catch stands out at most `overhang`, a
+ * line's width the printer draws out over the air; further out the catch is
+ * a plain one, 45° both ways, as the shallow flank would then reach up past
+ * the band into the tongue's lead-in.
  */
 export const CLIP = Object.freeze({
   span: 40, // a clip's length along the tongue
@@ -583,6 +594,7 @@ export const CLIP = Object.freeze({
   slot: 3, // the slot under a clip, from the face up
   snap: Object.freeze({ P: 0.4, floor: 0.1 }),
   light: Object.freeze({ P: 0.25, floor: 0.05 }),
+  lock: Object.freeze({ P: 0.4, floor: 0.1, bridge: 30, length: 8, retention: 60, lead: 30, overhang: 0.5 }),
 });
 
 /** How far a cut's tongue stands out of its piece (mm), as the planner, the measure and the pieces' sizes count it. */
@@ -602,10 +614,36 @@ const round6 = (v) => Math.round(v * 1e6) / 1e6;
  * @returns {{ p: number, i: number }|null}
  */
 export function catchSizes(hold, c = SPLIT_DEFAULTS.clearance) {
-  const h = hold === 'snap' || hold === 'light' ? CLIP[hold] : null;
+  const h = hold === 'lock' || hold === 'snap' || hold === 'light' ? CLIP[hold] : null;
   if (!h) return null;
   const p = round6(Math.max(h.P, c + h.floor));
   return { p, i: round6(p - c) };
+}
+
+/**
+ * A hold's clip at a clearance c on a tongue t thick (`lipSizesFor`), whole:
+ * the catch (`p`, `i`, as `catchSizes`), the clip's thickness (`t`), the
+ * bridge's length (`span`), the catch's length along it and its flanks'
+ * angles from the way the top is pulled off (degrees: 45 a plain ramp, 90 a
+ * square shoulder that never lets go) – `retention` the flank that holds the
+ * top on, `lead` the one it is pressed on over. A clip is stiffer as the cube
+ * of its thickness, so where a wider nozzle thickens the tongue its clips are
+ * thinned from the inside to the 1.6 mm the clips are sized for – a 0.8 mm
+ * nozzle's two lines – and only past that are they two lines thick, a lock's
+ * bridge then as much longer as its clip is thicker, up to Clicks on's: a
+ * lock holds alike on any nozzle up to 1 mm, the others up to 0.8 mm. Null
+ * for a hold with no catch (Lifts off).
+ * @returns {{ p: number, i: number, t: number, span: number, length: number, retention: number, lead: number }|null}
+ */
+export function clipShape(hold, c = SPLIT_DEFAULTS.clearance, t = LIP.t) {
+  const sizes = catchSizes(hold, c);
+  if (!sizes) return null;
+  const band = round6(Math.min(t, Math.max(LIP.t, t / 2)));
+  if (hold !== 'lock') return { ...sizes, t: band, span: CLIP.span, length: CLIP.length, retention: 45, lead: 45 };
+  const h = CLIP.lock;
+  const steep = sizes.p <= h.overhang + 1e-9;
+  const span = round6(Math.min(CLIP.span, (h.bridge * band) / LIP.t));
+  return { ...sizes, t: band, span, length: h.length, retention: steep ? h.retention : 45, lead: steep ? h.lead : 45 };
 }
 
 /** The gap inside the tongue where the other piece holds material there: c, or i + 0.15 where clips must bow in. */
@@ -653,26 +691,53 @@ export function lipReach(H, kind = 'opening', c = SPLIT_DEFAULTS.clearance, i = 
   return { zTop: round6(zTop), reach: round6(zTop + wall) };
 }
 
-/** A clip's section as built (mm⁴, bending towards the inside, lead-in counted) for a 1.6 mm tongue. */
+/** A clip's section as built (mm⁴, bending towards the inside, lead-in counted), 1.6 mm thick. */
 const CLIP_SECTION = 0.937;
 
 /**
- * About how hard a lip's clips hold (N): each clip a bridge held at both
- * ends, k = 192·E·I / L³, pulled off over its catch's slope with friction μ,
- * k·i·(1 + μ)/(1 − μ). Worked out, not measured – the fit test is the real
- * check: by default with a weak print's stiffness (PLA at 2.5 GPa, μ 0.2;
- * `conservative: false` takes 3.5 GPa and 0.3). A thicker tongue is stiffer
- * as its cube.
- * @param {number|object[]} clips how many (or the clips)
- * @param {{ t?: number, i?: number, conservative?: boolean }} options `i` the interference (`catchSizes`)
- * @returns {number} about 10.5 N for four Clicks on clips at the default clearance
+ * The force (N) to push a lip's clips past their catches' flank at `angle`
+ * from the way the top moves: each clip a bridge `span` long held at both
+ * ends, k = 192·E·I / L³, bowed in by the interference i over a slope with
+ * friction μ, k·i·(tan α + μ)/(1 − μ·tan α) – (1 + μ)/(1 − μ) at 45°. By
+ * default with a weak print's stiffness (PLA at 2.5 GPa, μ 0.2;
+ * `conservative: false` takes 3.5 GPa and 0.3). A thicker clip (`t`, the
+ * clip's own: `clipShape`) is stiffer as its cube.
  */
-export function clipHold(clips, { t = LIP.t, i = 0, conservative = true } = {}) {
+function clipForce(clips, { t = LIP.t, i = 0, conservative = true, span = CLIP.span }, angle) {
   const n = Array.isArray(clips) ? clips.length : Number(clips) || 0;
   if (!(n > 0) || !(i > 0)) return 0;
   const [E, mu] = conservative ? [2500, 0.2] : [3500, 0.3];
-  const k = (192 * E * CLIP_SECTION * (t / LIP.t) ** 3) / CLIP.span ** 3;
-  return (n * k * i * (1 + mu)) / (1 - mu);
+  const k = (192 * E * CLIP_SECTION * (t / LIP.t) ** 3) / span ** 3;
+  // a 45° ramp exactly as it always was: tan 45° in floating point is a hair under 1
+  const slope = angle === 45 ? 1 : Math.tan((angle * Math.PI) / 180);
+  return (n * k * i * (slope + mu)) / (1 - mu * slope);
+}
+
+/**
+ * About how hard a lip's clips hold (N): what it takes to pull the top off
+ * over the catches' retention flank (`clipForce`). Worked out, not measured
+ * – the fit test is the real check. Pass a hold's `clipShape` for its clip's
+ * thickness, bridge and flank; without one it is Clicks on's 1.6 mm clip, its
+ * 40 mm bridge and 45° ramp.
+ * @param {number|object[]} clips how many (or the clips)
+ * @param {{ t?: number, i?: number, conservative?: boolean, span?: number, retention?: number }} options `i` the
+ *   interference (`catchSizes`)
+ * @returns {number} about 10.5 N for four Clicks on clips at the default clearance, 49 N for four that lock
+ */
+export function clipHold(clips, { retention = 45, ...options } = {}) {
+  return clipForce(clips, options, retention);
+}
+
+/**
+ * About how hard the top must be pressed on (N): the clips pushed past the
+ * catches' lead-in flank (`clipForce`), as `clipHold` pulls them off over the
+ * other. A lock's shallow lead-in takes under a third of its pull-off.
+ * @param {number|object[]} clips how many (or the clips)
+ * @param {{ t?: number, i?: number, conservative?: boolean, span?: number, lead?: number }} options
+ * @returns {number}
+ */
+export function clipPush(clips, { lead = 45, ...options } = {}) {
+  return clipForce(clips, options, lead);
 }
 
 // ---------- fitting the bed ----------
@@ -3627,7 +3692,14 @@ const NOTE_TEXT = {
     const verb = (one, more) => (many ? more : one);
     const into = z && above;
     let s = `Cut ${letter} comes apart: ${moving} `;
-    if (clicks) {
+    if (clicks && hold === 'lock') {
+      // pressed on with a click, and off only with a firm pull: the seated top hides the key's gap, so there is
+      // nowhere to lever it
+      s += into ? `${verb('locks', 'lock')} into ${piecesOf(female, 1)} on ${lip}` : `${verb('locks', 'lock')} onto ${lip}`;
+      const it = verb('it', 'them');
+      s += clips === 1 ? ` – 1 clip holds ${it} firmly, on one side only.` : ` – ${clips} clips hold ${it} firmly.`;
+      s += ` Press ${it} on until ${verb('it clicks', 'they click')}; to take ${it} off, pull hard.`;
+    } else if (clicks) {
       const how = `${verb('clicks', 'click')}${hold === 'light' ? ' lightly' : ''}`;
       s += into ? `${how} into ${piecesOf(female, 1)} on ${lip}` : `${how} onto ${lip} on ${piecesOf(male, 1)}`;
       const it = verb('it', 'them');
@@ -3763,8 +3835,8 @@ const NOTE_TEXT = {
  * axis, pieces, why: 'thin'|'room'|'lying'|'tall'|'small', wall, need, suggestedAt, by, fixed, piece, other }` (no lip
  * at all: `pieces` [below, above], `wall` the thinnest wall that takes one, `need` the room the smallest lip needs,
  * `by` the letters of the cuts whose lips already lie `fixed` another way, 'tall' piece `piece` too tall for the
- * printer with a lip and `other` printing worse with it); APART_HEAVY `{ letter, cutId, weight, hold }` (`weight` in g of what hangs below a Z cut, `hold`
- * the clips' in N); APART_KEPT `{ letters }`;
+ * printer with a lip and `other` printing worse with it); APART_HEAVY `{ letter, cutId, weight, hold, firmer }` (`weight` in g of what hangs
+ * below a Z cut, `hold` the clips' in N, `firmer` the gentlest firmer hold that would hold it up, where one would); APART_KEPT `{ letters }`;
  * CONNECTORS_SHORTER `{ letter, depth, pegs }` (`pegs`: the cut has built-in pegs, `depth` their length);
  * CONNECTORS_FILAMENT `{ letter, count, diameter, length, lengths: [{ length, count }] }`
  * (`length` the longest; `lengths` when the holes take more than one); PEGS_SMALLER `{ letter, asked, pegSizes: [{ size,
@@ -3883,9 +3955,15 @@ function apartStepText(letter, group, lower, upper, axis) {
   const many = !z && upper.length > 1;
   const verb = (one, more) => (many ? more : one);
   const lip = group.filter((s) => s.joint === 'lip');
+  const oneWay = `${verb('It goes', 'They go')} on one way round only – turn ${verb('it', 'them')} until ${verb('it drops', 'they drop')} onto the lip.`;
+  if (lip.some((s) => s.apart.clips > 0 && s.apart.hold === 'lock')) {
+    // it takes a firm pull to come off: the seated top hides the key's gap, so there is nowhere to lever it
+    const press = z ? `Press ${top} on until it clicks` : `Press ${pieceList(upper)} onto ${pieceList(lower)} until ${verb('it clicks', 'they click')}`;
+    return `${lead} ${press} – ${verb('it locks', 'they lock')}; pull hard to open it. ${oneWay}`;
+  }
   if (lip.some((s) => s.apart.clips > 0 && s.apart.hold !== 'lift')) {
     const press = z ? `Press ${top} on until it clicks.` : `Press ${pieceList(upper)} onto ${pieceList(lower)} until ${verb('it clicks', 'they click')}.`;
-    return `${lead} ${press} ${verb('It goes', 'They go')} on one way round only – turn ${verb('it', 'them')} until ${verb('it drops', 'they drop')} onto the lip.`;
+    return `${lead} ${press} ${oneWay}`;
   }
   if (lip.length) {
     const set = z ? `Set ${top} on its lip` : `Set ${pieceList(upper)} against ${pieceList(lower)} on the lip`;
@@ -3941,9 +4019,11 @@ const size1 = (dims) => `${dims.map((v) => v.toFixed(1)).join(' × ')} mm`;
  * them (or that nothing is glued, when no other cut is).
  * @param {{ name: string, pieces: { index: number, cell: number[], size: number[], lies: string, yaw?: number, fits?: boolean, shells?: number }[],
  *   seams: object[], pins?: { d: number, length: number, count: number, spares?: number, own?: boolean }[],
- *   parts?: { name: string }[], clearance?: number, bed?: number[], printer?: { size: number[], margin: number }|null, steps?: object[] }} plan
+ *   parts?: { name: string }[], clearance?: number, bed?: number[], printer?: { size: number[], margin: number }|null, steps?: object[],
+ *   bridges?: number[] }} plan
  *   `seams` as for `assemblySteps`; `pins` one group per pin size (count without spares); `bed` the usable bed;
- *   `printer` the printer itself, when known, for the heading
+ *   `printer` the printer itself, when known, for the heading; `bridges` the clips' bridges' lengths as built (each
+ *   hold's own on a 1.6 mm tongue when not given)
  * @returns {string}
  */
 export function howToGlueText(plan) {
@@ -4000,7 +4080,11 @@ export function howToGlueText(plan) {
     }
   }
   parts.forEach((part, i) => out.push(`  ${pad(`part ${i + 1}`, 12)}${quoted(part.name)} – prints separately; glue it on after the pieces`));
-  if (anyClips) out.push(`  Clips are ${mm(CLIP.span)} mm bridges over a slot: print with bridging on (the default) and no supports.`);
+  if (anyClips) {
+    // a lock's bridges are shorter than the others' – longer again where a wide nozzle makes its clips thicker
+    const spans = [...new Set(plan.bridges ?? [...lips.values()].filter((l) => l.clicks).map((l) => clipShape(l.hold)?.span ?? CLIP.span))].sort((a, b) => a - b);
+    out.push(`  Clips are ${listOf(spans.map(mm))} mm bridges over a slot: print with bridging on (the default) and no supports.`);
+  }
   if (anyPins || anyPegs || anyTabs || anyLip) out.push('  Not sure about the fit? Print the fit test first (Split card → Download fit test).');
   out.push('');
 
@@ -4020,7 +4104,9 @@ export function howToGlueText(plan) {
     const who = l.axis === 2 ? `The top of cut ${l.letter}` : `${off.length > 1 ? 'Pieces' : 'Piece'} ${listOf(off)} of cut ${l.letter}`;
     const its = l.axis !== 2 && off.length > 1 ? 'their' : 'its';
     if (!l.clicks) out.push(`  ${who} should drop onto ${its} lip and lift off freely.`);
-    else {
+    else if (l.hold === 'lock') {
+      out.push(`  ${who} should lock onto ${its} lip and come off only with a firm pull. Too stiff to open: raise Clearance by 0.05 mm (or set the cut to Clicks on); too loose: lower it by 0.05 mm, and download again.`);
+    } else {
       const lighter = l.hold === 'light' ? '' : ' (or set the cut to Light click)';
       out.push(`  ${who} should click onto ${its} lip and pull off again by hand. Too stiff: raise Clearance by 0.05 mm${lighter}; no click or too loose: lower it by 0.05 mm, and download again.`);
     }

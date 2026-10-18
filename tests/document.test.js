@@ -504,14 +504,14 @@ describe('cuts that come apart', () => {
     return { doc, id };
   };
 
-  it('ticking a cut is one undo step that flags it and holds it on by clicks; doing it again changes nothing', () => {
+  it('ticking a cut is one undo step that flags it and locks it on; doing it again changes nothing', () => {
     const { doc, id } = lantern();
     const steps = doc.history.length;
     doc.setCutJoint(id, {});
-    expect(doc.split.cuts[0]).toEqual({ id, position: [0, 0, 190], normal: Z, joint: 'apart', hold: 'snap' });
+    expect(doc.split.cuts[0]).toEqual({ id, position: [0, 0, 190], normal: Z, joint: 'apart', hold: 'lock' });
     expect(doc.history.length).toBe(steps + 1);
     doc.setCutJoint(id, {}); // ticked already: the hold it has stays
-    doc.setCutJoint(id, { hold: 'snap' });
+    doc.setCutJoint(id, { hold: 'lock' });
     doc.setCutJoint('c9', {}); // no such cut
     expect(doc.history.length).toBe(steps + 1);
     doc.setCutJoint(id, { hold: 'light' });
@@ -591,15 +591,45 @@ describe('cuts that come apart', () => {
     const steps = doc.history.length;
     doc.setSplit({ cuts: doc.split.cuts.map(({ hold, joint, ...c }) => ({ hold, ...c, joint })) });
     expect(doc.history.length).toBe(steps);
-    // a new cut can come apart from the start
+    // a new cut can come apart from the start, and then locks
     const id = doc.addCut({ position: [0, 0, 40], normal: Z, joint: 'apart' });
-    expect(doc.split.cuts.at(-1)).toEqual({ id, position: [0, 0, 40], normal: Z, joint: 'apart', hold: 'snap' });
+    expect(doc.split.cuts.at(-1)).toEqual({ id, position: [0, 0, 40], normal: Z, joint: 'apart', hold: 'lock' });
     expect(doc.addCut({ position: [0, 0, 45], normal: Z, hold: 'lift' })).toBe('c6');
     expect(doc.split.cuts.at(-1)).toEqual({ id: 'c6', position: [0, 0, 45], normal: Z });
   });
 
+  it('a cut that already clicks on keeps clicking on: only a cut newly ticked locks, and undo and redo go between them', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'lantern');
+    doc.setSplit({ cuts: [{ id: 'c1', position: [0, 0, 190], normal: Z, joint: 'apart', hold: 'snap' }, { id: 'c2', position: [0, 0, 100], normal: Z }] });
+    expect(doc.split.cuts[0].hold).toBe('snap');
+    const steps = doc.history.length;
+    doc.setCutJoint('c1', {}); // ticked again: it keeps its hold
+    expect(doc.split.cuts[0].hold).toBe('snap');
+    expect(doc.history.length).toBe(steps);
+    doc.setCutJoint('c2', {});
+    expect(doc.split.cuts[1]).toEqual({ id: 'c2', position: [0, 0, 100], normal: Z, joint: 'apart', hold: 'lock' });
+    doc.setCutJoint('c1', { hold: 'lock' });
+    expect(doc.split.cuts.map((c) => c.hold)).toEqual(['lock', 'lock']);
+    doc.undo();
+    expect(doc.split.cuts.map((c) => c.hold)).toEqual(['snap', 'lock']);
+    doc.undo();
+    expect(doc.split.cuts[1]).toEqual({ id: 'c2', position: [0, 0, 100], normal: Z });
+    doc.redo();
+    doc.redo();
+    expect(doc.split.cuts.map((c) => c.hold)).toEqual(['lock', 'lock']);
+    // unticked and ticked again, a cut that clicked on locks: unticking dropped its hold
+    doc.undo();
+    doc.setCutJoint('c1', null);
+    doc.setCutJoint('c1', {});
+    expect(doc.split.cuts[0].hold).toBe('lock');
+    // a hold the document doesn't know still clicks on, as it always did
+    doc.setCutJoint('c1', { hold: 'firm' });
+    expect(doc.split.cuts[0].hold).toBe('snap');
+  });
+
   it('the holds are the engine\'s', () => {
-    expect(CUT_HOLDS).toEqual(['snap', 'light', 'lift']);
+    expect(CUT_HOLDS).toEqual(['lock', 'snap', 'light', 'lift']);
     expect(CUT_HOLDS).toEqual(APART_HOLDS);
     expect(Object.isFrozen(CUT_HOLDS)).toBe(true);
   });

@@ -36,6 +36,7 @@ import {
   axisCuts,
   boxesBeside,
   catchSizes,
+  clipShape,
   cellOf,
   cellOfPoint,
   cellSupport,
@@ -531,8 +532,10 @@ export function pinSheet({ d, length, count }, U = null) {
  * cut comes apart, a small closed box (60 × 30 × 24 mm, 4 mm walls, a 2 mm
  * floor and top) cut at 12 mm, with the same lip, clips and key at the same
  * clearance: the box standing upright, its lid on its cut face, as the
- * pieces of a lantern print. In a row with 5 mm gaps, centred, standing on
- * z = 0.
+ * pieces of a lantern print. A wider nozzle's lip is thicker and its groove
+ * reaches further, so there the walls are ten lines thick round the same
+ * inside and the lid as tall as the full lip needs: the lid gets the clips
+ * the model's lip has. In a row with 5 mm gaps, centred, standing on z = 0.
  * @param {object} spec the split settings: diameter (0 = 5 mm; with pegs, the peg's side), depth, clearance, pins, joint
  * @param {number} nozzle
  * @param {{ dovetail?: boolean, pins?: boolean, pegs?: boolean, apart?: string|null }} options `dovetail` adds the
@@ -581,8 +584,14 @@ export function fitTestCoupon(spec = {}, nozzle = 0.4, { dovetail = spec.joint =
       }
     }
     if (apart) {
-      const outside = t.add(t.add(Manifold.cube([60, 30, 24])).translate([-30, -15, 0]));
-      const closed = t.add(outside.subtract(t.add(t.add(Manifold.cube([52, 22, 20])).translate([-26, -11, 2]))));
+      // 4 mm walls and 10 mm inside the lid, or more where the full lip needs them: its groove's reach, and half a
+      // millimetre over it, to the mm
+      const wall = Math.max(4, Math.round(10 * nozzle * 1e6) / 1e6);
+      const R = lipReach(LIP.heights[0], 'opening', c, catchSizes(apart, c)?.i ?? 0, false, nozzle).reach;
+      const inside = R < 10 ? 10 : Math.ceil(R + 0.5);
+      const [X, Y] = [52 + 2 * wall, 22 + 2 * wall];
+      const outside = t.add(t.add(Manifold.cube([X, Y, 14 + inside])).translate([-X / 2, -Y / 2, 0]));
+      const closed = t.add(outside.subtract(t.add(t.add(Manifold.cube([52, 22, 10 + inside])).translate([-26, -11, 2]))));
       const lip = lipOnFace(closed, { id: 'fit', letter: 'A', axis: 2, at: 12 }, { c, hold: apart, nozzle });
       const box = t.add(closed.trimByPlane([0, 0, -1], -12));
       const lid = t.add(closed.trimByPlane([0, 0, 1], 12));
@@ -933,34 +942,52 @@ export function keyOn(T, Q, runs, windows, t = LIP.t) {
 
 /**
  * A clip's catch (c = 0) or the recess for it in the other piece (grown by c), in the plane frame: a convex hull
- * 6 mm along the clip with a 0.4 mm flat tip standing `p` out of it and 45° flanks on every side, its foot sunk
- * 0.2 mm into the clip (a recess reaches 0.6 back, into the gap), centred `zc` above the face. Framed on the chord
- * of the run under it (`chord`: its middle `p`, its way along `dir` and out of the tongue `out`): a curved run bulges
- * past the chord by its sagitta only, and on the edge its middle falls on the catch would stand further out.
+ * `length` along the clip (6 mm) with a 0.4 mm flat tip standing `p` out of it, 45° flanks at its ends, its foot
+ * sunk 0.2 mm into the clip (a recess reaches 0.6 back, into the gap), centred `zc` above the face. Its flank
+ * towards the face, which the top's wall bears on as it is pulled off, is at `retention` from the way it is pulled
+ * (degrees), and the one away from the face, which the wall rides over as the top is pressed on, at `lead`: both 45°
+ * on a plain catch. Grown by c, a flank at α moves its edge on the tip by c·tan(α/2). Framed on the chord of the run
+ * under it (`chord`: its middle `p`, its way along `dir` and out of the tongue `out`): a curved run bulges past the
+ * chord by its sagitta only, and on the edge its middle falls on the catch would stand further out.
  * @returns {Manifold}
  */
-export function catchSolid(chord, { zc, p, c = 0 }) {
+export function catchSolid(chord, { zc, p, c = 0, retention = 45, lead = 45, length = CLIP.length }) {
+  // at 45° exactly as the plain catch always was: tan 45° in floating point is a hair under 1
+  const edge = (deg) => c * (deg === 45 ? Math.SQRT2 - 1 : Math.tan((deg * Math.PI) / 360));
+  const slope = (deg) => (deg === 45 ? 1 : Math.tan((deg * Math.PI) / 180));
   const grow = c * (Math.SQRT2 - 1);
   const P = p + c;
-  const tipHalfL = CLIP.length / 2 - p + grow;
-  const tipHalfH = CLIP.flat / 2 + grow;
+  const tipHalfL = length / 2 - p + grow;
+  // [towards the face, away from it]: each flank's edge on the tip, and how far out it goes per mm along the pull
+  const tipHalfH = [CLIP.flat / 2 + edge(retention), CLIP.flat / 2 + edge(lead)];
+  const s = [slope(retention), slope(lead)];
   const back = -CLIP.sink - (c ? 0.4 : 0);
   const at = (a, o, z) => [chord.p[0] + a * chord.dir[0] + o * chord.out[0], chord.p[1] + a * chord.dir[1] + o * chord.out[1], zc + z];
   const pts = [];
   for (const sa of [-1, 1]) {
     for (const sz of [-1, 1]) {
-      pts.push(at(sa * tipHalfL, P, sz * tipHalfH));
-      pts.push(at(sa * (tipHalfL + P - back), back, sz * (tipHalfH + P - back)));
+      const k = sz < 0 ? 0 : 1;
+      pts.push(at(sa * tipHalfL, P, sz * tipHalfH[k]));
+      pts.push(at(sa * (tipHalfL + P - back), back, sz * (tipHalfH[k] + P / s[k] - back / s[k])));
     }
   }
   return manifold().Manifold.hull(pts);
 }
 
-/** The chord a clip's catch is framed on (`catchSolid`): its length either side of the window's middle. */
-function chordOf(run, w) {
+/**
+ * How far a clip's catch (`catchSolid`, c = 0) reaches from its centre at its foot: [down towards the face, up away
+ * from it]. Alike for a plain catch; a lock's shallow lead flank reaches up further than its steep flank down.
+ */
+export function catchReach(p, { retention = 45, lead = 45 } = {}) {
+  const slope = (deg) => (deg === 45 ? 1 : Math.tan((deg * Math.PI) / 180));
+  return [retention, lead].map((deg) => CLIP.flat / 2 + p / slope(deg) + CLIP.sink / slope(deg));
+}
+
+/** The chord a clip's catch is framed on (`catchSolid`): the catch's length either side of the window's middle. */
+function chordOf(run, w, length = CLIP.length) {
   const mid = (w.s0 + w.s1) / 2;
-  const a = along(run, mid - CLIP.length / 2).p;
-  const b = along(run, mid + CLIP.length / 2).p;
+  const a = along(run, mid - length / 2).p;
+  const b = along(run, mid + length / 2).p;
   const l = Math.hypot(b[0] - a[0], b[1] - a[1]);
   const dir = [(b[0] - a[0]) / l, (b[1] - a[1]) / l];
   return { p: [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], dir, out: [dir[1], -dir[0]] };
@@ -1190,11 +1217,22 @@ export function planLip(patch, options = {}) {
     if (kind === 'channel' && windows.length) Tc = t.add(Tc.add(t.add(CrossSection.union(windows.map((w) => t.add(reliefOf(runs[w.run], w)))))));
     Tc = t.add(Tc.simplify(LIP.eps));
     const { zTop, reach } = lipReach(H, kind, c, i, hasOver, nozzle);
+    // a lock's bridge is the middle of its window, and its catch longer: the window, and so the room it needs, is the same
+    const shape = withClips ? clipShape(hold, c, th) : null;
+    const slotOf = (w) => {
+      if (!shape || shape.span >= CLIP.span) return [w.s0, w.s1];
+      const mid = (w.s0 + w.s1) / 2;
+      return [mid - shape.span / 2, mid + shape.span / 2];
+    };
+    // a wider nozzle's thicker tongue is thinned from the inside along each bridge, down to the clip's own thickness:
+    // a clip is stiffer as the cube of it
+    const thin = (w) => (shape && shape.t < th - 1e-9 ? { thin: polygonsOf(t.add(stripSection(runs[w.run], ...slotOf(w), -shape.t, th + 0.6))) } : {});
     return {
       kind, hasOver, H, c, p, i, t: th, g0, d0, gIn, hold, zTop, reach, want, why: [...why],
       key: keyAt ? { p: keyAt.p, len: keyAt.len } : null,
       windows: windows.map((w) => ({
-        s0: w.s0, s1: w.s1, slot: polygonsOf(t.add(stripSection(runs[w.run], w.s0, w.s1, 0.5, th + 0.5))), chord: chordOf(runs[w.run], w),
+        s0: w.s0, s1: w.s1, slot: polygonsOf(t.add(stripSection(runs[w.run], ...slotOf(w), 0.5, th + 0.5))), chord: chordOf(runs[w.run], w, shape?.length),
+        ...thin(w),
       })),
       area: T.area(), T: polygonsOf(T), Tc: polygonsOf(Tc), A: polygonsOf(Ae),
     };
@@ -1373,14 +1411,22 @@ export function lipSolids(lip) {
     const mouths = [];
     for (let j = 0; j < Math.round(LIP.mouth / S); j++) mouths.push(t.add(prism(t.add(Tc.offset(LIP.mouth - S * j, 'Miter', 4)), -1.1 - 0.1 * j, S * (j + 1))));
     cavity = t.add(cavity.add(t.add(Manifold.union(mouths))));
-    const zc = (CLIP.slot + H - LIP.lead) / 2;
     const slots = [];
     const catches = [];
     const recesses = [];
+    // a lock's catch is longer, with a steep flank that holds and a shallow one it goes on over; the others' are plain
+    const shape = lip.hold === 'lock' && lip.windows.length ? clipShape('lock', c, th) : null;
+    const flanks = shape ? { retention: shape.retention, lead: shape.lead, length: shape.length } : {};
+    // the catch, foot and all, sits in the middle of the clip's band, between the slot and the tongue's lead-in: a
+    // lock's reaches up further than down, so it sits lower – up into the lead-in it would leave slivers of itself
+    const [down, up] = catchReach(p, flanks);
+    const zc = (CLIP.slot + H - LIP.lead) / 2 + (down - up) / 2;
     for (const w of lip.windows) {
       slots.push(t.add(prism(t.add(new CrossSection(w.slot, 'Positive')), -0.6, CLIP.slot)));
-      catches.push(t.add(catchSolid(w.chord, { zc, p })));
-      recesses.push(t.add(catchSolid(w.chord, { zc, p, c })));
+      // a foot and a top of its own, inside the slot and over the lead-in's cutters
+      if (w.thin) slots.push(t.add(prism(t.add(new CrossSection(w.thin, 'Positive')), 1, H + 1.15)));
+      catches.push(t.add(catchSolid(w.chord, { zc, p, ...flanks })));
+      recesses.push(t.add(catchSolid(w.chord, { zc, p, c, ...flanks })));
     }
     if (slots.length) tongue = t.add(t.add(tongue.subtract(t.add(Manifold.union(slots)))).add(t.add(Manifold.union(catches))));
     const cutters = recesses.length ? Manifold.union([cavity, ...recesses]) : cavity.translate([0, 0, 0]);
@@ -1394,7 +1440,8 @@ export function lipSolids(lip) {
 
 /** What a lip's solids are built from, as a key: the same plan builds the same solids. */
 const lipKey = (lip) => JSON.stringify([
-  lip.kind, Boolean(lip.hasOver), lip.H, lip.c, lip.p, lip.t, lip.g0, lip.d0, lip.zTop, lip.T, lip.Tc, lip.A, lip.windows.map((w) => [w.slot, w.chord]),
+  lip.kind, Boolean(lip.hasOver), lip.H, lip.c, lip.p, lip.t, lip.g0, lip.d0, lip.zTop, lip.T, lip.Tc, lip.A,
+  lip.windows.map((w) => [w.slot, w.chord, w.thin ?? null]), lip.hold === 'lock',
 ]);
 
 /** A lip's tongue and cutters, kept: never delete them, transform or copy them. */

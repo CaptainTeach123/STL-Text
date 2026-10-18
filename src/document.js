@@ -66,7 +66,7 @@ export const ITEM_DEFAULTS = Object.freeze({
  * `hold` says.
  */
 export const SPLIT_DEFAULTS = Object.freeze({
-  cuts: Object.freeze([]), // [{ id: 'c1', position: [x, y, z], normal: [1, 0, 0], joint?: 'apart', hold?: 'snap' }], model mm
+  cuts: Object.freeze([]), // [{ id: 'c1', position: [x, y, z], normal: [1, 0, 0], joint?: 'apart', hold?: 'lock' }], model mm
   joint: 'auto', // 'auto' | 'dowels' | 'dovetail' | 'none'
   diameter: 0, // mm: 0 = automatic | 1.75 (filament) | 3 | 4 | 5 | 6 | 8 | 10
   depth: 0, // mm into each piece: 0 = automatic | 3–30
@@ -217,21 +217,27 @@ const cutNumber = (id) => Number(/^c(\d+)$/.exec(String(id))?.[1] ?? 0);
 const nextCutId = (cuts) => `c${1 + Math.max(0, ...cuts.map((c) => cutNumber(c.id)))}`;
 
 /**
- * How a cut that comes apart holds: its top clicks on, clicks on lightly, or
- * just lifts off. The same list as split.js's `APART_HOLDS`.
+ * How a cut that comes apart holds, firmest first: its top locks on, clicks
+ * on, clicks on lightly, or just lifts off. The same list as split.js's
+ * `APART_HOLDS`.
  */
-export const CUT_HOLDS = Object.freeze(['snap', 'light', 'lift']);
+export const CUT_HOLDS = Object.freeze(['lock', 'snap', 'light', 'lift']);
+
+/** The hold of a cut newly made one that comes apart: it locks. */
+const NEW_HOLD = 'lock';
 
 /**
  * A cut as the document keeps it: its own arrays, and the take-apart flag with
- * a hold it knows (Clicks on for any other) only on a cut that comes apart, so
- * an ordinary cut stays `{ id, position, normal }`. Any other joint is dropped.
+ * a hold it knows only on a cut that comes apart, so an ordinary cut stays
+ * `{ id, position, normal }`. A cut that comes apart with no hold yet locks;
+ * one with a hold the document doesn't know clicks on, as it always did. Any
+ * other joint is dropped.
  */
 const copyCut = ({ id, position, normal, joint, hold }) => ({
   id,
   position: [...position],
   normal: [...normal],
-  ...(joint === 'apart' ? { joint, hold: CUT_HOLDS.includes(hold) ? hold : 'snap' } : {}),
+  ...(joint === 'apart' ? { joint, hold: hold == null ? NEW_HOLD : CUT_HOLDS.includes(hold) ? hold : 'snap' } : {}),
 });
 
 /**
@@ -475,8 +481,9 @@ export class Document {
 
   /**
    * Make a cut one that comes apart (`apart`: `{ hold }`, where an empty `{}`
-   * keeps the hold it has, or Clicks on) or a glued one again (null, which
-   * drops its hold too). One undo step; nothing when the cut is that already.
+   * keeps the hold it has, or locks a cut newly ticked) or a glued one again
+   * (null, which drops its hold too). One undo step; nothing when the cut is
+   * that already.
    */
   setCutJoint(id, apart) {
     const cut = this.state.split?.cuts.find((c) => c.id === id);

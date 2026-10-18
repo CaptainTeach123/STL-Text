@@ -13,7 +13,7 @@ import {
 } from '../src/split.js';
 import { clearSplitCaches, dowelHole, halfHole, pegAt, pinAt, pinSolid, socketAt } from '../src/splitGeometry.js';
 import { setup, soupOf as soupGeometry } from './helpers.js';
-import { lanternSolid, lift, stlCheck } from './lanternFixture.js';
+import { box, lanternSolid, lift, stlCheck } from './lanternFixture.js';
 
 const fontBytes = (pkg, file) => {
   const buf = fs.readFileSync(path.resolve('node_modules/@fontsource', pkg, 'files', file));
@@ -1702,6 +1702,57 @@ describe('cuts that come apart', () => {
     expect(Math.abs(lift(a, b, [0, 0, 0.25]) - 0.206)).toBeLessThan(0.02);
   });
 
+  it('a lantern whose top locks: the same pieces with stiffer clips, notes and a sheet that say it takes a hard pull to come off, and no warning', async () => {
+    await lantern();
+    const split = S({ cuts: [apartAt(2, 190, 'c1', 'lock')] });
+    const ex = await exportSplit(split, { name: 'lantern', archive: 'zip' });
+    const zip = unzipSync(new Uint8Array(ex.zip));
+    expect(Object.keys(zip).sort()).toEqual(['lantern-how-to-glue.txt', 'lantern-piece-1-of-2.stl', 'lantern-piece-2-of-2.stl']);
+    expect(ex.pieces.map((p) => [p.lies, p.down, p.size.map((v) => +v.toFixed(3)), p.lips, p.lids])).toEqual([
+      ['flat as modelled', '-z', [108, 108, 196], [{ letter: 'A', clips: 4 }], []],
+      ['on a cut face', '-z', [110, 110, 101], [], ['A']],
+    ]);
+    expect(ex.seams).toEqual([expect.objectContaining({
+      letter: 'A', pieces: [1, 2], joint: 'lip', male: 1, labels: null, dowels: [], pegs: [],
+      apart: { hold: 'lock', lip: true, clips: 4, height: 6, key: true, faces: 1, flat: 0 },
+    })]);
+    // four locking clips hold far more than the body weighs: no warning
+    expect(codes(ex)).toEqual(['SPLIT', 'APART']);
+    // the seated top hides the key's gap inside its wall, so the only way off is a hard pull: nothing says to lever it
+    expect(noteOf(ex, 'APART')).toMatchObject({
+      hold: 'lock', clips: 4,
+      text: 'Cut A comes apart: the top (piece 2) locks onto a 6 mm lip – 4 clips hold it firmly. Press it on until it clicks; to take it off, pull hard.',
+    });
+    expect(noteOf(ex, 'APART')).not.toHaveProperty('key');
+    expect(ex.assembly).toEqual([
+      'Do not glue cut A: it comes apart. Press the top on until it clicks – it locks; pull hard to open it. It goes on one way round only – turn it until it drops onto the lip.',
+    ]);
+    const text = strFromU8(zip['lantern-how-to-glue.txt']);
+    expect(text).not.toMatch(/lever|gap/);
+    expect(text).toContain('  Clips are 30 mm bridges over a slot: print with bridging on (the default) and no supports.');
+    expect(text).toContain('  The top of cut A should lock onto its lip and come off only with a firm pull. Too stiff to open: raise Clearance by 0.05 mm (or set the cut to Clicks on); too loose: lower it by 0.05 mm, and download again.');
+    expect(text).toContain(`PUT TOGETHER – nothing is glued\n  1. ${ex.assembly[0]}\n`);
+    // clean files; put back, the top sits with the clearance all round and is held sooner and harder than Clicks on's
+    const files = piecesOf(await exportSplit(split, { name: 'lantern' }));
+    expect(files.map(fileCheck)).toEqual([{ degenerate: 0, open: 0 }, { degenerate: 0, open: 0 }]);
+    const [body, top] = files.map(pieceSolid);
+    expect(Math.abs(body.volume() - 221066.2)).toBeLessThan(1);
+    expect(Math.abs(top.volume() - 80823.0)).toBeLessThan(1);
+    expect([body.genus(), top.genus()]).toEqual([12, 1]);
+    const [a, b] = files.map(assembled);
+    expect(overlap(a, b)).toBeLessThan(1e-6);
+    expect(Math.abs(lift(a, b, [0, 0, 0.25]) - 0.572)).toBeLessThan(0.02);
+    // the fit test: the box and its lid with the locking clips
+    const fit = await client.fitTest([], version, { printing, split, bed: BED, name: 'lantern' });
+    expect(fit).toMatchObject({ apart: 'lock', pins: false, pegs: false, dovetail: false });
+    const bodies = own(solidOfStl(fit.stl)).decompose().map(own).map((m) => boxOf(m).size.map((v) => +v.toFixed(3)));
+    expect(bodies.sort((p, q) => q[2] - p[2])).toEqual([[60, 30, 18], [60, 30, 12]]);
+    const clicks = await client.fitTest([], version, { printing, split: S({ cuts: [apartAt(2, 190)] }), bed: BED, name: 'lantern' });
+    expect(Math.abs(own(solidOfStl(fit.stl)).volume() - own(solidOfStl(clicks.stl)).volume())).toBeGreaterThan(10);
+    // set to lock without the model, the settings say so too
+    expect(await client.call('split.fitTest', { split: split, printing, name: 'lantern' })).toMatchObject({ apart: 'lock' });
+  });
+
   it('a light click may not hold up the body when the model is carried by its top, and says so', async () => {
     await lantern();
     const ex = await exportSplit(S({ cuts: [apartAt(2, 190, 'c1', 'light')], labels: false }), { name: 'lantern' });
@@ -1712,6 +1763,63 @@ describe('cuts that come apart', () => {
     expect(heavy.text).toBe('Cut A\'s clips may not hold up what hangs below it (about 270 g) – carry the model by its base, not its top.');
     expect(heavy.weight).toBe(Math.round(own(own(lanternSolid()).trimByPlane([0, 0, -1], -190)).volume() * 1.24e-3));
     expect(heavy.hold).toBeCloseTo(4.2, 1);
+    // Clicks on's 10.5 N would hold it up: that is the hold the note offers
+    expect(heavy.firmer).toBe('snap');
+  });
+
+  it('with a heavy base under the cut Clicks on may not hold it up either: the note offers Locks, which does', async () => {
+    // the lantern with a solid base, about 650 g below the cut: under 2 × 6.4 N, Clicks on's 10.5 N is too little
+    await load(own(own(lanternSolid()).add(own(box([-46, -46, 3], [46, 46, 40])))), 'heavy');
+    const of = async (hold) => noteOf(await exportSplit(S({ cuts: [apartAt(2, 190, 'c1', hold)], labels: false }), { name: 'heavy' }), 'APART_HEAVY');
+    const [snap, light, lock] = [await of('snap'), await of('light'), await of('lock')];
+    expect(snap).toMatchObject({ weight: 648, firmer: 'lock', text: 'Cut A\'s clips may not hold up what hangs below it (about 650 g) – carry the model by its base, not its top.' });
+    expect(snap.hold).toBeCloseTo(10.5, 1);
+    expect(light).toMatchObject({ weight: 648, firmer: 'lock' });
+    expect(lock).toBeUndefined();
+  });
+
+  it('on a wider nozzle the clips are thinned to a 0.4 mm nozzle\'s, so they hold alike: a light click warns as it would, and Clicks on is enough', async () => {
+    // an open box 100 × 100 × 200 with 7 mm walls, 512 g below a cut at 150 (10 N twice over); a 0.6 mm nozzle's tongue
+    // is 2.4 mm
+    await load(own(own(box([-50, -50, 0], [50, 50, 200])).subtract(own(box([-43, -43, 3], [43, 43, 201])))), 'tower');
+    const wide = { nozzle: 0.6, layerHeight: 0.3 };
+    const ex = await client.export([], version, 'tower', { printing: wide, split: S({ cuts: [apartAt(2, 150, 'c1', 'light')], labels: false }), bed: BED, archive: 'files' });
+    // its clips hold as a 0.4 mm nozzle's do, 4.2 N – not the 14.2 N the whole 2.4 mm tongue would make them
+    expect(codes(ex)).toEqual(['SPLIT', 'APART', 'APART_HEAVY']);
+    expect(noteOf(ex, 'APART_HEAVY')).toMatchObject({ weight: 512, firmer: 'snap' });
+    expect(noteOf(ex, 'APART_HEAVY').hold).toBeCloseTo(4.2, 1);
+    expect(piecesOf(ex).map(fileCheck)).toEqual([{ degenerate: 0, open: 0 }, { degenerate: 0, open: 0 }]);
+    // a lock's clips are its 30 mm bridges at 0.6 mm; at 1 mm, two lines thick, 37.5 mm, as long as they are thicker
+    const sheet = async (nozzle, wall) => {
+      await load(own(own(box([-50, -50, 0], [50, 50, 200])).subtract(own(box([-50 + wall, -50 + wall, 3], [50 - wall, 50 - wall, 201])))), 'tower');
+      const r = await client.export([], version, 'tower', { printing: { nozzle, layerHeight: 0.3 }, split: S({ cuts: [apartAt(2, 150, 'c1', 'lock')], labels: false }), bed: BED, archive: 'zip' });
+      return { codes: codes(r), clips: r.seams[0].apart.clips, text: strFromU8(unzipSync(new Uint8Array(r.zip))['tower-how-to-glue.txt']) };
+    };
+    for (const [nozzle, wall, bridge] of [[0.6, 7, 30], [1, 10, 37.5]]) {
+      const got = await sheet(nozzle, wall);
+      expect(got.codes).toEqual(['SPLIT', 'APART']);
+      expect(got.clips).toBe(4);
+      expect(got.text).toContain(`  Clips are ${bridge} mm bridges over a slot: print with bridging on (the default) and no supports.`);
+    }
+  });
+
+  it('the fit test of a cut that locks has the locking clips on a wider nozzle too: its box and lid grow for the thicker lip', async () => {
+    // the settings alone, glue only for any other cut: the box and its lid and nothing else
+    const split = S({ joint: 'none', cuts: [apartAt(2, 190, 'c1', 'lock')] });
+    const coupon = async (nozzle, hold = 'lock') => {
+      const r = await client.call('split.fitTest', { split: S({ joint: 'none', cuts: [apartAt(2, 190, 'c1', hold)] }), printing: { nozzle, layerHeight: 0.2 }, name: 'lantern' });
+      const solid = own(solidOfStl(r.stl));
+      return { apart: r.apart, volume: solid.volume(), bodies: solid.decompose().map(own).map((m) => boxOf(m).size.map((v) => +v.toFixed(3))).sort((p, q) => q[2] - p[2]) };
+    };
+    expect((await client.call('split.fitTest', { split, printing, name: 'lantern' })).apart).toBe('lock');
+    // a full 6 mm lip on the box, 6 mm over its 12, where a 0.5 mm nozzle and wider had only 4.5 mm and no clips
+    for (const [nozzle, sizes] of [[0.4, [[60, 30, 18], [60, 30, 12]]], [0.6, [[64, 34, 18], [64, 34, 14]]], [0.8, [[68, 38, 18], [68, 38, 15]]]]) {
+      const [lock, lift] = [await coupon(nozzle), await coupon(nozzle, 'lift')];
+      expect(lock.apart).toBe('lock');
+      expect(lock.bodies).toEqual(sizes);
+      expect(lift.bodies).toEqual(sizes);
+      expect(Math.abs(lock.volume - lift.volume)).toBeGreaterThan(100); // its slots and catches
+    }
   });
 
   it('a cut glued beside one that comes apart is glued first, with its labels, and the lid goes on last; the lip lays the box', async () => {
@@ -1875,7 +1983,7 @@ describe('cuts that come apart', () => {
     await lantern();
     /** Every way through a split: the pieces view, the measure, the download, a fit test and Fit to my printer. */
     const round = async (i) => {
-      const split = S({ cuts: [apartAt(2, 189 + (i % 4), 'c1', APART_HOLDS[i % 3])], labels: false });
+      const split = S({ cuts: [apartAt(2, 189 + (i % 4), 'c1', APART_HOLDS[i % APART_HOLDS.length])], labels: false });
       await resultSplit(split);
       await client.planSplit([], version, { printing, split, bed: BED, mode: 'measure' });
       await exportSplit(split, { name: 'lantern', archive: 'zip' });

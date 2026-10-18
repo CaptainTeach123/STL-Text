@@ -2,6 +2,7 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
 import { FILAMENT, PIN_DIAMETERS, TO_PLANE, chooseOrientation, isSymmetric, normaliseSplit, pegMales, pegSizesFor, sizesFor } from '../src/split.js';
 import {
+  bandFor,
   buildSplitDisplay,
   cutPieces,
   dovetailCells,
@@ -20,6 +21,7 @@ import {
   pinSpares,
   pinsPerSheet,
   planDovetails,
+  shadowFor,
   socketAt,
   socketSolid,
 } from '../src/splitGeometry.js';
@@ -374,6 +376,21 @@ describe('built-in pegs on the cut faces', () => {
     expect(plan.notes).toEqual([expect.objectContaining({ code: 'DOVETAIL_NOT_PLATE', pegs: true, text: 'Cut B isn\'t through a thin plate, so it uses built-in pegs.' })]);
   });
 
+  it('a peg\'s shadow reaches as far as its socket on one side and just past the face on the other', () => {
+    // 3 mm of solid under the face and 20 mm over it: a socket above and a peg below meet no air, a hole either way does
+    const slab = cube([30, 30, 23], [0, 0, 8.5]);
+    const cut = { axis: 2, at: 0 };
+    const band = own(bandFor(slab, cut, 10));
+    const face = own(band.slice(0));
+    const left = (reach) => own(face.subtract(own(shadowFor(band, cut, reach)))).area();
+    expect(left({ below: 1, above: 10 })).toBeCloseTo(900, 6);
+    expect(left({ below: 10, above: 10 })).toBe(0);
+    expect(left(10)).toBe(0);
+    // the other way round, the socket below meets the air 3 mm down
+    expect(left({ below: 10, above: 1 })).toBe(0);
+    expect(left({ below: 2.5, above: 10 })).toBeCloseTo(900, 6);
+  });
+
   /** Every peg and socket lies inside the model, the sockets a wall's thickness from its outside. */
   function expectPegsInside(solid, layout) {
     const b = boxOf(solid);
@@ -386,9 +403,103 @@ describe('built-in pegs on the cut faces', () => {
     }
   }
 
+  it('a lid too thin for a socket carries the pegs, though the box under it would have, and the box takes the sockets', () => {
+    // the box stands on its foot and the 6 mm lid on its cut face, so the box would carry them, its sockets in the lid
+    const lidded = cube([150, 150, 100], [0, 0, 50]);
+    const s = split(lidded, [[2, 94]], { joint: 'pegs', labels: false });
+    expect(s.pieces.map((p) => p.lying.down)).toEqual(['-z', '-z']);
+    expect(s.layout.seams).toEqual([expect.objectContaining({ pieces: [1, 2], joint: 'pegs', male: 2 })]);
+    expect(s.layout.pegs.length).toBeGreaterThanOrEqual(2);
+    for (const g of s.layout.pegs) expect(g).toMatchObject({ s: 8, length: 12, male: 1, dir: -1 });
+    expect(s.layout.notes).toEqual([]);
+    expectPegsInside(lidded, s.layout);
+    for (const piece of s.drilled) {
+      expect(piece.status()).toBe('NoError');
+      expect(piece.genus()).toBe(0);
+    }
+    // with no say in which piece carries them, the one below does, unless only it has room for the sockets
+    const bare = layoutSplit(lidded, s.cuts, s.pieces, s.spec, { joints: s.plan.joints, tabs: s.plan.tabs });
+    expect(bare.seams).toEqual([expect.objectContaining({ joint: 'pegs', male: 2 })]);
+  });
+
+  it('the sockets go into the piece with more room for them, whichever side of the cut it is', () => {
+    // a sealed void 8 mm behind the face on one side: the pegs stand on that piece, over the void, and their sockets go
+    // deep into the other; mirrored, the same. Before, the lower-numbered piece carried them, and on one side they were
+    // 4 mm and 3 mm long, the face told too narrow for 8 mm
+    for (const side of [1, -1]) {
+      const hollow = own(cube([200, 40, 40]).subtract(cube([52, 30, 30], [34 * side, 0, 0])));
+      for (const diameter of [0, 8]) {
+        const s = split(hollow, [[0, 0]], { joint: 'pegs', labels: false, diameter });
+        expect(s.layout.pegs.map((g) => [g.s, g.length, g.dir])).toEqual([[8, 12, -side], [8, 12, -side]]);
+        expect(s.layout.notes).toEqual([]);
+        expectPegsInside(hollow, s.layout);
+      }
+    }
+    // a box with 12 mm walls and an 8 mm lid: the lid lies on its cut face, so the box would carry them, their sockets
+    // 3.7 mm deep in the lid; the lid lies as well on its top, so it carries them and the sockets go into the walls
+    const lidded = own(cube([120, 120, 108], [0, 0, 54]).subtract(cube([96, 96, 94], [0, 0, 53])));
+    const s = split(lidded, [[2, 100]], { joint: 'pegs', labels: false });
+    expect(s.layout.seams).toEqual([expect.objectContaining({ pieces: [1, 2], joint: 'pegs', male: 2 })]);
+    expect(s.layout.pegs.length).toBeGreaterThanOrEqual(2);
+    for (const g of s.layout.pegs) expect(g).toMatchObject({ s: 4, length: 6, dir: -1 });
+    expectPegsInside(lidded, s.layout);
+  });
+
+  it('Auto sizes the pegs on the side their sockets go into, and only on faces that get them', () => {
+    // an 8 mm base under a 20 mm block: the base could take 4 mm sockets, but the block takes them, and 8 mm ones
+    const base = own(wasm.Manifold.union([cube([160, 100, 8], [0, 0, 4]), cube([160, 100, 20], [0, 0, 18])]));
+    let s = split(base, [[2, 8]], { joint: 'pegs', labels: false });
+    expect(s.layout.pegSize).toBe(8);
+    for (const g of s.layout.pegs) expect(g).toMatchObject({ s: 8, length: 12, male: 0, dir: 1 });
+    expect(s.layout.notes).toEqual([]);
+    expectPegsInside(base, s.layout);
+    // a frame cut across a 40 mm bar and a 17 mm one, with a pocket 3 mm behind the narrow bar's face on the right: only
+    // the left has room for its sockets, and it takes 5 mm pegs, the wide bar 6 mm ones
+    const frame = own(own(wasm.Manifold.union([
+      cube([200, 17, 30], [100, 8.5, 15]), cube([200, 40, 30], [100, 180, 15]), cube([40, 200, 30], [20, 100, 15]), cube([40, 200, 30], [180, 100, 15]),
+    ])).subtract(cube([47, 11, 24], [126.5, 8.5, 15])));
+    // with the sockets on the left, both bars get pegs, of the narrow bar's size; before, the left piece carried them
+    s = split(frame, [[0, 100]], { joint: 'pegs', labels: false });
+    expect(s.layout.seams).toEqual([expect.objectContaining({ joint: 'pegs', male: 2 })]);
+    expect(s.layout.pegs.map((g) => g.s)).toEqual([5, 5, 5, 5]);
+    expect(s.layout.pegs.filter((g) => g.centre[1] < 17)).toHaveLength(2);
+    expect(s.layout.notes).toEqual([]);
+    expectPegsInside(frame, s.layout);
+    // made to go into the right, the narrow bar is glued, and its size is none of the model's
+    const { spec, cuts, plan, pieces } = s;
+    const right = layoutSplit(frame, cuts, pieces, spec, { joints: plan.joints, tabs: plan.tabs, pegMales: (pairs) => pairs.map(() => 0) });
+    expect(right.pegSize).toBe(6);
+    expect(right.pegs.map((g) => [g.s, g.centre[1] > 160])).toEqual([[6, true], [6, true]]);
+    expect(right.notes).toEqual([expect.objectContaining({ code: 'CONNECTORS_DROPPED', count: 1, total: 2 })]);
+  });
+
+  it('a peg stands on a wall\'s thickness of solid, not on the skin over a void', () => {
+    // a box with a void whose roof is 1.5 mm under the cut: the lower piece carries the pegs, none of them over it
+    const hollow = own(cube([200, 140, 80], [0, 0, 40]).subtract(cube([150, 90, 18.5], [0, 0, 29.25])));
+    const s = split(hollow, [[2, 40]], { joint: 'pegs', labels: false });
+    expect(s.layout.pegs.length).toBe(6);
+    for (const g of s.layout.pegs) {
+      expect(g).toMatchObject({ s: 8, dir: 1 });
+      // the peg's diamond, as deep into its piece as its root must be solid
+      const r = g.s / Math.SQRT2;
+      const root = 0.5 + pegSizesFor(g.s).wall;
+      const diamond = own(new wasm.CrossSection([[[r, 0], [0, r], [-r, 0], [0, -r]]]));
+      const under = own(own(wasm.Manifold.extrude(diamond, root)).translate([g.centre[0], g.centre[1], g.at - root]));
+      expect(own(under.subtract(hollow)).volume()).toBeLessThan(1e-6);
+    }
+    expectPegsInside(hollow, s.layout);
+  });
+
+  it('names the cuts whose faces would take pins instead: not a plate too thin for sockets, which carries the pegs', () => {
+    const plated = (t) => own(wasm.Manifold.union([cube([140, 90, t], [0, 0, t / 2]), cube([140, 90, 30], [0, 0, t + 15])]));
+    // a 5 mm plate has no room for a 3 mm pin's holes; a 10 mm one has
+    expect(split(plated(5), [[2, 5]], { joint: 'pegs', labels: false }).layout).toMatchObject({ pinnable: [], seams: [expect.objectContaining({ joint: 'pegs' })] });
+    expect(split(plated(10), [[2, 10]], { joint: 'pegs', labels: false }).layout).toMatchObject({ pinnable: ['c1'], seams: [expect.objectContaining({ joint: 'pegs' })] });
+  });
+
   it('keep a wall from the air and from each other: a void behind the face takes shorter pegs, parallel cuts never meet', () => {
-    // a sealed void 8 mm behind the face: a 4 mm peg's socket reaches it, a 3 mm peg's does not
-    const hollow = own(cube([200, 40, 40]).subtract(cube([52, 30, 30], [34, 0, 0])));
+    // a sealed void 8 mm behind the face on both sides: a 4 mm peg's socket reaches it, a 3 mm peg's does not
+    const hollow = own(own(cube([200, 40, 40]).subtract(cube([52, 30, 30], [34, 0, 0]))).subtract(cube([52, 30, 30], [-34, 0, 0])));
     let s = split(hollow, [[0, 0]], { joint: 'pegs', labels: false });
     expect(s.layout.pegs.map((g) => [g.s, g.length])).toEqual([[4, 3], [4, 3]]);
     expect(s.layout.notes).toEqual([expect.objectContaining({ code: 'CONNECTORS_SHORTER', pegs: true, depth: 3 })]);

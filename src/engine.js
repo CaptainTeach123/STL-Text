@@ -17,7 +17,7 @@ import {
   cutPlane, fitsBed, glueFileName, gridCandidates, howToGlueText, layPieces, letterFor, normaliseSplit, partFileName, pieceFileName, pinsFileName,
   planCost, planGrid, planSamples, plateAxis, safeFileName, slabAxis, sizesFor, smallPieceNotes, soupCells, splitActive, splitNote, usableBed,
   zipFileName, cellSupport, flatProbes, outlineColumns, textNotes, baseAxis, modelPlates, layPegged, pegAllowance, pegMales, pegSizeOf, pegSizesFor,
-  pegSides, cellFits,
+  pegSides, cellFits, uprightPegNotes,
 } from './split.js';
 import {
   buildSplitDisplay, clearSplitCaches, cutPieces, drillPiece, fitTestCoupon, layoutSplit, partedSolids, pinAt, pinSheet, pinSpares, pinsPerSheet,
@@ -2588,7 +2588,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const held = laid[i].stats.allowed.length < 6 || o.pegged;
       notes.push(...o.notes.filter((x) => !(held && x.code === 'ORIENT_FALLBACK')));
     });
-    notes.push(...layout.notes);
+    // pegs that all print pointing up (on a plate under a thick top) are weaker across their layers: said once a cut,
+    // naming pins only where they would fit
+    notes.push(...layout.notes, ...uprightPegNotes(layout.pegs, laid, lying, layout.pinnable));
     // the peg size is the one the pieces have, as the summary says: a size asked for that no face took is none of theirs
     return { ...split, pieces, seams, pins, notes, grid: cut.grid, diameter: layout.diameter, pegSize: pegSizes[0]?.size ?? layout.pegSize };
   }

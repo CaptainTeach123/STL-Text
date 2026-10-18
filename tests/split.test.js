@@ -9,7 +9,7 @@ import { manifold } from '../src/manifold.js';
 import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
 import { FILAMENT, SPLIT_DEFAULTS, TO_PLANE, cellSizes, cellSupport, fitPieces, isSymmetric, orientationStats, pegSizesFor, sizesFor } from '../src/split.js';
-import { clearSplitCaches, dowelHole, halfHole, pegAt, pinAt, pinSolid } from '../src/splitGeometry.js';
+import { clearSplitCaches, dowelHole, halfHole, pegAt, pinAt, pinSolid, socketAt } from '../src/splitGeometry.js';
 import { setup, soupOf as soupGeometry } from './helpers.js';
 
 const fontBytes = (pkg, file) => {
@@ -1549,6 +1549,91 @@ describe('built-in pegs', () => {
     expect(noteOf(ex, 'CONNECTORS_DROPPED')).toMatchObject({
       lying: true, text: 'On 2 of 2 faces at cut A neither piece can lie on the bed with pegs standing out of it – they are flat glue joints. Pins (Joints: Pins) would join them.',
     });
+  });
+
+  it('a thin plate under a thick top carries the pegs, standing up, and the top takes the sockets', async () => {
+    // a plaque cut along the top of its 5 mm base: over it a 2 mm field with 1 mm pockets, and a 15 mm rim and a 60 × 40
+    // block rising 8 mm; under it, letters engraved 1 mm deep, so the base would rather lie on its cut face. It has no
+    // room for a socket, so it carries the pegs; the top has room under the rim and the block (before, the room was the
+    // thinner side's, and no peg fitted)
+    const plaque = own(wasm.Manifold.union([
+      own(cube([174, 120, 5], [0, 0, 2.5]).subtract(own(wasm.Manifold.union([cube([60, 12, 2], [-40, 0, 0]), cube([60, 12, 2], [40, 0, 0])])))),
+      own(cube([174, 120, 2], [0, 0, 6]).subtract(own(wasm.Manifold.union([[-50, 30], [50, 30], [-50, -30], [50, -30]].map(([x, y]) => cube([16, 8, 2], [x, y, 7])))))),
+      own(cube([174, 120, 8], [0, 0, 9]).subtract(cube([144, 90, 10], [0, 0, 9]))),
+      cube([60, 40, 8], [0, 0, 9]),
+    ]));
+    await load(plaque, 'plaque');
+    const ex = await exportSplit(S({ cuts: [cutAt(2, 5)], joint: 'pegs', labels: false }), { name: 'plaque' });
+    const [seam] = ex.seams;
+    expect(seam).toMatchObject({ pieces: [1, 2], joint: 'pegs', male: 1 });
+    expect(seam.pegs.length).toBeGreaterThanOrEqual(2);
+    const { length } = seam.pegs[0];
+    expect(noteOf(ex, 'SPLIT').text).toBe(`Cut into 2 pieces joined by ${seam.pegs.length} built-in pegs (4 mm square).`);
+    // the sockets go only where the top is thick enough: inside the model, a wall's thickness from the air
+    const air = own(cube([200, 150, 40], [0, 0, 6.5]).subtract(plaque));
+    for (const g of seam.pegs) {
+      const socket = own(socketAt(g));
+      expect(own(socket.subtract(plaque)).volume()).toBeLessThan(1e-6);
+      expect(socket.minGap(air, 5)).toBeGreaterThanOrEqual(pegSizesFor(g.s).wall - 1e-6);
+    }
+    // the base lies on its underside with its pegs pointing up, its height counting them, and is told they stand up;
+    // the top lies on its cut face, the sockets mouth down
+    expect(ex.pieces.map((p) => [p.lies, p.down, p.pegs, p.sockets])).toEqual([['flat as modelled', '-z', seam.pegs.length, 0], ['on a cut face', '-z', 0, seam.pegs.length]]);
+    expect(+ex.pieces[0].size[2].toFixed(3)).toBe(5 + length);
+    // pins are not offered: the base is too thin for their holes as well
+    expect(noteOf(ex, 'PEGS_UPRIGHT')).toMatchObject({
+      level: 'info', letter: 'A', pieces: [1],
+      text: 'Cut A\'s pegs print standing up on piece 1 – they are a little weaker across the layers than pegs lying flat.',
+    });
+    // put back together they never overlap, and each peg sits in its socket with the clearance all round
+    const [a, b] = piecesOf(ex).map(assembled);
+    expect(overlap(a, b)).toBeLessThan(0.01);
+    for (const g of seam.pegs) {
+      const inPlace = own(pegAt(g));
+      expect(own(inPlace.subtract(a)).volume()).toBeLessThan(1e-3);
+      expect(overlap(inPlace, b)).toBeLessThan(1e-3);
+      expect(inPlace.minGap(b, 1)).toBeGreaterThanOrEqual(0.15 - 1e-4);
+    }
+  });
+
+  it('a lid too thin for sockets is glued, lying flat, rather than carry the pegs standing on its edge or its knob', async () => {
+    // a box with 12 mm walls and a 5 mm lid: the body has room for sockets, the lid none, so the lid would carry them;
+    // with a knob on it, it could then only stand on its edge or rest on the knob
+    const body = own(cube([120, 120, 100], [0, 0, 50]).subtract(cube([96, 96, 94], [0, 0, 53])));
+    const knob = own(own(wasm.Manifold.cylinder(20, 12, 12, 48)).translate([0, 0, 105]));
+    await load(own(wasm.Manifold.union([body, cube([120, 120, 5], [0, 0, 102.5]), knob])), 'knob');
+    let ex = await exportSplit(S({ cuts: [cutAt(2, 100)], joint: 'pegs', labels: false }), { name: 'knob' });
+    expect(ex.seams).toEqual([expect.objectContaining({ joint: 'none', pegs: [] })]);
+    expect(noteOf(ex, 'CONNECTORS_DROPPED')).toMatchObject({
+      level: 'warn', thin: true, text: 'On 1 of 1 face at cut A one piece is too thin for sockets and can\'t lie flat on the bed with pegs standing out of it – it is a flat glue joint.',
+    });
+    expect(ex.pieces.map((p) => [p.lies, p.down])).toEqual([['flat as modelled', '-z'], ['on a cut face', '-z']]);
+    // a plain lid lies as well on its top, its pegs pointing up
+    await load(own(wasm.Manifold.union([body, cube([120, 120, 5], [0, 0, 102.5])])), 'lid');
+    ex = await exportSplit(S({ cuts: [cutAt(2, 100)], joint: 'pegs', labels: false }), { name: 'lid' });
+    expect(ex.seams).toEqual([expect.objectContaining({ joint: 'pegs', male: 2 })]);
+    expect(ex.pieces[1]).toMatchObject({ lies: 'upside down', down: '+z' });
+  });
+
+  it('a plate too thin for sockets between two cuts carries the pegs of one face, lying flat on the other, which is glued', async () => {
+    // with the pegs of both faces it could only stand on its edge, 150 mm tall
+    await load(cube([150, 150, 125], [0, 0, 62.5]), 'sandwich');
+    const ex = await exportSplit(S({ cuts: [cutAt(2, 60, 'c1'), cutAt(2, 65, 'c2')], joint: 'pegs', labels: false }), { name: 'sandwich' });
+    expect(ex.seams.map((x) => [x.letter, x.joint, x.male])).toEqual([['A', 'pegs', 2], ['B', 'none', null]]);
+    expect(noteOf(ex, 'CONNECTORS_DROPPED')).toMatchObject({ letter: 'B', thin: true });
+    const [{ length }] = ex.seams[0].pegs;
+    expect(ex.pieces[1]).toMatchObject({ down: '+z', pegs: ex.seams[0].pegs.length, sockets: 0 });
+    expect(+ex.pieces[1].size[2].toFixed(3)).toBe(5 + length);
+  });
+
+  it('a sliver between two cuts never carries pegs: its pegs would stand on 1.5 mm of material', async () => {
+    await load(cube([150, 150, 125], [0, 0, 62.5]), 'sliver');
+    const ex = await exportSplit(S({ cuts: [cutAt(2, 60, 'c1'), cutAt(2, 61.5, 'c2')], joint: 'pegs', labels: false }), { name: 'sliver' });
+    // the middle one of the three boxes up the model
+    const sliver = ex.pieces.find((p) => p.cell[2] === 1);
+    expect(sliver).toBeDefined();
+    expect(sliver.pegs).toBe(0);
+    for (const seam of ex.seams) if (seam.male !== null) expect(seam.male).not.toBe(sliver.index);
   });
 
   it('a sheet too thin for anything is glued, and the note speaks of pegs', async () => {

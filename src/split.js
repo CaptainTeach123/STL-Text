@@ -2602,36 +2602,55 @@ export function layPieces(pieces, U, orient = 'auto', { flat = null, soups = nul
  * Which piece of each pair across a cut with built-in pegs carries them
  * (the male; the other gets the sockets), for every pair at once: one piece
  * of each face pair carries all of that face's pegs, and as they stand out
- * of its face it may not lie on it. Pair by pair, in the order given, from
- * the way each piece lies with no pegs (`layPieces`): when one of the two
- * lies on that face, the other carries them; when both do, the one whose
- * best way down without that face costs the least more
- * (`chooseOrientation`'s score, its pegs counted in its size, a way that
- * does not fit counting as no way), which lies that way from then on, for
- * the pairs that follow; when neither does, the one that prints its pegs
- * lying down (strong across the layers) over one that prints them pointing
- * up; then the lower-numbered. Whichever that is, when the pegs would push
- * it off the bed and the other piece still fits carrying them, the other
- * one does: a piece near the bed's size never gets pegs it has no room for.
+ * of its face it may not lie on it; nor may it be the one across from a
+ * piece with no room for their sockets (`sockets`): a plate under a thick
+ * top carries the pegs, standing up, and the top takes the sockets. Pair by
+ * pair, in the order given, from the way each piece lies with no pegs
+ * (`layPieces`): when only one of the two may carry them, it does, as long
+ * as it then lies about as well as it does without them – it fits as well,
+ * on at least half as much of the bed, needing support under no more than a
+ * tenth of that more (a plaque's base lies on its underside, letters
+ * engraved in it bridged) – else neither: a lid with a knob is glued rather
+ * than stood on its edge, and so is the second face of a plate between two
+ * cuts, which lies on the first; when one of the two lies on that face, the
+ * other carries them; when both do, the one whose best way down without
+ * that face costs the least more (`chooseOrientation`'s score, its pegs
+ * counted in its size, a way that does not fit counting as no way), which
+ * lies that way from then on, for the pairs that follow; when neither does,
+ * the one that prints its pegs lying down (strong across the layers) over
+ * one that prints them pointing up; ties going to the one across from more
+ * room for the sockets (`prefer`), then to the lower-numbered. The one
+ * across from more room also carries them wherever it prints about as well
+ * as the other would – carrying them costs it no more than `STEADY` more
+ * than it costs the other, and its pegs lie down if the other's would: a
+ * box's 8 mm lid lies on its top carrying them, so the sockets go deep into
+ * the walls. Whichever that is, when the pegs would push it off the bed and
+ * the other piece may carry them and still fits with them, the other one
+ * does: a piece near the bed's size never gets pegs it has no room for.
  * Then a piece left with every good way to lie pegged – fitting, and
- * needing about as little as its best (`orientationScore`'s need), as the
- * corner of a ball cut in eight is once each of its three cut faces is
- * taken in turn – hands the pegs of one of those faces to the pieces across
- * it, as long as they keep a good way of their own, or can be given one the
- * same way, and still fit; and one that the pegs of all its faces push off
- * the bed hands those of a face to the pieces across it when then they all
- * fit. A piece of several shells only lies where every one of them rests on
- * the bed, as `layPieces` laid it, and one left with no way down at all
- * never carries them. Deterministic.
+ * needing about as little as its best
+ * (`orientationScore`'s need), as the corner of a ball cut in eight is once
+ * each of its three cut faces is taken in turn – hands the pegs of one of
+ * those faces to the pieces across it, as long as they keep a good way of
+ * their own, or can be given one the same way, and still fit; and one that
+ * the pegs of all its faces push off the bed hands those of a face to the
+ * pieces across it when then they all fit – never pegs that a piece across
+ * may not carry: a plate too thin for sockets keeps its pegs, lying on its
+ * underside, though it lies best on its cut face. A piece of several shells
+ * only lies where every one of them rests on the bed, as `layPieces` laid
+ * it, and one left with no way down at all never carries them.
+ * Deterministic.
  * @param {{ index: number, stats: object, boxes?: object[], lying: { down: string, score: number, fits: boolean } }[]} laid
  *   from `layPieces` (`boxes` its shells')
  * @param {number[]} U the usable bed
  * @param {'auto'|'cut'|'model'} orient
  * @param {{ flat?: number|null, length?: number }} options `flat` as for `chooseOrientation`; `length` how far the pegs
  *   will stand out (`pegAllowance`), for whether a piece carrying them still fits
- * @returns {(pairs: { axis: number, lo: number, hi: number }[], length?: number) => (0|1|null)[]} for each pair (the
- *   cut's axis, the numbers of the pieces below and above it) 0 when the piece below carries the pegs, 1 the one above,
- *   null neither; `length` the pegs' own, once their size is known
+ * @returns {(pairs: { axis: number, lo: number, hi: number, sockets?: boolean[], prefer?: 0|1|null }[], length?: number)
+ *   => (0|1|null)[]} for each pair (the cut's axis, the numbers of the pieces below and above it, whether each of them
+ *   has room for the sockets, [below, above], both when not given, and which would rather carry them, its neighbour
+ *   having more room for the sockets) 0 when the piece below carries the pegs, 1 the one above, null neither; `length`
+ *   the pegs' own, once their size is known
  */
 export function pegMales(laid, U, orient = 'auto', { flat = null, length = 0 } = {}) {
   const byIndex = new Map(laid.map((p) => [p.index, p]));
@@ -2659,38 +2678,57 @@ export function pegMales(laid, U, orient = 'auto', { flat = null, length = 0 } =
   }));
   return (pairs, along = length) => {
     // how a piece lies with pegs standing out of these faces: never on them, and with every shell on the bed; null
-    // when it has no way down left
+    // when it has no way down left. With what that way needs and how much of it rests on the bed
     const lay = (p, faces) => {
       const off = offFaces(p.stats, faces);
       const stats = off && restingOnly(along > 0 ? grown(off, faces, along) : off, p.boxes);
-      return stats ? chooseOrientation(stats, U, orient, { pieceIndex: p.index, flat }) : null;
+      if (!stats) return null;
+      const o = chooseOrientation(stats, U, orient, { pieceIndex: p.index, flat });
+      return { ...o, need: orientationScore(stats, o.down).need, bed: stats.dirs[o.down].bed };
+    };
+    // whether a piece lies about as well this way as it does with no pegs: fitting as well, on at least half as much of
+    // the bed, needing support under no more than a tenth of that more
+    const asWell = (p, o) => {
+      const { bed } = p.stats.dirs[p.lying.down];
+      return (o.fits || !p.lying.fits) && o.bed >= 0.5 * bed && o.need <= orientationScore(p.stats, p.lying.down).need + Math.max(STEADY, 0.1 * bed);
     };
     const down = new Map(laid.map((p) => [p.index, p.lying.down]));
     const banned = new Map(laid.map((p) => [p.index, new Set()]));
     const best = (p, extra) => lay(p, new Set([...banned.get(p.index), ...extra]));
     const faceOf = (pair, k) => `${k === 0 ? '+' : '-'}${AXES[pair.axis]}`;
     const pieceOf = (pair, k) => (k === 0 ? pair.lo : pair.hi);
+    // a piece may carry a pair's pegs only when the other one has room for their sockets
+    const may = (pair, k) => pair.sockets?.[1 - k] !== false;
     const males = pairs.map((pair) => {
       const pieces = [byIndex.get(pair.lo), byIndex.get(pair.hi)];
-      if (!pieces[0] || !pieces[1]) return null;
+      if (!pieces[0] || !pieces[1] || (!may(pair, 0) && !may(pair, 1))) return null;
       // the face each one's pegs would stand out of: the top of the piece below the cut, the bottom of the one above
       const face = [faceOf(pair, 0), faceOf(pair, 1)];
       const onFace = [0, 1].map((k) => down.get(pieces[k].index) === face[k]);
       const after = [0, 1].map((k) => best(pieces[k], [face[k]]));
-      const tie = () => (pieces[0].index <= pieces[1].index ? 0 : 1);
+      // the one across from more room for the sockets, where both have some
+      const prefer = may(pair, 0) && may(pair, 1) ? pair.prefer ?? null : null;
+      const tie = () => prefer ?? (pieces[0].index <= pieces[1].index ? 0 : 1);
+      // what carrying them costs each more than its best way down now; and whether its pegs then lie along the bed
+      const extra = (k) => cost(after[k]) - cost(best(pieces[k], []));
+      const alongBed = (k) => Boolean(after[k]) && dirAxis(after[k].down) !== pair.axis;
       let male;
       if (onFace[0] !== onFace[1]) male = onFace[0] ? 1 : 0;
       else if (onFace[0]) {
-        const extra = [0, 1].map((k) => cost(after[k]) - cost(best(pieces[k], [])));
-        male = Math.abs(extra[0] - extra[1]) > 1e-6 * Math.max(1, Math.abs(extra[0])) ? (extra[0] < extra[1] ? 0 : 1) : tie();
+        const more = [extra(0), extra(1)];
+        male = Math.abs(more[0] - more[1]) > 1e-6 * Math.max(1, Math.abs(more[0])) ? (more[0] < more[1] ? 0 : 1) : tie();
       } else {
         const lying = [0, 1].map((k) => dirAxis(down.get(pieces[k].index)) !== pair.axis);
         male = lying[0] !== lying[1] ? (lying[0] ? 0 : 1) : tie();
       }
+      // deeper sockets win wherever the piece across from them prints about as well carrying the pegs
+      if (prefer !== null && male !== prefer && after[prefer] && extra(prefer) <= extra(male) + STEADY && (alongBed(prefer) || !alongBed(male))) male = prefer;
       // pegs that would push their piece off the bed go on the other one when it still fits with them
-      if (after[male] && !after[male].fits && after[1 - male]?.fits) male = 1 - male;
-      if (!after[male]) male = 1 - male;
-      if (!after[male]) return null;
+      if (after[male] && !after[male].fits && after[1 - male]?.fits && may(pair, 1 - male)) male = 1 - male;
+      if (!after[male] || !may(pair, male)) male = 1 - male;
+      if (!after[male] || !may(pair, male)) return null;
+      // one that must carry them, its neighbour having no room for sockets, does so only lying about as well as without
+      if (!may(pair, 1 - male) && !asWell(pieces[male], after[male])) return null;
       banned.get(pieces[male].index).add(face[male]);
       if (down.get(pieces[male].index) === face[male]) down.set(pieces[male].index, after[male].down);
       return male;
@@ -2702,10 +2740,10 @@ export function pegMales(laid, U, orient = 'auto', { flat = null, length = 0 } =
       return Boolean(o) && (o.fits || !byIndex.get(q).lying.fits);
     };
     // the pairs whose pegs stand out of a face of a piece, handed to the pieces across it: undone, and false, unless
-    // `keep` holds of those pieces
+    // `keep` holds of those pieces. Never to one across from a piece with no room for their sockets
     const hand = (index, d, keep) => {
       const mine = pairs.flatMap((pair, i) => (males[i] !== null && pieceOf(pair, males[i]) === index && faceOf(pair, males[i]) === d ? [i] : []));
-      if (!mine.length) return false;
+      if (!mine.length || mine.some((i) => !may(pairs[i], 1 - males[i]))) return false;
       const flip = () => mine.forEach((i) => {
         males[i] = 1 - males[i];
       });
@@ -2812,6 +2850,35 @@ export function layPegged(laid, pegs, U, orient = 'auto', { flat = null } = {}) 
     const notes = o.notes.map((x) => (x.code === 'PIECE_UNSTABLE' && steady ? splitNote('PIECE_UNSTABLE', { pieceIndex: p.index, pegs: true }) : x));
     return { ...o, notes, pegged: true };
   });
+}
+
+/**
+ * A `PEGS_UPRIGHT` note for each cut whose built-in pegs all print standing
+ * up, their pieces lying with the pegs pointing up (a plate under a thick
+ * top carries them on its top): they print without supports, but are a
+ * little weaker across their layers than pegs lying along the bed. Pins are
+ * named as the stronger joint only where they would fit (`pinnable`): a
+ * plate too thin for sockets is mostly too thin for pin holes too.
+ * @param {{ cutId: string, letter: string, axis: number, dir: number, sides: { piece: number, peg: boolean }[] }[]} pegs
+ *   `layoutSplit`'s
+ * @param {{ index: number }[]} laid the pieces
+ * @param {{ up: string }[]} lying how each piece of `laid` prints (`layPegged`)
+ * @param {string[]} pinnable the ids of the cuts whose faces would take pins (`layoutSplit`'s)
+ * @returns {object[]}
+ */
+export function uprightPegNotes(pegs, laid, lying, pinnable = []) {
+  const up = new Map(laid.map((p, i) => [p.index, lying[i]?.up]));
+  const cuts = new Map();
+  for (const g of pegs ?? []) {
+    const piece = g.sides.find((x) => x.peg)?.piece;
+    if (!cuts.has(g.cutId)) cuts.set(g.cutId, { letter: g.letter, cutId: g.cutId, pieces: new Set(), upright: true });
+    const cut = cuts.get(g.cutId);
+    cut.pieces.add(piece);
+    if (up.get(piece) !== `${g.dir > 0 ? '+' : '-'}${AXES[g.axis]}`) cut.upright = false;
+  }
+  return [...cuts.values()].filter((x) => x.upright).map(({ letter, cutId, pieces }) => splitNote('PEGS_UPRIGHT', {
+    letter, cutId, pieces: [...pieces].sort((p, q) => p - q), ...(pinnable.includes(cutId) ? { pins: true } : {}),
+  }));
 }
 
 /**
@@ -3021,6 +3088,7 @@ const NOTE_LEVELS = Object.freeze({
   CONNECTORS_SHORTER: 'info',
   CONNECTORS_FILAMENT: 'info',
   PEGS_SMALLER: 'info',
+  PEGS_UPRIGHT: 'info',
   CONNECTORS_DROPPED: 'warn',
   ONE_CONNECTOR: 'warn',
   DOWELS_CAPPED: 'info',
@@ -3086,8 +3154,15 @@ const NOTE_TEXT = {
     const took = pegSizes.length ? `${listOf(pegSizes.map((g) => `${g.count} × ${mm(g.size)} mm`))} ${count === 1 ? 'peg' : 'pegs'}` : 'smaller pegs';
     return `Cut ${letter} is too narrow for ${asked ? `${mm(asked)} mm` : 'full-size'} pegs – it takes ${took} instead.`;
   },
-  CONNECTORS_DROPPED: ({ letter, count = 1, total = count, wall = null, suggestedDiameter = null, dovetail = false, pegs = false, lying = false }) => {
+  PEGS_UPRIGHT: ({ letter, pieces = [], pins = false }) => {
+    const list = [pieces].flat();
+    return `Cut ${letter}'s pegs print standing up on ${list.length > 1 ? `pieces ${listOf(list)}` : `piece ${list[0] ?? ''}`} – they are a little weaker across the layers than pegs lying flat${pins ? '; pins (Joints: Pins) would be stronger' : ''}.`;
+  },
+  CONNECTORS_DROPPED: ({ letter, count = 1, total = count, wall = null, suggestedDiameter = null, dovetail = false, pegs = false, lying = false, thin = false }) => {
     if (dovetail) return `Cut ${letter} has no room for dovetail tabs – it is a flat glue joint. A strip glued behind it makes it stronger.`;
+    if (thin) {
+      return `On ${count} of ${plural(total, 'face')} at cut ${letter} one piece is too thin for sockets and can't lie flat on the bed with pegs standing out of it – ${count === 1 ? 'it is a flat glue joint' : 'they are flat glue joints'}.`;
+    }
     if (lying) {
       return `On ${count} of ${plural(total, 'face')} at cut ${letter} neither piece can lie on the bed with pegs standing out of it – ${count === 1 ? 'it is a flat glue joint' : 'they are flat glue joints'}. Pins (Joints: Pins) would join them.`;
     }
@@ -3152,8 +3227,11 @@ const NOTE_TEXT = {
  * CONNECTORS_FILAMENT `{ letter, count, diameter, length, lengths: [{ length, count }] }`
  * (`length` the longest; `lengths` when the holes take more than one); PEGS_SMALLER `{ letter, asked, pegSizes: [{ size,
  * count }] }` (`asked` the peg size chosen for the model, `pegSizes` the smaller ones the narrow faces took);
- * CONNECTORS_DROPPED `{ letter, count, total, wall, suggestedDiameter, dovetail, pegs, lying }` (`lying`: the faces could take
- * pegs, but neither piece could lie on the bed carrying them); ONE_CONNECTOR `{ letter, pegs }`;
+ * PEGS_UPRIGHT `{ letter, cutId, pieces, pins }` (`pieces` those carrying the cut's pegs, which all print pointing up;
+ * `pins` that pins would fit its faces);
+ * CONNECTORS_DROPPED `{ letter, count, total, wall, suggestedDiameter, dovetail, pegs, lying, thin }` (`lying`: the faces could
+ * take pegs, but neither piece could lie on the bed carrying them; `thin`: only one piece has room for the sockets, and the
+ * other, too thin for them, could not lie flat carrying the pegs); ONE_CONNECTOR `{ letter, pegs }`;
  * DOWELS_CAPPED `{ placed, dropped, pegs }`; LABELS_SKIPPED `{ letters }`;
  * PIECE_TOO_BIG `{ pieceIndex, size, bed }`; SMALL_PIECE `{ pieceIndex, thickness, letters, cutId }`;
  * CUTS_MERGED `{ letters, cutIds }`; SPLIT_CHECK `{ ratio }` (signed, (pieces − model) / model);

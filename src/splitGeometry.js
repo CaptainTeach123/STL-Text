@@ -85,6 +85,12 @@ const TAB_INSIDE = 2;
 const TAB_ROUND = 0.8;
 /** How far something must stand out of a plate (mm) before its tabs keep clear of it; less is the plate's own unevenness. */
 const PROUD = 0.3;
+/**
+ * How deep behind its face a built-in peg's own piece must be solid (mm): the peg starts 0.5 mm inside it, and a
+ * wall's thickness under that keeps it on material, not on a skin over a pocket or the sliver of a shelf a cut leaves.
+ * Only the socket runs deep, into the other piece.
+ */
+const pegRoot = (s) => 0.5 + s.wall;
 
 /** Collects temporaries so they are all deleted, even when something throws (the engine's pattern). */
 function scope() {
@@ -1650,9 +1656,13 @@ export function patchesFor(band, cut, cuts = []) {
  * reach would meet air within ±reach of the face, plus the holes already
  * placed: the hole centres must keep their inset away from it. Exact for
  * hidden pockets, slanted walls and cones, unlike an inset of the face.
+ * A pin's hole goes as far into both pieces; a built-in peg's socket goes
+ * deep into one and its peg only just into the other, so its reach is told
+ * for each side.
  * @param {Manifold} band from `bandFor` (borrowed), at least 0.5 mm thicker than the reach
  * @param {{ axis: number, at: number }} cut
- * @param {number} reach (mm)
+ * @param {number|{ below: number, above: number }} reach (mm): as far either way, or how far below the face (towards
+ *   −w, into the piece below the cut) and above it
  * @param {{ obstacles?: Manifold[], air?: boolean }} options `obstacles` the holes placed so far, in world
  *   coordinates (borrowed), each a valid solid on its own (disjoint shells composed together are fine);
  *   `air: false` leaves out the air and gives the obstacles' shadow alone (the air's is the costly part on a big
@@ -1665,7 +1675,9 @@ export function shadowFor(band, cut, reach, { obstacles = [], air = true } = {})
   try {
     if (band.isEmpty()) return CrossSection.square([0, 0]); // empty (new CrossSection([]) throws)
     const { min, max } = band.boundingBox();
-    const slab = t.add(t.add(Manifold.cube([max[0] - min[0] + 4, max[1] - min[1] + 4, 2 * reach], true)).translate([(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, cut.at]));
+    const { below, above } = typeof reach === 'number' ? { below: reach, above: reach } : reach;
+    const slab = t.add(t.add(Manifold.cube([max[0] - min[0] + 4, max[1] - min[1] + 4, below + above], true))
+      .translate([(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, cut.at + (above - below) / 2]));
     let shadow = air ? t.add(t.add(slab.subtract(band)).project()) : t.add(CrossSection.square([0, 0]));
     for (const obstacle of obstacles ?? []) {
       if (obstacle.isEmpty()) continue;
@@ -1704,14 +1716,17 @@ function socketsOf(plan, cuts, bounds, clearance) {
   }
 }
 
-/** How far a cut's holes may reach: to the nearest parallel cut, or the model's end, on the nearer side. */
+/**
+ * How far a cut's holes may reach on each side: to the nearest parallel cut, or the model's end, below it (towards
+ * −axis) and above it. A pin's holes go into both pieces and take the nearer; a peg's socket goes into one of them.
+ */
 function roomAround(cut, by, bounds) {
   const list = by[cut.axis];
   const below = list.filter((t) => t < cut.at - CUT_TOLERANCE);
   const above = list.filter((t) => t > cut.at + CUT_TOLERANCE);
   const lo = below.length ? below[below.length - 1] : bounds.min[cut.axis];
   const hi = above.length ? above[0] : bounds.max[cut.axis];
-  return Math.min(cut.at - lo, hi - cut.at);
+  return { below: cut.at - lo, above: hi - cut.at };
 }
 
 /**
@@ -1727,10 +1742,16 @@ function roomAround(cut, by, bounds) {
  * first. A cut with built-in pegs is laid out the same way with square
  * pegs (8, 6, 5 or 4 mm, `pegSizesFor`), their socket's reach and inset, and
  * falls back to smaller pegs, then shorter ones, then glue only – never to
- * anything that must be printed or bought apart. One piece of each pair
- * across it carries all of that face's pegs (`pegMales`), the other gets the
- * sockets. Labels ("2A") go on each pinned or pegged face, in the same spot
- * on both pieces.
+ * anything that must be printed or bought apart. A socket goes into one
+ * piece only, so its reach and its depth cap are those of that piece's side,
+ * and the peg needs only a wall's thickness of solid under its root
+ * (`pegRoot`): a thin plate under a thick top carries the pegs and the top
+ * takes the sockets. One piece of each pair across it carries all of that
+ * face's pegs (`pegMales`), never one whose neighbour has no room for their
+ * sockets, and where both have room, rather the one across from more of it
+ * (`prefer`); the other gets the sockets. The model's peg size is sized on
+ * the side each face's sockets go into. Labels ("2A") go on each pinned or
+ * pegged face, in the same spot on both pieces.
  * @param {Manifold} solid the model (borrowed)
  * @param {{ id, letter, axis, at }[]} cuts normalised, in canonical order
  * @param {{ index: number, cell: number[], up?: string, boxes?: object[] }[]} pieces from `cutPieces`, or `layPieces`, with
@@ -1743,10 +1764,14 @@ function roomAround(cut, by, bounds) {
  *   dovetail tabs, whose sockets reach past their cut right through the model, so the holes of a crossing cut keep out
  *   of them as out of an earlier cut's holes; `font` the labels' (Inter), labels are skipped without it;
  *   `pegMales(pairs, length)` which of the pieces either side of each pegged face carries its pegs (split.js
- *   `pegMales`: for each `{ axis, lo, hi }`, 0 the one below the cut, 1 the one above, null neither, and so glue only;
- *   `length` how far the model's pegs stand out at most); the one below when not given
+ *   `pegMales`: for each `{ axis, lo, hi, sockets, prefer }`, 0 the one below the cut, 1 the one above, null neither,
+ *   and so glue only; `sockets` which of the two has room for the sockets of the smallest peg the cut may take, [below,
+ *   above]; `prefer`, where both have, the one across from more room for them – more of the faces, then larger pegs,
+ *   then longer ones – or null; `length` how far the model's pegs stand out at most); when not given the one below, or
+ *   the one across from the only one with room for the sockets, or from more of it, or neither when neither has
  * @returns {{ diameter: number|null, pegSize: number|null, dowels: object[], pegs: object[], labels: object[],
- *   seams: object[], notes: object[] }}
+ *   seams: object[], notes: object[], pinnable: string[] }} `pinnable` the ids of the cuts with pegs whose faces
+ *   would take pins instead (3 mm or larger), for the note on pegs printed standing up
  *   dowel `{ cutId, letter, patch, axis, at, centre, uv, d, depth, R, h, ch, cell, sides: [{ piece, tear, apex }, …] }`
  *   (side 0 the lower piece, `cell` the pin's half-cell for the exploded view);
  *   peg `{ cutId, letter, patch, axis, at, centre, uv, s, length, c, half, ch, e, h, tip, a, cell, male, dir, sides:
@@ -1810,9 +1835,9 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
   const placed = []; // { m, side, box }: every half-hole placed so far, world
   const keep = scope(); // bands, patches, shadows and obstacles that live until the layout is done
 
-  /** A cut's shadow at a reach, kept for the layout: the air's once per reach, the earlier holes' added on top. */
+  /** A cut's shadow at a reach (as `shadowFor`), kept for the layout: the air's once per reach, the earlier holes' added on top. */
   const shadowAt = (ctx, reach, withObstacles) => {
-    const key = reach.toFixed(4);
+    const key = typeof reach === 'number' ? reach.toFixed(4) : `${reach.below.toFixed(4)}/${reach.above.toFixed(4)}`;
     if (!ctx.shadows.has(key)) ctx.shadows.set(key, keep.add(shadowFor(ctx.band, ctx.cut, reach)));
     if (!withObstacles || !ctx.obstacles.length) return ctx.shadows.get(key);
     if (!ctx.shadows.has(`${key}|holes`)) {
@@ -1822,9 +1847,25 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     return ctx.shadows.get(`${key}|holes`);
   };
 
-  /** Pin centres for a patch at these sizes, or none. */
-  const centresFor = (ctx, patch, s, n, withObstacles, t) => {
-    const free = t.add(patch.cs.subtract(shadowAt(ctx, s.reach, withObstacles)));
+  /**
+   * How far a peg of these sizes reaches either side of its face with its socket in the piece on side k (0 the one
+   * below the cut): the socket and its wall into that piece, the peg's root into the other.
+   */
+  const socketReach = (s, k) => (k === 0 ? { below: s.reach, above: pegRoot(s) } : { below: pegRoot(s), above: s.reach });
+  // pegs whose sockets go into side k of a cut: the socket needs its room on that side, and the peg's own piece its
+  // root's depth before the next cut on the other (the shadow only sees the model, so a sliver between two cuts would
+  // otherwise carry pegs on 1.5 mm of material)
+  const pegsInto = (ctx, k) => ({
+    ...PEG,
+    room: (d, dep, room) => {
+      const s = PEG.room(d, dep, room);
+      return s && ctx.rooms[1 - k] >= pegRoot(s) - 1e-9 ? s : null;
+    },
+  });
+
+  /** Pin (or peg) centres for a patch at these sizes, their holes (or socket and peg) reaching this far, or none. */
+  const centresFor = (ctx, patch, s, n, withObstacles, t, reach = s.reach) => {
+    const free = t.add(patch.cs.subtract(shadowAt(ctx, reach, withObstacles)));
     const tear = patch.apex.some(Boolean);
     const safe = t.add(free.offset(-(tear ? s.rhoTear : s.rho), 'Round', 2, 32));
     if (safe.isEmpty()) return [];
@@ -1832,49 +1873,50 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
   };
 
   /**
-   * The sizing pass: per patch of at least 50 mm², the largest standard
-   * size with D ≤ W/3 (W twice the deepest inset of the patch's solid
-   * columns) that takes two pins (or pegs, `kind`), first against the
-   * shadow of the largest size's reach, which is conservative for every
-   * size; patches that find none try again with each size's own reach. The
-   * model's size is the smallest found. Null when no patch takes any.
+   * The largest of `sizes` with D ≤ W/3 (W twice the deepest inset of the
+   * patch's solid columns) that takes two pins (or pegs, `kind`) on a patch,
+   * their holes reaching `reachOf(sizes)` from the face, within `room` of it:
+   * first against the shadow of the largest size's reach, which is
+   * conservative for every size, then, finding none, with each size's own
+   * reach. Its sizes (`kind.room`'s, as deep as the room lets them go), or
+   * null when none takes two.
    */
-  function sizePass(list, kind = PIN) {
-    let best = null;
+  function sizeOn(ctx, patch, kind, sizes, reachOf, room, t) {
     const need = Math.min(2, wanted || 2);
-    const sizes = kind.auto;
     const widest = kind.full(sizes[0], depth);
-    const widthCap = (3 * sizes[0]) / 2; // D ≤ W/3, so no width beyond 3 × 8 mm changes the answer
+    const widthCap = (3 * sizes[0]) / 2; // D ≤ W/3, so no width beyond three of the largest size changes the answer
+    const free = t.add(patch.cs.subtract(shadowAt(ctx, reachOf(widest), false)));
+    const W = 2 * largestInset(free, widthCap);
+    const tear = patch.apex.some(Boolean);
+    for (const D of sizes) {
+      const s = kind.room(D, depth, room);
+      if (!s || D > W / 3 + 1e-9) continue;
+      const safe = t.add(free.offset(-(tear ? s.rhoTear : s.rho), 'Round', 2, 32));
+      if (!safe.isEmpty() && chooseCentres(polygonsOf(safe), need, s.sMin, patch.centroid, { d: D }).length >= need) return s;
+    }
+    const small = kind.room(sizes[sizes.length - 1], depth, room);
+    const W3 = small ? 2 * largestInset(t.add(patch.cs.subtract(shadowAt(ctx, reachOf(small), false))), widthCap) : 0;
+    for (const D of sizes) {
+      const s = kind.room(D, depth, room);
+      if (!s || D > W3 / 3 + 1e-9) continue;
+      if (centresFor(ctx, patch, s, need, false, t, reachOf(s)).length >= need) return s;
+    }
+    return null;
+  }
+
+  /**
+   * The pins' sizing pass: per patch of at least 50 mm², the largest
+   * automatic size it takes (`sizeOn`); the model's diameter is the smallest
+   * found. Null when no patch takes any.
+   */
+  function sizePass(list) {
+    let best = null;
     for (const ctx of list) {
       for (const patch of ctx.patches) {
         if (patch.skip || patch.area < SIZING_PATCH) continue;
         const t = scope();
         try {
-          let found = null;
-          const free = t.add(patch.cs.subtract(shadowAt(ctx, widest.reach, false)));
-          const W = 2 * largestInset(free, widthCap);
-          for (const D of sizes) {
-            const s = kind.room(D, depth, ctx.room);
-            if (!s || D > W / 3 + 1e-9) continue;
-            const tear = patch.apex.some(Boolean);
-            const safe = t.add(free.offset(-(tear ? s.rhoTear : s.rho), 'Round', 2, 32));
-            if (!safe.isEmpty() && chooseCentres(polygonsOf(safe), need, s.sMin, patch.centroid, { d: D }).length >= need) {
-              found = D;
-              break;
-            }
-          }
-          if (found === null) {
-            const small = kind.room(sizes[sizes.length - 1], depth, ctx.room);
-            const W3 = small ? 2 * largestInset(t.add(patch.cs.subtract(shadowAt(ctx, small.reach, false))), widthCap) : 0;
-            for (const D of sizes) {
-              const s = kind.room(D, depth, ctx.room);
-              if (!s || D > W3 / 3 + 1e-9) continue;
-              if (centresFor(ctx, patch, s, need, false, t).length >= need) {
-                found = D;
-                break;
-              }
-            }
-          }
+          const found = sizeOn(ctx, patch, PIN, PIN.auto, (s) => s.reach, ctx.room, t)?.d ?? null;
           if (found !== null) best = best === null ? found : Math.min(best, found);
         } finally {
           t.dispose();
@@ -1882,6 +1924,31 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
       }
     }
     return best;
+  }
+
+  /**
+   * Whether pins of the smallest size Auto gives (3 mm) would join a pegged
+   * cut's faces in place of its pegs, as `layoutCut` looks for room for
+   * them: holes in both pieces, on every face that has pegs. A plate too thin
+   * for sockets is mostly too thin for pin holes too.
+   */
+  function pinsFit(ctx) {
+    const faces = ctx.patches.filter((patch) => !patch.skip && patch.pegs.length);
+    if (!faces.length) return false;
+    const d = AUTO_DIAMETERS[AUTO_DIAMETERS.length - 1];
+    const room = Math.min(ctx.room, PEG.reach - 0.01); // no deeper than the band the cut's faces were measured in
+    const t = scope();
+    try {
+      return faces.every((patch) => {
+        const need = Math.min(2, patch.pegs.length);
+        return [depth, sizesFor(d, c, nozzle).minDepth].some((dep) => {
+          const s = sizesForRoom(d, c, nozzle, dep, room);
+          return Boolean(s) && centresFor(ctx, patch, s, need, false, t).length >= need;
+        });
+      });
+    } finally {
+      t.dispose();
+    }
   }
 
   /** The pins of one cut: each patch tries its options in turn; the notes say what had to give. */
@@ -1988,8 +2055,9 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
    * The built-in pegs of one cut: each patch tries the size chosen, then
    * the smaller ones, then each of them shorter, and is glued when none
    * fits; never anything printed or bought apart. All the pegs of a patch
-   * stand on the piece `pegMales` chose for its pair. The notes say what
-   * had to give.
+   * stand on the piece `pegMales` chose for its pair, their sockets reaching
+   * into the other one only, as deep as its side has room for. The notes say
+   * what had to give.
    */
   function layoutPegs(ctx, D) {
     const { cut } = ctx;
@@ -2002,27 +2070,33 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     let one = false;
     let dropped = 0;
     let unlaid = 0;
+    let thin = 0;
     let total = 0;
     let thinWalls = 0;
     ctx.patches.forEach((patch, patchIndex) => {
       if (patch.skip || patch.capped || !patch.alloc) return;
       total++;
-      // a pair neither of whose pieces can lie on the bed carrying the pegs is glued
-      if (patch.male === null) {
+      // a pair neither of whose pieces can lie on the bed carrying the pegs is glued: when one of them has no room for
+      // the sockets, it is the one that can't
+      if (patch.male === null && patch.sockets.some(Boolean)) {
         unlaid++;
+        if (!patch.sockets.every(Boolean)) thin++;
         return;
       }
+      // the sockets go into the piece across from the one carrying the pegs; a face with room for them on neither
+      // side tries nothing, and is told of as one no peg fits
+      const k = 1 - patch.male;
       const need = Math.min(2, patch.alloc);
       const t = scope();
       try {
         let chosen = null;
         let single = null;
         const seen = new Set();
-        for (const [x, dep] of tries) {
-          const s = PEG.room(x, dep, ctx.room);
+        for (const [x, dep] of patch.male === null ? [] : tries) {
+          const s = pegsInto(ctx, k).room(x, dep, ctx.rooms[k]);
           if (!s || seen.has(`${x}|${s.length}`)) continue;
           seen.add(`${x}|${s.length}`);
-          const pts = centresFor(ctx, patch, s, patch.alloc, true, t);
+          const pts = centresFor(ctx, patch, s, patch.alloc, true, t, socketReach(s, k));
           if (pts.length >= need) {
             chosen = { s, pts };
             break;
@@ -2080,9 +2154,11 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     if (smaller.size) {
       notes.push(splitNote('PEGS_SMALLER', { ...base, asked: D, pegSizes: [...smaller].sort((p, q) => q[0] - p[0]).map(([size, count]) => ({ size, count })) }));
     }
-    // faces too thin for a peg are told of as such; when none is, only that no piece could carry them
+    // faces too thin for a peg are told of as such; when none is, only that no piece could carry them, or that the
+    // piece too thin for the sockets could not
     if (dropped || unlaid) {
-      notes.push(splitNote('CONNECTORS_DROPPED', { ...base, count: dropped + unlaid, total, ...(thinWalls ? { wall: thinWalls } : {}), ...(dropped ? {} : { lying: true }) }));
+      const why = dropped ? {} : thin === unlaid ? { thin: true } : { lying: true };
+      notes.push(splitNote('CONNECTORS_DROPPED', { ...base, count: dropped + unlaid, total, ...(thinWalls ? { wall: thinWalls } : {}), ...why }));
     }
     if (one) notes.push(splitNote('ONE_CONNECTOR', base));
   }
@@ -2206,35 +2282,110 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
         patch.dowels = [];
         patch.pegs = [];
         patch.male = null;
+        patch.sockets = [true, true];
+        patch.fit = [null, null];
         patch.label = null;
         patch.alloc = 0;
       }
-      contexts.push({ cut, joint, kind, band, patches, room: roomAround(cut, by, bounds), shadows: new Map(), obstacles: [] });
+      // a pin's holes go into both pieces and take the nearer room; a peg's socket only that of its own side
+      const room = roomAround(cut, by, bounds);
+      contexts.push({ cut, joint, kind, band, patches, room: Math.min(room.below, room.above), rooms: [room.below, room.above], shadows: new Map(), obstacles: [] });
     }
     const pinned = contexts.filter((x) => x.joint === 'dowels');
     const pegged = contexts.filter((x) => x.joint === 'pegs');
     const connected = contexts.filter((x) => x.joint === 'dowels' || x.joint === 'pegs');
     const sockets = connected.length && tabs?.seams?.some((x) => x.tabs.length) ? keep.add(socketsOf(tabs, cuts, bounds, c)) : null;
 
-    // ---- one diameter (and one peg size) for the whole model ----
+    // ---- which side of each pegged face has room for its sockets at all: the smallest peg the cut may fall back to,
+    // as short as it may be, fits there. A plate under a thick top has none, and carries the pegs instead ----
     progress?.(stage, { done: cuts.length, total: steps });
-    const D = pinned.length ? manual || sizePass(pinned) || AUTO_DIAMETERS[AUTO_DIAMETERS.length - 1] : null;
-    const P = pegged.length ? pegManual || sizePass(pegged, PEG) || AUTO_PEGS[AUTO_PEGS.length - 1] : null;
+    const leastPeg = Math.min(pegManual || Infinity, AUTO_PEGS[AUTO_PEGS.length - 1]);
+    const { minDepth } = pegSizesFor(leastPeg, c, nozzle);
+    const shortest = depth > 0 ? Math.min(depth, minDepth) : minDepth;
+    for (const ctx of pegged) {
+      for (const patch of ctx.patches) {
+        if (patch.skip) continue;
+        const t = scope();
+        try {
+          patch.sockets = [0, 1].map((k) => {
+            const s = pegsInto(ctx, k).room(leastPeg, shortest, ctx.rooms[k]);
+            return Boolean(s) && centresFor(ctx, patch, s, 1, false, t, socketReach(s, k)).length > 0;
+          });
+        } finally {
+          t.dispose();
+        }
+      }
+    }
 
-    // ---- which piece of each pair across a pegged face carries the pegs: one for all of that face's ----
+    // ---- the largest peg each side's sockets take on each face of 50 mm² or more (`sizeOn`): the model's size is
+    // that of the side its sockets go into, and the two sides are told apart by it. With a size set, it is only
+    // needed where both sides have room ----
+    const sizesOn = pegManual ? [pegManual, ...AUTO_PEGS.filter((x) => x < pegManual)] : AUTO_PEGS;
+    for (const ctx of pegged) {
+      for (const patch of ctx.patches) {
+        if (patch.skip || patch.area < SIZING_PATCH || (pegManual && !patch.sockets.every(Boolean))) continue;
+        const t = scope();
+        try {
+          patch.fit = [0, 1].map((k) => (patch.sockets[k] ? sizeOn(ctx, patch, pegsInto(ctx, k), sizesOn, (s) => socketReach(s, k), ctx.rooms[k], t) : null));
+        } finally {
+          t.dispose();
+        }
+      }
+    }
+
+    // ---- one diameter for the whole model ----
+    const D = pinned.length ? manual || sizePass(pinned) || AUTO_DIAMETERS[AUTO_DIAMETERS.length - 1] : null;
+
+    // ---- which piece of each pair across a pegged face carries the pegs: one for all of that face's, never one
+    // whose neighbour has no room for their sockets, and where both have room, rather the one across from more of it:
+    // more of the pair's faces, then the larger pegs its narrowest face takes, then the longer (at the smallest size,
+    // on faces too narrow for Auto to size) ----
     const pairs = new Map();
     for (const ctx of pegged) {
       for (const patch of ctx.patches) {
-        const key = `${ctx.cut.id}|${patch.lo?.index}|${patch.hi?.index}`;
-        if (!patch.skip && !pairs.has(key)) pairs.set(key, { axis: ctx.cut.axis, lo: patch.lo.index, hi: patch.hi.index });
+        if (patch.skip) continue;
+        const key = `${ctx.cut.id}|${patch.lo.index}|${patch.hi.index}`;
+        if (!pairs.has(key)) pairs.set(key, { pair: { axis: ctx.cut.axis, lo: patch.lo.index, hi: patch.hi.index, sockets: [false, false], prefer: null }, ctx, patches: [] });
+        pairs.get(key).patches.push(patch);
       }
     }
-    // whether a piece still fits carrying them is judged at their own length: smaller and shorter pegs are no longer
-    const males = pegMales ? pegMales([...pairs.values()], PEG.full(P ?? AUTO_PEGS[0], depth).length) : [...pairs.values()].map(() => 0);
+    // the room a pair's faces have for sockets on side k: the area of those that take any, the size the narrowest takes
+    // (0 where Auto sizes none), and how long that size, or the smallest, may be there
+    const roomIn = (ctx, patches, k) => {
+      const taking = patches.filter((patch) => patch.sockets[k]);
+      const sized = taking.filter((patch) => patch.area >= SIZING_PATCH);
+      const size = sized.length ? Math.min(...sized.map((patch) => patch.fit[k]?.d ?? 0)) : 0;
+      return [taking.reduce((sum, patch) => sum + patch.area, 0), size, PEG.room(size || leastPeg, depth, ctx.rooms[k])?.length ?? 0];
+    };
+    // whether room x beats room y, in that order
+    const roomier = (x, y) => {
+      if (Math.abs(x[0] - y[0]) > 1e-6 * Math.max(1, y[0])) return x[0] > y[0];
+      return x[1] !== y[1] ? x[1] > y[1] : x[2] > y[2] + 1e-9;
+    };
+    for (const { pair, ctx, patches } of pairs.values()) {
+      pair.sockets = [0, 1].map((k) => patches.some((patch) => patch.sockets[k]));
+      if (!pair.sockets.every(Boolean)) continue;
+      const room = [roomIn(ctx, patches, 0), roomIn(ctx, patches, 1)];
+      pair.prefer = roomier(room[1], room[0]) ? 0 : roomier(room[0], room[1]) ? 1 : null;
+    }
+    // whether a piece still fits carrying them is judged at their length at the size of the better side of each face:
+    // the size they get is no larger
+    const fitOf = (patch, k) => patch.fit[k]?.d ?? null;
+    const faces = pegged.flatMap((ctx) => ctx.patches.filter((patch) => !patch.skip));
+    const better = faces.map((patch) => Math.max(fitOf(patch, 0) ?? 0, fitOf(patch, 1) ?? 0)).filter((x) => x > 0);
+    const longest = PEG.full(pegManual || (better.length ? Math.min(...better) : AUTO_PEGS[AUTO_PEGS.length - 1]), depth).length;
+    const list = [...pairs.values()].map((x) => x.pair);
+    const males = pegMales
+      ? pegMales(list, longest)
+      : list.map((pair) => (!pair.sockets[1] ? (pair.sockets[0] ? 1 : null) : !pair.sockets[0] ? 0 : pair.prefer ?? 0));
     const maleOf = new Map([...pairs.keys()].map((key, i) => [key, males[i]]));
     for (const ctx of pegged) {
       for (const patch of ctx.patches) if (!patch.skip) patch.male = maleOf.get(`${ctx.cut.id}|${patch.lo.index}|${patch.hi.index}`);
     }
+
+    // ---- one peg size for the whole model: the smallest that a face's sockets take on the side they go into ----
+    const found = faces.filter((patch) => patch.male !== null).map((patch) => fitOf(patch, 1 - patch.male)).filter((x) => x !== null);
+    const P = pegged.length ? pegManual || (found.length ? Math.min(...found) : AUTO_PEGS[AUTO_PEGS.length - 1]) : null;
 
     // ---- at most 48 pins or pegs: every patch its first two, larger patches first, then the rest the same way ----
     const asks = connected.flatMap((ctx) => ctx.patches.filter((p) => !p.skip).map((patch) => ({ patch, n: wanted || clamp(1 + Math.round(patch.area / 1500), 2, 6) })));
@@ -2273,6 +2424,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
       if (sockets) ctx.obstacles.push(sockets);
       if (ctx.joint === 'pegs') {
         layoutPegs(ctx, P);
+        ctx.pinnable = pinsFit(ctx);
         for (const peg of pegs.filter((x) => x.cutId === ctx.cut.id)) {
           // side 0 the sockets, side 1 the pegs (a pegged split has no pins)
           for (const [side, m] of [[0, keep.add(socketAt(peg))], [1, keep.add(pegAt(peg))]]) placed.push({ m, side, box: boxOf(m) });
@@ -2329,7 +2481,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
         seams.push(seam);
       }
     }
-    return { diameter: D, pegSize: P, dowels, pegs, labels, seams, notes };
+    return { diameter: D, pegSize: P, dowels, pegs, labels, seams, notes, pinnable: pegged.filter((ctx) => ctx.pinnable).map((ctx) => ctx.cut.id) };
   } finally {
     keep.dispose();
   }

@@ -10,7 +10,7 @@ import {
   planSamples, plateAxis, polygonsArea, polygonsCentroid, printTransform, safeFileName, cellSupport, fitPieces, flatProbes, liesFlat, statsWithSoup,
   sizesFor, sizesForRoom, soupCells, splitActive, splitNote, teardropApex, usableBed, yawMat4, zipFileName, triangleInBox, baseAxis,
   outlineColumns, pieceHolding, textNotes, AUTO_PEGS, SMALLEST_PEG, layPegged, pegAllowance, pegMales, pegSides, pegSizeOf, pegSizesFor,
-  pegSizesForRoom, statsWithPegs,
+  pegSizesForRoom, statsWithPegs, uprightPegNotes,
 } from '../src/split.js';
 
 const U = [210, 210, 249]; // the default printer's usable bed
@@ -1577,6 +1577,104 @@ describe('built-in pegs', () => {
     expect(pegMales(held, U)([{ axis: 0, lo: 1, hi: 2 }])).toEqual([1]);
     const both = laidOf([{ index: 1, stats: { ...boxStats([150, 40, 5], ['+x']), allowed: ['+x'] } }, { index: 2, stats: { ...boxStats([150, 40, 5], ['-x']), allowed: ['-x'] } }]);
     expect(pegMales(both, U)([{ axis: 0, lo: 1, hi: 2 }])).toEqual([null]);
+  });
+
+  it('the pegs go on the piece across from the one with room for their sockets, whichever way the two would lie', () => {
+    const pair = { axis: 0, lo: 1, hi: 2 };
+    // only the second lies on the face, so the first would carry them; told only the first has room for the sockets,
+    // the second carries them and lies another way
+    const one = laidOf([{ index: 1, stats: boxStats([150, 40, 20], ['+x']) }, { index: 2, stats: boxStats([60, 40, 30], ['-x']) }]);
+    expect(pegMales(one, U)([pair])).toEqual([0]);
+    expect(pegMales(one, U)([{ ...pair, sockets: [true, false] }])).toEqual([1]);
+    expect(pegMales(one, U)([{ ...pair, sockets: [true, true] }])).toEqual([0]);
+    // only the first lies on it: the second would carry them, but only it has room for the sockets
+    const other = laidOf([{ index: 1, stats: boxStats([60, 40, 30], ['+x']) }, { index: 2, stats: boxStats([150, 40, 20], ['-x']) }]);
+    expect(pegMales(other, U)([pair])).toEqual([1]);
+    expect(pegMales(other, U)([{ ...pair, sockets: [false, true] }])).toEqual([0]);
+    // room on neither side, or only across from a piece with no way down without the face: glued
+    expect(pegMales(one, U)([{ ...pair, sockets: [false, false] }])).toEqual([null]);
+    const held = laidOf([{ index: 1, stats: { ...boxStats([150, 40, 5], ['+x']), allowed: ['+x'] } }, { index: 2, stats: boxStats([150, 40, 5], ['-x']) }]);
+    expect(pegMales(held, U)([pair])).toEqual([1]);
+    expect(pegMales(held, U)([{ ...pair, sockets: [false, true] }])).toEqual([null]);
+    // a piece made too big by the pegs hands them to the other only where that one may carry them; one that must carry
+    // them and that they push off the bed is glued
+    const column = laidOf([{ index: 1, stats: boxStats([205, 100, 240], ['+x']) }, { index: 2, stats: boxStats([155, 100, 240], ['-x']) }]);
+    expect(pegMales(column, U, 'auto', { length: 12 })([{ ...pair, sockets: [true, false] }])).toEqual([1]);
+    expect(pegMales(column, U, 'auto', { length: 12 })([{ ...pair, sockets: [false, true] }])).toEqual([null]);
+    expect(pegMales(column, U, 'auto', { length: 12 })([{ ...pair, sockets: [false, true] }], 4)).toEqual([0]);
+    // a plaque's 5 mm base lies best on its cut face (its underside has engraved letters to hold up), the top on its own:
+    // only the top has room for sockets, so the base carries the pegs and lies on its underside – it neither hands
+    // them back nor drops them for the sake of its cut face
+    const base = boxStats([174, 120, 5], ['+z'], { '-z': { support: 400 } });
+    const plaque = laidOf([{ index: 1, stats: base }, { index: 2, stats: boxStats([174, 120, 8], ['-z']) }]);
+    expect(plaque.map((p) => p.lying.down)).toEqual(['+z', '-z']);
+    expect(pegMales(plaque, U, 'auto', { length: 6 })([{ axis: 2, lo: 1, hi: 2, sockets: [false, true] }])).toEqual([0]);
+    // a 5 mm plate between two blocks, with no room for sockets, carries the pegs of its first face and lies on the
+    // second, which is glued: with the pegs of both it could only stand on its edge. With room in it, the block under it
+    // takes the lower face's
+    const sandwich = laidOf([
+      { index: 1, stats: boxStats([150, 150, 60], ['+z']) }, { index: 2, stats: boxStats([150, 150, 5], ['-z', '+z']) }, { index: 3, stats: boxStats([150, 150, 60], ['-z']) },
+    ]);
+    const faces = [{ axis: 2, lo: 1, hi: 2, sockets: [true, false] }, { axis: 2, lo: 2, hi: 3, sockets: [false, true] }];
+    expect(pegMales(sandwich, U, 'auto', { length: 6 })(faces)).toEqual([1, null]);
+    expect(pegMales(sandwich, U, 'auto', { length: 6 })(faces.map(({ sockets, ...rest }) => rest))).toEqual([0, 0]);
+  });
+
+  it('a piece that must carry the pegs, its neighbour having no room for sockets, does so only lying about as well as glued', () => {
+    const pair = { axis: 2, lo: 1, hi: 2, sockets: [true, false] };
+    const body = { index: 1, stats: boxStats([120, 120, 100], ['+z']) };
+    const males = (lid) => pegMales(laidOf([body, { index: 2, stats: lid }]), U, 'auto', { length: 6 })([pair]);
+    // a 5 mm lid with a knob lies flat on its cut face; carrying the pegs it would rest on the knob (452 mm² on the bed,
+    // the rest over supports) or stand on its edge, a 5 mm wall: it is glued, and lies flat
+    expect(males(boxStats([120, 120, 25], ['-z'], { '+z': { bed: 452, support: 13948 } }))).toEqual([null]);
+    // a plain lid lies as well on its top, and carries them; so does one with letters engraved in its top, bridged
+    // over a tenth of its footing or less
+    expect(males(boxStats([120, 120, 5], ['-z']))).toEqual([1]);
+    expect(males(boxStats([120, 120, 5], ['-z'], { '+z': { bed: 13000, support: 1400 } }))).toEqual([1]);
+    // but not one that would need more support than that, nor one left on under half the bed it had
+    expect(males(boxStats([120, 120, 5], ['-z'], { '+z': { bed: 13000, support: 1500 } }))).toEqual([null]);
+    expect(males(boxStats([120, 120, 5], ['-z'], { '+z': { bed: 7000 } }))).toEqual([null]);
+  });
+
+  it('where both pieces have room for the sockets, the one across from more of it carries the pegs when it prints as well', () => {
+    const pair = { axis: 2, lo: 1, hi: 2 };
+    // the body stands on its foot and the lid lies on its cut face, so the body would carry them; the lid lies as well
+    // on its top, and carries them when the body has more room for the sockets
+    const lidded = laidOf([{ index: 1, stats: boxStats([120, 120, 100], ['+z']) }, { index: 2, stats: boxStats([120, 120, 8], ['-z']) }]);
+    expect(pegMales(lidded, U)([pair])).toEqual([0]);
+    expect(pegMales(lidded, U)([{ ...pair, sockets: [true, true], prefer: 1 }])).toEqual([1]);
+    expect(pegMales(lidded, U)([{ ...pair, sockets: [true, true], prefer: 0 }])).toEqual([0]);
+    // a pyramid roof that could lie only on its point or its eaves carrying them leaves them to the body, room or not
+    const eaves = { bed: 480, support: 3000 };
+    const roof = boxStats([120, 120, 40], ['-z'], { '+z': { bed: 4, support: 14000 }, '+x': eaves, '-x': eaves, '+y': eaves, '-y': eaves });
+    const roofed = laidOf([{ index: 1, stats: boxStats([120, 120, 100], ['+z']) }, { index: 2, stats: roof }]);
+    expect(pegMales(roofed, U)([{ ...pair, sockets: [true, true], prefer: 1 }])).toEqual([0]);
+    // halves of a bar both lying on their cut faces: the one across from more room, not the lower-numbered
+    const bar = laidOf([{ index: 1, stats: boxStats([60, 40, 30], ['+x']) }, { index: 2, stats: boxStats([60, 40, 30], ['-x']) }]);
+    expect(pegMales(bar, U)([{ axis: 0, lo: 1, hi: 2 }])).toEqual([0]);
+    expect(pegMales(bar, U)([{ axis: 0, lo: 1, hi: 2, sockets: [true, true], prefer: 1 }])).toEqual([1]);
+    // only where both have room
+    expect(pegMales(bar, U)([{ axis: 0, lo: 1, hi: 2, sockets: [false, true], prefer: 1 }])).toEqual([0]);
+  });
+
+  it('a cut whose pegs all print standing up says so, once, naming the pieces that carry them', () => {
+    // cut A's pegs point up out of piece 1's top and down out of piece 3's bottom, which lies upside down; cut B's lie
+    // along the bed on piece 2, and cut C's stand up on piece 4 but lie down on piece 2
+    const peg = (cutId, letter, piece, dir, axis = 2) => ({ cutId, letter, axis, dir, sides: [{ piece, peg: true }, { piece: 99, peg: false }] });
+    const laid = [1, 2, 3, 4].map((index) => ({ index }));
+    const lying = [{ up: '+z' }, { up: '+x' }, { up: '-z' }, { up: '+y' }];
+    const pegs = [peg('c1', 'A', 1, 1), peg('c1', 'A', 3, -1), peg('c1', 'A', 1, 1), peg('c2', 'B', 2, 1), peg('c3', 'C', 4, 1, 1), peg('c3', 'C', 2, 1, 1)];
+    const notes = uprightPegNotes(pegs, laid, lying, ['c1', 'c2']);
+    expect(notes).toEqual([splitNote('PEGS_UPRIGHT', { letter: 'A', cutId: 'c1', pieces: [1, 3], pins: true })]);
+    expect(notes[0]).toMatchObject({
+      level: 'info', text: 'Cut A\'s pegs print standing up on pieces 1 and 3 – they are a little weaker across the layers than pegs lying flat; pins (Joints: Pins) would be stronger.',
+    });
+    // pins are named only where their holes would fit: a plate too thin for sockets is mostly too thin for them
+    expect(uprightPegNotes([peg('c3', 'C', 4, 1, 1)], laid, lying, ['c1']).map((n) => n.text)).toEqual([
+      'Cut C\'s pegs print standing up on piece 4 – they are a little weaker across the layers than pegs lying flat.',
+    ]);
+    expect(uprightPegNotes([peg('c3', 'C', 4, 1, 1)], laid, lying)[0].pins).toBeUndefined();
+    expect(uprightPegNotes([], laid, lying)).toEqual([]);
   });
 
   it('no piece is left with every good way to lie pegged: each corner of a ball cut in eight keeps a cut face', () => {

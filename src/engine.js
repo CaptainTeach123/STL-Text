@@ -16,8 +16,8 @@ import {
   CUT_TOLERANCE, FILAMENT, SPLIT_KEEP_TRIANGLES, SplitError, TO_PLANE, applyToSoup, assemblySteps, axisCuts, cellOfPoint,
   cutPlane, fitsBed, glueFileName, gridCandidates, howToGlueText, layPieces, letterFor, normaliseSplit, partFileName, pieceFileName, pinsFileName,
   planCost, planGrid, planSamples, plateAxis, safeFileName, slabAxis, sizesFor, smallPieceNotes, soupCells, splitActive, splitNote, usableBed,
-  zipFileName, cellSupport, flatProbes, outlineColumns, textNotes, baseAxis, modelPlates, layPegged, pegAllowance, pegMales, pegSizeOf, pegSizesFor,
-  pegSides, cellFits, uprightPegNotes,
+  zipFileName, cellSupport, flatProbes, outlineColumns, textNotes, baseAxis, modelPlates, layGrown, pegAllowance, pegMales, pegSizeOf, pegSizesFor,
+  pegSides, cellFits, uprightPegNotes, apartMales, cellSizes, clipHold, lipSides, APART_HOLDS, LIP_ALLOWANCE,
 } from './split.js';
 import {
   buildSplitDisplay, clearSplitCaches, cutPieces, drillPiece, fitTestCoupon, layoutSplit, partedSolids, pinAt, pinSheet, pinSpares, pinsPerSheet,
@@ -46,13 +46,17 @@ import {
  *                                                          (stl null, + files, zip, pieces, seams, assembly, diameter,
  *                                                          pegSize with a split)
  *   split.plan  { items, baseVersion, printing, split, bed, mode: 'fit'|'measure' }
- *                                                       -> fit: { cuts, counts, pieces, notes }
+ *                                                       -> fit: { cuts, counts, pieces, notes } (the cuts that come
+ *                                                          apart first, as stored, then the new ones without ids)
  *                                                          measure: { bounds, cuts, notes } (a dovetail cut also has
- *                                                          tabs, reach [below, above] and w, for `cellSizes`, and a cut
- *                                                          with built-in pegs reach [L, L]; estimate: true when the
- *                                                          faces are the model's without the text)
+ *                                                          tabs, reach [below, above] and w, for `cellSizes`, a cut
+ *                                                          with built-in pegs reach [L, L], and one that comes apart
+ *                                                          apart: { hold } and, with a lip, reach [6, 0] or [0, 6]
+ *                                                          on the side the pieces say it goes; estimate: true when
+ *                                                          the faces are the model's without the text)
  *   split.fitTest { items?, baseVersion?, split, printing, bed?, name, dovetail? }
- *                                                       -> { stl, name, triangles, diameter, pins, dovetail, pegs, pegSize }
+ *                                                       -> { stl, name, triangles, diameter, pins, dovetail, pegs, pegSize,
+ *                                                          apart }
  *   ping        {}                                      -> { ready: true, caches }
  *
  * `display` = { positions, normals, index, passthroughStart, bvhRoots } —
@@ -61,7 +65,8 @@ import {
  * vertCount] per piece, pin and part) and `parts` (what each range is).
  *
  * `split` is the document's split (`{ cuts: [{ id, position, normal }], joint, … }`,
- * see split.js); no cuts means no split, and the replies are exactly those of
+ * a cut that comes apart with `joint: 'apart'` and its `hold`, see split.js);
+ * no cuts means no split, and the replies are exactly those of
  * a model that was never split. `bed` is the room a piece may use on the
  * printer, [x, y, z] mm (`usableBed`); `printer` ({ size, margin }) only
  * names the printer on the glue sheet.
@@ -77,6 +82,9 @@ const TINY_SHELL_FRACTION = 1e-3;
 // copy so the view stays fluid; downloads always use the full-detail solid.
 const LOD_TRIANGLES = 400_000;
 const LOD_TOLERANCE = 0.02;
+// What hangs below a take-apart cut's clips is weighed as PLA (g/mm³) under gravity (m/s²).
+const PLA_DENSITY = 1.24e-3;
+const GRAVITY = 9.81;
 
 export class EngineError extends Error {
   constructor(code, message, details) {
@@ -317,6 +325,20 @@ function spreadOf(polygons) {
 function boxOf(m) {
   const { min, max } = m.boundingBox();
   return { min: [min[0], min[1], min[2]], max: [max[0], max[1], max[2]] };
+}
+
+/** A cut id's number ('c3' → 3; 0 for any other id). */
+const cutNumber = (id) => Number(/^c(\d+)$/.exec(String(id))?.[1] ?? 0);
+
+/** Cuts numbered as the document numbers them (`mergeSplit`): an id given is kept, a cut without one gets one past the highest. */
+function numberedCuts(cuts) {
+  let top = Math.max(0, ...cuts.map((c) => cutNumber(c.id)));
+  const seen = new Set();
+  return cuts.map((c) => {
+    const id = c.id != null && !seen.has(c.id) ? c.id : `c${++top}`;
+    seen.add(id);
+    return { ...c, id };
+  });
 }
 
 /** A bed size from a request: the usable [x, y, z] mm, or the default printer's when it is missing or nonsense. */
@@ -2325,9 +2347,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * drilling (booleans, keyed by the cut, the connector settings and each
    * piece's way up – so a new bed that turns no piece over costs nothing).
    * A piece that carries built-in pegs is laid again once they are placed:
-   * they stand out of it, and never point down. Returns null without cuts;
-   * `{ notes }` when the model is exported whole after all (it cannot be
-   * split, or every cut missed); else the split.
+   * they stand out of it, and never point down; so is one a take-apart
+   * cut's lip stands out of, the one way that keeps the lip standing up
+   * (the layout chose it, before the other cuts' pins). Returns null
+   * without cuts; `{ notes }` when the model is exported whole after all (it
+   * cannot be split, or every cut missed); else the split.
    */
   function splitFor(final, items, { split, bed, printing }, progress) {
     if (!splitActive(split)) return null;
@@ -2343,17 +2367,19 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const cut = cutStage(final, items, cuts, plan, progress);
     progress?.('Choosing how each piece lies…');
     // how each piece lies, and which of a box's shells print apart because lying that way they would not rest on the bed
-    const laid = layPieces(cut.pieces, U, spec.orient, { flat: slabOf(final), soups: cut.fragments });
-    const drill = drillStage(final, cut, laid, { cuts, spec, joints: plan.joints, nozzle, U }, progress);
-    const lying = layPegged(laid, drill.layout.pegs, U, spec.orient, { flat: slabOf(final) });
+    const flat = slabOf(final);
+    const laid = layPieces(cut.pieces, U, spec.orient, { flat, soups: cut.fragments });
+    const drill = drillStage(final, cut, laid, { cuts, spec, joints: plan.joints, nozzle, U, flat }, progress);
+    const lying = layGrown(laid, drill.layout, U, spec.orient, { flat });
     return summarise({ final, spec, cuts, U, given, plan, cut, laid, lying, drill });
   }
 
   /** Stage A: the model cut into one piece per cell, each with its orientation statistics. */
   function cutStage(final, items, cuts, { dove, tabs }, progress) {
     const state = splitState(final);
-    // the tabs follow from the model, the cuts and `dove`, so the key needs no more
-    const key = `${final.key}|cut:${stableKey({ cuts, dove })}`;
+    // the tabs follow from the model, the cuts and `dove`, so the key needs no more: whether a cut comes apart, and
+    // how it holds, change only the drilling (a plate's cut that comes apart on tabs changes `dove`)
+    const key = `${final.key}|cut:${stableKey({ cuts: cuts.map(({ id, letter, axis, at }) => ({ id, letter, axis, at })), dove })}`;
     if (state.cut?.key === key) return state.cut;
     disposeSplitStage(state.drill);
     disposeSplitStage(state.cut);
@@ -2413,24 +2439,34 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   }
 
   /**
-   * Stage C and D: pins, pegs and labels laid out (plain data), and every piece drilled. The pieces are those
+   * Stage C and D: lips, pins, pegs and labels laid out (plain data), and every piece drilled. The pieces are those
    * `layPieces` made of the cut's: the way each prints up and which shells print apart are in the key. Which piece of a
-   * pair carries built-in pegs follows from how they lie on the bed (`pegMales`), so with pegs the bed is in it too.
+   * pair carries built-in pegs follows from how they lie on the bed (`pegMales`), and so does which carries a lip and
+   * so lies with it standing up (`apartMales`), so with pegs or a cut that comes apart the bed is in it too, and with
+   * the latter each such cut's hold.
    */
-  function drillStage(final, cut, laid, { cuts, spec, joints, nozzle, U }, progress) {
+  function drillStage(final, cut, laid, { cuts, spec, joints, nozzle, U, flat }, progress) {
     const state = splitState(final);
     const { joint, diameter, depth, clearance, count, labels, orient } = spec;
     const font = labels ? fontFor('inter') : null;
     const ups = laid.map((p) => p.lying.up);
     const groups = laid.map((p) => [p.from, p.parts]);
-    const pegged = joint === 'pegs' ? { U, orient } : {};
-    const key = `${cut.key}|drill:${stableKey({ joint, diameter, depth, clearance, count, labels, nozzle, ups, groups, font: font?.key ?? null, ...pegged })}`;
+    const apart = cuts.filter((c) => c.apart);
+    // spread only when there is something: `stableKey` would keep an undefined field
+    const onBed = {
+      ...(joint === 'pegs' ? { U, orient } : {}),
+      ...(apart.length ? { apart: apart.map((c) => [c.id, c.apart.hold]), U, orient } : {}),
+    };
+    const key = `${cut.key}|drill:${stableKey({ joint, diameter, depth, clearance, count, labels, nozzle, ups, groups, font: font?.key ?? null, ...onBed })}`;
     if (state.drill?.key === key) return state.drill;
     disposeSplitStage(state.drill);
     state.drill = null;
+    const length = pegAllowance(spec);
     const layout = layoutSplit(final.solid, cuts, laid.map((p) => ({ index: p.index, cell: p.cell, up: p.lying.up, boxes: p.boxes })), spec, {
       nozzle, joints, tabs: cut.tabs, font: font?.font ?? null, bounds: boxOf(final.solid), progress,
-      pegMales: joint === 'pegs' ? pegMales(laid, U, orient, { flat: slabOf(final), length: pegAllowance(spec) }) : null,
+      apartMales: apart.length ? apartMales(laid, U, orient, { flat }) : null,
+      // the pieces a lip stands out of lie its way, known only once the lips are laid out
+      pegMales: joint === 'pegs' ? (pairs, longest, forced) => pegMales(laid, U, orient, { flat, length, forced })(pairs, longest) : null,
     });
     const drilled = drillAll(final, cut, laid, layout, font?.font ?? null, progress);
     const keep = drilled.reduce((n, m) => n + m.numTri(), 0) <= splitKeepTriangles;
@@ -2479,16 +2515,55 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   }
 
   /**
+   * An `APART_HEAVY` note for each Z cut whose clips may not hold up what
+   * hangs below it when the model is carried by its top: their hold
+   * (`clipHold`, a weak print's) under twice the weight of every piece below
+   * the cut, in PLA. Worked out, not measured, as the hold is.
+   */
+  function heavyNotes(cuts, lips, laid) {
+    const notes = [];
+    const along = axisCuts(cuts)[2];
+    for (const c of cuts) {
+      if (!c.apart || c.axis !== 2) continue;
+      const clipped = lips.filter((l) => l.cutId === c.id && l.clips > 0 && l.i > 0);
+      if (!clipped.length) continue;
+      const hold = clipped.reduce((sum, l) => sum + clipHold(l.clips, { t: l.t, i: l.i }), 0);
+      const below = along.indexOf(c.at);
+      const grams = laid.filter((p) => p.cell[2] <= below).reduce((sum, p) => sum + (p.volume ?? 0), 0) * PLA_DENSITY;
+      if (hold < 2 * (grams / 1000) * GRAVITY) {
+        notes.push(splitNote('APART_HEAVY', { letter: c.letter, cutId: c.id, weight: Math.round(grams), hold: Math.round(hold * 10) / 10 }));
+      }
+    }
+    return notes;
+  }
+
+  /**
    * The plain description of a split, shared by the pieces view and the
    * download: the pieces as they print, the seams, the pin groups and every
-   * note, the summary first.
+   * note, the summary first. A piece a take-apart cut's lip stands out of
+   * lists it (`lips`, by cut letter with its clips), and the one that comes
+   * off it – the top of a Z cut, the piece with the groove across X or Y – the
+   * letters of the cuts it comes off at (`lids`).
    */
   function summarise(split) {
     const { final, spec, cuts, U, given, plan, cut, laid, lying, drill } = split;
     const { layout } = drill;
     const n = laid.length;
+    const lips = layout.lips ?? [];
     const pieces = laid.map((p, i) => {
       const o = lying[i];
+      // a cut's lip may stand out of a piece on more than one face: one entry a cut, its clips added up. What comes off
+      // is the top of a Z cut, whichever piece has the lip (a box's lid may), and across X or Y the piece that goes on
+      // the other's lip
+      const carried = new Map();
+      const lids = new Set();
+      for (const l of lips) {
+        l.sides.forEach((s, j) => {
+          if (s.piece !== p.index) return;
+          if (s.male) carried.set(l.letter, (carried.get(l.letter) ?? 0) + l.clips);
+          if (j === (l.axis === 2 ? 1 : 1 - l.male)) lids.add(l.letter);
+        });
+      }
       return {
         index: p.index,
         name: `piece ${p.index} of ${n}`,
@@ -2504,6 +2579,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         // the built-in pegs it carries, and the sockets it has for another piece's
         pegs: layout.pegs.filter((g) => g.sides.some((s) => s.peg && s.piece === p.index)).length,
         sockets: layout.pegs.filter((g) => g.sides.some((s) => !s.peg && s.piece === p.index)).length,
+        lips: [...carried].sort((x, y) => x[0].localeCompare(y[0])).map(([letter, clips]) => ({ letter, clips })),
+        lids: [...lids].sort(),
         unrepaired: (p.soup?.length ?? 0) / 9,
       };
     });
@@ -2525,7 +2602,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         cell: g.cell, patch: g.patch, male: g.male, dir: g.dir, sides: g.sides,
       })),
       male: s.male,
+      ...(s.apart ? { apart: { ...s.apart } } : {}),
     }));
+    // the cuts that come apart, by letter: never glued, and said so in the summary
+    const apartLetters = [...new Set(seams.filter((s) => s.apart).map((s) => s.letter))].sort();
+    const apartIds = new Set(cuts.filter((c) => c.apart).map((c) => c.id));
     // one group per pin size: the pins file holds each group, with spares
     const groups = new Map();
     for (const d of layout.dowels) {
@@ -2556,6 +2637,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       ...(pegSizes.length ? { pegs: layout.pegs.length, pegSize: pegSizes[0].size } : {}),
       ...(pegSizes.length > 1 ? { pegSizes } : {}),
       dovetails: cut.dovetails.length, pairs,
+      ...(apartLetters.length ? { apart: apartLetters } : {}),
     }));
     for (const g of pins) {
       // pins that fell back to filament on some faces are told of by that cut's own note
@@ -2564,7 +2646,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     }
     for (const x of cut.dovetails) {
       const seam = seams.find((s) => s.cutId === x.cutId && s.joint === 'dovetail');
-      notes.push(splitNote('DOVETAIL', { letter: x.letter, cutId: x.cutId, tabs: x.tabs, pieces: seam?.pieces ?? [], ...(spec.joint === 'pegs' ? { pegs: true } : {}) }));
+      const how = apartIds.has(x.cutId) ? { apart: true } : spec.joint === 'pegs' ? { pegs: true } : {};
+      notes.push(splitNote('DOVETAIL', { letter: x.letter, cutId: x.cutId, tabs: x.tabs, pieces: seam?.pieces ?? [], ...how }));
     }
     // the cut numbers the boxes' pieces: a box whose shells print apart is more than one piece, so the thin pieces are
     // looked for again, and text through a cut names the pieces as they print, beside the cut's other notes
@@ -2590,7 +2673,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     });
     // pegs that all print pointing up (on a plate under a thick top) are weaker across their layers: said once a cut,
     // naming pins only where they would fit
-    notes.push(...layout.notes, ...uprightPegNotes(layout.pegs, laid, lying, layout.pinnable));
+    notes.push(...layout.notes, ...heavyNotes(cuts, lips, laid), ...uprightPegNotes(layout.pegs, laid, lying, layout.pinnable));
     // the peg size is the one the pieces have, as the summary says: a size asked for that no face took is none of theirs
     return { ...split, pieces, seams, pins, notes, grid: cut.grid, diameter: layout.diameter, pegSize: pegSizes[0]?.size ?? layout.pegSize };
   }
@@ -2733,6 +2816,24 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   }
 
   /**
+   * The cuts that come apart, which Fit to my printer keeps where they are:
+   * checked and merged against the solid as the split will (`normaliseSplit`),
+   * in the order they are listed, each with the cut as the document will
+   * hold it once the plan is taken (`stored`: its id, place and hold).
+   */
+  function keptCutsOf(final, split) {
+    const listed = (Array.isArray(split?.cuts) ? split.cuts : [])
+      .map((c, i) => (c ? { ...c, id: c.id ?? `c${i + 1}` } : c))
+      .filter((c) => c?.joint === 'apart');
+    if (!listed.length) return [];
+    const { cuts } = normaliseSplit({ cuts: listed }, splitBounds(final));
+    return listed.flatMap((s) => {
+      const c = cuts.find((x) => x.id === s.id && x.apart);
+      return c ? [{ ...c, stored: { id: s.id, position: [...s.position], normal: [...s.normal], joint: 'apart', hold: c.apart.hold } }] : [];
+    });
+  }
+
+  /**
    * Fit to my printer (`mode: 'fit'`): the fewest pieces that fit the bed,
    * and where their cuts go – away from letters, ledges and narrow necks, on
    * faces with room for pins – from the cost of cutting at each sample of a
@@ -2768,9 +2869,12 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const U = bedOf(bed);
       const nozzle = printing?.nozzle ?? 0.4;
       const { spec } = normaliseSplit({ ...(split ?? {}), cuts: [] });
-      const key = stableKey({ U, nozzle, joint: spec.joint, diameter: spec.diameter, depth: spec.depth, clearance: spec.clearance });
+      // the cuts that come apart stay where they are: the plan is made round them, and they come back as they are
+      const kept = keptCutsOf(final, split);
+      const fixed = kept.length ? { fixed: kept.map((c) => [c.id, c.axis, c.at, c.apart.hold]) } : {};
+      const key = stableKey({ U, nozzle, joint: spec.joint, diameter: spec.diameter, depth: spec.depth, clearance: spec.clearance, ...fixed });
       const state = splitState(final);
-      if (state.fit?.key !== key) state.fit = { key, plan: fitCuts(final, items, split, U, nozzle, progress), made: new Map() };
+      if (state.fit?.key !== key) state.fit = { key, plan: fitCuts(final, items, split, U, nozzle, kept, progress), made: new Map() };
       // how the pieces lie decides which loose parts print apart: worked out again only for another way of laying them
       if (!state.fit.made.has(spec.orient)) {
         state.fit.made.set(spec.orient, planPieces(final, items, state.fit.plan, spec, U, progress));
@@ -2795,8 +2899,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const boxes = plan.pieces.map(({ cell, size, fits }) => ({ cell, size, fits }));
     if (!plan.cuts.length) return boxes.map(({ size, fits }) => ({ size, fits }));
     try {
-      // the cuts as the document will hold them once taken: numbered in order, so the split that follows finds this cut
-      const { cuts } = normaliseSplit({ ...spec, cuts: plan.cuts.map((c, i) => ({ id: `c${i + 1}`, ...c })) }, splitBounds(final));
+      // the cuts as the document will hold them once taken, numbered as it numbers them – the ones kept keep their
+      // ids, the new ones follow on – so the split that follows finds this cut
+      const { cuts } = normaliseSplit({ ...spec, cuts: numberedCuts(plan.cuts) }, splitBounds(final));
       const laid = layCuts(final, items, cuts, spec, U, progress);
       const box = new Map(boxes.map((b) => [b.cell.join(','), b]));
       return laid.map((p) => ({ size: box.get(p.cell.join(','))?.size ?? p.lying.size, fits: p.lying.fits }));
@@ -2880,9 +2985,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   }
 
   /**
-   * Each stored cut measured on the model, in list order (a cut that misses has joint 'miss'). On the final result of
-   * a model that is not dense, with the bed (`U`), also the pieces the download will hold (`pieces`, the box each
-   * comes from): the model is cut as the split cuts it, as a box whose loose parts print apart is more than one piece.
+   * Each stored cut measured on the model, in list order (a cut that misses has joint 'miss'; one that comes apart
+   * has its `apart` and the joint it gets, 'lip', 'dovetail' or 'none'). On the final result of a model that is not
+   * dense, with the bed (`U`), also the pieces the download will hold (`pieces`, the box each comes from): the model is
+   * cut as the split cuts it, as a box whose loose parts print apart is more than one piece.
    */
   function measureCuts(final, items, split, U, progress) {
     progress?.('Measuring the cuts…');
@@ -2891,13 +2997,18 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const plan = platesFor(final, cuts, spec);
     // a dense model takes seconds to cut: its count waits for the pieces themselves
     let pieces = null;
+    let laid = null;
     if (U && cuts.length && final.solid.numTri() <= Math.min(lodTriangles, splitKeepTriangles)) {
       try {
-        pieces = layCuts(final, items, cuts, spec, U, progress).map((p) => ({ cell: p.cell }));
+        laid = layCuts(final, items, cuts, spec, U, progress);
+        pieces = laid.map((p) => ({ cell: p.cell }));
       } catch {
         pieces = null; // the pieces view or the download says what is wrong
+        laid = null;
       }
     }
+    // the side each lip will go on, as the pieces (or without them the boxes between the cuts) tell
+    const lipped = cuts.some((c) => c.apart) ? lipSides(laid, cuts, U, spec.orient, { flat: laid ? slabOf(final) : null, clearance: spec.clearance, bounds }) : new Map();
     const temps = scope();
     try {
       const measured = (Array.isArray(split?.cuts) ? split.cuts : []).map((stored, i) => {
@@ -2915,13 +3026,19 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         const reach = (dir) => Math.max(0, ...tabs.filter((tb) => tb.dir === dir).map((tb) => tb.E));
         const joint = plan.joints[kept.id] ?? 'dowels';
         // a cut's built-in pegs make one of the pieces either side longer, as far as the longest peg its faces take
-        // stands out (`pegSides` says which), and lay neither flat
+        // stands out (`pegSides` says which), and lay neither flat; so does the lip of a cut that comes apart
         const pegged = joint === 'pegs' && islands > 0;
+        const lip = joint === 'lip' && islands > 0;
+        // a lip on the side the pieces say it goes, else on the side the boxes fit best (`pegSides`)
+        const side = lip ? lipped.get(kept.id) : undefined;
         return {
           id, letter, axis: kept.axis, at: plane.at, area: face.area(), islands, joint,
           crosses: textCrossing(final, items, kept, temps), ...(kept.id !== id ? { merged: kept.id } : {}),
+          ...(kept.apart ? { apart: { ...kept.apart } } : {}),
           ...(tabs.length ? { tabs: tabs.length, reach: [reach(1), reach(-1)], w: seam.w ?? plan.tabs.w } : {}),
           ...(pegged ? { peg: pegAllowance(spec, [1, 2].map((k) => bounds.max[(kept.axis + k) % 3] - bounds.min[(kept.axis + k) % 3])) } : {}),
+          ...(lip && side === undefined ? { peg: LIP_ALLOWANCE } : {}),
+          ...(lip && side != null ? { reach: side === 0 ? [LIP_ALLOWANCE, 0] : [0, LIP_ALLOWANCE] } : {}),
         };
       });
       // the pegs go on the side the boxes fit best, as the pieces will have them: only boxes that make a piece count
@@ -2953,9 +3070,13 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * beside it can lie flat on the plate. When no grid's pieces can all lie
    * on something flat, they are planned as they fit. Its `pieces` are the
    * boxes that hold model, each with its `cell`: `planPieces` makes them the
-   * pieces the cut gives.
+   * pieces the cut gives. The cuts that come apart (`kept`, `keptCutsOf`)
+   * are never moved or left out: the other cuts are planned round them, each
+   * reaching a lip's height past it on one side, and they come back first,
+   * as they are stored (`APART_KEPT`); when the pieces they make fit
+   * already, they alone come back (`SPLIT_NOT_NEEDED` with `apart`).
    */
-  function fitCuts(final, items, split, U, nozzle, progress) {
+  function fitCuts(final, items, split, U, nozzle, kept, progress) {
     progress?.('Planning cuts…');
     const solidBox = splitBounds(final);
     const bounds = withSoup(solidBox, final.passthrough);
@@ -2963,17 +3084,37 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const E = [0, 1, 2].map((a) => bounds.max[a] - bounds.min[a]);
     const flat = plateAxis(E);
     const whole = fitsBed(E, U, { flat });
-    if (whole.fits) {
+    if (whole.fits && !kept.length) {
       return { cuts: [], counts: [0, 0, 0], pieces: [{ size: E, fits: true }], notes: [splitNote('SPLIT_NOT_NEEDED', { yaw: whole.yaw, down: whole.down })] };
+    }
+    let mesh = null;
+    // the cuts that come apart are lettered first once the plan is taken, as they come first in it
+    const keptLetters = kept.map((_, i) => letterFor(i));
+    const fixedAt = [0, 1, 2].map((a) => kept.filter((c) => c.axis === a).map((c) => c.at));
+    if (kept.length) {
+      // with them alone the pieces may fit already, each lip counted on the piece it fits best on, as `apartMales` gives
+      // the lip to a piece that still fits
+      const by = axisCuts(kept);
+      const held = cellSupport((mesh ??= final.solid.getMesh()), by);
+      const isPiece = (c) => held.get(c.cell.join(','))?.filled !== false;
+      const fits = (c) => !isPiece(c) || cellFits(c, U);
+      const boxes = cellSizes(bounds, pegSides(bounds, kept.map((c) => ({ ...c, peg: LIP_ALLOWANCE })), fits)).cells.filter(isPiece);
+      if (boxes.every((c) => cellFits(c, U))) {
+        return {
+          cuts: kept.map((c) => c.stored), counts: by.map((list) => list.length), pieces: boxes.map(({ cell, size }) => ({ cell, size, fits: true })),
+          notes: [splitNote('SPLIT_NOT_NEEDED', { apart: keptLetters })],
+        };
+      }
     }
     // a slab too thick for a plate (a 15 mm plaque) is best printed lying flat too: stood on its edge it is a tall
     // wall with its face upright. Its pieces are planned lying flat first, and only stand when no grid of flat ones
     // works; so are those of a model on a base plate (a terrain tile with a tower on it), which would be walls of it
-    let mesh = null;
-    const slab = slabAxis(E) ?? (flat === null ? baseAxis(modelPlates((mesh = final.solid.getMesh()).vertProperties, mesh.numProp, mesh.triVerts)) : null);
+    const slab = slabAxis(E) ?? (flat === null ? baseAxis(modelPlates((mesh ??= final.solid.getMesh()).vertProperties, mesh.numProp, mesh.triVerts)) : null);
     const ways = slab === null ? [flat] : [slab, null];
-    // tabs only make pieces longer, so the grids whose plain even cells fit are the only ones worth a profile
-    const candidatesOf = new Map(ways.map((lying) => [lying, gridCandidates(E, U, { flat: lying }).filter((c) => c.pieces > 1)]));
+    // tabs only make pieces longer, so the grids whose plain even cells fit are the only ones worth a profile; a grid
+    // with fewer cuts on an axis than come apart there is none
+    const minCounts = kept.length ? fixedAt.map((list) => list.length) : null;
+    const candidatesOf = new Map(ways.map((lying) => [lying, gridCandidates(E, U, { flat: lying, minCounts }).filter((c) => c.pieces > 1)]));
     const tooMany = { cuts: [], counts: null, pieces: [], notes: [splitNote('PLAN_TOO_MANY')] };
     if (![...candidatesOf.values()].some((list) => list.length)) return tooMany;
     // the pieces at either end must take a hole (or a peg's socket) and its wall, and middle ones one from each side
@@ -3004,7 +3145,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         // further apart than 2 mm, the samples cannot tell a cut that runs right beside a letter: it is looked for, and
         // the middle of each gap between letters is a sample too, the place furthest from both
         const apart = grid.length > 1 ? grid[1] - grid[0] : 0;
-        const samples = apart > 2 && text.length ? withGaps(grid, (t) => lettersAt(letters, items, a, t, temps)) : grid;
+        const gapped = apart > 2 && text.length ? withGaps(grid, (t) => lettersAt(letters, items, a, t, temps)) : grid;
+        // the cuts that come apart are samples too, exactly where they are
+        const own = fixedAt[a];
+        const samples = own.length ? [...gapped.filter((t) => !own.some((f) => Math.abs(f - t) <= 1e-6)), ...own].sort((p, q) => p - q) : gapped;
         progressOf.total += samples.length;
         // whether a face has room for pins is judged where the model runs a hole's reach either side too: the samples
         // nearest there are looked at, so each is sliced once, and kept only while a sample within reach may need it
@@ -3088,16 +3232,20 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           for (const group of new Set(candidates.map((c) => c.pieces))) {
             let best = null;
             for (const { k } of candidates.filter((c) => c.pieces === group)) {
-              const plan = planGrid(k, { E, U, bounds, flat: lying, minEnd, minMid, profileOf, support, stable, peg });
+              const plan = planGrid(k, { E, U, bounds, flat: lying, minEnd, minMid, profileOf, support, stable, peg, ...(kept.length ? { fixed: fixedAt } : {}) });
               // an L leaves a box empty: fewer pieces win, then the cost; candidates come fewest axes first, then fewest
               // Z cuts, so an equal cost keeps the earlier one
               if (plan && (!best || plan.pieces.length < best.pieces.length || (plan.pieces.length === best.pieces.length && plan.cost < best.cost - 1e-9))) best = plan;
             }
             if (!best) continue;
-            const cuts = best.offsets.flatMap((list, a) =>
-              list.map((t) => ({ position: centre.map((c, i) => (i === a ? t : c)), normal: [0, 1, 2].map((i) => (i === a ? 1 : 0)) })),
+            // the cuts that come apart first, as they are stored, then the new ones
+            const added = best.offsets.flatMap((list, a) =>
+              list
+                .filter((t) => !fixedAt[a].some((f) => Math.abs(f - t) <= 1e-6))
+                .map((t) => ({ position: centre.map((c, i) => (i === a ? t : c)), normal: [0, 1, 2].map((i) => (i === a ? 1 : 0)) })),
             );
-            return { cuts, counts: best.k, pieces: best.pieces, notes: [] };
+            const notes = kept.length ? [splitNote('APART_KEPT', { letters: keptLetters })] : [];
+            return { cuts: [...kept.map((c) => c.stored), ...added], counts: best.k, pieces: best.pieces, notes };
           }
         }
       }
@@ -3230,15 +3378,21 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * (cached, so the download after it costs nothing). Without them the
    * settings say: the pin size set (5 mm for Auto), a peg of the size set
    * (5 mm for Auto) when Joints is Built-in pegs, a dovetail when Joints is
-   * Dovetails. `dovetail` forces the plates in or out. No pins, pegs or tabs
-   * (glue only) gives no file (`stl: null`).
+   * Dovetails. `dovetail` forces the plates in or out. Where a cut comes
+   * apart on a lip (or, without the model, where one is set to come apart)
+   * it adds a small box and its lid with the same lip, held as that cut's
+   * lip holds (`apart`: the hold of the first seam whose lip has clips,
+   * 'lift' when none has). No pins, pegs, tabs or lip (glue only) gives no
+   * file (`stl: null`).
    */
   function fitTest({ items = null, baseVersion = null, split = null, printing = null, bed = null, name = 'model', dovetail = null }, progress) {
     const { spec } = normaliseSplit({ ...(split ?? {}), cuts: [] });
     const pegJoint = spec.joint === 'pegs';
+    const asked = (Array.isArray(split?.cuts) ? split.cuts : []).find((c) => c?.joint === 'apart');
     const uses = {
       pins: spec.joint !== 'none' && !pegJoint, pegs: pegJoint, dovetail: spec.joint === 'dovetail',
       diameter: spec.diameter || 5, pegSize: pegSizeOf(spec.diameter) || 5,
+      apart: asked ? (APART_HOLDS.includes(asked.hold) ? asked.hold : 'snap') : null,
     };
     if (Array.isArray(items) && splitActive(split)) {
       const final = finalFor(items, baseVersion, printing, progress);
@@ -3249,22 +3403,29 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         uses.dovetail = parted.cut.dovetails.length > 0;
         uses.diameter = parted.diameter ?? uses.diameter;
         uses.pegSize = parted.pegSize ?? uses.pegSize;
+        // the hold the lip got, not the one asked for: a lip with no clips (no straight stretch, or cut short by a
+        // roof) lifts off, and so does its coupon – one that clicks would tune a catch the model hasn't got
+        const lipped = parted.seams.filter((s) => s.apart?.lip);
+        const clicking = lipped.find((s) => s.apart.clips > 0 && s.apart.hold !== 'lift');
+        uses.apart = clicking ? clicking.apart.hold : lipped.length ? 'lift' : null;
       }
     }
     if (dovetail !== null) uses.dovetail = Boolean(dovetail);
     const file = `${safeFileName(name)}-fit-test`;
-    if (!uses.pins && !uses.pegs && !uses.dovetail) {
-      return { message: { stl: null, name: file, triangles: 0, diameter: null, pins: false, dovetail: false, pegs: false, pegSize: null }, transfer: [] };
+    if (!uses.pins && !uses.pegs && !uses.dovetail && !uses.apart) {
+      return { message: { stl: null, name: file, triangles: 0, diameter: null, pins: false, dovetail: false, pegs: false, pegSize: null, apart: null }, transfer: [] };
     }
     progress?.('Making the fit test…');
-    const coupon = fitTestCoupon({ ...spec, diameter: uses.pegs ? uses.pegSize : uses.diameter }, printing?.nozzle ?? 0.4, { dovetail: uses.dovetail, pins: uses.pins, pegs: uses.pegs });
+    const coupon = fitTestCoupon({ ...spec, diameter: uses.pegs ? uses.pegSize : uses.diameter }, printing?.nozzle ?? 0.4, {
+      dovetail: uses.dovetail, pins: uses.pins, pegs: uses.pegs, apart: uses.apart,
+    });
     try {
       const soup = manifoldToSoup(coupon);
       const stl = writeBinarySTL(soup, `STL-Text ${file}`);
       return {
         message: {
           stl, name: file, triangles: soup.length / 9, diameter: uses.pins ? uses.diameter : null, pins: uses.pins, dovetail: uses.dovetail,
-          pegs: uses.pegs, pegSize: uses.pegs ? uses.pegSize : null,
+          pegs: uses.pegs, pegSize: uses.pegs ? uses.pegSize : null, apart: uses.apart,
         },
         transfer: [stl],
       };

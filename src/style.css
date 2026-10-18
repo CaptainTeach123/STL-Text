@@ -11,6 +11,7 @@
   --ok: #0f9d7a;
   --err: #d6294b;
   --cut: #8b5cf6; /* the violet of the cut planes in the view */
+  --apart: #0d9488; /* the teal of a cut that comes apart (split.js APART_COLOR) */
   --stage-top: #eef2fa;
   --stage-bottom: #cfd8e8;
   --radius: 10px;
@@ -547,6 +548,7 @@ input[type='range'] {
 }
 .notes li {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: flex-start;
   font-size: 12.5px;
@@ -562,11 +564,13 @@ input[type='range'] {
 .notes li.ok {
   border-color: color-mix(in srgb, var(--ok) 50%, var(--border));
 }
+/* a button with a long label ("Move cut A to 190.5 mm") goes under its note rather than squeeze it into a column */
 .notes li .text {
-  flex: 1;
+  flex: 1 1 12em;
 }
 .notes li .btn {
   flex: none;
+  margin-left: auto;
 }
 .suggestions:empty {
   display: none;
@@ -884,6 +888,12 @@ ul.plan li select {
   width: auto;
   flex: 1;
 }
+/* a setting that means nothing for these cuts (glue only, or every cut comes apart) looks it */
+.split-settings select:disabled,
+.split-settings input[type='number']:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
 #splitCard .badge {
   display: inline-grid;
   place-items: center;
@@ -925,6 +935,39 @@ ul.plan li select {
 }
 #cutList li .meta {
   grid-column: 2 / -1;
+}
+/* a cut that comes apart: the box on a line of its own, how the top holds beside it (below it where there is no room),
+   the row and its badge teal as its plane is */
+#cutList .cut-joint {
+  grid-column: 2 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+#cutList .cut-apart {
+  font-size: 0.82rem;
+}
+#cutList .cut-apart input {
+  margin: 0;
+  accent-color: var(--apart);
+}
+#cutList .cut-hold span {
+  padding: 2px 7px;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+#cutList .cut-hold input:checked + span {
+  background: var(--apart);
+}
+#cutList .cut-hold input:focus-visible + span {
+  outline-color: var(--apart);
+}
+#cutList li.apart .badge {
+  background: var(--apart);
+}
+#cutList li.apart.selected {
+  background: color-mix(in srgb, var(--apart) 12%, var(--panel));
 }
 
 /* one row per piece: its colour in the view, then what it is */
@@ -969,6 +1012,9 @@ ul.plan li select {
 .dot.cut {
   background: var(--cut);
 }
+.dot.apart {
+  background: var(--apart);
+}
 .dot.pieces {
   background: conic-gradient(#4f8fe6 0 33%, #e88d67 0 66%, #5aa469 0);
 }
@@ -989,5 +1035,16 @@ ul.plan li select {
   }
   #spreadField input {
     width: 60px;
+  }
+}
+/* a phone's width: Undo and Redo give up a little more room, and on the narrowest the download's label wraps rather
+   than push the page wider than the screen */
+@media (max-width: 400px) {
+  .actions.pieces .btn {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+  .actions.pieces #downloadBtn {
+    white-space: normal;
   }
 }

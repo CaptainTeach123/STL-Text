@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Matrix4 } from 'three';
-import { Document, SPLIT_DEFAULTS, coversKey, coversOf, createItem, createPart, createSpot, fontIds, frameOf, hasText, isSpot, itemLabel, itemText, linesOf, maxSize, modelPlacementKey, placeKey, shapeKey, spotsKey, stableKey, transformItems } from '../src/document.js';
+import { APART_HOLDS } from '../src/split.js';
+import { CUT_HOLDS, Document, SPLIT_DEFAULTS, coversKey, coversOf, createItem, createPart, createSpot, fontIds, frameOf, hasText, isSpot, itemLabel, itemText, linesOf, maxSize, modelPlacementKey, placeKey, shapeKey, spotsKey, stableKey, transformItems } from '../src/document.js';
 
 describe('keys', () => {
   it('stableKey ignores key order and slider jitter', () => {
@@ -489,5 +490,117 @@ describe('split for printing', () => {
     expect(doc.split.cuts[0].position).toEqual([4, 0, 0]);
     expect(doc.state.baseVersion).toBe(v0);
     expect(modelPlacementKey(doc.base)).toBe(modelPlacementKey(null));
+  });
+});
+
+describe('cuts that come apart', () => {
+  const Z = [0, 0, 1];
+  const X = [1, 0, 0];
+  const r = (v) => v.map((x) => Math.round(x * 1e6) / 1e6 + 0);
+  const lantern = () => {
+    const doc = new Document();
+    doc.setBase('stl', 'lantern');
+    const id = doc.addCut({ position: [0, 0, 190], normal: Z });
+    return { doc, id };
+  };
+
+  it('ticking a cut is one undo step that flags it and holds it on by clicks; doing it again changes nothing', () => {
+    const { doc, id } = lantern();
+    const steps = doc.history.length;
+    doc.setCutJoint(id, {});
+    expect(doc.split.cuts[0]).toEqual({ id, position: [0, 0, 190], normal: Z, joint: 'apart', hold: 'snap' });
+    expect(doc.history.length).toBe(steps + 1);
+    doc.setCutJoint(id, {}); // ticked already: the hold it has stays
+    doc.setCutJoint(id, { hold: 'snap' });
+    doc.setCutJoint('c9', {}); // no such cut
+    expect(doc.history.length).toBe(steps + 1);
+    doc.setCutJoint(id, { hold: 'light' });
+    expect(doc.split.cuts[0].hold).toBe('light');
+    doc.setCutJoint(id, {}); // a box ticked again keeps the hold chosen
+    expect(doc.split.cuts[0].hold).toBe('light');
+    expect(doc.history.length).toBe(steps + 2);
+    // never coalesced with a drag before it
+    doc.updateCut(id, { position: [0, 0, 191] }, { coalesce: 'split:drag' });
+    doc.setCutJoint(id, { hold: 'lift' });
+    doc.undo();
+    expect(doc.split.cuts[0]).toMatchObject({ position: [0, 0, 191], hold: 'light' });
+    doc.redo();
+    expect(doc.split.cuts[0].hold).toBe('lift');
+    // an unknown hold reads as Clicks on
+    doc.setCutJoint(id, { hold: 'tight' });
+    expect(doc.split.cuts[0].hold).toBe('snap');
+  });
+
+  it('unticking drops the hold too: the cut is an ordinary one again, and undo brings the flag back', () => {
+    const { doc, id } = lantern();
+    doc.setCutJoint(id, { hold: 'lift' });
+    const steps = doc.history.length;
+    doc.setCutJoint(id, null);
+    expect(doc.split.cuts[0]).toEqual({ id, position: [0, 0, 190], normal: Z });
+    expect(doc.history.length).toBe(steps + 1);
+    doc.setCutJoint(id, null);
+    expect(doc.history.length).toBe(steps + 1);
+    doc.undo();
+    expect(doc.split.cuts[0]).toMatchObject({ joint: 'apart', hold: 'lift' });
+    doc.redo();
+    expect(doc.split.cuts[0]).not.toHaveProperty('joint');
+    expect(doc.split.cuts[0]).not.toHaveProperty('hold');
+  });
+
+  it('the flag survives moving and turning the cut, the model\'s transforms and its reset, undo and redo', () => {
+    const { doc, id } = lantern();
+    doc.setCutJoint(id, { hold: 'light' });
+    for (const z of [180, 185, 192.5]) doc.updateCut(id, { position: [0, 0, z] }, { coalesce: 'split:drag' });
+    doc.endCoalescing();
+    expect(doc.split.cuts[0]).toEqual({ id, position: [0, 0, 192.5], normal: Z, joint: 'apart', hold: 'light' });
+    doc.updateCut(id, { normal: X });
+    expect(doc.split.cuts[0]).toMatchObject({ normal: X, joint: 'apart', hold: 'light' });
+    doc.undo();
+    expect(doc.split.cuts[0]).toMatchObject({ normal: Z, joint: 'apart', hold: 'light' });
+    doc.transformBase(new Matrix4().makeRotationX(Math.PI / 2));
+    expect(doc.split.cuts[0]).toMatchObject({ joint: 'apart', hold: 'light' });
+    expect(r(doc.split.cuts[0].normal)).toEqual([0, -1, 0]);
+    doc.resetBase();
+    expect(r(doc.split.cuts[0].position)).toEqual([0, 0, 192.5]);
+    expect(doc.split.cuts[0]).toMatchObject({ joint: 'apart', hold: 'light' });
+    doc.undo();
+    doc.undo();
+    expect(doc.split.cuts[0]).toMatchObject({ normal: Z, joint: 'apart', hold: 'light' });
+    doc.redo();
+    expect(doc.split.cuts[0]).toMatchObject({ joint: 'apart', hold: 'light' });
+  });
+
+  it('cuts given whole keep the flag, normalised; any other joint, and a hold on a glued cut, are dropped', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'box');
+    doc.setSplit({
+      cuts: [
+        { id: 'c1', position: [0, 0, 52], normal: Z, joint: 'apart', hold: 'lift' },
+        { id: 'c2', position: [0, 0, 20], normal: Z, joint: 'apart', hold: 'firm' },
+        { id: 'c3', position: [10, 0, 0], normal: X, joint: 'pins', hold: 'snap' },
+        { position: [20, 0, 0], normal: X, hold: 'light' },
+      ],
+    });
+    expect(doc.split.cuts).toEqual([
+      { id: 'c1', position: [0, 0, 52], normal: Z, joint: 'apart', hold: 'lift' },
+      { id: 'c2', position: [0, 0, 20], normal: Z, joint: 'apart', hold: 'snap' },
+      { id: 'c3', position: [10, 0, 0], normal: X },
+      { id: 'c4', position: [20, 0, 0], normal: X },
+    ]);
+    // the same split again, keys in another order, is no change
+    const steps = doc.history.length;
+    doc.setSplit({ cuts: doc.split.cuts.map(({ hold, joint, ...c }) => ({ hold, ...c, joint })) });
+    expect(doc.history.length).toBe(steps);
+    // a new cut can come apart from the start
+    const id = doc.addCut({ position: [0, 0, 40], normal: Z, joint: 'apart' });
+    expect(doc.split.cuts.at(-1)).toEqual({ id, position: [0, 0, 40], normal: Z, joint: 'apart', hold: 'snap' });
+    expect(doc.addCut({ position: [0, 0, 45], normal: Z, hold: 'lift' })).toBe('c6');
+    expect(doc.split.cuts.at(-1)).toEqual({ id: 'c6', position: [0, 0, 45], normal: Z });
+  });
+
+  it('the holds are the engine\'s', () => {
+    expect(CUT_HOLDS).toEqual(['snap', 'light', 'lift']);
+    expect(CUT_HOLDS).toEqual(APART_HOLDS);
+    expect(Object.isFrozen(CUT_HOLDS)).toBe(true);
   });
 });

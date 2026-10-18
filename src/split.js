@@ -4,12 +4,14 @@
  * share one copy of the rules. It holds the printer's bed, how cuts are read
  * and checked, the frames the geometry is built in, where Fit to my printer
  * puts its cuts, where pins go on a face, how each piece lies on the bed,
- * the colours of the pieces, the file names and the glue sheet.
+ * the colours of the pieces, the file names and the glue sheet, and the
+ * sizes of the lip a cut that comes apart gets.
  *
  * Conventions used throughout:
  *  - an axis is 0, 1 or 2 (x, y, z); a direction is one of '+x' … '-z';
- *  - a cut as the document stores it is `{ id, position, normal }`; once
- *    normalised it is `{ id, letter, axis, at }`;
+ *  - a cut as the document stores it is `{ id, position, normal }`, with
+ *    `joint: 'apart'` and its `hold` when it comes apart; once normalised it
+ *    is `{ id, letter, axis, at }`, with `apart: { hold }` when it comes apart;
  *  - matrices are 16 numbers, column-major, like `toMat4` and
  *    `Manifold.transform`;
  *  - a cell is `[i, j, k]`, the slot of a piece in the grid the cuts make;
@@ -61,7 +63,11 @@ export function usableBed(bed = BED_DEFAULTS) {
 
 // ---------- settings and limits ----------
 
-/** A split's settings as the document stores them (`cuts` hold `{ id, position, normal }` in model mm). */
+/**
+ * A split's settings as the document stores them (`cuts` hold `{ id, position, normal }` in model mm, and
+ * `joint: 'apart'` with its `hold` on a cut that comes apart). They are for the glued cuts: one that comes apart has a
+ * lip, whatever `joint` says.
+ */
 export const SPLIT_DEFAULTS = Object.freeze({
   cuts: Object.freeze([]),
   joint: 'auto', // 'auto' | 'dowels' | 'pegs' (built-in square pegs) | 'dovetail' | 'none'
@@ -153,14 +159,28 @@ function snapDiameter(d) {
 }
 
 /**
+ * The take-apart flag of a cut, stored (`joint: 'apart'` and `hold`) or
+ * normalised (`apart: { hold }`), as `{ hold }` with a hold there is (Clicks
+ * on for any other); null for a glued cut.
+ */
+function apartOf(cut) {
+  if (cut?.joint !== 'apart' && !cut?.apart) return null;
+  const hold = cut.hold ?? cut.apart?.hold;
+  return { hold: APART_HOLDS.includes(hold) ? hold : 'snap' };
+}
+
+/**
  * Settings clamped to their ranges, and the cuts snapped to the axes,
  * checked against the model and put in their canonical order (x, then y,
  * then z, then position). Each cut keeps the letter of its place in the
- * stored list, so letters never jump about when a cut is left out.
+ * stored list, so letters never jump about when a cut is left out. Cuts in
+ * one place are one, and it comes apart when any of them did, held as the
+ * first of those in the list is.
  * @param {object|null} split the document's split (missing fields take their defaults)
  * @param {{ min: number[], max: number[] }|null} bounds the solid's bounds with the unrepaired triangles; null skips the miss test
- * @returns {{ spec: object, cuts: { id: string, letter: string, axis: number, at: number }[], notes: object[], grid: number[] }}
- *   `spec` holds the clamped settings (no cuts), `grid` the number of cuts on each axis. No cuts left means: export unsplit, with the notes.
+ * @returns {{ spec: object, cuts: { id: string, letter: string, axis: number, at: number, apart?: { hold: string } }[],
+ *   notes: object[], grid: number[] }} `spec` holds the clamped settings (no cuts), `grid` the number of cuts on each
+ *   axis; `apart` only on a cut that comes apart. No cuts left means: export unsplit, with the notes.
  * @throws {SplitError} `SPLIT_INVALID` for more than 12 cuts or 64 pieces
  */
 export function normaliseSplit(split, bounds = null) {
@@ -194,7 +214,8 @@ export function normaliseSplit(split, bounds = null) {
       notes.push(splitNote('CUT_MISSES', { cutId: id, letter }));
       return;
     }
-    kept.push({ id, letter, axis, at, index });
+    const apart = apartOf(cut);
+    kept.push({ id, letter, axis, at, index, ...(apart ? { apart } : {}) });
   });
   // cuts on one axis less than the tolerance apart are one cut: the earliest in the list stays
   kept.sort((a, b) => a.axis - b.axis || a.at - b.at || a.index - b.index);
@@ -209,7 +230,8 @@ export function normaliseSplit(split, bounds = null) {
     const byIndex = [...g].sort((a, b) => a.index - b.index);
     if (g.length > 1) notes.push(splitNote('CUTS_MERGED', { cutIds: byIndex.map((c) => c.id), letters: byIndex.map((c) => c.letter) }));
     const { id, letter, axis, at } = byIndex[0];
-    return { id, letter, axis, at };
+    const apart = byIndex.find((c) => c.apart)?.apart;
+    return { id, letter, axis, at, ...(apart ? { apart: { ...apart } } : {}) };
   });
   cuts.sort((a, b) => a.axis - b.axis || a.at - b.at);
   const grid = [0, 1, 2].map((a) => cuts.filter((c) => c.axis === a).length);
@@ -508,6 +530,151 @@ export function pegAllowance(spec = {}, face = null) {
   return pegSizesFor(s, 0, 0.4, depth).length;
 }
 
+// ---------- cuts that come apart ----------
+
+/**
+ * How a cut that comes apart holds (the document's `CUT_HOLDS`): its top
+ * clicks on (`snap`), clicks on lightly (`light`), or just lifts off (`lift`).
+ */
+export const APART_HOLDS = Object.freeze(['snap', 'light', 'lift']);
+
+/**
+ * The lip of a cut that comes apart (mm): a tongue standing out of one piece
+ * round the inside edge of its wall, and a groove for it in the other. Its
+ * sizes are for a 0.4 mm nozzle; `lipSizesFor` widens them for a wider one.
+ */
+export const LIP = Object.freeze({
+  t: 1.6, // the tongue's thickness: four lines
+  tMin: 1.2, // the thinnest tongue kept: three lines
+  skirt: 1.6, // a solid face's skirt: how far the groove round its core keeps from the outside
+  wall: 1.2, // the thinnest wall the groove's piece keeps beside and over the groove: three lines
+  g0: 0.1, // the tongue's inside face this far back from the opening's edge
+  into: 0.5, // the groove reaches this far into an opening's air
+  step: 0.2, // the groove's roof, its mouth and the tongue's lead-in step 0.2 in for 0.2 up: 45°
+  lead: 0.6, // the tongue's top edge taken off this much
+  mouth: 0.4, // the groove's mouth widened this much at the face (squeeze-out, elephant's foot)
+  heights: Object.freeze([6, 4.5, 3]), // the lip's heights, tried in turn where the other piece has less room
+  opening: 0.25, // a hole in a face is an opening when its outline is at least this share of the face's
+  minPiece: 25, // mm²: smaller pieces of tongue are dropped
+  root: 0.5, // how far the tongue's foot is sunk into its own piece
+  faceTolerance: 0.02, // a face's outline is simplified this far before its lip is planned
+  eps: 0.001, // the lip's own outlines are simplified this far
+});
+
+/**
+ * The spring clips of a lip that clicks on (mm, degrees): each a stretch of
+ * the tongue `span` long over a slot `slot` high, so a bridge held at both
+ * ends, with a catch on its outside that clicks into a recess in the other
+ * piece. `snap` and `light` give each hold's catch: `P` how far it stands out
+ * of the clip, at least `floor` more than the clearance.
+ */
+export const CLIP = Object.freeze({
+  span: 40, // a clip's length along the tongue
+  margin: 3, // kept clear of a clip at each end of its run
+  turn: 20, // the most a run may turn under a clip and its margins
+  corner: 15, // a run ends where the outline turns more than this ...
+  cornerReach: 1.5, // ... within this distance
+  length: 6, // the catch's length along the clip
+  flat: 0.4, // the catch's flat tip
+  sink: 0.2, // the catch's foot sunk into the clip
+  every: 95, // one clip per this much of the tongue's outside
+  most: 8, // clips on one face at most
+  key: 6, // the gap in the tongue that lets the top on one way round only
+  slot: 3, // the slot under a clip, from the face up
+  snap: Object.freeze({ P: 0.4, floor: 0.1 }),
+  light: Object.freeze({ P: 0.25, floor: 0.05 }),
+});
+
+/** How far a cut's tongue stands out of its piece (mm), as the planner, the measure and the pieces' sizes count it. */
+export const LIP_ALLOWANCE = 6;
+
+/** How a cut that comes apart reaches past it for the planner: a tongue's height on the one piece that carries it. */
+const APART_GROW = Object.freeze({ below: LIP_ALLOWANCE, above: LIP_ALLOWANCE, peg: true });
+
+const round6 = (v) => Math.round(v * 1e6) / 1e6;
+
+/**
+ * How far a clip's catch stands out of it (`p`) and how far it reaches past
+ * the clearance into the other piece (`i`, the interference) for a hold and
+ * a clearance c: `p` is fixed while the clearance is small, so a clearance
+ * tuned to the printer leaves the catch reaching i past the gap it prints,
+ * whatever the printer. Null for a hold with no catch (Lifts off).
+ * @returns {{ p: number, i: number }|null}
+ */
+export function catchSizes(hold, c = SPLIT_DEFAULTS.clearance) {
+  const h = hold === 'snap' || hold === 'light' ? CLIP[hold] : null;
+  if (!h) return null;
+  const p = round6(Math.max(h.P, c + h.floor));
+  return { p, i: round6(p - c) };
+}
+
+/** The gap inside the tongue where the other piece holds material there: c, or i + 0.15 where clips must bow in. */
+const gapIn = (c, i) => (i > 0 ? Math.max(c, round6(i + 0.15)) : c);
+
+/**
+ * Every size of a lip that follows from the clearance, the nozzle and the
+ * hold: the tongue (`t`, at least four lines; `tMin` the thinnest kept), the
+ * wall kept round the groove (three lines), the skin kept outside a catch's
+ * recess (two lines), how far the groove reaches from the opening's edge
+ * (`d0`), the catch (`p`, `i`: 0 for Lifts off) and the gap inside the tongue
+ * where the other piece has material there (`gIn`).
+ * @returns {{ c: number, hold: string, t: number, tMin: number, wall: number, skin: number, g0: number, d0: number,
+ *   p: number, i: number, gIn: number }}
+ */
+export function lipSizesFor(c = SPLIT_DEFAULTS.clearance, nozzle = 0.4, hold = 'snap') {
+  const t = round6(Math.max(LIP.t, 4 * nozzle));
+  const wall = round6(Math.max(LIP.wall, 3 * nozzle));
+  const sizes = catchSizes(hold, c);
+  const i = sizes?.i ?? 0;
+  return {
+    c, hold, t, tMin: round6(Math.max(LIP.tMin, 3 * nozzle)), wall, skin: round6(2 * nozzle), g0: LIP.g0,
+    d0: round6(LIP.g0 + t + c), p: sizes?.p ?? 0, i, gIn: gapIn(c, i),
+  };
+}
+
+/**
+ * How far a lip H mm tall reaches into the piece with its groove: the
+ * groove's top over the face (`zTop`) and, a wall over that, `reach`. A
+ * hollow face's groove (`kind` 'opening') has a 45° roof that steps in from
+ * the outside past the opening's edge – past the inside gap too where
+ * something over the opening moves the tongue out (`over`); a solid face's
+ * groove round its core (`kind` 'channel') has a flat one.
+ * @param {number} H the lip's height
+ * @param {'opening'|'channel'} kind
+ * @param {number} c clearance per side
+ * @param {number} i the catch's interference (`catchSizes`), 0 with no clips
+ * @param {boolean} over whether the other piece has material over the opening just past the cut
+ * @returns {{ zTop: number, reach: number }} at c = 0.15: 9.35 for a 6 mm lip, 7.85 for 4.5 mm, 6.35 for 3 mm
+ */
+export function lipReach(H, kind = 'opening', c = SPLIT_DEFAULTS.clearance, i = 0, over = false, nozzle = 0.4) {
+  const { d0, wall } = lipSizesFor(c, nozzle, 'lift');
+  const past = over ? gapIn(c, i) - LIP.g0 : 0;
+  const zTop = kind === 'channel' ? H + c : H + c + Math.ceil((d0 + past) / LIP.step - 1e-9) * LIP.step;
+  return { zTop: round6(zTop), reach: round6(zTop + wall) };
+}
+
+/** A clip's section as built (mm⁴, bending towards the inside, lead-in counted) for a 1.6 mm tongue. */
+const CLIP_SECTION = 0.937;
+
+/**
+ * About how hard a lip's clips hold (N): each clip a bridge held at both
+ * ends, k = 192·E·I / L³, pulled off over its catch's slope with friction μ,
+ * k·i·(1 + μ)/(1 − μ). Worked out, not measured – the fit test is the real
+ * check: by default with a weak print's stiffness (PLA at 2.5 GPa, μ 0.2;
+ * `conservative: false` takes 3.5 GPa and 0.3). A thicker tongue is stiffer
+ * as its cube.
+ * @param {number|object[]} clips how many (or the clips)
+ * @param {{ t?: number, i?: number, conservative?: boolean }} options `i` the interference (`catchSizes`)
+ * @returns {number} about 10.5 N for four Clicks on clips at the default clearance
+ */
+export function clipHold(clips, { t = LIP.t, i = 0, conservative = true } = {}) {
+  const n = Array.isArray(clips) ? clips.length : Number(clips) || 0;
+  if (!(n > 0) || !(i > 0)) return 0;
+  const [E, mu] = conservative ? [2500, 0.2] : [3500, 0.3];
+  const k = (192 * E * CLIP_SECTION * (t / LIP.t) ** 3) / CLIP.span ** 3;
+  return (n * k * i * (1 + mu)) / (1 - mu);
+}
+
 // ---------- fitting the bed ----------
 
 const EPS = 1e-9;
@@ -578,11 +745,12 @@ export const evenCell = (E, k, grow = [0, 0, 0]) => E.map((e, a) => (e + 2 * k[a
  * flat, so that only makes layers to glue.
  * @param {number[]} E the model's extents [x, y, z]
  * @param {number[]} U the usable bed
- * @param {{ flat?: number|null, grow?: number[] }} options `flat` as for `fitsBed` (every piece lies flat on that
- *   axis); `grow` how far the pieces reach past each cut on each axis (dovetail tabs, see `evenCell`)
+ * @param {{ flat?: number|null, grow?: number[], minCounts?: number[]|null }} options `flat` as for `fitsBed` (every
+ *   piece lies flat on that axis); `grow` how far the pieces reach past each cut on each axis (dovetail tabs, see
+ *   `evenCell`); `minCounts` the fewest cuts each axis may have (the cuts that come apart, which stay)
  * @returns {{ k: number[], pieces: number }[]}
  */
-export function gridCandidates(E, U, { flat = null, grow = [0, 0, 0] } = {}) {
+export function gridCandidates(E, U, { flat = null, grow = [0, 0, 0], minCounts = null } = {}) {
   const found = [];
   const most = [0, 1, 2].map((a) => (a === flat ? 0 : SPLIT_LIMITS.cuts));
   for (let kx = 0; kx <= most[0]; kx++) {
@@ -591,6 +759,7 @@ export function gridCandidates(E, U, { flat = null, grow = [0, 0, 0] } = {}) {
         const pieces = (kx + 1) * (ky + 1) * (kz + 1);
         if (pieces > SPLIT_LIMITS.cells || kx + ky + kz > SPLIT_LIMITS.cuts) break; // more Z cuts only make more
         const k = [kx, ky, kz];
+        if (minCounts && k.some((v, a) => v < (minCounts[a] || 0))) continue;
         if (fitsBed(evenCell(E, k, grow), U, { flat }).fits) found.push({ k, pieces });
       }
     }
@@ -1016,28 +1185,40 @@ export function runsOf(samples, occupied, { lo, hi, sliver }) {
  * piece, or a loose part of one, and costs `PLAN_WEIGHTS.parts`, and much
  * more (`PLAN_WEIGHTS.sliver`) when it is a sliver: shorter along the axis
  * than a quarter of an even piece, or than an end piece may be.
+ *
+ * Cuts that come apart stay where they are (`fixed`): each is one of the k
+ * cuts, at its own sample, and reaches a tongue's height past it on one side
+ * (`LIP_ALLOWANCE`, chosen as pegs are), whatever `grow` says there – never
+ * tabs. The others are planned round them.
  * @param {number[]} samples positions, ascending (from `planSamples`)
  * @param {number[]} costs one per sample (from `planCost`)
  * @param {{ lo: number, hi: number, k: number, S?: number, Sflat?: number, minEnd?: number, minMid?: number,
- *   grow?: ({ below: number, above: number, peg?: boolean }|null)[], occupied?: Uint8Array[]|null }} limits
+ *   grow?: ({ below: number, above: number, peg?: boolean }|null)[], occupied?: Uint8Array[]|null,
+ *   fixed?: number[]|null }} limits
  *   lo/hi the model's extent on the axis, S the longest piece that fits (`maxCellLength`), Sflat the longest that fits
  *   lying flat; `grow` per sample, for a cut there with dovetail tabs (or pegs, `peg`), how far the piece below it
  *   (`below`) and the piece above it (`above`) reach past it. The minimums are for the pieces between the cuts, tabs
  *   left out.
- *   `occupied` per sample, a flag per column
+ *   `occupied` per sample, a flag per column; `fixed` the indices of the samples where a cut must be (counted in k)
  * @returns {{ offsets: number[], reach: (number[]|null)[], cost: number, parts: number|null, slivers: number|null,
  *   relaxed: boolean }|null} null when no choice keeps every piece within S; `reach` per cut [below, above] as counted
  *   (a peg's length on one side for pegs), null for a plain one; `cost` leaves the parts out, `parts` and `slivers`
  *   count them (null without `occupied`)
  */
-export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat = S, minEnd = 0, minMid = 0, grow = null, occupied = null }) {
+export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat = S, minEnd = 0, minMid = 0, grow = null, occupied = null, fixed = null }) {
   const n = samples.length;
   const E = hi - lo;
   const tol = 1e-6;
   const even = (j) => lo + (E * (j + 1)) / (k + 1);
   const cell = E / (k + 1) || 1;
   const own = (i, j) => costs[i] + (PLAN_WEIGHTS.even * Math.abs(samples[i] - even(j))) / cell;
-  const tabs = (i) => grow?.[i] ?? null;
+  // the cuts that come apart: no step from one cut to the next passes one, the first cut is at or before the first of
+  // them and the last at or after the last, so every one of them is a cut
+  const must = fixed?.length ? [...fixed].sort((a, b) => a - b) : null;
+  const passes = (p, i) => must !== null && must.some((f) => f > p && f < i);
+  const firstOk = (i) => must === null || i <= must[0];
+  const lastOk = (i) => must === null || i >= must[must.length - 1];
+  const tabs = (i) => (must !== null && must.includes(i) ? APART_GROW : grow?.[i] ?? null);
   // the ways a cut at each sample may reach: its tabs, or its pegs on the piece below it, then on the one above
   const wayList = samples.map((_, i) => {
     const g = tabs(i);
@@ -1065,7 +1246,7 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
     let prev = new Float64Array(n * W).fill(Infinity);
     for (let i = 0; i < n; i++) {
       ways(i).forEach((g, v) => {
-        if (ok(samples[i] - lo, mEnd, null, g)) prev[i * W + v] = own(i, 0) + parts(-1, i);
+        if (firstOk(i) && ok(samples[i] - lo, mEnd, null, g)) prev[i * W + v] = own(i, 0) + parts(-1, i);
       });
     }
     const back = [];
@@ -1077,7 +1258,7 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
         for (let p = 0; p < i; p++) {
           const there = ways(p);
           for (let u = 0; u < there.length; u++) {
-            if (prev[p * W + u] === Infinity) continue;
+            if (prev[p * W + u] === Infinity || passes(p, i)) continue;
             for (let v = 0; v < here.length; v++) {
               if (!ok(samples[i] - samples[p], mMid, there[u], here[v])) continue;
               const c = prev[p * W + u] + own(i, j) + parts(p, i);
@@ -1097,6 +1278,7 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
     for (let x = 0; x < n * W; x++) {
       const g = ways(Math.floor(x / W))[x % W];
       if (g === undefined || prev[x] === Infinity) continue;
+      if (!lastOk(Math.floor(x / W))) continue;
       if (total(x) < (best < 0 ? Infinity : total(best)) && ok(hi - samples[Math.floor(x / W)], mEnd, g, null)) best = x;
     }
     if (best < 0) return null;
@@ -1165,36 +1347,63 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
  * they fit is added to the cost (`PLAN_WEIGHTS.support`), so of two grids
  * the one whose pieces stand up wins over one whose pieces lie with a leg
  * held over the bed.
+ *
+ * Cuts that come apart (`fixed`) are never moved or left out: each is one of
+ * its axis's cuts, at its own sample, and reaches a tongue's height past it on
+ * the side `pegSides` gives it, as pegs do (`chooseOffsets`). A grid with fewer
+ * cuts on an axis than stay there is no plan.
  * @param {number[]} k cuts per axis
  * @param {{ E: number[], U: number[], bounds: { min: number[], max: number[] }, flat?: number|null, minEnd?: number,
- *   minMid?: number, profileOf: function, support?: function|null, stable?: boolean, peg?: number|number[] }} options E the
+ *   minMid?: number, profileOf: function, support?: function|null, stable?: boolean, peg?: number|number[],
+ *   fixed?: number[][]|null }} options E the
  *   model's extents, `flat` the axis every piece lies flat on (a thin plate, or a slab planned lying flat) or null;
  *   `profileOf(axis, k)` gives `{ samples, costs, tabs, rings? }` for k cuts on that axis, `tabs` per sample
  *   `{ below, above, w, span, t }` when a cut there would take dovetail tabs (see `chooseOffsets`; `span` the plate's
  *   extent along w, `t` its thickness), `{ below, above, peg: true }` when it would take built-in pegs, else null, and
  *   `rings` per sample the slice's outlines in the axis's plane coordinates (`TO_PLANE`); `support(cutsByAxis)` gives
- *   `cellSupport`'s map; `peg` the pegs' length when the joints are built-in pegs (per axis, or one for all), else 0
+ *   `cellSupport`'s map; `peg` the pegs' length when the joints are built-in pegs (per axis, or one for all), else 0;
+ *   `fixed` per axis the positions of the cuts that come apart, each one of the samples `profileOf` gives (a plan
+ *   whose samples miss one is null)
  * @returns {{ k: number[], offsets: number[][], cost: number, support: number, pieces: { cell: number[], size: number[],
  *   fits: true }[] }|null} `pieces` every box that makes a piece, as it will print, tabs and pegs counted; `support` the area
  *   (mm²) they need support under, as far as the boxes tell
  */
 export function planGrid(k, options) {
-  const { E, U, flat = null, profileOf } = options;
+  const { E, U, flat = null, fixed = null } = options;
+  if (fixed && [0, 1, 2].some((a) => (fixed[a]?.length ?? 0) > k[a])) return null;
+  const profileOf = fixed ? keptCuts(options.profileOf, fixed) : options.profileOf;
+  const planned = fixed ? { ...options, profileOf } : options;
   // pegs lay nothing flat, but a piece that would lie flat with pins should with pegs too, where the cuts can give it
   // room: a 30 mm slab's quarters, not stood on their edges for a peg's length. So the pieces are planned lying as the
   // even ones with no pegs would, then any way
   if (flat === null && [0, 1, 2].some((a) => k[a] > 0 && profileOf(a, k[a]).tabs.some((x) => x?.peg))) {
     const lie = fitsBed(evenCell(E, k), U).down;
-    const lying = lie ? gridPlan(k, { ...options, flat: dirAxis(lie) }) : null;
+    const lying = lie ? gridPlan(k, { ...planned, flat: dirAxis(lie) }) : null;
     if (lying) return lying;
   }
-  return gridPlan(k, options);
+  return gridPlan(k, planned);
 }
+
+/**
+ * `profileOf` for a plan that keeps the cuts that come apart (`fixed`, their
+ * positions per axis): each axis's profile also gives the indices of their
+ * samples (`fixed`, −1 for one it lacks), and a tongue's reach there instead
+ * of any tabs.
+ */
+const keptCuts = (profileOf, fixed) => (a, k) => {
+  const profile = profileOf(a, k);
+  const at = fixed[a] ?? [];
+  if (!at.length) return profile;
+  const idx = at.map((t) => profile.samples.findIndex((x) => Math.abs(x - t) <= 1e-6));
+  return { ...profile, fixed: idx, tabs: profile.tabs.map((x, i) => (idx.includes(i) ? APART_GROW : x)) };
+};
 
 /** `planGrid` for one way of laying the pieces (`flat`, or any way). */
 function gridPlan(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0, profileOf, support = null, stable = true, peg = 0 }) {
   const axes = [0, 1, 2].filter((a) => k[a] > 0);
   const profile = new Map(axes.map((a) => [a, profileOf(a, k[a])]));
+  // a cut that comes apart and is not among the samples cannot be kept
+  if (axes.some((a) => profile.get(a).fixed?.includes(-1))) return null;
   const tabsOf = new Map(axes.map((a) => [a, profile.get(a).tabs]));
   // a cut's tabs make both pieces either side longer, its pegs only one of them: half a peg either side shares them out
   // as `evenCell` counts
@@ -1224,7 +1433,8 @@ function gridPlan(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0, profil
       const S = Math.min(maxCellLength(cell, a, U, { flat }), room?.any[a] ?? Infinity);
       const Sflat = flat === null && ws.length ? Math.min(maxCellLength(cell, a, U, { flat: ws }), room?.flat[a] ?? Infinity) : S;
       const others = axes.some((b) => b !== a && grow[b] > 0);
-      limits.set(a, { lo: bounds.min[a], hi: bounds.max[a], k: k[a], S: others ? Sflat : S, Sflat, minEnd, minMid, grow: tabsOf.get(a) });
+      const fixed = profile.get(a).fixed ?? null;
+      limits.set(a, { lo: bounds.min[a], hi: bounds.max[a], k: k[a], S: others ? Sflat : S, Sflat, minEnd, minMid, grow: tabsOf.get(a), ...(fixed ? { fixed } : {}) });
       const choice = chooseOffsets(profile.get(a).samples, profile.get(a).costs, limits.get(a));
       if (!choice) return null;
       offsets[a] = choice.offsets;
@@ -2638,21 +2848,26 @@ export function layPieces(pieces, U, orient = 'auto', { flat = null, soups = nul
  * may not carry: a plate too thin for sockets keeps its pegs, lying on its
  * underside, though it lies best on its cut face. A piece of several shells
  * only lies where every one of them rests on the bed, as `layPieces` laid
- * it, and one left with no way down at all never carries them.
+ * it, and one left with no way down at all never carries them. A piece a
+ * take-apart cut's lip stands out of (`forced`, `apartMales`) lies the one way
+ * that keeps the lip standing up, its box taking the lip in, and is judged
+ * that way: it never carries pegs on the face it lies on.
  * Deterministic.
- * @param {{ index: number, stats: object, boxes?: object[], lying: { down: string, score: number, fits: boolean } }[]} laid
+ * @param {{ index: number, stats: object, boxes?: object[], lying: { down: string, score: number, fits: boolean } }[]} given
  *   from `layPieces` (`boxes` its shells')
  * @param {number[]} U the usable bed
  * @param {'auto'|'cut'|'model'} orient
- * @param {{ flat?: number|null, length?: number }} options `flat` as for `chooseOrientation`; `length` how far the pegs
- *   will stand out (`pegAllowance`), for whether a piece carrying them still fits
+ * @param {{ flat?: number|null, length?: number, forced?: Map<number, string>|null }} options `flat` as for
+ *   `chooseOrientation`; `length` how far the pegs will stand out (`pegAllowance`), for whether a piece carrying them
+ *   still fits; `forced` the way down of each piece a lip stands out of, by its number
  * @returns {(pairs: { axis: number, lo: number, hi: number, sockets?: boolean[], prefer?: 0|1|null }[], length?: number)
  *   => (0|1|null)[]} for each pair (the cut's axis, the numbers of the pieces below and above it, whether each of them
  *   has room for the sockets, [below, above], both when not given, and which would rather carry them, its neighbour
  *   having more room for the sockets) 0 when the piece below carries the pegs, 1 the one above, null neither; `length`
  *   the pegs' own, once their size is known
  */
-export function pegMales(laid, U, orient = 'auto', { flat = null, length = 0 } = {}) {
+export function pegMales(given, U, orient = 'auto', { flat = null, length = 0, forced = null } = {}) {
+  const laid = forced?.size ? given.map((p) => (forced.has(p.index) ? lipForced(p, forced.get(p.index), U, orient, flat) : p)) : given;
   const byIndex = new Map(laid.map((p) => [p.index, p]));
   const cost = (o) => (o ? (o.fits ? 0 : 1e9) + o.score : Infinity);
   // a piece with pegs standing `along` out of these faces of it
@@ -2770,6 +2985,17 @@ export function pegMales(laid, U, orient = 'auto', { flat = null, length = 0 } =
 }
 
 /**
+ * A laid piece (`layPieces`) with a take-apart cut's lip standing out of the
+ * face across from `down`: its statistics take the lip in and allow only that
+ * way down, and it lies so.
+ */
+function lipForced(p, down, U, orient, flat) {
+  const grown = lipGrown(p.stats, oppositeDir(down), LIP_ALLOWANCE);
+  const stats = restingOnly(grown, p.boxes) ?? grown;
+  return { ...p, stats, lying: chooseOrientation(stats, U, orient, { pieceIndex: p.index, flat }) };
+}
+
+/**
  * A piece's statistics held to the ways down on which every one of its
  * shells (`boxes`, each one's box) rests on the bed, as `layPieces` lays a
  * piece of several: null when there is no such way. One shell rests any way.
@@ -2826,30 +3052,238 @@ export function statsWithPegs(stats, pegs) {
   return offFaces(grown, faces) ?? grown;
 }
 
+/** A piece's statistics with its box grown H past its face `face` (a lip standing out of it), lying only face up. */
+function lipGrown(stats, face, H) {
+  const a = dirAxis(face);
+  const min = [...stats.bbox.min];
+  const max = [...stats.bbox.max];
+  if (face[0] === '+') max[a] += H;
+  else min[a] -= H;
+  const dirs = {};
+  for (const d of DIR_KEYS) dirs[d] = { ...stats.dirs[d], extent: max[dirAxis(d)] - min[dirAxis(d)] };
+  return { ...stats, bbox: { min, max }, dims: max.map((v, k) => v - min[k]), dirs, allowed: [oppositeDir(face)] };
+}
+
+/**
+ * A piece's statistics once a take-apart cut's lip stands `H` mm out of its
+ * face `face` (the direction it looks out of the piece, '+z' for the top of a
+ * piece below a Z cut): its box takes the lip in, and it may lie only on the
+ * face across from it, the lip standing up – lying any other way, the lip's
+ * band would be an overhang as tall as the lip. They rest on nothing and add
+ * no bed. Null when the piece may not lie that way (one beside a dovetail
+ * seam lies flat) or not every one of its shells (`boxes`) would rest on the
+ * bed lying so.
+ * @param {object} stats `orientationStats` of the piece (or `mergeStats`)
+ * @returns {object|null} as `orientationStats` gives, `allowed` the one way down
+ */
+export function statsWithLip(stats, face, H = LIP_ALLOWANCE, boxes = null) {
+  if (!(stats.allowed?.length ? stats.allowed : DIR_KEYS).includes(oppositeDir(face))) return null;
+  return restingOnly(lipGrown(stats, face, H), boxes);
+}
+
+/**
+ * Which piece of each pair across a cut that comes apart carries its lip
+ * (the male; the other gets the groove), for every pair at once. The lip is
+ * a band standing out of the male's face, so the male lies on the face
+ * across from it, the lip standing up: on its side the band would be an
+ * overhang, and upside down the lip would be on the bed. Of the two pieces,
+ * each judged lying that way with the lip in its box (`statsWithLip`), only
+ * one that has a way to lie so – every shell on the bed, fitting the bed if
+ * it fitted without the lip – and a lip the faces' plans give it (`quality`)
+ * may carry it. Of those, first one that prints about as well as without the
+ * lip (`pegMales`' rule: fitting as well, on at least half as much of the
+ * bed, needing support under no more than a tenth of that more), then the
+ * better lip (one at all, one with clips, the taller, more clips, more
+ * tongue), then the one needing the least more support, then the one below
+ * the cut. A lantern's body carries its top's lip, standing on its foot as
+ * it would anyway, rather than the top standing on its handle; a box with an
+ * 8 mm lid gives the lid the lip, since there both print as well and only
+ * the box has room for a 6 mm groove with clips. When the one chosen so
+ * prints worse with the lip and the other would print as well with it but
+ * has no room for it – no room past the cut for the groove (a lantern cut
+ * just under its roof's eaves), or too tall for the bed with the lip
+ * standing up – that one is named too (`alt`), so the cut can be moved to
+ * where it can carry it. Pair by pair in the order given: a piece once given
+ * a way down keeps it, as one given in `given` (by an earlier cut's lips)
+ * does, so a pair whose lip would need it another way goes to the other
+ * piece, or has no lip.
+ * @param {{ index: number, stats: object, boxes?: object[], lying: { down: string, fits: boolean } }[]} laid from
+ *   `layPieces`
+ * @param {number[]} U the usable bed
+ * @param {'auto'|'cut'|'model'} orient
+ * @param {{ flat?: number|null }} options `flat` as for `chooseOrientation`
+ * @returns {(pairs: { axis: number, lo: number, hi: number, quality?: ({ H: number, clips: number, area: number }|null)[] }[],
+ *   given?: Map<number, string>|null) => ({ male: 0|1, piece: number, down: string, alt?: { k: 0|1, piece: number,
+ *   down: string, why: 'room'|'tall', over?: number } }|null)[]} for each pair (the cut's axis, the numbers of the pieces
+ *   below and above it, and the lip each would carry, [below, above], from the faces' plans: its height, clips and
+ *   tongue area, null for none; any lip when not given) the one that carries the lip – 0 the one below the cut, 1 the
+ *   one above – its number and the way it lies, with `alt` the piece that would print as well carrying it and why it
+ *   cannot here (`over` how much too tall it would be, mm); null when neither may. `given` the ways down pieces were
+ *   given already
+ */
+export function apartMales(laid, U, orient = 'auto', { flat = null } = {}) {
+  const byIndex = new Map(laid.map((p) => [p.index, p]));
+  const near = (a, b) => Math.abs(a - b) <= 1e-6 * Math.max(1, Math.abs(a), Math.abs(b));
+  // the lip a piece would carry, best first when compared in order: one at all, with clips, height, clips, tongue
+  const rank = (q) => (q ? [1, q.clips > 0 ? 1 : 0, q.H, q.clips ?? 0, q.area ?? 0] : [0, 0, 0, 0, 0]);
+  const better = (x, y) => {
+    if (x.asWell !== y.asWell) return x.asWell ? -1 : 1;
+    const [rx, ry] = [rank(x.quality), rank(y.quality)];
+    for (let i = 0; i < rx.length; i++) if (!near(rx[i], ry[i])) return ry[i] - rx[i];
+    if (!near(x.extra, y.extra)) return x.extra - y.extra;
+    return x.k - y.k;
+  };
+  return (pairs, given = null) => {
+    const forced = new Map(given ?? []);
+    return pairs.map((pair) => {
+      const pieces = [byIndex.get(pair.lo), byIndex.get(pair.hi)];
+      if (!pieces[0] || !pieces[1]) return null;
+      let tall = null; // a piece that would print as well carrying the lip but for the bed's height
+      const options = [0, 1].flatMap((k) => {
+        const quality = pair.quality ? pair.quality[k] ?? null : undefined;
+        const lip = quality === undefined || quality?.H > 0;
+        const p = pieces[k];
+        // the face the lip stands out of: the top of the piece below the cut, the bottom of the one above
+        const face = `${k === 0 ? '+' : '-'}${AXES[pair.axis]}`;
+        const down = oppositeDir(face);
+        if (forced.has(p.index) && forced.get(p.index) !== down) return [];
+        const stats = statsWithLip(p.stats, face, LIP_ALLOWANCE, p.boxes);
+        if (!stats) return [];
+        const o = chooseOrientation(stats, U, orient, { pieceIndex: p.index, flat });
+        const bed = p.stats.dirs[p.lying.down].bed;
+        const was = orientationScore(p.stats, p.lying.down).need;
+        const need = orientationScore(stats, o.down).need;
+        const asWell = stats.dirs[o.down].bed >= 0.5 * bed && need <= was + Math.max(STEADY, 0.1 * bed);
+        if (!o.fits && p.lying.fits) {
+          // only its height is in the way: lower by `over`, it would stand on the bed with the lip
+          const [a, b, h] = laidDims(stats.dims, down);
+          if (lip && asWell && footprintYaw(a, b, U) !== null) tall = { k, piece: p.index, down, why: 'tall', over: round6(h - U[2]) };
+          return [];
+        }
+        return [{ k, piece: p.index, down: o.down, asWell, lip, quality: quality ?? null, extra: need - was }];
+      });
+      const lipped = options.filter((o) => o.lip).sort(better);
+      if (!lipped.length) return null;
+      const best = lipped[0];
+      forced.set(best.piece, best.down);
+      // one that prints worse with the lip, where the other would print as well with it given room
+      const room = !best.asWell && options.find((o) => !o.lip && o.asWell);
+      const alt = room ? { k: room.k, piece: room.piece, down: room.down, why: 'room' } : !best.asWell ? tall : null;
+      return { male: best.k, piece: best.piece, down: best.down, ...(alt ? { alt } : {}) };
+    });
+  };
+}
+
+/**
+ * Which side of each cut that comes apart its lip will go on, as far as the
+ * pieces themselves tell before their faces are planned (the measure's
+ * piece sizes count the lip there): `apartMales`' choice, each piece's lip
+ * judged by the room it leaves the other piece's groove – that piece's
+ * length past the cut, at least the reach a lip of that height needs
+ * (`lipReach`). A box's 8 mm lid would leave the box a 4.5 mm lip with no
+ * clips, so the lid carries a full one, as the pieces will have it. Without
+ * the pieces (`laid` null) the boxes between the cuts stand in for them,
+ * and only the room decides: the better lip, the one below on a tie.
+ * @param {object[]|null} laid from `layPieces`
+ * @param {{ id: string, axis: number, at: number, apart?: { hold: string } }[]} cuts normalised
+ * @param {number[]|null} U the usable bed
+ * @param {'auto'|'cut'|'model'} orient
+ * @param {{ flat?: number|null, clearance?: number, nozzle?: number, bounds?: { min: number[], max: number[] } }} options
+ *   `bounds` the model's, for the boxes
+ * @returns {Map<string, 0|1|null>} by cut id: 0 the piece below carries it, 1 the one above, null neither
+ */
+export function lipSides(laid, cuts, U, orient = 'auto', { flat = null, clearance = SPLIT_DEFAULTS.clearance, nozzle = 0.4, bounds = null } = {}) {
+  const by = axisCuts(cuts);
+  const choose = laid && U ? apartMales(laid, U, orient, { flat }) : null;
+  const out = new Map();
+  const touches = (v, at) => Math.abs(v - at) < CUT_TOLERANCE;
+  const rank = (q) => (q ? [1, q.clips, q.H] : [0, 0, 0]);
+  for (const cut of cuts.filter((x) => x.apart)) {
+    const a = cut.axis;
+    const j = by[a].indexOf(cut.at);
+    const caught = catchSizes(cut.apart.hold, clearance);
+    // the tallest lip whose groove the other piece has the length for
+    const lipIn = (length) => {
+      const H = LIP.heights.find((h) => lipReach(h, 'opening', clearance, 0, false, nozzle).reach <= length + 1e-9);
+      return H ? { H, clips: H >= LIP.heights[0] && caught ? 1 : 0, area: 0 } : null;
+    };
+    if (!choose) {
+      if (!bounds) continue;
+      const along = [bounds.min[a], ...by[a], bounds.max[a]];
+      const q = [lipIn(along[j + 2] - cut.at), lipIn(cut.at - along[j])];
+      const [r0, r1] = q.map(rank);
+      const n = r0.findIndex((x, i) => x !== r1[i]);
+      out.set(cut.id, !q[0] && !q[1] ? null : n < 0 || r0[n] > r1[n] ? 0 : 1);
+      continue;
+    }
+    const same = (p, q) => [0, 1, 2].every((n) => n === a || p.cell[n] === q.cell[n]);
+    const lo = laid.filter((p) => p.cell[a] === j && touches(p.stats.bbox.max[a], cut.at));
+    const hi = laid.filter((p) => p.cell[a] === j + 1 && touches(p.stats.bbox.min[a], cut.at));
+    const pairs = lo.flatMap((p) => hi.filter((q) => same(p, q)).map((q) => ({
+      axis: a, lo: p.index, hi: q.index, quality: [lipIn(q.stats.bbox.max[a] - cut.at), lipIn(cut.at - p.stats.bbox.min[a])],
+    })));
+    const chosen = choose(pairs).filter(Boolean);
+    out.set(cut.id, chosen.length ? chosen[0].male : null);
+  }
+  return out;
+}
+
+/**
+ * How the pieces print once their built-in pegs and their lips are placed
+ * (`layoutSplit`'s `pegs` and `lips`): each piece that carries some is laid
+ * again with them in its box, so its printed size, its fit and its file
+ * count them; the rest lie as `layPieces` laid them. A piece carrying pegs
+ * never lies on a face they stand out of (`statsWithPegs`); one carrying a
+ * lip lies the way `apartMales` chose for it, the lip standing up
+ * (`statsWithLip`), and nothing is said of a way down asked for that it
+ * missed (`ORIENT_FALLBACK`): the lip is why. A piece of several shells lies again
+ * only where every one of them rests on the bed (`layPieces`' rule;
+ * `pegMales` and `apartMales` choose only a piece that has such a way). One
+ * left with nothing flat to stand on but the face its pegs or its lip stand
+ * out of (a dome cut in two) is told that they are why, not its shape
+ * (`PIECE_UNSTABLE` with `pegs` or `lip`).
+ * @param {object[]} laid from `layPieces`
+ * @param {{ pegs?: { sides: { piece: number, peg: boolean }[] }[], lips?: { axis: number, dir?: number, down?: string,
+ *   H?: number, male?: number, sides?: { piece: number, male: boolean }[] }[] }} layout the lips' male (its number, or
+ *   the side with `male`), the way it lies (`down`, or from `dir`: +1 when the male is below the cut) and how far
+ *   the lip stands out (`H`, `LIP_ALLOWANCE` when not given; none at 0)
+ * @returns {object[]} `chooseOrientation`'s answer per piece of `laid`, with `pegged: true` on those laid again with
+ *   pegs and `lip: true` on those with a lip
+ */
+export function layGrown(laid, { pegs = [], lips = [] } = {}, U, orient = 'auto', { flat = null } = {}) {
+  const maleOf = (lip) => lip.sides?.find((s) => s.male)?.piece ?? lip.male;
+  const faceOf = (lip) => (lip.down ? oppositeDir(lip.down) : `${lip.dir < 0 ? '-' : '+'}${AXES[lip.axis]}`);
+  return laid.map((p) => {
+    const own = (pegs ?? []).filter((g) => g.sides.some((s) => s.peg && s.piece === p.index));
+    const tongues = (lips ?? []).filter((l) => maleOf(l) === p.index && (l.H ?? LIP_ALLOWANCE) > 0);
+    if (!own.length && !tongues.length) return p.lying;
+    // a cut's lip may stand out of a piece on several faces (four posts cut across), all in the one plane: the box
+    // takes in the tallest once, not each
+    const out = new Map();
+    for (const lip of tongues) out.set(faceOf(lip), Math.max(out.get(faceOf(lip)) ?? 0, lip.H ?? LIP_ALLOWANCE));
+    let stats = p.stats;
+    for (const [face, H] of out) stats = { ...lipGrown(stats, face, H), allowed: [oppositeDir(faceOf(tongues[0]))] };
+    if (own.length) stats = statsWithPegs(stats, own);
+    const lip = tongues.length > 0;
+    const o = chooseOrientation(restingOnly(stats, p.boxes) ?? stats, U, orient, { pieceIndex: p.index, flat });
+    const steady = !p.lying.notes?.some((x) => x.code === 'PIECE_UNSTABLE');
+    const why = lip ? { lip: true } : { pegs: true };
+    const notes = o.notes
+      .filter((x) => !(lip && x.code === 'ORIENT_FALLBACK'))
+      .map((x) => (x.code === 'PIECE_UNSTABLE' && steady ? splitNote('PIECE_UNSTABLE', { pieceIndex: p.index, ...why }) : x));
+    return { ...o, notes, ...(own.length ? { pegged: true } : {}), ...(lip ? { lip: true } : {}) };
+  });
+}
+
 /**
  * How the pieces print once their built-in pegs are placed (`layoutSplit`'s
- * `pegs`): each piece that carries some is laid again with them in its box
- * and never on a face they stand out of (`statsWithPegs`), so its printed
- * size, its fit and its file count them; the rest lie as `layPieces` laid them.
- * A piece of several shells lies again only where every one of them rests
- * on the bed (`layPieces`' rule; `pegMales` gives pegs only to a piece that
- * has such a way). One left with nothing flat to stand on but the face its
- * pegs stand out of (a dome cut in two) is told that the pegs are why, not
- * its shape (`PIECE_UNSTABLE` with `pegs`).
+ * `pegs`), as `layGrown` lays them with no lips.
  * @param {object[]} laid from `layPieces`
  * @param {{ sides: { piece: number, peg: boolean }[] }[]} pegs
  * @returns {object[]} `chooseOrientation`'s answer per piece of `laid`, with `pegged: true` on those laid again
  */
-export function layPegged(laid, pegs, U, orient = 'auto', { flat = null } = {}) {
-  return laid.map((p) => {
-    const own = (pegs ?? []).filter((g) => g.sides.some((s) => s.peg && s.piece === p.index));
-    if (!own.length) return p.lying;
-    const grown = statsWithPegs(p.stats, own);
-    const o = chooseOrientation(restingOnly(grown, p.boxes) ?? grown, U, orient, { pieceIndex: p.index, flat });
-    const steady = !p.lying.notes?.some((x) => x.code === 'PIECE_UNSTABLE');
-    const notes = o.notes.map((x) => (x.code === 'PIECE_UNSTABLE' && steady ? splitNote('PIECE_UNSTABLE', { pieceIndex: p.index, pegs: true }) : x));
-    return { ...o, notes, pegged: true };
-  });
+export function layPegged(laid, pegs, U, orient = 'auto', options = {}) {
+  return layGrown(laid, { pegs: pegs ?? [] }, U, orient, options);
 }
 
 /**
@@ -3080,6 +3514,19 @@ function listOf(items) {
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 const pieceName = (index) => (index ? `Piece ${index}` : 'A piece');
 const quoted = (name) => (/^“/.test(name ?? '') ? name : `“${name ?? ''}”`);
+/** A length that is needed, to a tenth of a millimetre and never less: 9.35 → "9.4". */
+const need1 = (v) => String(Math.ceil(v * 10 - 1e-6) / 10);
+/** "piece 2", "pieces 3 and 4". */
+const piecesOf = (list, fallback) => {
+  const all = [list ?? fallback].flat().filter((x) => x != null);
+  return all.length > 1 ? `pieces ${listOf(all)}` : `piece ${all[0] ?? fallback}`;
+};
+/** What comes off at a cut that comes apart: the top of a Z cut, else the piece named. */
+const mover = (axis, piece) => (axis == null || axis === 2 ? 'the top' : piecesOf(piece, 2));
+/** Whether what comes off is more than one piece by name (pieces across an X or Y cut), and its verb plural. */
+const manyMove = (axis, piece) => !(axis == null || axis === 2) && [piece].flat().filter((x) => x != null).length > 1;
+/** "Move the cut to 190.5 mm." when there is a place to move it to. */
+const moveTo = (at) => (Number.isFinite(at) ? ` Move the cut to ${mm(at)} mm.` : '');
 
 const NOTE_LEVELS = Object.freeze({
   SPLIT: 'ok',
@@ -3089,6 +3536,11 @@ const NOTE_LEVELS = Object.freeze({
   CONNECTORS_FILAMENT: 'info',
   PEGS_SMALLER: 'info',
   PEGS_UPRIGHT: 'info',
+  APART: 'info',
+  APART_NO_CLIPS: 'warn',
+  APART_FLAT: 'warn',
+  APART_HEAVY: 'info',
+  APART_KEPT: 'info',
   CONNECTORS_DROPPED: 'warn',
   ONE_CONNECTOR: 'warn',
   DOWELS_CAPPED: 'info',
@@ -3117,7 +3569,7 @@ const NOTE_LEVELS = Object.freeze({
 export const SPLIT_NOTE_CODES = Object.freeze(Object.keys(NOTE_LEVELS));
 
 const NOTE_TEXT = {
-  SPLIT: ({ pieces, dowels = 0, diameter, length, lengths = [], sizes = [], pegs = 0, pegSize = null, pegSizes = [], dovetails = 0, pairs = [] }) => {
+  SPLIT: ({ pieces, dowels = 0, diameter, length, lengths = [], sizes = [], pegs = 0, pegSize = null, pegSizes = [], dovetails = 0, pairs = [], apart = [] }) => {
     let s = `Cut into ${plural(pieces, 'piece')}`;
     // built-in pegs are no parts to make: their count and size, or how many of each size where narrow faces took smaller
     if (pegs > 0) {
@@ -3132,6 +3584,7 @@ const NOTE_TEXT = {
     if (dovetails > 0) s += `${dowels > 0 || pegs > 0 ? ' and' : ' with'} dovetail tabs`;
     s += '.';
     if (pairs.length) s += ` Glue matching letters together: ${pairs.join(', ')}.`;
+    if (apart.length) s += ` ${apart.length > 1 ? `Cuts ${listOf(apart)} come apart – don't glue them.` : `Cut ${apart[0]} comes apart – don't glue it.`}`;
     return s;
   },
   PINS: ({ count, spares = 0, diameter, length, own = false }) => {
@@ -3140,7 +3593,12 @@ const NOTE_TEXT = {
     const spare = spares ? `, ${spares === 1 ? 'one spare' : `${spares} spares`}` : '';
     return `Print the pins file (${plural(count + spares, 'pin')}${spare}) lying flat – or use Ø${mm(diameter)} mm wooden dowels cut to ${mm(length)} mm.`;
   },
-  DOVETAIL: ({ letter, tabs, pieces = [], pegs = false }) => `Cut ${letter} goes through a thin plate, so it has ${plural(tabs, 'dovetail tab')} instead of ${pegs ? 'pegs' : 'pins'} – lay both pieces flat and lower piece ${pieces[1] ?? 2} onto piece ${pieces[0] ?? 1}.`,
+  DOVETAIL: ({ letter, tabs, pieces = [], pegs = false, apart = false }) => {
+    const [lower, upper] = [pieces[0] ?? 1, pieces[1] ?? 2];
+    return apart
+      ? `Cut ${letter} goes through a thin plate, so it comes apart on ${plural(tabs, 'dovetail tab')} – lay both pieces flat and lower piece ${upper} onto piece ${lower}; lift it off again to take it apart. Don't glue it.`
+      : `Cut ${letter} goes through a thin plate, so it has ${plural(tabs, 'dovetail tab')} instead of ${pegs ? 'pegs' : 'pins'} – lay both pieces flat and lower piece ${upper} onto piece ${lower}.`;
+  },
   CONNECTORS_SHORTER: ({ letter, depth, pegs = false }) => (pegs
     ? `Cut ${letter} uses ${mm(depth)} mm-long pegs – longer ones would break through the side.`
     : `Cut ${letter} uses ${mm(depth)} mm-deep holes – deeper ones would break through the side.`),
@@ -3158,6 +3616,70 @@ const NOTE_TEXT = {
     const list = [pieces].flat();
     return `Cut ${letter}'s pegs print standing up on ${list.length > 1 ? `pieces ${listOf(list)}` : `piece ${list[0] ?? ''}`} – they are a little weaker across the layers than pegs lying flat${pins ? '; pins (Joints: Pins) would be stronger' : ''}.`;
   },
+  APART: ({ letter, axis = 2, above = false, male = 1, female = 2, hold = 'snap', clips = 0, height = LIP_ALLOWANCE, flat = 0, lying = 0 }) => {
+    const lip = `a ${mm(height)} mm lip`;
+    const z = axis == null || axis === 2;
+    const clicks = clips > 0 && hold !== 'lift';
+    // the top clicks onto the lip below it, or into the piece below on its own lip; across X or Y the piece that comes
+    // off clicks onto the other's lip, and several such pieces click on together
+    const moving = z ? `the top (${piecesOf(above ? male : female, 2)})` : piecesOf(female, 2);
+    const many = manyMove(axis, female);
+    const verb = (one, more) => (many ? more : one);
+    const into = z && above;
+    let s = `Cut ${letter} comes apart: ${moving} `;
+    if (clicks) {
+      const how = `${verb('clicks', 'click')}${hold === 'light' ? ' lightly' : ''}`;
+      s += into ? `${how} into ${piecesOf(female, 1)} on ${lip}` : `${how} onto ${lip} on ${piecesOf(male, 1)}`;
+      const it = verb('it', 'them');
+      const off = `${verb('it pulls', 'they pull')} off again by hand.`;
+      s += clips === 1 ? ` – 1 clip holds ${it}, on one side only, and ${off}` : ` – ${clips} clips hold ${it}, and ${off}`;
+    } else {
+      const sits = verb('sits', 'sit');
+      const lifts = `${verb('lifts', 'lift')} straight off.`;
+      s += into ? `${sits} in ${piecesOf(female, 1)} on ${lip} and ${lifts}` : `${sits} on ${lip} on ${piecesOf(male, 1)} and ${lifts}`;
+    }
+    if (flat > 0) s += flat === 1 ? ' 1 small face beside it just rests on the other piece.' : ` ${flat} small faces beside it just rest on each other.`;
+    // a face of the cut whose pieces already lie another way for another cut's lip, or would not fit the printer so
+    if (lying > 0) s += ` On ${lying === 1 ? '1 other face' : `${lying} other faces`} neither piece can lie with a lip standing up, so the pieces there just rest on each other.`;
+    return s;
+  },
+  APART_NO_CLIPS: ({ letter, axis = 2, female = 2, why = 'height', height = 4.5, need = lipReach(LIP.heights[0]).reach, suggestedAt = null }) => {
+    const off = `${mover(axis, female)} just ${manyMove(axis, female) ? 'lift' : 'lifts'} off`;
+    let s;
+    if (why === 'short') s = `Cut ${letter}'s lip has no straight stretch ${mm(CLIP.span + 2 * CLIP.margin)} mm long for a clip, so ${off}.`;
+    else if (why === 'edge') s = `Cut ${letter} runs along the edge of an opening or a ledge, which breaks its lip into short stretches, so it has no clips and ${off}.`;
+    else if (why === 'flex') s = `Cut ${letter}'s lip has no room for clips – something over the opening just above the cut leaves them no room to bow in – so ${off}.`;
+    else if (why === 'skin') s = `Cut ${letter}'s walls are too thin for the clips' catches, so ${off}.`;
+    else s = `Cut ${letter}'s lip is only ${mm(height)} mm tall, so it has no clips and ${off}: a lip that clicks on needs ${need1(need)} mm of plain wall in ${piecesOf(female, 2)} past the cut.`;
+    return s + moveTo(suggestedAt);
+  },
+  APART_FLAT: ({ letter, axis = 2, pieces = [], why = 'room', wall = 2.7, need = lipReach(LIP.heights[LIP.heights.length - 1]).reach, suggestedAt = null, by = [], fixed = null, piece = 1, other = 2 }) => {
+    const [lower, upper] = [pieces[0] ?? 1, pieces[1] ?? 2];
+    if (why === 'thin') {
+      return `Cut ${letter} has no room for a lip – its walls are under ${mm(wall)} mm thick – so ${mover(axis, upper)} just ${manyMove(axis, upper) ? 'rest' : 'rests'} on ${piecesOf(lower, 1)}, with nothing to line it up or hold it.`;
+    }
+    if (why === 'lying' && by.length) {
+      // the pieces already lie another way for another cut's lip
+      const lie = [fixed].flat().length > 1 ? 'lie' : 'lies';
+      const whose = by.length > 1 ? `cuts ${listOf(by)}' lips` : `cut ${by[0]}'s lip`;
+      return `Cut ${letter} has no lip: ${piecesOf(fixed, 1)} already ${lie} another way for ${whose}, and the other piece can't carry one, so the pieces just rest on each other.`;
+    }
+    if (why === 'lying') return `Cut ${letter} has no lip: neither piece fits your printer lying with the lip standing up out of it, so the pieces just rest on each other.`;
+    if (why === 'tall') {
+      return `Cut ${letter} has no lip: piece ${piece} would be too tall for your printer standing up with one, and piece ${other} would need supports carrying it.${moveTo(suggestedAt)}`;
+    }
+    if (why === 'small') return `Cut ${letter} runs through openings, so its faces are too small for a lip – cut through a solid band of the model.`;
+    return `Cut ${letter} has no room for a lip – ${piecesOf(upper, 2)} ${[upper].flat().length > 1 ? 'have' : 'has'} under ${need1(need)} mm of plain wall past the cut before a roof, a ledge or an opening.${moveTo(suggestedAt)}`;
+  },
+  APART_HEAVY: ({ letter, weight = 0 }) => {
+    // two figures are as near as a guess of the hold deserves
+    const g = Number(weight) > 0 ? Number(Number(weight).toPrecision(2)) : 0;
+    const about = g >= 1000 ? `${mm1(g / 1000)} kg` : `${g} g`;
+    return `Cut ${letter}'s clips may not hold up what hangs below it (about ${about}) – carry the model by its base, not its top.`;
+  },
+  APART_KEPT: ({ letters = [] }) => (letters.length > 1
+    ? `Cuts ${listOf(letters)} come apart, so Fit to my printer kept them where they are and planned the other cuts around them.`
+    : `Cut ${letters[0] ?? ''} comes apart, so Fit to my printer kept it where it is and planned the other cuts around it.`),
   CONNECTORS_DROPPED: ({ letter, count = 1, total = count, wall = null, suggestedDiameter = null, dovetail = false, pegs = false, lying = false, thin = false }) => {
     if (dovetail) return `Cut ${letter} has no room for dovetail tabs – it is a flat glue joint. A strip glued behind it makes it stronger.`;
     if (thin) {
@@ -3174,9 +3696,12 @@ const NOTE_TEXT = {
   DOWELS_CAPPED: ({ placed, dropped, pegs = false }) => `${plural(placed, pegs ? 'peg' : 'pin')} placed; ${plural(dropped, 'small face is', 'small faces are')} glued flat.`,
   LABELS_SKIPPED: ({ letters = [] }) => `No room for a label at ${letters.length > 1 ? 'cuts' : 'cut'} ${listOf(letters)}.`,
   PIECE_TOO_BIG: ({ pieceIndex, size, bed }) => `${pieceName(pieceIndex)} (${formatSize(size)}) doesn't fit your printer in any position${bed ? ` – it has room for ${formatSize(bed)}` : ''}.`,
-  PIECE_UNSTABLE: ({ pieceIndex, pegs = false }) => (pegs
-    ? `${pieceName(pieceIndex)} has nothing flat to stand on but the face its built-in pegs stand out of – it rests on a curve or an edge and needs supports. With pins (Joints: Pins) it lies on that face.`
-    : `${pieceName(pieceIndex)} has nothing flat to stand on where it fits your printer – it rests on a curve or an edge and needs supports. Another cut through it gives it a flat face to lie on.`),
+  PIECE_UNSTABLE: ({ pieceIndex, pegs = false, lip = false }) => {
+    if (lip) return `${pieceName(pieceIndex)} has nothing flat to stand on but the face its lip stands out of – it rests on a curve or an edge and needs supports.`;
+    return pegs
+      ? `${pieceName(pieceIndex)} has nothing flat to stand on but the face its built-in pegs stand out of – it rests on a curve or an edge and needs supports. With pins (Joints: Pins) it lies on that face.`
+      : `${pieceName(pieceIndex)} has nothing flat to stand on where it fits your printer – it rests on a curve or an edge and needs supports. Another cut through it gives it a flat face to lie on.`;
+  },
   PART_TOO_BIG: ({ name, size, bed, pins = false }) => {
     const room = `${formatSize(size)}${bed ? `; the printer has room for ${formatSize(bed)}` : ''}`;
     return pins
@@ -3207,9 +3732,13 @@ const NOTE_TEXT = {
   ORIENT_FALLBACK: ({ pieceIndex, mode, lies }) => `${pieceName(pieceIndex)} can't lie ${mode === 'model' ? 'as modelled' : 'on its cut face'} on your printer – it lies ${lies}.`,
   SPLIT_UNREPAIRED: ({ count }) => `${plural(count, 'triangle')} that couldn't be repaired ${count === 1 ? 'was' : 'were'} cut with the pieces but ${count === 1 ? 'has' : 'have'} no pins or labels.`,
   SPLIT_UNAVAILABLE: () => 'Splitting needs a solid model – this one couldn\'t be repaired.',
-  SPLIT_NOT_NEEDED: ({ yaw = 0, down = '-z' }) => (down && down !== '-z'
-    ? `This model already fits your printer lying on its ${down.replace('-', '−').toUpperCase()} side${yaw ? `, turned ${yaw}° on the bed` : ''} – no need to split, but turn it that way in your slicer.`
-    : `This model already fits your printer${yaw ? ` (turned ${yaw}° on the bed)` : ''} – no need to split.`),
+  SPLIT_NOT_NEEDED: ({ yaw = 0, down = '-z', apart = [] }) => {
+    // with cuts that come apart, the pieces they make are what fits
+    if (apart.length) return `This model fits your printer with ${apart.length > 1 ? `cuts ${listOf(apart)} as they are` : `cut ${apart[0]} as it is`} – no more cuts needed.`;
+    return down && down !== '-z'
+      ? `This model already fits your printer lying on its ${down.replace('-', '−').toUpperCase()} side${yaw ? `, turned ${yaw}° on the bed` : ''} – no need to split, but turn it that way in your slicer.`
+      : `This model already fits your printer${yaw ? ` (turned ${yaw}° on the bed)` : ''} – no need to split.`;
+  },
   PLAN_TOO_MANY: () => `This would need more than ${SPLIT_LIMITS.cells} pieces – scale the model down or choose a bigger printer.`,
   BED_TOO_SMALL: ({ size, bed }) => `${formatSize(size)} – bigger than your ${formatSize(bed)} printer.`,
 };
@@ -3220,9 +3749,22 @@ const NOTE_TEXT = {
  * SPLIT `{ pieces, dowels, diameter, length, lengths: [{ length, count }] (when the pins of that size come in more than
  * one length), sizes: [{ diameter, length, count }] (every group, when the pins come in more than one size), pegs,
  * pegSize, pegSizes: [{ size, count }] (when the built-in pegs come in more than one size), dovetails,
- * pairs: ['1A ↔ 2A'] }` (`dowels` counts every pin, `diameter` and `length` are the main size's; `pegs` every peg);
- * PINS `{ count, spares, diameter, length, own }`; DOVETAIL `{ letter, tabs, pieces, pegs }` (`pegs`: the joints are
- * built-in pegs);
+ * pairs: ['1A ↔ 2A'], apart: ['A'] }` (`dowels` counts every pin, `diameter` and `length` are the main size's; `pegs`
+ * every peg; `apart` the letters of the cuts that come apart);
+ * PINS `{ count, spares, diameter, length, own }`; DOVETAIL `{ letter, tabs, pieces, pegs, apart }` (`pegs`: the joints are
+ * built-in pegs; `apart`: the cut comes apart, its tabs unglued);
+ * APART `{ letter, cutId, axis, above, male, female, hold, clips, height, faces, flat, lying }` (a cut that comes
+ * apart: `male` the pieces its lip stands out of, `female` those with its groove, `above` that the male is the piece
+ * above a Z cut, `height` the lip's, `faces` how many of its faces have one, `flat` how many small ones just rest and
+ * `lying` how many have no piece that may lie with a lip standing up);
+ * APART_NO_CLIPS `{ letter, cutId, axis, female, why: 'height'|'short'|'edge'|'flex'|'skin', height, need, suggestedAt }`
+ * (a lip with no clips: `height` the lip's, `need` the room a lip with clips needs in the female, 'edge' its tongue
+ * broken by an opening right beside the cut, `suggestedAt` where the cut has a full lip); APART_FLAT `{ letter, cutId,
+ * axis, pieces, why: 'thin'|'room'|'lying'|'tall'|'small', wall, need, suggestedAt, by, fixed, piece, other }` (no lip
+ * at all: `pieces` [below, above], `wall` the thinnest wall that takes one, `need` the room the smallest lip needs,
+ * `by` the letters of the cuts whose lips already lie `fixed` another way, 'tall' piece `piece` too tall for the
+ * printer with a lip and `other` printing worse with it); APART_HEAVY `{ letter, cutId, weight, hold }` (`weight` in g of what hangs below a Z cut, `hold`
+ * the clips' in N); APART_KEPT `{ letters }`;
  * CONNECTORS_SHORTER `{ letter, depth, pegs }` (`pegs`: the cut has built-in pegs, `depth` their length);
  * CONNECTORS_FILAMENT `{ letter, count, diameter, length, lengths: [{ length, count }] }`
  * (`length` the longest; `lengths` when the holes take more than one); PEGS_SMALLER `{ letter, asked, pegSizes: [{ size,
@@ -3239,10 +3781,11 @@ const NOTE_TEXT = {
  * the cut that splits letters, when there is more than one); PART_SPANS_CUT `{ itemId, name, letter }`;
  * DOVETAIL_NOT_PLATE `{ letter, lying, pegs }` (`lying`: through a plate, but a piece beside it can't lie flat on it;
  * `pegs`: it has built-in pegs instead of pins);
- * ORIENT_FALLBACK `{ pieceIndex, mode, lies }`; PIECE_UNSTABLE `{ pieceIndex, pegs }` (`pegs`: only the face its pegs
- * stand out of was flat); PART_TOO_BIG `{ name, size, bed, pins }`
- * (a part printed separately, or with `pins` a single pin, too big for the bed); SPLIT_NOT_NEEDED `{ yaw, down }` (down
- * other than '-z' when it fits only on its side); BED_TOO_SMALL `{ size, bed, pieces }`.
+ * ORIENT_FALLBACK `{ pieceIndex, mode, lies }`; PIECE_UNSTABLE `{ pieceIndex, pegs, lip }` (`pegs`, `lip`: only the
+ * face its pegs or its lip stand out of was flat); PART_TOO_BIG `{ name, size, bed, pins }`
+ * (a part printed separately, or with `pins` a single pin, too big for the bed); SPLIT_NOT_NEEDED `{ yaw, down, apart }`
+ * (down other than '-z' when it fits only on its side; `apart` the letters of the cuts that come apart, when the pieces
+ * they make fit); BED_TOO_SMALL `{ size, bed, pieces }`.
  * Every field passed is kept on the note.
  */
 export function splitNote(code, fields = {}) {
@@ -3278,14 +3821,16 @@ const pegCount = (seam) => (Array.isArray(seam.pegs) ? seam.pegs.length : Number
  * The order to glue the pieces in, so that no step ever locks: the X seams
  * along each row, then the Y seams joining rows, then the Z seams joining
  * layers. Each step joins two rigid assemblies across one plane with
- * parallel pins (or pegs, which are parallel to the cut's normal too).
+ * parallel pins (or pegs, which are parallel to the cut's normal too). The
+ * cuts that come apart are never glued: they come last, once everything
+ * else is set, each step saying so first.
  * @param {{ pieces: { index: number, cell: number[] }[], seams: { letter: string, axis: number, at: number, pieces: number[],
- *   joint: 'dowels'|'pegs'|'dovetail'|'none', dowels: number|object[], pegs?: number|object[], male?: number|null,
- *   labels: string[]|null }[] }} plan
+ *   joint: 'dowels'|'pegs'|'dovetail'|'lip'|'none', dowels: number|object[], pegs?: number|object[], male?: number|null,
+ *   labels: string[]|null, apart?: { hold: string, lip: boolean, clips: number }|null }[] }} plan
  *   piece numbers are 1-based; `labels` are the two faces' labels in the order of `pieces`; `male` the piece that carries
- *   a seam's built-in pegs
- * @returns {{ letter: string, axis: number, pieces: number[], joins: number[], pins: number, pegs: number, text: string }[]}
- *   `pieces` already in place, `joins` the ones put on in this step
+ *   a seam's built-in pegs, or its lip; `apart` on a seam of a cut that comes apart
+ * @returns {{ letter: string, axis: number, pieces: number[], joins: number[], pins: number, pegs: number, text: string,
+ *   apart?: true }[]} `pieces` already in place, `joins` the ones put on in this step; `apart` on a cut that comes apart
  */
 export function assemblySteps({ pieces = [], seams = [] } = {}) {
   const cells = new Map(pieces.map((p) => [p.index, p.cell]));
@@ -3302,8 +3847,10 @@ export function assemblySteps({ pieces = [], seams = [] } = {}) {
     // the line of the grid this seam joins along: a row for X, a layer for Y, the whole stack for Z
     const line = a === 0 ? [cell[2], cell[1]] : a === 1 ? [cell[2], 0] : [0, 0];
     const key = `${a}|${line.join(',')}|${seam.letter}`;
-    if (!groups.has(key)) groups.set(key, { sort: [a, ...line, seam.at ?? 0], letter: seam.letter, axis: a, seams: [] });
-    groups.get(key).seams.push({ p, q, lp, lq, joint: seam.joint, pins: dowelCount(seam), pegs: pegCount(seam), male: seam.male ?? null });
+    // a cut that comes apart goes on after every glued one
+    const apart = seam.apart ? 1 : 0;
+    if (!groups.has(key)) groups.set(key, { sort: [apart, a, ...line, seam.at ?? 0], letter: seam.letter, axis: a, seams: [] });
+    groups.get(key).seams.push({ p, q, lp, lq, joint: seam.joint, pins: dowelCount(seam), pegs: pegCount(seam), male: seam.male ?? null, apart: seam.apart ?? null });
   }
   const list = [...groups.values()].sort((g, h) => {
     for (let i = 0; i < g.sort.length; i++) if (g.sort[i] !== h.sort[i]) return g.sort[i] - h.sort[i];
@@ -3315,12 +3862,44 @@ export function assemblySteps({ pieces = [], seams = [] } = {}) {
     const upper = [...new Set(group.map((s) => s.q))];
     const pins = group.reduce((n, s) => n + s.pins, 0);
     const pegs = group.reduce((n, s) => n + s.pegs, 0);
-    return { letter, axis, pieces: lower, joins: upper, pins, pegs, text: stepText(letter, group, lower, upper, pins) };
+    const apart = group.some((s) => s.apart);
+    return { letter, axis, pieces: lower, joins: upper, pins, pegs, text: stepText(letter, group, lower, upper, pins, axis), ...(apart ? { apart: true } : {}) };
   });
 }
 
-function stepText(letter, group, lower, upper, pins) {
-  const pieceList = (list) => `${list.length > 1 ? 'pieces' : 'piece'} ${listOf(list)}`;
+const pieceList = (list) => `${list.length > 1 ? 'pieces' : 'piece'} ${listOf(list)}`;
+
+/**
+ * The step for a cut that comes apart, starting with what matters most:
+ * that it is not glued. The top of a Z cut is pressed on until it clicks, or
+ * set on its lip; across X or Y the piece beyond the cut is pressed onto the
+ * one before it.
+ */
+function apartStepText(letter, group, lower, upper, axis) {
+  const lead = `Do not glue cut ${letter}: it comes apart.`;
+  const z = axis === 2;
+  const top = upper.length > 1 ? `the top (${pieceList(upper)})` : 'the top';
+  // across X or Y, several pieces beyond the cut go on together
+  const many = !z && upper.length > 1;
+  const verb = (one, more) => (many ? more : one);
+  const lip = group.filter((s) => s.joint === 'lip');
+  if (lip.some((s) => s.apart.clips > 0 && s.apart.hold !== 'lift')) {
+    const press = z ? `Press ${top} on until it clicks.` : `Press ${pieceList(upper)} onto ${pieceList(lower)} until ${verb('it clicks', 'they click')}.`;
+    return `${lead} ${press} ${verb('It goes', 'They go')} on one way round only – turn ${verb('it', 'them')} until ${verb('it drops', 'they drop')} onto the lip.`;
+  }
+  if (lip.length) {
+    const set = z ? `Set ${top} on its lip` : `Set ${pieceList(upper)} against ${pieceList(lower)} on the lip`;
+    return `${lead} ${set} – ${verb('it goes', 'they go')} on one way round only – and lift ${verb('it', 'them')} off to open it.`;
+  }
+  if (group.every((s) => s.joint === 'dovetail')) {
+    return `${lead} Lay ${pieceList([...lower, ...upper])} flat and lower ${pieceList(upper)}'s tabs into ${pieceList(lower)}; lift ${verb('it', 'them')} out to take it apart.`;
+  }
+  const set = z ? `Set ${top} on ${pieceList(lower)}` : `Set ${pieceList(upper)} against ${pieceList(lower)}`;
+  return `${lead} ${set} and line the edges up – nothing holds ${verb('it', 'them')}.`;
+}
+
+function stepText(letter, group, lower, upper, pins, axis) {
+  if (group.some((s) => s.apart)) return apartStepText(letter, group, lower, upper, axis);
   if (group.every((s) => s.joint === 'dovetail')) {
     return `Cut ${letter}: a thin film of glue on the tabs, lay ${pieceList(lower)} flat and lower ${pieceList(upper)} onto ${lower.length > 1 ? 'them' : 'it'}. Hold 1 minute.`;
   }
@@ -3357,7 +3936,9 @@ const size1 = (dims) => `${dims.map((v) => v.toFixed(1)).join(' × ')} mm`;
 /**
  * The glue sheet that goes in the zip: what to print, a dry fit, and the
  * glue steps in an order that never locks – or, when no two pieces touch
- * (cuts only between letters), that there is nothing to glue.
+ * (cuts only between letters), that there is nothing to glue. The cuts that
+ * come apart are put together last, under a heading that says not to glue
+ * them (or that nothing is glued, when no other cut is).
  * @param {{ name: string, pieces: { index: number, cell: number[], size: number[], lies: string, yaw?: number, fits?: boolean, shells?: number }[],
  *   seams: object[], pins?: { d: number, length: number, count: number, spares?: number, own?: boolean }[],
  *   parts?: { name: string }[], clearance?: number, bed?: number[], printer?: { size: number[], margin: number }|null, steps?: object[] }} plan
@@ -3373,12 +3954,27 @@ export function howToGlueText(plan) {
   const anyPins = seams.some((s) => dowelCount(s) > 0);
   const anyPegs = seams.some((s) => pegCount(s) > 0);
   const anyTabs = seams.some((s) => s.joint === 'dovetail');
+  // the cuts that come apart on a lip, each once: whether it clicks on, the pieces with the lip and those that come off
+  // it – the top of a Z cut, whichever has the lip, and across X or Y the piece that goes on the other's lip
+  const lips = new Map();
+  for (const s of seams) {
+    if (s.joint !== 'lip' || !s.apart) continue;
+    const lip = lips.get(s.letter) ?? { letter: s.letter, axis: s.axis, clicks: false, hold: s.apart.hold, male: new Set(), off: new Set() };
+    if (s.apart.clips > 0 && s.apart.hold !== 'lift') lip.clicks = true;
+    const [p, q] = s.pieces;
+    const male = s.male ?? p;
+    lip.male.add(male);
+    lip.off.add(s.axis === 2 ? q : male === p ? q : p);
+    lips.set(s.letter, lip);
+  }
+  const anyLip = lips.size > 0;
+  const anyClips = [...lips.values()].some((l) => l.clicks);
   const where = printer?.size
     ? `a ${formatSize(printer.size)} printer${printer.margin ? ` (${mm(printer.margin)} mm margin)` : ''}`
     : bed ? `a printer with room for ${formatSize(bed)}` : 'your printer';
   const out = [`${name} – ${plural(n, 'piece')} for ${where} – STL Text`, ''];
 
-  const unsupported = [anyPins && 'holes', anyPegs && 'pegs and sockets'].filter(Boolean);
+  const unsupported = [anyPins && 'holes', anyPegs && 'pegs and sockets', anyLip && (anyClips ? 'lips and clips' : 'lips')].filter(Boolean);
   out.push(`PRINT (each file is already turned the way to print it${unsupported.length ? `; ${listOf(unsupported)} need no supports` : ''})`);
   const sizes = pieces.map((p) => size1(p.size));
   const width = Math.max(0, ...sizes.map((s) => s.length));
@@ -3386,6 +3982,10 @@ export function howToGlueText(plan) {
     const extra = [p.fits === false ? 'TOO BIG for this printer' : 'fits'];
     if (p.yaw && p.yaw !== 90) extra.push(`turned ${p.yaw}° to fit`); // a quarter turn is already in the file and looks ordinary
     if (p.shells > 1) extra.push(`${p.shells} parts`);
+    for (const l of lips.values()) {
+      if (l.male.has(p.index)) extra.push(`lip for cut ${l.letter}`);
+      if (l.off.has(p.index)) extra.push(`comes off at cut ${l.letter}`);
+    }
     out.push(`  ${pad(`piece ${p.index} of ${n}`, 12)}${pad(size1(p.size), width)}${pad(`lies ${p.lies}`, 0)}${extra.join(', ')}`);
   });
   const indent = ' '.repeat(17);
@@ -3400,7 +4000,8 @@ export function howToGlueText(plan) {
     }
   }
   parts.forEach((part, i) => out.push(`  ${pad(`part ${i + 1}`, 12)}${quoted(part.name)} – prints separately; glue it on after the pieces`));
-  if (anyPins || anyPegs || anyTabs) out.push('  Not sure about the fit? Print the fit test first (Split card → Download fit test).');
+  if (anyClips) out.push(`  Clips are ${mm(CLIP.span)} mm bridges over a slot: print with bridging on (the default) and no supports.`);
+  if (anyPins || anyPegs || anyTabs || anyLip) out.push('  Not sure about the fit? Print the fit test first (Split card → Download fit test).');
   out.push('');
 
   if (!steps.length) {
@@ -3414,14 +4015,34 @@ export function howToGlueText(plan) {
   if (anyPins) out.push('  Pins should slide in by hand. Too tight: raise Clearance by 0.05 mm and download again.');
   if (anyPegs) out.push('  Pegs should push into their sockets by hand. Too tight: raise Clearance by 0.05 mm and download again.');
   if (anyTabs) out.push('  Tabs should drop into their sockets by hand. Too tight: raise Clearance by 0.05 mm and download again.');
-  if (!anyPins && !anyPegs && !anyTabs) out.push('  Hold the pieces together and check that the faces meet all round.');
+  for (const l of lips.values()) {
+    const off = [...l.off].sort((p, q) => p - q);
+    const who = l.axis === 2 ? `The top of cut ${l.letter}` : `${off.length > 1 ? 'Pieces' : 'Piece'} ${listOf(off)} of cut ${l.letter}`;
+    const its = l.axis !== 2 && off.length > 1 ? 'their' : 'its';
+    if (!l.clicks) out.push(`  ${who} should drop onto ${its} lip and lift off freely.`);
+    else {
+      const lighter = l.hold === 'light' ? '' : ' (or set the cut to Light click)';
+      out.push(`  ${who} should click onto ${its} lip and pull off again by hand. Too stiff: raise Clearance by 0.05 mm${lighter}; no click or too loose: lower it by 0.05 mm, and download again.`);
+    }
+  }
+  if (!anyPins && !anyPegs && !anyTabs && !anyLip) out.push('  Hold the pieces together and check that the faces meet all round.');
   out.push('');
 
-  const pairs = seams.filter((s) => s.labels?.length === 2).map((s) => `${s.labels[0]} ↔ ${s.labels[1]}`);
-  const room = anyPins || anyPegs ? `; ${anyPins ? 'holes' : 'sockets'} have ${mm(clearance)} mm of room per side` : '';
-  out.push(`GLUE – ${pairs.length ? 'put each letter on the same letter' : 'in this order'} (medium/thick CA or 5-minute epoxy${room})`);
-  if (pairs.length) out.push(`  Matching faces: ${pairs.join(', ')}`);
-  steps.forEach((s, i) => out.push(`  ${i + 1}. ${s.text}`));
+  // the glued steps, then those of the cuts that come apart, numbered on
+  const glued = steps.filter((s) => !s.apart);
+  const loose = steps.filter((s) => s.apart);
+  if (glued.length) {
+    const pairs = seams.filter((s) => s.labels?.length === 2).map((s) => `${s.labels[0]} ↔ ${s.labels[1]}`);
+    const room = anyPins || anyPegs ? `; ${anyPins ? 'holes' : 'sockets'} have ${mm(clearance)} mm of room per side` : '';
+    out.push(`GLUE – ${pairs.length ? 'put each letter on the same letter' : 'in this order'} (medium/thick CA or 5-minute epoxy${room})`);
+    if (pairs.length) out.push(`  Matching faces: ${pairs.join(', ')}`);
+    glued.forEach((s, i) => out.push(`  ${i + 1}. ${s.text}`));
+  }
+  if (loose.length) {
+    if (glued.length) out.push('');
+    out.push(glued.length ? 'LAST – DO NOT GLUE' : 'PUT TOGETHER – nothing is glued');
+    loose.forEach((s, i) => out.push(`  ${glued.length + i + 1}. ${s.text}`));
+  }
   return `${out.join('\n')}\n`;
 }
 
@@ -3429,6 +4050,9 @@ export function howToGlueText(plan) {
 
 /** Cut planes, their badges and the card's letters. */
 export const CUT_COLOR = 0x8b5cf6;
+
+/** The planes and badges of the cuts that come apart: teal, so a joint that is never glued stands out. */
+export const APART_COLOR = 0x0d9488;
 
 /**
  * Piece colours: cool shades at even indices, warm at odd ones, so that

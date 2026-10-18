@@ -61,10 +61,12 @@ export const ITEM_DEFAULTS = Object.freeze({
  * Splitting the finished model into pieces that fit the printer. Each cut is
  * a full plane through a point, kept like an item's placement so it moves with
  * the model; the engine snaps it to the nearest axis. The settings apply to
- * every seam.
+ * every seam but those of a cut that comes apart (`joint: 'apart'`): a joint
+ * that is never glued, a lantern's top taken off to change its light, held as
+ * `hold` says.
  */
 export const SPLIT_DEFAULTS = Object.freeze({
-  cuts: Object.freeze([]), // [{ id: 'c1', position: [x, y, z], normal: [1, 0, 0] }], model mm
+  cuts: Object.freeze([]), // [{ id: 'c1', position: [x, y, z], normal: [1, 0, 0], joint?: 'apart', hold?: 'snap' }], model mm
   joint: 'auto', // 'auto' | 'dowels' | 'dovetail' | 'none'
   diameter: 0, // mm: 0 = automatic | 1.75 (filament) | 3 | 4 | 5 | 6 | 8 | 10
   depth: 0, // mm into each piece: 0 = automatic | 3–30
@@ -214,7 +216,23 @@ const cutNumber = (id) => Number(/^c(\d+)$/.exec(String(id))?.[1] ?? 0);
 /** One past the highest cut id in use, so a new cut never takes the id of one still listed. */
 const nextCutId = (cuts) => `c${1 + Math.max(0, ...cuts.map((c) => cutNumber(c.id)))}`;
 
-const copyCut = ({ id, position, normal }) => ({ id, position: [...position], normal: [...normal] });
+/**
+ * How a cut that comes apart holds: its top clicks on, clicks on lightly, or
+ * just lifts off. The same list as split.js's `APART_HOLDS`.
+ */
+export const CUT_HOLDS = Object.freeze(['snap', 'light', 'lift']);
+
+/**
+ * A cut as the document keeps it: its own arrays, and the take-apart flag with
+ * a hold it knows (Clicks on for any other) only on a cut that comes apart, so
+ * an ordinary cut stays `{ id, position, normal }`. Any other joint is dropped.
+ */
+const copyCut = ({ id, position, normal, joint, hold }) => ({
+  id,
+  position: [...position],
+  normal: [...normal],
+  ...(joint === 'apart' ? { joint, hold: CUT_HOLDS.includes(hold) ? hold : 'snap' } : {}),
+});
 
 /**
  * The split after `patch` (null switches it off): settings merged over the
@@ -423,24 +441,29 @@ export class Document {
   }
 
   /**
-   * Add a cut (a plane through `position`, square to `normal`) and return
-   * its id. With no split yet, one starts from `defaults` (the last-used
-   * settings) over SPLIT_DEFAULTS.
+   * Add a cut (a plane through `position`, square to `normal`; with `joint:
+   * 'apart'` one that comes apart, held as `hold` says) and return its id.
+   * With no split yet, one starts from `defaults` (the last-used settings)
+   * over SPLIT_DEFAULTS.
    */
-  addCut({ position, normal }, { defaults = null } = {}) {
+  addCut({ position, normal, joint, hold }, { defaults = null } = {}) {
     const id = nextCutId(this.state.split?.cuts ?? []);
     this.commit((s) => {
       s.split ??= mergeSplit(null, { ...defaults, cuts: [] });
-      s.split.cuts.push(copyCut({ id, position, normal }));
+      s.split.cuts.push(copyCut({ id, position, normal, joint, hold }));
     });
     return id;
   }
 
-  /** Move a cut or turn it to another axis (`patch`: `position` and/or `normal`). Handle drags coalesce. */
+  /**
+   * Move a cut or turn it to another axis (`patch`: `position` and/or
+   * `normal`). Handle drags coalesce. A cut that comes apart still does once
+   * it is moved.
+   */
   updateCut(id, patch, { coalesce = null } = {}) {
     const cut = this.state.split?.cuts.find((c) => c.id === id);
     if (!cut) return;
-    const moved = (c) => copyCut({ id, position: patch.position ?? c.position, normal: patch.normal ?? c.normal });
+    const moved = (c) => copyCut({ ...c, id, position: patch.position ?? c.position, normal: patch.normal ?? c.normal });
     if (JSON.stringify(moved(cut)) === JSON.stringify(cut)) return;
     this.commit(
       (s) => {
@@ -448,6 +471,22 @@ export class Document {
       },
       { coalesce },
     );
+  }
+
+  /**
+   * Make a cut one that comes apart (`apart`: `{ hold }`, where an empty `{}`
+   * keeps the hold it has, or Clicks on) or a glued one again (null, which
+   * drops its hold too). One undo step; nothing when the cut is that already.
+   */
+  setCutJoint(id, apart) {
+    const cut = this.state.split?.cuts.find((c) => c.id === id);
+    if (!cut) return;
+    const next = (c) => copyCut({ ...c, joint: apart ? 'apart' : undefined, hold: apart ? apart.hold ?? c.hold : undefined });
+    const want = next(cut);
+    if (want.joint === cut.joint && want.hold === cut.hold) return;
+    this.commit((s) => {
+      s.split.cuts = s.split.cuts.map((c) => (c.id === id ? next(c) : c));
+    });
   }
 
   /** Remove one cut; the split keeps its settings (with no cuts left it cuts nothing). */

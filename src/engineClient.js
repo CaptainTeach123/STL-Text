@@ -267,7 +267,8 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
     /**
      * Fit to my printer (`mode: 'fit'`) or measure the cuts (`'measure'`),
      * on a channel of its own: a plan never supersedes a waiting download,
-     * and a newer plan replaces one still waiting.
+     * and a newer plan replaces one still waiting. The cuts of the split
+     * sent that come apart are kept by Fit: they come back first, as sent.
      */
     planSplit(items, baseVersion, options = {}) {
       return request('split', 'split.plan', { items, baseVersion, ...options });
@@ -275,7 +276,8 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
 
     /**
      * The fit test for a split (`{ printing, split, bed, name }`): made from
-     * the pin or peg size and joints the split really uses, so it needs the model.
+     * the pin or peg size and joints the split really uses, so it needs the model,
+     * with a box and its lid when a cut comes apart (`apart` in the reply, its hold).
      * On the misc channel, so a measure never supersedes it.
      */
     fitTest(items, baseVersion, options = {}) {

@@ -418,7 +418,7 @@
         <!-- ============================================================ split -->
         <section class="card" aria-labelledby="h-split" id="splitCard">
           <h2 id="h-split"><span class="step">6</span> Split for printing <span class="deriving-note" aria-live="polite">working…</span></h2>
-          <p class="hint" id="splitHint">Too big for your printer? Cut it into pieces that print one by one and glue together on pins.</p>
+          <p class="hint" id="splitHint">Too big for your printer, or want the top to come off – a lantern's, a box's lid? Cut it into pieces that print one by one.</p>
           <p class="hint" id="splitBedHint"><span id="splitBedText">Your printer: 220 × 220 × 250 mm</span> · <a href="#printing" id="splitBedLink">change</a></p>
           <div class="row">
             <button type="button" id="splitFitBtn" class="btn accent" title="Cut into the fewest pieces that fit your printer, away from letters and thin spots">Fit to my printer</button>
@@ -435,6 +435,7 @@
               <label title="Tabs through thin plates, so the pieces lock as they are laid together (pins where a cut is not through a plate)"><input type="radio" name="splitJoint" data-split="joint" value="dovetail" /><span>Dovetails</span></label>
               <label title="Flat faces with nothing to line them up"><input type="radio" name="splitJoint" data-split="joint" value="none" /><span>Glue only</span></label>
             </fieldset>
+            <p class="hint" id="splitJointsHint" hidden></p>
             <label class="field inline" title="One pin size for the whole model – with built-in pegs, the side of the square. Auto picks the largest that fits every face; 1.75 mm is a piece of filament.">
               <span data-pin-label="Pin size" data-peg-label="Peg size">Pin size</span>
               <select data-split="diameter">
@@ -460,7 +461,7 @@
                   <span><span data-pin-label="Depth per side" data-peg-label="Peg length">Depth per side</span> <small>mm · 0 = auto</small></span>
                   <input type="number" data-split="depth" min="0" max="30" step="0.5" value="0" />
                 </label>
-                <label class="field num" title="Room around each pin or peg, per side, so it slides in after printing. Applied to the holes and sockets only.">
+                <label class="field num" title="Room around each pin or peg, per side, so it slides in after printing. Applied to the holes and sockets only – and to the groove of a cut that comes apart, where it also sets how firmly the top clicks on.">
                   <span>Clearance per side <small>mm</small></span>
                   <input type="number" data-split="clearance" min="0" max="0.5" step="0.05" value="0.15" />
                 </label>
@@ -481,7 +482,7 @@
             </details>
             <div class="row spread">
               <span class="hint">Not sure of the fit?</span>
-              <button type="button" id="splitFitTestBtn" class="btn small" title="A small print of the joints these cuts get – holes and a pin of the size the pieces use, a peg and its socket with built-in pegs, a dovetail where a cut has one – to try before printing the pieces">Download fit test</button>
+              <button type="button" id="splitFitTestBtn" class="btn small" title="A small print of the joints these cuts get – holes and a pin of the size the pieces use, a peg and its socket with built-in pegs, a dovetail where a cut has one, a small box and its lid where a cut comes apart – to try before printing the pieces">Download fit test</button>
             </div>
           </div>
           <ul class="plan" id="pieceList" aria-label="Pieces"></ul>
@@ -529,6 +530,7 @@
           <span><i class="dot engrave"></i> cut text</span>
           <span id="legendPass" hidden><i class="dot pass"></i> unrepaired</span>
           <span id="legendCut" hidden><i class="dot cut"></i> cut</span>
+          <span id="legendApart" hidden><i class="dot apart"></i> comes apart</span>
           <span id="legendPieces" hidden><i class="dot pieces"></i> pieces</span>
         </div>
         <div class="stage-tools">

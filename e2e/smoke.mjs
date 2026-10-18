@@ -10,6 +10,7 @@ import { unzipSync, strFromU8 } from 'three/examples/jsm/libs/fflate.module.js';
 import { initManifold, manifold } from '../src/manifold.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold, manifoldToSoup } from '../src/mesh.js';
+import { lanternSolid } from '../tests/lanternFixture.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const out = path.join(root, 'e2e', 'out');
@@ -1565,6 +1566,413 @@ try {
     await idle();
     await setLineSize(0, sizeBefore);
     await setText('');
+
+    console.log('\na lantern whose top comes apart');
+    {
+      // a lantern: its top comes off to change the light inside, so the cut under the roof is one that comes apart
+      const lantern = lanternSolid();
+      const lanternFile = writeFixture('lantern.stl', soupOf(lantern));
+      lantern.delete();
+      await page.waitForTimeout(1000); // Chromium lets a page start about ten downloads a second
+      await openStl(lanternFile, 'lantern');
+      check(
+        (await page.locator('#splitHint').innerText()) === "Too big for your printer, or want the top to come off – a lantern's, a box's lid? Cut it into pieces that print one by one.",
+        "the split card's hint offers a top that comes off as well",
+        await page.locator('#splitHint').innerText(),
+      );
+      /** Pixels of the view in the cut planes' colours, unlit as the handles are: violet (glued) and teal (comes apart). */
+      const cutColours = () =>
+        page.evaluate(() => {
+          const c = document.querySelector('#stage canvas');
+          const probe = document.createElement('canvas');
+          probe.width = c.width;
+          probe.height = c.height;
+          const ctx = probe.getContext('2d');
+          ctx.drawImage(c, 0, 0);
+          const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+          const near = (i, [r, g, b]) => Math.abs(d[i] - r) + Math.abs(d[i + 1] - g) + Math.abs(d[i + 2] - b) < 30;
+          let violet = 0;
+          let teal = 0;
+          for (let i = 0; i < d.length; i += 4) {
+            if (near(i, [139, 92, 246])) violet++;
+            else if (near(i, [13, 148, 136])) teal++;
+          }
+          return { violet, teal };
+        });
+      /** The first cut row's state: its classes, the box, the hold chosen and what it says it cuts. */
+      const apartRow = async () =>
+        page.evaluate(() => {
+          const li = document.querySelector('#cutList li');
+          return {
+            apart: li.classList.contains('apart'),
+            ticked: li.querySelector('[data-cut-apart]').checked,
+            hold: li.querySelector('[data-cut-hold]:checked')?.value ?? null,
+            holds: !li.querySelector('.cut-hold').hidden,
+            meta: li.querySelector('.meta').textContent,
+          };
+        });
+      /** Wait for the pieces worked out again after a change: the list is current and the engine idle. */
+      const piecesAgain = async () => {
+        await idle();
+        await page.waitForFunction(() => !document.querySelector('#pieceList').classList.contains('stale') && !document.querySelector('#pieceList li.predicted'), null, { timeout: 60000 });
+        await idle();
+      };
+      await page.click('#addCutBtn');
+      await idle();
+      check(JSON.stringify(await cutState()) === '[2,"145.5"]', '+ Cut cuts the 291 mm lantern across Z in the middle', JSON.stringify(await cutState()));
+      await page.fill('#cutList input[data-cut-at]', '190');
+      await page.dispatchEvent('#cutList input[data-cut-at]', 'change');
+      await measured();
+      const glued = await cutColours();
+      await page.click('#cutList li:first-child label.cut-apart');
+      await measured();
+      const ticked = await apartRow();
+      check(
+        ticked.apart && ticked.ticked && ticked.holds && ticked.hold === 'snap' && /^1,728 mm² · comes apart$/.test(ticked.meta),
+        'ticking Comes apart: the row turns teal, Clicks on is chosen and the row says the cut comes apart',
+        JSON.stringify(ticked),
+      );
+      const teal = await cutColours();
+      const legend = { apart: !(await page.locator('#legendApart').isHidden()), cut: !(await page.locator('#legendCut').isHidden()) };
+      check(
+        glued.violet > 100 && glued.teal === 0 && teal.teal > 100 && teal.violet === 0 && legend.apart && !legend.cut,
+        'its plane and handle turn from violet to teal, and the legend says "comes apart"',
+        `${JSON.stringify(glued)} → ${JSON.stringify(teal)}, ${JSON.stringify(legend)}`,
+      );
+      const settings = await page.evaluate(() => ({
+        hint: document.querySelector('#splitJointsHint').hidden ? null : document.querySelector('#splitJointsHint').textContent,
+        off: ['joint', 'diameter', 'pins', 'labels', 'depth', 'count'].every((k) => [...document.querySelectorAll(`[data-split="${k}"]`)].every((e) => e.disabled)),
+        on: ['clearance', 'orient'].every((k) => !document.querySelector(`[data-split="${k}"]`).disabled) && !document.querySelector('#splitFitTestBtn').disabled,
+      }));
+      check(
+        settings.hint === 'Every cut here comes apart – Joints are for glued cuts.' && settings.off && settings.on,
+        'with every cut coming apart the joint settings are off and say why; the clearance, how pieces lie and the fit test stay on',
+        JSON.stringify(settings),
+      );
+      // the box clicked keeps the keys for the cut, as its axis does: Ctrl+Z undoes the tick, Ctrl+Y does it again
+      await page.keyboard.press('Control+z');
+      await idle();
+      const undone = await apartRow();
+      await page.keyboard.press('Control+y');
+      await idle();
+      const redone = await apartRow();
+      check(
+        !undone.apart && !undone.ticked && !undone.holds && redone.apart && redone.ticked && redone.hold === 'snap',
+        'Ctrl+Z unticks it and Ctrl+Y ticks it again',
+        `${JSON.stringify(undone)} / ${JSON.stringify(redone)}`,
+      );
+      // its handle in the view lights up under the pointer in a lighter teal, as a glued cut's does in a lighter violet
+      const hovered = await page.evaluate(() => {
+        const c = document.querySelector('#stage canvas');
+        const rect = c.getBoundingClientRect();
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        const found = [];
+        for (let y = 0; y < c.height; y += 2) {
+          for (let x = 0; x < c.width; x += 2) {
+            const i = (y * c.width + x) * 4;
+            if (Math.abs(d[i] - 13) + Math.abs(d[i + 1] - 148) + Math.abs(d[i + 2] - 136) < 30) found.push([rect.left + (x * rect.width) / c.width, rect.top + (y * rect.height) / c.height]);
+          }
+        }
+        return found;
+      });
+      let lit = 0;
+      for (const [x, y] of hovered.filter((_, i) => i % 7 === 0).slice(0, 120)) {
+        await page.mouse.move(x, y);
+        await page.waitForTimeout(40);
+        if ((await page.evaluate(() => document.querySelector('#stage canvas').style.cursor)) !== 'grab') continue;
+        // the hover sets the cursor in one frame and draws the lighter handle in the next: wait for it
+        lit = await page.evaluate(async () => {
+          await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+          const c = document.querySelector('#stage canvas');
+          const probe = document.createElement('canvas');
+          probe.width = c.width;
+          probe.height = c.height;
+          const ctx = probe.getContext('2d');
+          ctx.drawImage(c, 0, 0);
+          const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+          let n = 0;
+          for (let i = 0; i < d.length; i += 4) if (Math.abs(d[i] - 45) + Math.abs(d[i + 1] - 212) + Math.abs(d[i + 2] - 191) < 30) n++;
+          return n;
+        });
+        break;
+      }
+      await page.mouse.move(700, 800);
+      check(lit > 50, "the handle of a cut that comes apart turns a lighter teal under the pointer", `${lit} pixels`);
+      await page.locator('#splitCard').scrollIntoViewIfNeeded();
+      await page.screenshot({ path: path.join(out, '8-split-apart-row.png') });
+
+      // the pieces: the body carries the lip and its clips, the top comes off it
+      await page.check('#resultToggle');
+      await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
+      await piecesAgain();
+      const lidRows = await page.locator('#pieceList li').allInnerTexts();
+      check(
+        lidRows.length === 2 && /^1 · 108 × 108 × 196 mm · .*· lip at A, 4 clips$/.test(lidRows[0]) && /^2 · 110 × 110 × 101 mm · .*· comes off at A$/.test(lidRows[1]),
+        'piece 1 has the lip and its 4 clips, 6 mm taller for it, and piece 2 comes off at A',
+        lidRows.join(' / '),
+      );
+      check(
+        /Cut A comes apart – don't glue it\./.test(await splitNotes()) &&
+          (await splitNotes()).includes('Cut A comes apart: the top (piece 2) clicks onto a 6 mm lip on piece 1 – 4 clips hold it, and it pulls off again by hand.'),
+        'the notes say the top clicks onto a 6 mm lip with 4 clips, and not to glue it',
+        await splitNotes(),
+      );
+      check(/· comes apart: clicks on \(4 clips\)$/.test((await apartRow()).meta), 'the row says how it holds once the pieces are worked out', (await apartRow()).meta);
+      // the lid lifted well off the lip, for the screenshot, with the offer made when the lantern was opened out of the way
+      await page.fill('#spreadRange', '2');
+      await page.dispatchEvent('#spreadRange', 'input');
+      await page.evaluate(() => (document.querySelector('#toast').hidden = true));
+      await page.mouse.move(700, 800);
+      await page.waitForTimeout(300);
+      await page.screenshot({ path: path.join(out, '8-split-apart-pieces.png') });
+      await page.fill('#spreadRange', '1');
+      await page.dispatchEvent('#spreadRange', 'input');
+
+      const lidZip = await downloadZip();
+      const lidNames = Object.keys(lidZip.entries).sort();
+      const sheet = lidZip.entries['lantern-text-how-to-glue.txt'] ?? '';
+      check(
+        lidNames.join() === 'lantern-text-how-to-glue.txt,lantern-text-piece-1-of-2.stl,lantern-text-piece-2-of-2.stl' &&
+          lidNames.filter((n) => n.endsWith('.stl')).every((n) => lidZip.entries[n].volume > 0 && lidZip.entries[n].sizeOk),
+        'the zip holds the two pieces, both solid, and the sheet, with no pins',
+        lidNames.join(', '),
+      );
+      check(
+        sheet.includes('Do not glue cut A: it comes apart. Press the top on until it clicks.') && /PUT TOGETHER/.test(sheet) && !/GLUE –/.test(sheet),
+        'the sheet says not to glue cut A but press the top on until it clicks, with nothing glued',
+        sheet.split('\n').filter((l) => /PUT TOGETHER|Do not glue|GLUE/.test(l)).join(' | '),
+      );
+
+      // 2 mm higher the roof leaves room for a 4.5 mm lip only, with no clips: the note offers to move the cut back
+      await page.fill('#cutList input[data-cut-at]', '192');
+      await page.dispatchEvent('#cutList input[data-cut-at]', 'change');
+      await piecesAgain();
+      const move = page.locator('#splitNotes li', { hasText: 'only 4.5 mm tall' });
+      const moveText = (await move.count()) ? await move.locator('.text').innerText() : await splitNotes();
+      const moveLabel = (await move.count()) ? await move.locator('button').innerText() : '';
+      check(
+        moveText ===
+          "Cut A's lip is only 4.5 mm tall, so it has no clips and the top just lifts off: a lip that clicks on needs 9.4 mm of plain wall in piece 2 past the cut. Move the cut to 190.5 mm." &&
+          moveLabel === 'Move cut A to 190.5 mm' &&
+          /· comes apart: lifts off$/.test((await apartRow()).meta),
+        'at 192 mm the lip is 4.5 mm with no clips, and its note offers to move the cut to 190.5 mm',
+        `${moveText} [${moveLabel}] ${(await apartRow()).meta}`,
+      );
+      if (moveLabel) await move.locator('button').click();
+      await piecesAgain();
+      check(
+        (await cutState())[1] === '190.5' && /· comes apart: clicks on \(4 clips\)$/.test((await apartRow()).meta),
+        'its button moves the cut there, and the lip has its 4 clips again',
+        `${(await cutState())[1]} · ${(await apartRow()).meta}`,
+      );
+
+      // Light click: smaller catches, which may not hold up the body hanging from the top; the note offers the full click
+      await page.click('#cutList li:first-child .cut-hold label:has-text("Light click")');
+      await piecesAgain();
+      const heavy = page.locator('#splitNotes li', { hasText: 'may not hold up' });
+      const heavyText = (await heavy.count()) ? await heavy.locator('.text').innerText() : await splitNotes();
+      const heavyLabel = (await heavy.locator('button').count()) ? await heavy.locator('button').innerText() : '';
+      check(
+        /· comes apart: light click \(4 clips\)$/.test((await apartRow()).meta) &&
+          /^Cut A's clips may not hold up what hangs below it \(about \d+ g\) – carry the model by its base, not its top\.$/.test(heavyText) &&
+          heavyLabel === 'Use Clicks on',
+        'with Light click the row says so, and a note warns that the clips may not hold the body up, offering Clicks on',
+        `${(await apartRow()).meta} | ${heavyText}`,
+      );
+      await page.waitForTimeout(1000); // Chromium lets a page start about ten downloads a second
+      const lightTest = await fitTest('lantern-light-fit-test.stl');
+      check(
+        lightTest.shells.length === 2 && /check that the lid clicks lightly onto the box and pulls off again by hand/.test(lightTest.status),
+        "its fit test's lid clicks on lightly",
+        lightTest.status,
+      );
+      if (heavyLabel) await heavy.locator('button').click();
+      await piecesAgain();
+      check(
+        (await apartRow()).hold === 'snap' && /clicks on \(4 clips\)$/.test((await apartRow()).meta) && !/may not hold up/.test(await splitNotes()),
+        'its button sets the cut to Clicks on, and the warning goes',
+        `${(await apartRow()).hold} · ${(await apartRow()).meta}`,
+      );
+      await page.click('#cutList li:first-child .cut-hold label:has-text("Lifts off")');
+      await piecesAgain();
+      const lifts = await apartRow();
+      const liftRows = await page.locator('#pieceList li').allInnerTexts();
+      check(
+        lifts.hold === 'lift' && /· comes apart: lifts off$/.test(lifts.meta) && /· lip at A$/.test(liftRows[0]),
+        'Lifts off: no clips, and the row says the top lifts off',
+        `${lifts.meta} | ${liftRows[0]}`,
+      );
+      await page.waitForTimeout(1000);
+      const liftTest = await fitTest('lantern-lift-fit-test.stl');
+      check(
+        liftTest.shells.length === 2 && /check that the lid drops onto the box and lifts off freely by hand – too tight: raise Clearance by 0\.05 mm\.$/.test(liftTest.status),
+        "and its fit test's lid lifts off freely",
+        liftTest.status,
+      );
+      await page.click('#cutList li:first-child .cut-hold label:has-text("Clicks on")');
+      await piecesAgain();
+
+      // its fit test: a small box and its lid with the same lip and clips
+      await page.waitForTimeout(1000);
+      const lidTest = await fitTest('lantern-fit-test.stl');
+      const sizes = lidTest.shells.map((e) => e.map((v) => Math.round(v * 10) / 10).join('×')).sort();
+      check(
+        sizes.join() === '12×30×60,18×30×60' && /the lid clicks onto the box and pulls off again by hand/.test(lidTest.status),
+        'the fit test is a 60 × 30 × 18 mm box and its 60 × 30 × 12 mm lid, and the status says how the lid should go on',
+        `${sizes.join(', ')} | ${lidTest.status}`,
+      );
+
+      // Fit to my printer keeps a cut that comes apart: on this printer it is all the lantern needs
+      await page.click('#splitFitBtn');
+      await idle();
+      await piecesAgain();
+      const kept = { cuts: await page.locator('#cutList li').count(), row: await apartRow(), at: (await cutState())[1], notes: await splitNotes() };
+      check(
+        kept.cuts === 1 && kept.row.ticked && kept.at === '190.5' && /This model fits your printer with cut A as it is – no more cuts needed\./.test(kept.notes),
+        'Fit to my printer keeps the cut that comes apart, and says the lantern needs no more',
+        JSON.stringify({ ...kept, row: kept.row.meta }),
+      );
+
+      // on an A1 mini the body is too tall: Fit cuts it again below the lip and keeps cut A where it is – even when A was
+      // ticked while the plan was being worked out, which plans it again
+      await page.evaluate(() => (document.querySelector('#bedPreset').closest('details').open = true));
+      await page.selectOption('#bedPreset', 'a1mini');
+      await idle();
+      await page.click('#cutList li:first-child label.cut-apart');
+      await idle();
+      await page.evaluate(() => (window.__engine.hold = true));
+      await page.click('#splitFitBtn');
+      await page.waitForFunction(() => window.__engine.held.length > 0, null, { timeout: 60000 });
+      await page.click('#cutList li:first-child label.cut-apart');
+      await releasePlans();
+      await idle();
+      await piecesAgain();
+      const mini = {
+        cuts: await page.locator('#cutList li').count(),
+        first: await apartRow(),
+        at: await cutState(0),
+        second: (await page.locator('#cutList li').count()) > 1 ? await cutState(1) : null,
+        rows: await page.locator('#pieceList li').allInnerTexts(),
+        notes: await splitNotes(),
+      };
+      check(
+        mini.cuts === 2 && mini.first.ticked && mini.at[1] === '190.5' && mini.second?.[0] === 2 && Number(mini.second[1]) < 190.5 &&
+          mini.rows.length === 3 && mini.rows.every((r) => /· fits/.test(r)) &&
+          mini.notes.includes('Cut A comes apart, so Fit to my printer kept it where it is and planned the other cuts around it.'),
+        'on an A1 mini Fit keeps cut A ticked at 190.5 mm, adds a cut below it, every piece fits and the notes say A was kept',
+        JSON.stringify({ ...mini, first: mini.first.meta }),
+      );
+      await page.locator('#splitCard').scrollIntoViewIfNeeded();
+      await page.screenshot({ path: path.join(out, '8-split-apart.png') });
+      await page.selectOption('#bedPreset', 'generic');
+      await idle();
+
+      // through the windows the faces are posts too small for a lip: there is nothing to try, and the row then says so
+      await page.uncheck('#resultToggle');
+      await page.click('#cutList li:nth-child(2) .cut-remove');
+      await idle();
+      await page.fill('#cutList input[data-cut-at]', '100');
+      await page.dispatchEvent('#cutList input[data-cut-at]', 'change');
+      await measured();
+      // nothing is saved, so no download to wait for: the status line says why
+      await page.click('#splitFitTestBtn');
+      await page.waitForFunction(() => /^Nothing to try/.test(document.querySelector('#status').textContent), null, { timeout: 60000 }).catch(() => null);
+      await idle();
+      check(
+        (await status()) === 'Nothing to try: these cuts get no lip or tabs, so the pieces just rest on each other.' && /· comes apart: no lip$/.test((await apartRow()).meta),
+        'a cut through the windows comes apart with no lip: the fit test has nothing to try, and the row says no lip',
+        `${await status()} | ${(await apartRow()).meta}`,
+      );
+      // a glued cut and one that comes apart in the same place are one cut, which comes apart: the glued one's row says
+      // so, not pins
+      await page.click('#cutList li:first-child label.cut-apart');
+      await page.fill('#cutList input[data-cut-at]', '190');
+      await page.dispatchEvent('#cutList input[data-cut-at]', 'change');
+      await measured();
+      await page.click('#addCutBtn');
+      await idle();
+      await page.fill('#cutList li >> nth=1 >> input[data-cut-at]', '190');
+      await page.dispatchEvent('#cutList li >> nth=1 >> input[data-cut-at]', 'change');
+      await measured();
+      await page.click('#cutList li:nth-child(2) label.cut-apart');
+      await measured();
+      const merged = { metas: await page.locator('#cutList .meta').allInnerTexts(), states: [await cutState(0), await cutState(1)] };
+      check(
+        merged.states.every((c) => c[0] === 2 && c[1] === '190') && /^1,728 mm² · comes apart$/.test(merged.metas[0]) && merged.metas[1] === 'in the same place as cut A',
+        'a glued cut with one that comes apart in the same place: its row says it comes apart, not pins',
+        JSON.stringify(merged),
+      );
+      await page.click('#splitClearBtn');
+      await idle();
+
+      // a plate with a thin tube standing on it: the plate's cut has dovetail tabs, and the tube's, which comes apart, is
+      // too thin for a lip. The fit test is the dovetail alone, and the tube's row then says it has no lip
+      await openStl(standFile, 'plate-and-tube');
+      await page.click('#addCutBtn');
+      await idle();
+      await page.click('#addCutBtn');
+      await idle();
+      await page.click('#cutList li >> nth=1 >> .seg label:has-text("Z")');
+      await idle();
+      for (const [n, at] of [[0, '-50'], [1, '40']]) {
+        await page.fill(`#cutList li >> nth=${n} >> input[data-cut-at]`, at);
+        await page.dispatchEvent(`#cutList li >> nth=${n} >> input[data-cut-at]`, 'change');
+      }
+      await measured();
+      await page.click('#cutList li:nth-child(2) label.cut-apart');
+      await measured();
+      const tubeMixed = {
+        hint: await page.locator('#splitJointsHint').innerText(),
+        joints: await page.isDisabled('[data-split="joint"][value="auto"]'),
+        meta: await page.locator('#cutList .meta').allInnerTexts(),
+      };
+      // with the glued cut glue only, the clearance is still the lip's, and its fit test can still be tried
+      await page.click('#splitSettings label:has(input[data-split="joint"][value="none"])');
+      await idle();
+      const glueOnly = await page.evaluate(() => ({
+        labels: document.querySelector('[data-split="labels"]').disabled,
+        clearance: document.querySelector('[data-split="clearance"]').disabled,
+        test: document.querySelector('#splitFitTestBtn').disabled,
+      }));
+      check(
+        glueOnly.labels && !glueOnly.clearance && !glueOnly.test,
+        'Glue only beside a cut that comes apart leaves its clearance and the fit test on',
+        JSON.stringify(glueOnly),
+      );
+      await page.click('#splitSettings label:has(input[data-split="joint"][value="auto"])');
+      await measured();
+      await page.waitForTimeout(1000);
+      const tubeTest = await fitTest('plate-and-tube-apart-fit-test.stl');
+      const tubeMeta = await page.locator('#cutList .meta').allInnerTexts();
+      check(
+        tubeMixed.hint === 'Joints are for the glued cuts; cut B comes apart.' && !tubeMixed.joints && /· comes apart$/.test(tubeMixed.meta[1]) &&
+          /the tab drops into its socket/.test(tubeTest.status) && !/lid/.test(tubeTest.status) && /· dovetails$/.test(tubeMeta[0]) && /· comes apart: no lip$/.test(tubeMeta[1]),
+        'with a glued cut beside it the joints stay on for that one; the fit test is its dovetail alone, and the tube\'s row then says no lip',
+        `${JSON.stringify(tubeMixed)} | ${tubeTest.status} | ${tubeMeta.join(' / ')}`,
+      );
+      await page.check('#resultToggle');
+      await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
+      await piecesAgain();
+      const thin = page.locator('#splitNotes li', { hasText: 'no room for a lip' });
+      check(
+        (await thin.count()) === 1 &&
+          (await thin.locator('.text').innerText()) === 'Cut B has no room for a lip – its walls are under 2.7 mm thick – so the top just rests on piece 2, with nothing to line it up or hold it.' &&
+          (await thin.locator('button').innerText()) === 'Select cut B',
+        'its note says the walls are too thin for a lip, and selects the cut',
+        await splitNotes(),
+      );
+      await page.uncheck('#resultToggle');
+      await page.click('#splitClearBtn');
+      await idle();
+      // selecting the cuts let go of the text: pick it again for what follows
+      await page.click('#itemList li:first-child');
+      await idle();
+    }
   }
 
   console.log('\nno model');

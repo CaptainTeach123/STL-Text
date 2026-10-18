@@ -8,9 +8,12 @@ import { createItem, createPart } from '../src/document.js';
 import { manifold } from '../src/manifold.js';
 import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
-import { FILAMENT, SPLIT_DEFAULTS, TO_PLANE, cellSizes, cellSupport, fitPieces, isSymmetric, orientationStats, pegSizesFor, sizesFor } from '../src/split.js';
+import {
+  APART_HOLDS, FILAMENT, SPLIT_DEFAULTS, TO_PLANE, cellSizes, cellSupport, fitPieces, isSymmetric, orientationStats, pegSizesFor, sizesFor,
+} from '../src/split.js';
 import { clearSplitCaches, dowelHole, halfHole, pegAt, pinAt, pinSolid, socketAt } from '../src/splitGeometry.js';
 import { setup, soupOf as soupGeometry } from './helpers.js';
+import { lanternSolid, lift, stlCheck } from './lanternFixture.js';
 
 const fontBytes = (pkg, file) => {
   const buf = fs.readFileSync(path.resolve('node_modules/@fontsource', pkg, 'files', file));
@@ -1642,5 +1645,254 @@ describe('built-in pegs', () => {
     expect(noteOf(ex, 'CONNECTORS_DROPPED')).toMatchObject({
       pegs: true, text: 'No peg fits on 1 of 1 face at cut A (walls under 2 mm) – it is a flat glue joint. A strip glued inside makes it stronger.',
     });
+  });
+});
+
+describe('cuts that come apart', () => {
+  const MINI = [170, 170, 179]; // an A1 mini's room
+  const apartAt = (axis, at, id = 'c1', hold = 'snap') => ({ ...cutAt(axis, at, id), joint: 'apart', hold });
+  const lantern = () => load(own(lanternSolid()), 'lantern');
+  // a chest 300 × 100 × 120 with 10 mm walls, floor and top
+  const chest = () => own(cube([300, 100, 120], [0, 0, 60]).subtract(cube([280, 80, 100], [0, 0, 60])));
+  const UP = { '+z': [0, 0, 1], '-z': [0, 0, -1] };
+  /** A piece's file as a slicer reads it: float32 corners matched exactly (`stlCheck`). */
+  const fileCheck = (f) => {
+    const p = parseSTL(f.stl).attributes.position.array;
+    return stlCheck({ getMesh: () => ({ vertProperties: p, numProp: 3, triVerts: Array.from({ length: p.length / 3 }, (_, i) => i) }) });
+  };
+
+  it('a lantern whose top comes off: the body carries a 6 mm lip with 4 clips, the top clicks onto it, and nothing is glued', async () => {
+    await lantern();
+    const split = S({ cuts: [apartAt(2, 190)] });
+    const ex = await exportSplit(split, { name: 'lantern', archive: 'zip' });
+    // the pieces and the sheet: no pins, and no labels on a face that is never glued
+    const zip = unzipSync(new Uint8Array(ex.zip));
+    expect(Object.keys(zip).sort()).toEqual(['lantern-how-to-glue.txt', 'lantern-piece-1-of-2.stl', 'lantern-piece-2-of-2.stl']);
+    // the body stands as modelled with the lip up out of it, counted in its height; the top lies on its cut face
+    expect(ex.pieces.map((p) => [p.lies, p.down, p.size.map((v) => +v.toFixed(3)), p.lips, p.lids])).toEqual([
+      ['flat as modelled', '-z', [108, 108, 196], [{ letter: 'A', clips: 4 }], []],
+      ['on a cut face', '-z', [110, 110, 101], [], ['A']],
+    ]);
+    expect(ex.seams).toEqual([expect.objectContaining({
+      letter: 'A', pieces: [1, 2], joint: 'lip', male: 1, labels: null, dowels: [], pegs: [],
+      apart: { hold: 'snap', lip: true, clips: 4, height: 6, key: true, faces: 1, flat: 0 },
+    })]);
+    // held well enough to carry the model by its top: no warning that it may not
+    expect(codes(ex)).toEqual(['SPLIT', 'APART']);
+    expect(noteOf(ex, 'SPLIT').text).toBe('Cut into 2 pieces. Cut A comes apart – don\'t glue it.');
+    expect(noteOf(ex, 'APART').text).toBe('Cut A comes apart: the top (piece 2) clicks onto a 6 mm lip on piece 1 – 4 clips hold it, and it pulls off again by hand.');
+    expect(ex.assembly).toEqual(['Do not glue cut A: it comes apart. Press the top on until it clicks. It goes on one way round only – turn it until it drops onto the lip.']);
+    const text = strFromU8(zip['lantern-how-to-glue.txt']);
+    expect(text).toContain('lips and clips need no supports');
+    expect(text).toMatch(/piece 1 of 2 .*fits, lip for cut A\n/);
+    expect(text).toMatch(/piece 2 of 2 .*fits, comes off at cut A\n/);
+    expect(text).toContain('The top of cut A should click onto its lip and pull off again by hand.');
+    expect(text).toContain(`PUT TOGETHER – nothing is glued\n  1. ${ex.assembly[0]}\n`);
+    expect(text).not.toContain('GLUE –');
+    // each file is clean as a slicer reads it, and put back where it came from the top sits on the lip with the
+    // clearance all round: lifted 0.25 mm, the clips' catches still meet the top's recesses
+    const files = piecesOf(await exportSplit(split, { name: 'lantern' }));
+    expect(files.map(fileCheck)).toEqual([{ degenerate: 0, open: 0 }, { degenerate: 0, open: 0 }]);
+    const [body, top] = files.map(pieceSolid);
+    expect(Math.abs(body.volume() - 220870.9)).toBeLessThan(1);
+    expect(Math.abs(top.volume() - 80826.8)).toBeLessThan(1);
+    expect([body.genus(), top.genus()]).toEqual([12, 1]);
+    const [a, b] = files.map(assembled);
+    expect(overlap(a, b)).toBeLessThan(1e-6);
+    expect(Math.abs(lift(a, b, [0, 0, 0.25]) - 0.206)).toBeLessThan(0.02);
+  });
+
+  it('a light click may not hold up the body when the model is carried by its top, and says so', async () => {
+    await lantern();
+    const ex = await exportSplit(S({ cuts: [apartAt(2, 190, 'c1', 'light')], labels: false }), { name: 'lantern' });
+    expect(codes(ex)).toEqual(['SPLIT', 'APART', 'APART_HEAVY']);
+    expect(noteOf(ex, 'APART').text).toBe('Cut A comes apart: the top (piece 2) clicks lightly onto a 6 mm lip on piece 1 – 4 clips hold it, and it pulls off again by hand.');
+    // what hangs below the cut is the body as it was cut, in PLA; four light clips hold about 4.2 N, under twice its 2.7 N
+    const heavy = noteOf(ex, 'APART_HEAVY');
+    expect(heavy.text).toBe('Cut A\'s clips may not hold up what hangs below it (about 270 g) – carry the model by its base, not its top.');
+    expect(heavy.weight).toBe(Math.round(own(own(lanternSolid()).trimByPlane([0, 0, -1], -190)).volume() * 1.24e-3));
+    expect(heavy.hold).toBeCloseTo(4.2, 1);
+  });
+
+  it('a cut glued beside one that comes apart is glued first, with its labels, and the lid goes on last; the lip lays the box', async () => {
+    await load(chest(), 'chest');
+    const ex = await exportSplit(S({ cuts: [apartAt(2, 95), cutAt(0, 0, 'c2')], orient: 'cut' }), { name: 'chest', archive: 'zip' });
+    // asked to lie on a cut face, the box halves would lie on their tops: the lip standing up out of them lays them
+    // as modelled, and nothing says they could not lie as asked
+    expect(ex.pieces.map((p) => [p.lies, p.up, p.lips.map((l) => l.letter), p.lids])).toEqual([
+      ['flat as modelled', '+z', ['A'], []], ['flat as modelled', '+z', ['A'], []], ['on a cut face', '+z', [], ['A']], ['on a cut face', '+z', [], ['A']],
+    ]);
+    expect(codes(ex)).toEqual(['SPLIT', 'PINS', 'APART', 'APART_HEAVY']);
+    // the glued cut's pin holes are drilled for the way the pieces print: their teardrops point up
+    const holes = ex.seams.filter((s) => s.letter === 'B').flatMap((s) => s.dowels.flatMap((d) => d.sides));
+    expect(holes.length).toBeGreaterThan(0);
+    for (const side of holes) expect([side.tear, side.apex]).toEqual([true, UP[ex.pieces[side.piece - 1].up]]);
+    expect(ex.seams.map((s) => [s.letter, s.joint, s.labels])).toEqual([['B', 'dowels', ['1B', '2B']], ['B', 'dowels', ['3B', '4B']], ['A', 'lip', null], ['A', 'lip', null]]);
+    expect(noteOf(ex, 'SPLIT').text).toBe('Cut into 4 pieces with 5 pins Ø3 × 10 mm. Glue matching letters together: 1B ↔ 2B, 3B ↔ 4B. Cut A comes apart – don\'t glue it.');
+    expect(ex.assembly).toEqual([
+      'Cut B: glue 3 pins into face 1B, a thin film on the face, push piece 2 on (2B). Hold 1 minute.',
+      'Cut B: glue 2 pins into face 3B, a thin film on the face, push piece 4 on (4B). Hold 1 minute.',
+      'Do not glue cut A: it comes apart. Press the top (pieces 3 and 4) on until it clicks. It goes on one way round only – turn it until it drops onto the lip.',
+    ]);
+    const text = strFromU8(unzipSync(new Uint8Array(ex.zip))['chest-how-to-glue.txt']);
+    expect(text).toContain('GLUE – put each letter on the same letter');
+    expect(text).toContain(`  2. ${ex.assembly[1]}\n\nLAST – DO NOT GLUE\n  3. ${ex.assembly[2]}\n`);
+  });
+
+  it('Fit to my printer keeps a cut that comes apart where it is, first, and plans the other cuts round it', async () => {
+    await lantern();
+    const kept = apartAt(2, 190, 'c5');
+    const split = { ...SPLIT_DEFAULTS, cuts: [kept] };
+    // on the default printer the pieces it makes fit already, the lip counted: it alone comes back
+    let plan = await client.planSplit([], version, { printing, split, bed: BED, mode: 'fit' });
+    expect(plan.cuts).toEqual([kept]);
+    expect(plan.notes).toEqual([expect.objectContaining({ code: 'SPLIT_NOT_NEEDED', apart: ['A'], text: 'This model fits your printer with cut A as it is – no more cuts needed.' })]);
+    // on an A1 mini the body is too tall even so: one more cut, below it
+    plan = await client.planSplit([], version, { printing, split, bed: MINI, mode: 'fit' });
+    expect(plan.cuts).toHaveLength(2);
+    expect(plan.cuts[0]).toEqual(kept);
+    expect(plan.cuts[1]).toEqual({ position: [0, 0, expect.any(Number)], normal: [0, 0, 1] });
+    expect(plan.cuts[1].position[2]).toBeLessThan(190 - 20);
+    expect(plan.counts).toEqual([0, 0, 2]);
+    expect(plan.pieces.map((p) => p.fits)).toEqual([true, true, true]);
+    expect(plan.notes).toEqual([expect.objectContaining({ code: 'APART_KEPT', text: 'Cut A comes apart, so Fit to my printer kept it where it is and planned the other cuts around it.' })]);
+    // set to lift off instead, it comes back so: the plan is made again for it
+    const lifting = await client.planSplit([], version, { printing, split: { ...split, cuts: [{ ...kept, hold: 'lift' }] }, bed: MINI, mode: 'fit' });
+    expect(lifting.cuts[0]).toEqual({ ...kept, hold: 'lift' });
+    // taken as the document numbers a new cut (one past the highest id), the split uses the pieces the plan cut, and they fit
+    const from = stages.length;
+    const ex = await exportSplit({ ...split, cuts: [kept, { id: 'c6', ...plan.cuts[1] }], labels: false }, { name: 'lantern', bed: MINI });
+    expect(stages.slice(from)).not.toContain('Cutting into pieces…');
+    expect(ex.pieces.map((p) => p.fits)).toEqual([true, true, true]);
+    expect(ex.seams.find((s) => s.cutId === 'c5')).toMatchObject({ joint: 'lip', apart: { hold: 'snap', clips: 4 } });
+    // a model that fits whole keeps its cut that comes apart too: Fit never takes it away
+    await load(own(cube([150, 100, 120], [0, 0, 60]).subtract(cube([130, 80, 100], [0, 0, 60]))), 'tub');
+    const lid = apartAt(2, 100, 'c1', 'light');
+    plan = await client.planSplit([], version, { printing, split: { ...SPLIT_DEFAULTS, cuts: [lid] }, bed: BED, mode: 'fit' });
+    expect(plan.cuts).toEqual([lid]);
+    expect(codes(plan)).toEqual(['SPLIT_NOT_NEEDED']);
+  });
+
+  it('the measure counts a lip on the piece that will carry it, as the pieces will have it', async () => {
+    await lantern();
+    const m = await client.planSplit([], version, { printing, split: S({ cuts: [apartAt(2, 190)] }), bed: BED, mode: 'measure' });
+    expect(m.cuts).toEqual([expect.objectContaining({ id: 'c1', letter: 'A', joint: 'lip', apart: { hold: 'snap' }, reach: [6, 0], islands: 1 })]);
+    expect(m.cuts[0].area).toBeCloseTo(1728, 3);
+    expect(cellSizes(m.bounds, m.cuts).cells.map((c) => +c.size[2].toFixed(3))).toEqual([196, 101]);
+    // a box with an 8 mm lid: the lid leaves the box's lip no room for clips, so the lid carries it, as the pieces will
+    await load(own(cube([80, 80, 60], [0, 0, 30]).subtract(cube([74, 74, 54], [0, 0, 30]))), 'lidded');
+    const lid = await client.planSplit([], version, { printing, split: S({ cuts: [apartAt(2, 52)] }), bed: BED, mode: 'measure' });
+    expect(lid.cuts[0]).toMatchObject({ joint: 'lip', reach: [0, 6] });
+    expect(cellSizes(lid.bounds, lid.cuts).cells.map((c) => +c.size[2].toFixed(3))).toEqual([52, 14]);
+    const ex = await exportSplit(S({ cuts: [apartAt(2, 52)], labels: false }), { name: 'lidded' });
+    expect(ex.pieces.map((p) => +p.size[2].toFixed(3))).toEqual([52, 14]);
+    // the lid is what comes off, whichever piece has the lip
+    expect(ex.pieces.map((p) => [p.lips.map((l) => l.letter), p.lids])).toEqual([[[], []], [['A'], ['A']]]);
+  });
+
+  it('ticking a cut or changing how it holds drills the pieces again but never cuts them again, and the printer can move the lip', async () => {
+    await load(chest(), 'chest');
+    const cuts = (hold) => [hold ? apartAt(2, 95, 'c1', hold) : cutAt(2, 95, 'c1'), cutAt(0, 0, 'c2')];
+    const males = (ex) => ex.seams.filter((s) => s.letter === 'A').map((s) => s.male);
+    await exportSplit(S({ cuts: cuts(null), labels: false }), { name: 'chest' });
+    let from = stages.length;
+    let ex = await exportSplit(S({ cuts: cuts('snap'), labels: false }), { name: 'chest' });
+    expect(stages.slice(from)).toContain('Fitting the lip…');
+    expect(stages.slice(from)).not.toContain('Cutting into pieces…');
+    expect(males(ex)).toEqual([2, 1]);
+    from = stages.length;
+    ex = await exportSplit(S({ cuts: cuts('lift'), labels: false }), { name: 'chest' });
+    expect(stages.slice(from)).not.toContain('Cutting into pieces…');
+    expect(ex.seams.find((s) => s.letter === 'A').apart).toMatchObject({ hold: 'lift', lip: true, clips: 0 });
+    await exportSplit(S({ cuts: cuts('snap'), labels: false }), { name: 'chest' });
+    // 100 mm tall, the printer has no room for the box halves with the lip on them, though they lie as before: the
+    // lids carry it, lying on their tops
+    from = stages.length;
+    ex = await exportSplit(S({ cuts: cuts('snap'), labels: false }), { name: 'chest', bed: [210, 210, 100] });
+    expect(stages.slice(from)).not.toContain('Cutting into pieces…');
+    expect(males(ex)).toEqual([4, 3]);
+    expect(ex.pieces.map((p) => [p.down, p.lips.length, +p.size[2].toFixed(3)])).toEqual([['-z', 0, 95], ['-z', 0, 95], ['+z', 1, 31], ['+z', 1, 31]]);
+  });
+
+  it('a piece its lip stands up out of never carries pegs on the face it lies on', async () => {
+    // a tub with 10 mm walls, glued with pegs at z 60 and coming apart at z 100: on a printer 65 mm tall the bottom
+    // piece has no room for the pegs, but the middle one lies on that face, its lip standing up
+    await load(own(cube([150, 100, 120], [0, 0, 60]).subtract(cube([130, 80, 100], [0, 0, 60]))), 'tub');
+    const ex = await exportSplit(S({ cuts: [cutAt(2, 60, 'c1'), apartAt(2, 100, 'c2')], joint: 'pegs', labels: false }), { name: 'tub', bed: [210, 210, 65] });
+    expect(ex.pieces[1]).toMatchObject({ down: '-z', lips: [{ letter: 'B', clips: 5 }], pegs: 0 });
+    expect(ex.seams.find((s) => s.letter === 'A')).toMatchObject({ joint: 'pegs', male: 1 });
+  });
+
+  it('the fit test of a cut that comes apart is a small box and its lid with the same lip', async () => {
+    await lantern();
+    const r = await client.fitTest([], version, { printing, split: S({ cuts: [apartAt(2, 190)] }), bed: BED, name: 'lantern' });
+    // the lantern's other joints are none: no pin blocks
+    expect(r).toMatchObject({ apart: 'snap', pins: false, pegs: false, dovetail: false });
+    const bodies = own(solidOfStl(r.stl)).decompose().map(own).map((m) => boxOf(m).size.map((v) => +v.toFixed(3)));
+    expect(bodies.sort((p, q) => q[2] - p[2])).toEqual([[60, 30, 18], [60, 30, 12]]);
+    // a cut too near the roof gets a 4.5 mm lip with no clips: its coupon lifts off as the lip does, though Clicks on
+    // was asked for – a coupon that clicks would tune a catch the model hasn't got
+    const short = await client.fitTest([], version, { printing, split: S({ cuts: [apartAt(2, 192)] }), bed: BED, name: 'lantern' });
+    const lifts = await client.fitTest([], version, { printing, split: S({ cuts: [apartAt(2, 190, 'c1', 'lift')] }), bed: BED, name: 'lantern' });
+    expect(short.apart).toBe('lift');
+    expect(short.triangles).toBe(lifts.triangles);
+    expect(short.triangles).toBeLessThan(r.triangles);
+    // a cut through the windows has no lip to try: nothing to print
+    const none = await client.fitTest([], version, { printing, split: S({ cuts: [apartAt(2, 100)] }), bed: BED, name: 'lantern' });
+    expect(none).toMatchObject({ stl: null, apart: null });
+    // without the model the settings say: the pins Auto would use, and the box and lid held as the cut is set
+    const settings = await client.call('split.fitTest', { split: S({ cuts: [apartAt(2, 190, 'c1', 'light')] }), printing, name: 'lantern' });
+    expect(settings).toMatchObject({ apart: 'light', pins: true });
+    expect(own(solidOfStl(settings.stl)).decompose().map(own)).toHaveLength(5);
+  });
+
+  it('a thin sign\'s cut that comes apart keeps unglued dovetail tabs', async () => {
+    await load(cube([360, 100, 4]), 'sign');
+    const ex = await exportSplit(S({ cuts: [apartAt(0, 0)], labels: false }), { name: 'sign' });
+    expect(ex.seams).toEqual([expect.objectContaining({ joint: 'dovetail', tabs: 2, apart: expect.objectContaining({ hold: 'snap', lip: false, tabs: 2 }) })]);
+    expect(codes(ex)).toEqual(['SPLIT', 'DOVETAIL']);
+    expect(noteOf(ex, 'DOVETAIL')).toMatchObject({
+      apart: true,
+      text: 'Cut A goes through a thin plate, so it comes apart on 2 dovetail tabs – lay both pieces flat and lower piece 2 onto piece 1; lift it off again to take it apart. Don\'t glue it.',
+    });
+    expect(ex.assembly).toEqual(['Do not glue cut A: it comes apart. Lay pieces 1 and 2 flat and lower piece 2\'s tabs into piece 1; lift it out to take it apart.']);
+  });
+
+  it('walls too thin for a lip: the top just rests on the piece below, and the notes and the sheet say so', async () => {
+    // a tower with 2.5 mm walls
+    await load(own(cube([80, 80, 120], [0, 0, 60]).subtract(cube([75, 75, 120], [0, 0, 62]))), 'tower');
+    const ex = await exportSplit(S({ cuts: [apartAt(2, 90)], labels: false }), { name: 'tower' });
+    expect(ex.seams).toEqual([expect.objectContaining({ joint: 'none', apart: expect.objectContaining({ lip: false, faces: 0, flat: 1 }) })]);
+    expect(codes(ex)).toEqual(['SPLIT', 'APART_FLAT']);
+    expect(noteOf(ex, 'APART_FLAT')).toMatchObject({
+      why: 'thin', text: 'Cut A has no room for a lip – its walls are under 2.7 mm thick – so the top just rests on piece 1, with nothing to line it up or hold it.',
+    });
+    expect(ex.assembly).toEqual(['Do not glue cut A: it comes apart. Set the top on piece 1 and line the edges up – nothing holds it.']);
+    expect(ex.pieces.map((p) => [p.lips, p.lids])).toEqual([[[], []], [[], []]]);
+  });
+
+  it('splitting with cuts that come apart again and again leaves no solids behind', async () => {
+    await lantern();
+    /** Every way through a split: the pieces view, the measure, the download, a fit test and Fit to my printer. */
+    const round = async (i) => {
+      const split = S({ cuts: [apartAt(2, 189 + (i % 4), 'c1', APART_HOLDS[i % 3])], labels: false });
+      await resultSplit(split);
+      await client.planSplit([], version, { printing, split, bed: BED, mode: 'measure' });
+      await exportSplit(split, { name: 'lantern', archive: 'zip' });
+      await client.fitTest([], version, { printing, split, bed: BED, name: 'lantern' });
+      await client.planSplit([], version, { printing, split, bed: MINI, mode: 'fit' });
+    };
+    await round(0);
+    const watch = trackSolids();
+    try {
+      await round(1);
+      await round(2);
+      const settled = watch.live();
+      for (let i = 3; i < 9; i++) await round(i);
+      expect(watch.made()).toBeGreaterThan(500);
+      expect(watch.live()).toBeLessThanOrEqual(settled);
+    } finally {
+      watch.stop();
+    }
   });
 });

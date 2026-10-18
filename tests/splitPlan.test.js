@@ -10,7 +10,8 @@ import {
   planSamples, plateAxis, polygonsArea, polygonsCentroid, printTransform, safeFileName, cellSupport, fitPieces, flatProbes, liesFlat, statsWithSoup,
   sizesFor, sizesForRoom, soupCells, splitActive, splitNote, teardropApex, usableBed, yawMat4, zipFileName, triangleInBox, baseAxis,
   outlineColumns, pieceHolding, textNotes, AUTO_PEGS, SMALLEST_PEG, layPegged, pegAllowance, pegMales, pegSides, pegSizeOf, pegSizesFor,
-  pegSizesForRoom, statsWithPegs, uprightPegNotes,
+  pegSizesForRoom, statsWithPegs, uprightPegNotes, APART_COLOR, APART_HOLDS, CLIP, LIP, LIP_ALLOWANCE, apartMales, catchSizes,
+  clipHold, layGrown, lipReach, lipSides, lipSizesFor, statsWithLip,
 } from '../src/split.js';
 
 const U = [210, 210, 249]; // the default printer's usable bed
@@ -1859,5 +1860,522 @@ describe('limits and constants', () => {
     expect(applyMat4(translationMat4([1, 2, 3]), [10, 20, 30])).toEqual([11, 22, 33]);
     expect(transposeMat4(YAW90)).toEqual(mulMat4(YAW90, mulMat4(YAW90, YAW90)));
     expect(transposeMat4(transposeMat4(LAY_DOWN['-x']))).toEqual([...LAY_DOWN['-x']]);
+  });
+});
+
+describe('cuts that come apart', () => {
+  const MINI = [170, 170, 179]; // the A1 mini's usable bed
+  const Z = [0, 0, 1];
+  const laidOf = (list, bed = U, orient = 'auto') => list.map(({ index, cell = [0, 0, 0], stats, boxes }) => ({
+    index, cell, stats, boxes, lying: chooseOrientation(stats, bed, orient, { pieceIndex: index }),
+  }));
+  // a 100 mm square tube's walls (4 mm) from z0 to z1, as triangle soups
+  const walls = (z0, z1, h = 50, w = 4) => [
+    boxSoup([-h, -h, z0], [h, -h + w, z1]), boxSoup([-h, h - w, z0], [h, h, z1]),
+    boxSoup([-h, -h + w, z0], [-h + w, h - w, z1]), boxSoup([h - w, -h + w, z0], [h, h - w, z1]),
+  ];
+  // a pyramid roof from its eaves (half side e, at z0) up to a point, with the eaves' flat underside outside the tube
+  const roof = (e, z0, apex, h = 50) => {
+    const c = [[-e, -e], [e, -e], [e, e], [-e, e]];
+    const out = [];
+    for (let i = 0; i < 4; i++) out.push(c[i][0], c[i][1], z0, c[(i + 1) % 4][0], c[(i + 1) % 4][1], z0, 0, 0, apex);
+    for (const [lo, hi] of [[[-e, -e], [e, -h]], [[-e, h], [e, e]], [[-e, -h], [-h, h]], [[h, -h], [e, h]]]) {
+      out.push(lo[0], lo[1], z0, lo[0], hi[1], z0, hi[0], hi[1], z0, lo[0], lo[1], z0, hi[0], hi[1], z0, hi[0], lo[1], z0);
+    }
+    return out;
+  };
+  const statsOf = (soups, at) => {
+    const m = meshOf(soups);
+    return orientationStats(m.vertProperties, m.numProp, m.triVerts, [{ axis: 2, at }]);
+  };
+  // a lantern cut at z 190: the body (a 4 mm floor and walls) and its top (the walls' last 10 mm and a pointed roof)
+  const body = statsOf([boxSoup([-46, -46, 0], [46, 46, 4]), ...walls(0, 190)], 190);
+  const top = statsOf([...walls(190, 200), roof(55, 200, 260)], 190);
+  // a box 80 × 80 × 60 (4 mm walls, 2 mm floor and top) cut 8 mm under its top
+  const box = statsOf([boxSoup([-36, -36, 0], [36, 36, 2]), ...walls(0, 52, 40)], 52);
+  const lid = statsOf([boxSoup([-36, -36, 58], [36, 36, 60]), ...walls(52, 60, 40)], 52);
+
+  it('the document\'s flag reads as apart: { hold } on the normalised cut, and cuts merged in one place come apart if any did', () => {
+    const cut = (id, z, extra = {}) => ({ id, position: [0, 0, z], normal: Z, ...extra });
+    const bounds = { min: [-55, -55, 0], max: [55, 55, 291] };
+    const { spec, cuts, notes } = normaliseSplit({
+      joint: 'pegs',
+      cuts: [cut('c1', 190, { joint: 'apart', hold: 'light' }), cut('c2', 100), cut('c3', 50, { joint: 'apart', hold: 'firm' }), cut('c4', 20, { hold: 'lift' })],
+    }, bounds);
+    expect(cuts).toEqual([
+      { id: 'c4', letter: 'D', axis: 2, at: 20 },
+      { id: 'c3', letter: 'C', axis: 2, at: 50, apart: { hold: 'snap' } }, // a hold there is not is Clicks on
+      { id: 'c2', letter: 'B', axis: 2, at: 100 },
+      { id: 'c1', letter: 'A', axis: 2, at: 190, apart: { hold: 'light' } },
+    ]);
+    expect(notes).toEqual([]);
+    // the settings are the glued cuts' and do not change
+    expect(spec).toEqual(normaliseSplit({ joint: 'pegs' }).spec);
+    // in one place: the first in the list stays, and it comes apart, held as the first that came apart
+    const merged = normaliseSplit({ cuts: [cut('c1', 100), cut('c2', 100.004, { joint: 'apart', hold: 'lift' }), cut('c3', 100.002, { joint: 'apart', hold: 'snap' })] }, bounds);
+    expect(merged.cuts).toEqual([{ id: 'c1', letter: 'A', axis: 2, at: 100, apart: { hold: 'lift' } }]);
+    expect(merged.notes.map((n) => n.code)).toEqual(['CUTS_MERGED']);
+    // a normalised cut is read alike
+    expect(normaliseSplit({ cuts: [{ id: 'c1', axis: 2, at: 190, apart: { hold: 'lift' } }, { id: 'c2', axis: 0, at: 0 }] }, bounds).cuts)
+      .toEqual([{ id: 'c2', letter: 'B', axis: 0, at: 0 }, { id: 'c1', letter: 'A', axis: 2, at: 190, apart: { hold: 'lift' } }]);
+  });
+
+  it('the lip\'s sizes: the catch stands a fixed way out, so Clearance tunes how hard it clicks', () => {
+    expect(APART_HOLDS).toEqual(['snap', 'light', 'lift']);
+    expect(LIP).toMatchObject({ t: 1.6, tMin: 1.2, skirt: 1.6, wall: 1.2, g0: 0.1, into: 0.5, step: 0.2, lead: 0.6, mouth: 0.4, heights: [6, 4.5, 3], opening: 0.25, minPiece: 25, root: 0.5, faceTolerance: 0.02, eps: 0.001 });
+    expect(CLIP).toMatchObject({ span: 40, margin: 3, turn: 20, corner: 15, cornerReach: 1.5, length: 6, flat: 0.4, sink: 0.2, every: 95, most: 8, key: 6, slot: 3, snap: { P: 0.4, floor: 0.1 }, light: { P: 0.25, floor: 0.05 } });
+    expect(Object.isFrozen(LIP.heights) && Object.isFrozen(CLIP.snap)).toBe(true);
+    expect(LIP_ALLOWANCE).toBe(6);
+    expect(APART_COLOR).toBe(0x0d9488);
+    // the interference is what the catch stands out past the clearance, never under a floor
+    expect([0.05, 0.15, 0.3, 0.45].map((c) => catchSizes('snap', c))).toEqual([{ p: 0.4, i: 0.35 }, { p: 0.4, i: 0.25 }, { p: 0.4, i: 0.1 }, { p: 0.55, i: 0.1 }]);
+    expect(catchSizes('light', 0.15)).toEqual({ p: 0.25, i: 0.1 });
+    expect(catchSizes('lift', 0.15)).toBeNull();
+    expect(lipSizesFor(0.15)).toEqual({ c: 0.15, hold: 'snap', t: 1.6, tMin: 1.2, wall: 1.2, skin: 0.8, g0: 0.1, d0: 1.85, p: 0.4, i: 0.25, gIn: 0.4 });
+    expect(lipSizesFor(0.15, 0.4, 'lift')).toMatchObject({ p: 0, i: 0, gIn: 0.15 });
+    // a wider nozzle: four and three of its lines, two of skin
+    expect(lipSizesFor(0.15, 0.6, 'light')).toMatchObject({ t: 2.4, tMin: 1.8, wall: 1.8, skin: 1.2, d0: 2.65, i: 0.1, gIn: 0.25 });
+    // how far the groove and a wall over it reach into the other piece
+    expect([6, 4.5, 3].map((H) => lipReach(H).reach)).toEqual([9.35, 7.85, 6.35]);
+    expect(lipReach(6)).toEqual({ zTop: 8.15, reach: 9.35 });
+    expect(lipReach(6, 'opening', 0.15, 0.25, true).reach).toBe(9.55); // the tongue moved out by something over the opening
+    expect(lipReach(6, 'opening', 0.15, 0, true).reach).toBe(9.35);
+    expect(lipReach(6, 'channel').reach).toBe(7.35);
+    expect(lipReach(6, 'opening', 0.5, catchSizes('snap', 0.5).i, true).reach).toBe(10.3); // the most any band reaches
+  });
+
+  it('how hard the clips hold, worked out from the clip\'s section: about 10.5 N for four that click on', () => {
+    expect(clipHold(4, { i: 0.25 })).toBeCloseTo(10.5, 1);
+    expect(clipHold(4, { i: 0.25, conservative: false })).toBeCloseTo(18.3, 1);
+    expect(clipHold(1, { i: 0.25, conservative: false })).toBeCloseTo(4.57, 2);
+    expect(clipHold(4, { i: 0.1 })).toBeCloseTo(4.2, 1); // Light click
+    expect(clipHold(4, { i: 0.1, conservative: false })).toBeCloseTo(7.3, 1);
+    expect(clipHold([{}, {}, {}, {}], { i: 0.25 })).toBe(clipHold(4, { i: 0.25 }));
+    expect(clipHold(4, { i: 0 })).toBe(0);
+    expect(clipHold(0, { i: 0.25 })).toBe(0);
+    // a thicker tongue is stiffer as its cube
+    expect(clipHold(4, { i: 0.25, t: 3.2 })).toBeCloseTo(8 * clipHold(4, { i: 0.25 }), 9);
+  });
+
+  it('the planner keeps the cuts that come apart where they are and plans the others round them', () => {
+    // samples as the planner makes them, with the kept positions among them; no cost but the pull towards even pieces
+    const plan = (lo, hi, k, S, at) => {
+      const samples = planSamples(lo, hi, k);
+      for (const f of at) if (!samples.some((t) => Math.abs(t - f) < 1e-9)) samples.push(f);
+      samples.sort((p, q) => p - q);
+      const fixed = at.map((f) => samples.findIndex((t) => Math.abs(t - f) < 1e-9));
+      return chooseOffsets(samples, samples.map(() => 0), { lo, hi, k, S, minEnd: 10, minMid: 20, fixed });
+    };
+    const offsets = (r) => r?.offsets.map((t) => Math.round(t * 10) / 10) ?? null;
+    // a 291 mm lantern whose top comes off at 190: on the A1 mini the other cut goes at 97, under it
+    expect(offsets(plan(0, 291, 1, 249, [190]))).toEqual([190]);
+    expect(plan(0, 291, 2, 179, [190])).toMatchObject({ reach: [null, [6, 0]], relaxed: false });
+    expect(offsets(plan(0, 291, 2, 179, [190]))).toEqual([97, 190]);
+    expect(offsets(plan(0, 291, 2, 179, [60]))).toEqual([60, 194]);
+    // a 400 mm bar on a 210 mm bed
+    expect(offsets(plan(0, 400, 2, 210, [300]))).toEqual([133.3, 300]);
+    expect(offsets(plan(0, 400, 2, 210, [50]))).toEqual([50, 258.7]);
+    expect(plan(0, 400, 3, 150, [50, 350])).toMatchObject({ reach: [[6, 0], null, [0, 6]] });
+    expect(offsets(plan(0, 400, 3, 150, [50, 350]))).toEqual([50, 200, 350]);
+    // one cut that must be at 100 leaves 300 mm: no plan, and the next grid is tried
+    expect(plan(0, 400, 1, 210, [100])).toBeNull();
+    // without the rule the even cuts win, and a cut that must stay where tabs would be counted reaches as a lip
+    const samples = planSamples(0, 400, 2);
+    const zero = samples.map(() => 0);
+    expect(chooseOffsets(samples, zero, { lo: 0, hi: 400, k: 2, S: 210 }).offsets.map(Math.round)).toEqual([133, 267]);
+    const at = samples.findIndex((t) => t >= 100);
+    const tabs = samples.map(() => ({ below: 8, above: 8, w: 2 }));
+    const kept = chooseOffsets(samples, zero, { lo: 0, hi: 400, k: 2, S: 210, grow: tabs, fixed: [at] });
+    expect(kept.offsets[0]).toBe(samples[at]);
+    expect(kept.reach).toEqual([[6, 0], [8, 8]]);
+  });
+
+  it('Fit to my printer\'s grids never have fewer cuts on an axis than stay there, and its plans keep them', () => {
+    const E = [110, 110, 291];
+    // even the default printer needs one cut in the 291 mm lantern; with two kept on Z it needs no fewer than two
+    expect(gridCandidates(E, U)[0]).toEqual({ k: [0, 0, 1], pieces: 2 });
+    expect(gridCandidates(E, U, { minCounts: [0, 0, 1] })[0]).toEqual({ k: [0, 0, 1], pieces: 2 });
+    expect(gridCandidates(E, U, { minCounts: [0, 0, 2] }).map((c) => c.k[2])).toEqual(expect.not.arrayContaining([0, 1]));
+    expect(gridCandidates(E, U, { minCounts: [0, 0, 2] })[0]).toEqual({ k: [0, 0, 2], pieces: 3 });
+    expect(gridCandidates([300, 40, 20], U, { minCounts: [0, 1, 0] }).every((c) => c.k[1] >= 1)).toBe(true);
+    expect(gridCandidates([400, 100, 4], U, { flat: 2, minCounts: [0, 0, 1] })).toEqual([]); // never cut through a plate's thickness
+    // the lantern on the A1 mini, its top coming off at 190: one cut is no plan, two put the other at 97
+    const bounds = { min: [-55, -55, 0], max: [55, 55, 291] };
+    const profileOf = (kept) => (a, k) => {
+      const list = planSamples(bounds.min[a], bounds.max[a], k);
+      for (const f of a === 2 ? kept : []) if (!list.some((t) => Math.abs(t - f) < 1e-9)) list.push(f);
+      list.sort((p, q) => p - q);
+      return { samples: list, costs: list.map(() => 0), tabs: list.map(() => null) };
+    };
+    const fixed = [[], [], [190]];
+    expect(planGrid([0, 0, 1], { E, U: MINI, bounds, profileOf: profileOf([190]), fixed })).toBeNull();
+    const two = planGrid([0, 0, 2], { E, U: MINI, bounds, profileOf: profileOf([190]), fixed });
+    expect(two.offsets).toEqual([[], [], [97, 190]]);
+    // the piece beside the kept cut that carries its tongue is 6 mm longer, and every piece fits
+    expect(two.pieces.map((x) => x.size[2])).toEqual([97, 99, 101]);
+    expect(two.pieces.every((x) => x.fits)).toBe(true);
+    expect(planGrid([0, 0, 2], { E, U: MINI, bounds, profileOf: profileOf([]) }).offsets).toEqual([[], [], [97, 194]]);
+    // on the default printer the kept cut is the plan
+    const one = planGrid([0, 0, 1], { E, U, bounds, profileOf: profileOf([190]), fixed });
+    expect(one.offsets).toEqual([[], [], [190]]);
+    expect(one.pieces.map((x) => x.size)).toEqual([[110, 110, 196], [110, 110, 101]]);
+    // a grid with no cut on the kept cut's axis, or samples that miss it, is no plan
+    expect(planGrid([1, 0, 0], { E, U, bounds, profileOf: profileOf([190]), fixed })).toBeNull();
+    expect(planGrid([0, 0, 1], { E, U, bounds, profileOf: profileOf([]), fixed })).toBeNull();
+  });
+
+  it('the lip goes on the piece that prints as well standing on its far end: the lantern\'s body, the box\'s lid', () => {
+    const pair = { axis: 2, lo: 1, hi: 2 };
+    // the body stands on its foot, the lip up, as it would anyway; its top would stand on the point of its roof
+    const lantern = laidOf([{ index: 1, stats: body }, { index: 2, cell: [0, 0, 1], stats: top }]);
+    expect(lantern.map((p) => [p.lying.down, p.lying.lies])).toEqual([['-z', 'flat as modelled'], ['-z', 'on a cut face']]);
+    expect(chooseOrientation(statsWithLip(top, '-z'), U)).toMatchObject({ down: '+z', lies: 'on a curve' });
+    expect(apartMales(lantern, U)([pair])).toEqual([{ male: 0, piece: 1, down: '-z' }]);
+    // on the A1 mini the body fits no way, with the lip or without: it still prints as well, and carries it
+    const mini = laidOf([{ index: 1, stats: body }, { index: 2, cell: [0, 0, 1], stats: top }], MINI);
+    expect(mini.map((p) => p.lying.fits)).toEqual([false, true]);
+    expect(apartMales(mini, MINI)([pair])).toEqual([{ male: 0, piece: 1, down: '-z' }]);
+    // a box with an 8 mm lid: both print as well with the lip, the lid lying on its top, so the better lip decides – a
+    // 6 mm one with clips in the lid, against 4.5 mm with none on the box, the lid having no room for its groove
+    const boxed = laidOf([{ index: 1, stats: box }, { index: 2, cell: [0, 0, 1], stats: lid }]);
+    expect(boxed.map((p) => p.lying.down)).toEqual(['-z', '+z']);
+    const quality = [{ H: 4.5, clips: 0, area: 1100 }, { H: 6, clips: 4, area: 1150 }];
+    expect(apartMales(boxed, U)([{ ...pair, quality }])).toEqual([{ male: 1, piece: 2, down: '+z' }]);
+    // as good a lip both ways: the lower piece; one with clips over one without, whatever the heights
+    expect(apartMales(boxed, U)([pair])).toEqual([{ male: 0, piece: 1, down: '-z' }]);
+    expect(apartMales(boxed, U)([{ ...pair, quality: [{ H: 6, clips: 4, area: 1100 }, { H: 6, clips: 4, area: 1150 }] }])[0].male).toBe(1);
+    expect(apartMales(boxed, U)([{ ...pair, quality: [{ H: 6, clips: 0, area: 1100 }, { H: 4.5, clips: 2, area: 900 }] }])[0].male).toBe(1);
+    // printing as well comes first: the lantern's top keeps standing on its cut face though its lip would be better
+    expect(apartMales(lantern, U)([{ ...pair, quality: [{ H: 3, clips: 0, area: 400 }, { H: 6, clips: 4, area: 590 }] }])[0].male).toBe(0);
+    // a piece with no lip on offer is no male: the other, or none. When the other prints worse with it (the lantern's
+    // top on its handle) and the one that prints as well has no room for the groove past the cut, that one is named too,
+    // so that the layout can move the cut to where it has (a cut just under the roof's eaves)
+    expect(apartMales(lantern, U)([{ ...pair, quality: [null, { H: 6, clips: 4, area: 590 }] }]))
+      .toEqual([{ male: 1, piece: 2, down: '+z', alt: { k: 0, piece: 1, down: '-z', why: 'room' } }]);
+    expect(apartMales(lantern, U)([{ ...pair, quality: [null, null] }])).toEqual([null]);
+    // the box's lid prints as well with the lip: nothing to move for
+    expect(apartMales(boxed, U)([{ ...pair, quality: [null, { H: 6, clips: 4, area: 1150 }] }])).toEqual([{ male: 1, piece: 2, down: '+z' }]);
+  });
+
+  it('the measure counts a lip on the piece that will carry it, as the pieces or the boxes between the cuts tell', () => {
+    const cut = (at, hold = 'snap') => ({ id: 'c1', letter: 'A', axis: 2, at, apart: { hold } });
+    // the lantern's body has the length past the cut for a full groove in its top, and prints as well with the lip
+    const lantern = laidOf([{ index: 1, stats: body }, { index: 2, cell: [0, 0, 1], stats: top }]);
+    expect(lipSides(lantern, [cut(190)], U)).toEqual(new Map([['c1', 0]]));
+    // a box's 8 mm lid leaves the box's lip 7.85 mm of groove, a 4.5 mm lip with no clips: the lid carries a full one
+    const boxed = laidOf([{ index: 1, stats: box }, { index: 2, cell: [0, 0, 1], stats: lid }]);
+    expect(lipSides(boxed, [cut(52)], U)).toEqual(new Map([['c1', 1]]));
+    // without the pieces, the boxes between the cuts stand in for them
+    const bounds = { min: [-40, -40, 0], max: [40, 40, 60] };
+    expect(lipSides(null, [cut(52)], null, 'auto', { bounds })).toEqual(new Map([['c1', 1]]));
+    expect(lipSides(null, [cut(30)], null, 'auto', { bounds })).toEqual(new Map([['c1', 0]]));
+    // 5 mm from the end either way: no lip at all
+    expect(lipSides(null, [cut(55)], null, 'auto', { bounds: { min: [-40, -40, 50], max: [40, 40, 60] } })).toEqual(new Map([['c1', null]]));
+  });
+
+  it('a piece that cannot lie with the lip standing up, or no longer fits so, is no male; one given a way down keeps it', () => {
+    const pair = { axis: 2, lo: 1, hi: 2 };
+    // the top would stand on its roof's point but fits; the body, held to lying on its side (a dovetail seam), cannot
+    const held = laidOf([{ index: 1, stats: { ...body, allowed: ['-x', '+x'] } }, { index: 2, cell: [0, 0, 1], stats: top }]);
+    expect(statsWithLip(held[0].stats, '+z')).toBeNull();
+    expect(apartMales(held, U)([pair])).toEqual([{ male: 1, piece: 2, down: '+z' }]);
+    // a body 6 mm short of the bed's height no longer fits with the lip
+    const tall = boxStats([100, 100, 245], ['+z']);
+    const lidded = laidOf([{ index: 1, stats: tall }, { index: 2, cell: [0, 0, 1], stats: boxStats([100, 100, 20], ['-z'], { '+z': { bed: 0, support: 9000 } }) }]);
+    expect(lidded[0].lying.fits).toBe(true);
+    expect(chooseOrientation(statsWithLip(tall, '+z'), U).fits).toBe(false);
+    expect(apartMales(lidded, U)([pair])[0]).toMatchObject({ male: 1, down: '+z' });
+    // the lid then lies on its top with nothing under it: the body, 2 mm too tall with the lip, is named, and how much
+    expect(apartMales(lidded, U)([pair])[0].alt).toEqual({ k: 0, piece: 1, down: '-z', why: 'tall', over: 2 });
+    // neither: no lip
+    const both = laidOf([{ index: 1, stats: { ...body, allowed: ['-x'] } }, { index: 2, cell: [0, 0, 1], stats: { ...top, allowed: ['-z'] } }]);
+    expect(apartMales(both, U)([pair])).toEqual([null]);
+    // three pieces with two cuts that come apart: the middle one, given the first cut's lip lying on its top, cannot take
+    // the second's too, which would stand it on its foot – that goes on the top piece
+    const ring = boxStats([100, 100, 90], ['-z', '+z']);
+    const stack = laidOf([
+      { index: 1, stats: boxStats([100, 100, 100], ['+z']) }, { index: 2, cell: [0, 0, 1], stats: ring }, { index: 3, cell: [0, 0, 2], stats: boxStats([100, 100, 20], ['-z']) },
+    ]);
+    const pairs = [{ axis: 2, lo: 1, hi: 2, quality: [null, { H: 6, clips: 4, area: 500 }] }, { axis: 2, lo: 2, hi: 3 }];
+    expect(apartMales(stack, U)(pairs)).toEqual([{ male: 1, piece: 2, down: '+z' }, { male: 1, piece: 3, down: '+z' }]);
+    expect(apartMales(stack, U)([pairs[1]])).toEqual([{ male: 0, piece: 2, down: '-z' }]);
+    // so does a piece given its way down by an earlier cut's lips, the layout asking cut by cut
+    expect(apartMales(stack, U)([pairs[1]], new Map([[2, '+z']]))).toEqual([{ male: 1, piece: 3, down: '+z' }]);
+    // and with no lip on the top piece either, the second cut has none
+    expect(apartMales(stack, U)([pairs[0], { ...pairs[1], quality: [{ H: 6, clips: 4, area: 500 }, null] }])).toEqual([{ male: 1, piece: 2, down: '+z' }, null]);
+    // a piece of several shells only where every one of them rests on the bed lying so
+    const shells = [{ min: [0, 0, 0], max: [100, 100, 90] }, { min: [0, 0, 50], max: [10, 10, 90] }];
+    const parted = laidOf([{ index: 1, stats: ring, boxes: shells }, { index: 2, cell: [0, 0, 1], stats: boxStats([100, 100, 20], ['-z']) }]);
+    expect(statsWithLip(ring, '+z', 6, shells)).toBeNull();
+    expect(statsWithLip(ring, '-z', 6, shells).allowed).toEqual(['+z']);
+    expect(apartMales(parted, U)([{ axis: 2, lo: 1, hi: 2 }])).toEqual([{ male: 1, piece: 2, down: '+z' }]);
+  });
+
+  it('a piece carrying a lip is laid again with it standing up: its size counts it, and the lip is why it lies so', () => {
+    const lantern = laidOf([{ index: 1, stats: body }, { index: 2, cell: [0, 0, 1], stats: top }]);
+    const lip = { cutId: 'c1', letter: 'A', axis: 2, at: 190, dir: 1, male: 1, down: '-z', H: 6, sides: [{ piece: 1, male: true }, { piece: 2, male: false }] };
+    const grown = statsWithLip(body, '+z');
+    expect(grown.bbox.max[2]).toBe(196);
+    expect(grown.dims).toEqual([100, 100, 196]);
+    expect(grown.dirs['-z'].extent).toBe(196);
+    expect(grown.allowed).toEqual(['-z']);
+    const [male, female] = layGrown(lantern, { lips: [lip] }, U);
+    expect(male).toMatchObject({ lip: true, down: '-z', fits: true, size: [100, 100, 196], notes: [] });
+    expect(male).not.toHaveProperty('pegged');
+    expect(female).toBe(lantern[1].lying);
+    // a shorter lip counts as itself, a male above the cut lies on its far end, and one with no lip is as it was
+    expect(layGrown(lantern, { lips: [{ ...lip, H: 4.5 }] }, U)[0].size).toEqual([100, 100, 194.5]);
+    const above = { ...lip, dir: -1, male: 2, down: undefined, sides: [{ piece: 1, male: false }, { piece: 2, male: true }] };
+    expect(layGrown(lantern, { lips: [above] }, U)[1]).toMatchObject({ lip: true, down: '+z', size: [110, 110, 76] });
+    expect(layGrown(lantern, { lips: [{ ...lip, H: 0 }] }, U)[0]).toBe(lantern[0].lying);
+    // a cut through four posts gives the piece below a lip on each of its four faces, all standing out of one plane:
+    // its box takes in one lip, the tallest, not four
+    const posts = [0, 1, 2, 3].map((patch) => ({ ...lip, patch, H: patch === 2 ? 4.5 : 6 }));
+    expect(layGrown(lantern, { lips: posts }, U)[0].size).toEqual([100, 100, 196]);
+    expect(layGrown(lantern, { lips: posts.map((l) => ({ ...l, H: 4.5 })) }, U)[0].size).toEqual([100, 100, 194.5]);
+    // asked to lie on its cut faces, the body cannot with the lip up – which goes without saying
+    const cutFirst = laidOf([{ index: 1, stats: body }], U, 'cut');
+    expect(cutFirst[0].lying.down).toBe('+z');
+    expect(chooseOrientation(grown, U, 'cut').notes.map((n) => n.code)).toEqual(['ORIENT_FALLBACK']);
+    expect(layGrown(cutFirst, { lips: [lip] }, U, 'cut')[0]).toMatchObject({ down: '-z', notes: [] });
+    // a dome's half that carries the lip stands on its curve: the lip, not its shape, is why
+    const curved = { bed: 0, support: 6000 };
+    const dome = boxStats([70, 70, 55], ['-z'], { '+z': curved, '-x': curved, '+x': curved, '-y': curved, '+y': curved });
+    const laid = laidOf([{ index: 1, stats: dome }]);
+    expect(laid[0].lying).toMatchObject({ down: '-z', notes: [] });
+    const [o] = layGrown(laid, { lips: [{ ...lip, dir: -1, down: '+z', sides: [{ piece: 1, male: true }] }] }, U);
+    expect(o.notes).toEqual([expect.objectContaining({ code: 'PIECE_UNSTABLE', level: 'warn', pieceIndex: 1, lip: true })]);
+    expect(o.notes[0].text).toBe('Piece 1 has nothing flat to stand on but the face its lip stands out of – it rests on a curve or an edge and needs supports.');
+    // pegs and a lip on one piece: both in its box, never on the pegs' face
+    const pegs = [{ axis: 0, at: 50, centre: [50, 0, 100], s: 6, length: 9, dir: 1, sides: [{ piece: 1, peg: true }] }];
+    expect(layGrown(lantern, { pegs, lips: [lip] }, U)[0]).toMatchObject({ lip: true, pegged: true, down: '-z', size: [109, 100, 196] });
+    // the pegs alone, as before
+    expect(layGrown(lantern, { pegs }, U)[0]).toEqual(layPegged(lantern, pegs, U)[0]);
+    expect(layPegged(lantern, pegs, U)[1]).toBe(lantern[1].lying);
+  });
+
+  it('pegs keep off the face a piece must lie on for its lip', () => {
+    // pegs across a cut under a ring whose top has a lip: the ring would carry them, as the piece under it lies on that
+    // face, but lying on its foot for the lip it cannot – so the piece under it does
+    const curved = { bed: 0, support: 6000 };
+    const under = boxStats([100, 100, 60], ['+z'], { '-z': curved, '-x': curved, '+x': curved, '-y': curved, '+y': curved });
+    const ring = boxStats([100, 100, 90], ['-z', '+z']);
+    const laid = laidOf([{ index: 1, stats: under }, { index: 2, cell: [0, 0, 1], stats: ring }]);
+    expect(laid.map((p) => p.lying.down)).toEqual(['+z', '-z']);
+    const pair = { axis: 2, lo: 1, hi: 2 };
+    expect(pegMales(laid, U)([pair])).toEqual([1]);
+    expect(pegMales(laid, U, 'auto', { forced: new Map([[2, '-z']]) })([pair])).toEqual([0]);
+    expect(pegMales(laid, U, 'auto', { forced: new Map() })([pair])).toEqual([1]);
+  });
+
+  it('the notes say which piece comes off, what holds it and what to do when nothing can', () => {
+    const note = (code, fields) => splitNote(code, { letter: 'A', cutId: 'c1', ...fields });
+    expect(note('APART', { axis: 2, male: 1, female: 2, hold: 'snap', clips: 4, height: 6, faces: 1, flat: 0 })).toMatchObject({
+      level: 'info', code: 'APART', male: 1, clips: 4,
+      text: 'Cut A comes apart: the top (piece 2) clicks onto a 6 mm lip on piece 1 – 4 clips hold it, and it pulls off again by hand.',
+    });
+    expect(note('APART', { axis: 2, male: 1, female: 2, hold: 'light', clips: 4, height: 6 }).text)
+      .toBe('Cut A comes apart: the top (piece 2) clicks lightly onto a 6 mm lip on piece 1 – 4 clips hold it, and it pulls off again by hand.');
+    expect(note('APART', { axis: 2, male: 1, female: 2, hold: 'lift', clips: 0, height: 6 }).text)
+      .toBe('Cut A comes apart: the top (piece 2) sits on a 6 mm lip on piece 1 and lifts straight off.');
+    expect(note('APART', { axis: 2, male: 1, female: 2, hold: 'snap', clips: 0, height: 4.5 }).text)
+      .toBe('Cut A comes apart: the top (piece 2) sits on a 4.5 mm lip on piece 1 and lifts straight off.');
+    expect(note('APART', { axis: 2, male: 1, female: 2, hold: 'snap', clips: 1, height: 6 }).text)
+      .toBe('Cut A comes apart: the top (piece 2) clicks onto a 6 mm lip on piece 1 – 1 clip holds it, on one side only, and it pulls off again by hand.');
+    expect(note('APART', { axis: 0, male: 1, female: 2, hold: 'snap', clips: 2, height: 6, flat: 3 }).text)
+      .toBe('Cut A comes apart: piece 2 clicks onto a 6 mm lip on piece 1 – 2 clips hold it, and it pulls off again by hand. 3 small faces beside it just rest on each other.');
+    expect(note('APART', { axis: 2, above: true, male: 2, female: 1, hold: 'snap', clips: 4, height: 6, flat: 1 }).text)
+      .toBe('Cut A comes apart: the top (piece 2) clicks into piece 1 on a 6 mm lip – 4 clips hold it, and it pulls off again by hand. 1 small face beside it just rests on the other piece.');
+    expect(note('APART', { axis: 2, above: true, male: 2, female: 1, hold: 'lift', height: 6 }).text).toBe('Cut A comes apart: the top (piece 2) sits in piece 1 on a 6 mm lip and lifts straight off.');
+    expect(note('APART', { letter: 'B', axis: 2, male: [1, 2], female: [3, 4], hold: 'snap', clips: 6, height: 6, faces: 2 }).text)
+      .toBe('Cut B comes apart: the top (pieces 3 and 4) clicks onto a 6 mm lip on pieces 1 and 2 – 6 clips hold it, and it pulls off again by hand.');
+    // across X or Y several pieces come off together, and the note says they click
+    expect(note('APART', { letter: 'B', axis: 0, male: [1, 3], female: [2, 4], hold: 'snap', clips: 3, height: 6, faces: 2 }).text)
+      .toBe('Cut B comes apart: pieces 2 and 4 click onto a 6 mm lip on pieces 1 and 3 – 3 clips hold them, and they pull off again by hand.');
+    expect(note('APART', { axis: 1, male: [1, 3], female: [2, 4], hold: 'light', clips: 1, height: 6 }).text)
+      .toBe('Cut A comes apart: pieces 2 and 4 click lightly onto a 6 mm lip on pieces 1 and 3 – 1 clip holds them, on one side only, and they pull off again by hand.');
+    expect(note('APART', { axis: 0, male: [1, 3], female: [2, 4], hold: 'lift', height: 6 }).text).toBe('Cut A comes apart: pieces 2 and 4 sit on a 6 mm lip on pieces 1 and 3 and lift straight off.');
+    expect(note('APART_NO_CLIPS', { axis: 0, female: [2, 4], why: 'short' }).text).toBe('Cut A\'s lip has no straight stretch 46 mm long for a clip, so pieces 2 and 4 just lift off.');
+    expect(note('APART_FLAT', { axis: 0, pieces: [[1, 3], [2, 4]], why: 'thin', wall: 2.7 }).text)
+      .toBe('Cut A has no room for a lip – its walls are under 2.7 mm thick – so pieces 2 and 4 just rest on pieces 1 and 3, with nothing to line it up or hold it.');
+    // a face of the cut whose pieces already lie another way for another cut's lip is told apart from a small one
+    expect(note('APART', { axis: 2, male: 2, female: 4, hold: 'snap', clips: 3, height: 6, faces: 1, lying: 1 }).text)
+      .toBe('Cut A comes apart: the top (piece 4) clicks onto a 6 mm lip on piece 2 – 3 clips hold it, and it pulls off again by hand. On 1 other face neither piece can lie with a lip standing up, so the pieces there just rest on each other.');
+
+    expect(note('APART_NO_CLIPS', { axis: 2, female: 2, why: 'height', height: 4.5, need: 9.35, suggestedAt: 190.5 })).toMatchObject({
+      level: 'warn', suggestedAt: 190.5,
+      text: 'Cut A\'s lip is only 4.5 mm tall, so it has no clips and the top just lifts off: a lip that clicks on needs 9.4 mm of plain wall in piece 2 past the cut. Move the cut to 190.5 mm.',
+    });
+    expect(note('APART_NO_CLIPS', { axis: 2, why: 'short' }).text).toBe('Cut A\'s lip has no straight stretch 46 mm long for a clip, so the top just lifts off.');
+    expect(note('APART_NO_CLIPS', { axis: 2, why: 'flex', suggestedAt: 160.5 }).text)
+      .toBe('Cut A\'s lip has no room for clips – something over the opening just above the cut leaves them no room to bow in – so the top just lifts off. Move the cut to 160.5 mm.');
+    expect(note('APART_NO_CLIPS', { axis: 2, why: 'skin' }).text).toBe('Cut A\'s walls are too thin for the clips\' catches, so the top just lifts off.');
+    expect(note('APART_NO_CLIPS', { axis: 1, female: 3, why: 'skin' }).text).toBe('Cut A\'s walls are too thin for the clips\' catches, so piece 3 just lifts off.');
+
+    expect(note('APART_FLAT', { axis: 2, pieces: [1, 2], why: 'thin', wall: 2.7 })).toMatchObject({
+      level: 'warn', text: 'Cut A has no room for a lip – its walls are under 2.7 mm thick – so the top just rests on piece 1, with nothing to line it up or hold it.',
+    });
+    expect(note('APART_FLAT', { axis: 0, pieces: [1, 2], why: 'thin', wall: 2 }).text)
+      .toBe('Cut A has no room for a lip – its walls are under 2 mm thick – so piece 2 just rests on piece 1, with nothing to line it up or hold it.');
+    expect(note('APART_FLAT', { axis: 2, pieces: [1, 2], why: 'room', need: 6.35, suggestedAt: 190.5 }).text)
+      .toBe('Cut A has no room for a lip – piece 2 has under 6.4 mm of plain wall past the cut before a roof, a ledge or an opening. Move the cut to 190.5 mm.');
+    expect(note('APART_FLAT', { why: 'lying' }).text).toBe('Cut A has no lip: neither piece fits your printer lying with the lip standing up out of it, so the pieces just rest on each other.');
+    expect(note('APART_FLAT', { why: 'small' }).text).toBe('Cut A runs through openings, so its faces are too small for a lip – cut through a solid band of the model.');
+    // the pieces already lying another way for another cut's lip; the piece that prints as well too tall with one
+    expect(note('APART_FLAT', { letter: 'B', why: 'lying', by: ['A'], fixed: 2 }).text)
+      .toBe('Cut B has no lip: piece 2 already lies another way for cut A\'s lip, and the other piece can\'t carry one, so the pieces just rest on each other.');
+    expect(note('APART_FLAT', { letter: 'C', why: 'lying', by: ['A', 'B'], fixed: [1, 3] }).text)
+      .toBe('Cut C has no lip: pieces 1 and 3 already lie another way for cuts A and B\' lips, and the other piece can\'t carry one, so the pieces just rest on each other.');
+    expect(note('APART_FLAT', { why: 'tall', piece: 1, other: 2, suggestedAt: 189 })).toMatchObject({
+      level: 'warn', suggestedAt: 189,
+      text: 'Cut A has no lip: piece 1 would be too tall for your printer standing up with one, and piece 2 would need supports carrying it. Move the cut to 189 mm.',
+    });
+    expect(note('APART_FLAT', { axis: 0, pieces: [[1, 3], [2, 4]], why: 'room', need: 6.35 }).text)
+      .toBe('Cut A has no room for a lip – pieces 2 and 4 have under 6.4 mm of plain wall past the cut before a roof, a ledge or an opening.');
+    expect(note('APART_NO_CLIPS', { axis: 2, why: 'edge', suggestedAt: 160.5 }).text)
+      .toBe('Cut A runs along the edge of an opening or a ledge, which breaks its lip into short stretches, so it has no clips and the top just lifts off. Move the cut to 160.5 mm.');
+
+    expect(note('APART_HEAVY', { weight: 274, hold: 4.2 })).toMatchObject({
+      level: 'info', hold: 4.2, text: 'Cut A\'s clips may not hold up what hangs below it (about 270 g) – carry the model by its base, not its top.',
+    });
+    expect(note('APART_HEAVY', { weight: 1340 }).text).toMatch(/\(about 1\.3 kg\)/);
+    expect(splitNote('APART_KEPT', { letters: ['A'] })).toMatchObject({
+      level: 'info', text: 'Cut A comes apart, so Fit to my printer kept it where it is and planned the other cuts around it.',
+    });
+    expect(splitNote('APART_KEPT', { letters: ['A', 'C'] }).text).toBe('Cuts A and C come apart, so Fit to my printer kept them where they are and planned the other cuts around them.');
+
+    // the notes that were there say so too
+    expect(splitNote('SPLIT', { pieces: 2, apart: ['A'] }).text).toBe('Cut into 2 pieces. Cut A comes apart – don\'t glue it.');
+    expect(splitNote('SPLIT', { pieces: 4, dowels: 4, diameter: 6, length: 19, pairs: ['1B ↔ 2B'], apart: ['A', 'C'] }).text)
+      .toBe('Cut into 4 pieces with 4 pins Ø6 × 19 mm. Glue matching letters together: 1B ↔ 2B. Cuts A and C come apart – don\'t glue them.');
+    expect(splitNote('SPLIT', { pieces: 2 }).text).toBe('Cut into 2 pieces.');
+    expect(splitNote('SPLIT_NOT_NEEDED', { apart: ['A'] }).text).toBe('This model fits your printer with cut A as it is – no more cuts needed.');
+    expect(splitNote('SPLIT_NOT_NEEDED', { apart: ['A', 'B'] }).text).toBe('This model fits your printer with cuts A and B as they are – no more cuts needed.');
+    expect(splitNote('DOVETAIL', { letter: 'A', tabs: 2, pieces: [1, 2], apart: true }).text)
+      .toBe('Cut A goes through a thin plate, so it comes apart on 2 dovetail tabs – lay both pieces flat and lower piece 2 onto piece 1; lift it off again to take it apart. Don\'t glue it.');
+    expect(splitNote('DOVETAIL', { letter: 'A', tabs: 2, pieces: [1, 2] }).text).toBe('Cut A goes through a thin plate, so it has 2 dovetail tabs instead of pins – lay both pieces flat and lower piece 2 onto piece 1.');
+  });
+
+  describe('steps and the glue sheet', () => {
+    const apart = (fields = {}) => ({ hold: 'snap', lip: true, clips: 4, height: 6, key: true, faces: 1, flat: 0, ...fields });
+    const lipSeam = (fields = {}) => ({ letter: 'A', axis: 2, at: 190, pieces: [1, 2], joint: 'lip', dowels: [], pegs: [], male: 1, labels: null, apart: apart(), ...fields });
+    const two = [{ index: 1, cell: [0, 0, 0], size: [108, 108, 196], lies: 'flat as modelled' }, { index: 2, cell: [0, 0, 1], size: [110, 110, 101], lies: 'on a cut face' }];
+    const text = (seams, pieces = two) => assemblySteps({ pieces, seams })[0].text;
+
+    it('a cut that comes apart is never glued, and says so first: how it goes on, by its hold and its lip', () => {
+      const [step] = assemblySteps({ pieces: two, seams: [lipSeam()] });
+      expect(step).toMatchObject({ letter: 'A', axis: 2, pieces: [1], joins: [2], pins: 0, pegs: 0, apart: true });
+      expect(step.text).toBe('Do not glue cut A: it comes apart. Press the top on until it clicks. It goes on one way round only – turn it until it drops onto the lip.');
+      expect(text([lipSeam({ apart: apart({ hold: 'light' }) })])).toBe(step.text);
+      expect(text([lipSeam({ male: 2 })])).toBe(step.text); // the lip on the top: it clicks on all the same
+      expect(text([lipSeam({ axis: 0, at: 0 })], [{ index: 1, cell: [0, 0, 0] }, { index: 2, cell: [1, 0, 0] }]))
+        .toBe('Do not glue cut A: it comes apart. Press piece 2 onto piece 1 until it clicks. It goes on one way round only – turn it until it drops onto the lip.');
+      const lifts = 'Do not glue cut A: it comes apart. Set the top on its lip – it goes on one way round only – and lift it off to open it.';
+      expect(text([lipSeam({ apart: apart({ hold: 'lift', clips: 0 }) })])).toBe(lifts);
+      expect(text([lipSeam({ apart: apart({ clips: 0, height: 4.5 }) })])).toBe(lifts);
+      expect(text([lipSeam({ joint: 'none', male: null, apart: apart({ lip: false, clips: 0, key: false }) })]))
+        .toBe('Do not glue cut A: it comes apart. Set the top on piece 1 and line the edges up – nothing holds it.');
+      expect(text([lipSeam({ axis: 0, at: 0, joint: 'dovetail', male: null, apart: apart({ lip: false, clips: 0, tabs: 2 }) })], [{ index: 1, cell: [0, 0, 0] }, { index: 2, cell: [1, 0, 0] }]))
+        .toBe('Do not glue cut A: it comes apart. Lay pieces 1 and 2 flat and lower piece 2\'s tabs into piece 1; lift it out to take it apart.');
+      // the steps of glued cuts carry no flag
+      expect(assemblySteps({ pieces: two, seams: [{ letter: 'A', axis: 2, at: 190, pieces: [1, 2], joint: 'none', dowels: 0, labels: null }] })[0]).not.toHaveProperty('apart');
+    });
+
+    it('it goes on last, after every glued cut, whichever axis it is on', () => {
+      // a base that comes off under a glued top: the top is glued first
+      const three = [{ index: 1, cell: [0, 0, 0] }, { index: 2, cell: [0, 0, 1] }, { index: 3, cell: [0, 0, 2] }];
+      const steps = assemblySteps({
+        pieces: three,
+        seams: [lipSeam({ at: 100 }), { letter: 'B', axis: 2, at: 190, pieces: [2, 3], joint: 'dowels', dowels: 2, labels: ['2B', '3B'] }],
+      });
+      expect(steps.map((s) => [s.letter, Boolean(s.apart)])).toEqual([['B', false], ['A', true]]);
+      // a top of two pieces glued across X first
+      const four = [{ index: 1, cell: [0, 0, 0] }, { index: 2, cell: [1, 0, 0] }, { index: 3, cell: [0, 0, 1] }, { index: 4, cell: [1, 0, 1] }];
+      const crossed = assemblySteps({
+        pieces: four,
+        seams: [
+          lipSeam({ letter: 'B', pieces: [1, 3], apart: apart({ clips: 3, faces: 2 }) }), lipSeam({ letter: 'B', pieces: [2, 4], male: 2, apart: apart({ clips: 3, faces: 2 }) }),
+          { letter: 'A', axis: 0, at: 0, pieces: [1, 2], joint: 'dowels', dowels: 2, labels: ['1A', '2A'] },
+          { letter: 'A', axis: 0, at: 0, pieces: [3, 4], joint: 'dowels', dowels: 2, labels: ['3A', '4A'] },
+        ],
+      });
+      expect(crossed.map((s) => s.letter)).toEqual(['A', 'A', 'B']);
+      expect(crossed[2]).toMatchObject({ pieces: [1, 2], joins: [3, 4], apart: true });
+      expect(crossed[2].text).toBe('Do not glue cut B: it comes apart. Press the top (pieces 3 and 4) on until it clicks. It goes on one way round only – turn it until it drops onto the lip.');
+      // a take-apart X cut goes on after a glued Z one
+      const sideways = assemblySteps({
+        pieces: four,
+        seams: [
+          lipSeam({ axis: 0, at: 0, pieces: [1, 2] }), lipSeam({ axis: 0, at: 0, pieces: [3, 4], male: 3 }),
+          { letter: 'B', axis: 2, at: 50, pieces: [1, 3], joint: 'none', dowels: 0, labels: null },
+          { letter: 'B', axis: 2, at: 50, pieces: [2, 4], joint: 'none', dowels: 0, labels: null },
+        ],
+      });
+      expect(sideways.map((s) => s.letter)).toEqual(['B', 'A', 'A']);
+      // two pieces beyond an X cut in one row (a box whose two shells print apart) go on together: they click
+      const shells = [{ index: 1, cell: [0, 0, 0] }, { index: 2, cell: [1, 0, 0] }, { index: 3, cell: [1, 0, 0] }];
+      const both = (fields) => assemblySteps({ pieces: shells, seams: [lipSeam({ axis: 0, at: 0, pieces: [1, 2], ...fields }), lipSeam({ axis: 0, at: 0, pieces: [1, 3], ...fields })] });
+      expect(both({})[0].text).toBe('Do not glue cut A: it comes apart. Press pieces 2 and 3 onto piece 1 until they click. They go on one way round only – turn them until they drop onto the lip.');
+      expect(both({ apart: apart({ hold: 'lift', clips: 0 }) })[0].text)
+        .toBe('Do not glue cut A: it comes apart. Set pieces 2 and 3 against piece 1 on the lip – they go on one way round only – and lift them off to open it.');
+    });
+
+    it('the glue sheet: lips and clips need no supports, the pieces say which has the lip, and nothing is glued', () => {
+      const sheet = howToGlueText({ name: 'lantern', pieces: two, seams: [lipSeam()], clearance: 0.15, printer: { size: [220, 220, 250], margin: 5 } });
+      const lines = sheet.split('\n');
+      expect(lines).toContain('PRINT (each file is already turned the way to print it; lips and clips need no supports)');
+      expect(lines).toContain('  piece 1 of 2   108.0 × 108.0 × 196.0 mm   lies flat as modelled   fits, lip for cut A');
+      expect(lines).toContain('  piece 2 of 2   110.0 × 110.0 × 101.0 mm   lies on a cut face   fits, comes off at cut A');
+      expect(lines).toContain('  Clips are 40 mm bridges over a slot: print with bridging on (the default) and no supports.');
+      expect(lines).toContain('  Not sure about the fit? Print the fit test first (Split card → Download fit test).');
+      expect(lines).toContain('  The top of cut A should click onto its lip and pull off again by hand. Too stiff: raise Clearance by 0.05 mm (or set the cut to Light click); no click or too loose: lower it by 0.05 mm, and download again.');
+      expect(sheet).not.toContain('Hold the pieces together');
+      expect(sheet).not.toContain('GLUE –');
+      expect(sheet).not.toContain('LAST');
+      expect(sheet.trimEnd().split('\n').slice(-2)).toEqual([
+        'PUT TOGETHER – nothing is glued',
+        '  1. Do not glue cut A: it comes apart. Press the top on until it clicks. It goes on one way round only – turn it until it drops onto the lip.',
+      ]);
+      // Light click asks for no lighter one; Lifts off just drops on, with no clips to bridge
+      expect(howToGlueText({ name: 'l', pieces: two, seams: [lipSeam({ apart: apart({ hold: 'light' }) })] }))
+        .toContain('  The top of cut A should click onto its lip and pull off again by hand. Too stiff: raise Clearance by 0.05 mm; no click or too loose: lower it by 0.05 mm, and download again.');
+      const lifts = howToGlueText({ name: 'l', pieces: two, seams: [lipSeam({ apart: apart({ hold: 'lift', clips: 0 }) })] });
+      expect(lifts).toContain('PRINT (each file is already turned the way to print it; lips need no supports)');
+      expect(lifts).toContain('  The top of cut A should drop onto its lip and lift off freely.');
+      expect(lifts).not.toContain('Clips are');
+      // the lip on the top, across X: the piece that comes off is named
+      const side = [{ index: 1, cell: [0, 0, 0], size: [100, 40, 20], lies: 'flat as modelled' }, { index: 2, cell: [1, 0, 0], size: [106, 40, 20], lies: 'flat as modelled' }];
+      const across = howToGlueText({ name: 'bar', pieces: side, seams: [lipSeam({ axis: 0, at: 100, male: 2 })] });
+      expect(across).toContain('  Piece 1 of cut A should click onto its lip');
+      expect(across).toMatch(/piece 1 of 2 .* fits, comes off at cut A/);
+      expect(across).toMatch(/piece 2 of 2 .* fits, lip for cut A/);
+      // a box's lid with the lip: the lid is still what comes off, and the box stays where it is
+      const lidded = howToGlueText({ name: 'box', pieces: two, seams: [lipSeam({ male: 2 })] });
+      expect(lidded).toMatch(/piece 1 of 2 .* fits\n/);
+      expect(lidded).toMatch(/piece 2 of 2 .* fits, lip for cut A, comes off at cut A\n/);
+    });
+
+    it('with glued cuts too, they come first and the cut that comes apart last, numbered on', () => {
+      const three = [
+        { index: 1, cell: [0, 0, 0], size: [100, 100, 100], lies: 'flat as modelled' }, { index: 2, cell: [0, 0, 1], size: [100, 100, 96], lies: 'on a cut face' },
+        { index: 3, cell: [0, 0, 2], size: [110, 110, 101], lies: 'on a cut face' },
+      ];
+      const seams = [{ letter: 'B', axis: 2, at: 100, pieces: [1, 2], joint: 'dowels', dowels: 4, labels: ['1B', '2B'] }, lipSeam({ pieces: [2, 3], male: 2 })];
+      const lines = howToGlueText({ name: 'lantern', pieces: three, seams, pins: [{ d: 6, length: 19, count: 4 }], clearance: 0.15 }).split('\n');
+      const at = lines.indexOf('LAST – DO NOT GLUE');
+      expect(lines.slice(at - 4, at + 2)).toEqual([
+        'GLUE – put each letter on the same letter (medium/thick CA or 5-minute epoxy; holes have 0.15 mm of room per side)',
+        '  Matching faces: 1B ↔ 2B',
+        '  1. Cut B: glue 4 pins into face 1B, a thin film on the face, push piece 2 on (2B). Hold 1 minute.',
+        '',
+        'LAST – DO NOT GLUE',
+        '  2. Do not glue cut A: it comes apart. Press the top on until it clicks. It goes on one way round only – turn it until it drops onto the lip.',
+      ]);
+      expect(lines).toContain('PRINT (each file is already turned the way to print it; holes and lips and clips need no supports)');
+      expect(lines).toContain('  Pins should slide in by hand. Too tight: raise Clearance by 0.05 mm and download again.');
+      expect(lines.filter((l) => /lip for cut A/.test(l))).toEqual([expect.stringMatching(/^ {2}piece 2 of 3/)]);
+      expect(lines.filter((l) => /comes off at cut A/.test(l))).toEqual([expect.stringMatching(/^ {2}piece 3 of 3/)]);
+      expect(lines).not.toContain('PUT TOGETHER – nothing is glued');
+    });
   });
 });

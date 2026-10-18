@@ -42,7 +42,7 @@ import { MeshBVH, acceleratedRaycast } from 'three-mesh-bvh';
 import { geometryFromBuffers } from './mesh.js';
 import { clickRadius, surfaceNormalAt } from './surfaceNormal.js';
 import {
-  CUT_COLOR, PIECE_COLORS, PIN_COLOR, TOO_BIG_COLOR, axisCuts, cellSizes, cutPlane, explodeOffset, letterFor, offsetAlongRay, pieceColorIndex, triangleInBox,
+  APART_COLOR, CUT_COLOR, PIECE_COLORS, PIN_COLOR, TOO_BIG_COLOR, axisCuts, cellSizes, cutPlane, explodeOffset, letterFor, offsetAlongRay, pieceColorIndex, triangleInBox,
 } from './split.js';
 
 Mesh.prototype.raycast = acceleratedRaycast;
@@ -56,6 +56,7 @@ const COLORS = {
   spot: 0x22d3a6, // a clean-up spot's ring
   marker: 0x22d3a6,
   cutHover: 0xa78bfa, // a cut's handle under the pointer or being dragged
+  apartHover: 0x2dd4bf, // the same for a cut that comes apart
   tooBig: 0xd6294b, // the number of a piece too big for the printer (the page's --err)
 };
 
@@ -204,20 +205,31 @@ function markedCells(seen, grid) {
 }
 
 /**
- * The cuts a caller passed, read as planes `{ id, letter, axis, at }`. Takes
- * the document's cuts (`{ id, position, normal }`, lettered by their place in
- * the list) or normalised ones; a cut that is not straight is left out. What
- * a cut's dovetail tabs add to the pieces (`reach`, `w`: see `cellSizes`) is kept.
+ * The cuts a caller passed, read as planes `{ id, letter, axis, at, apart }`.
+ * Takes the document's cuts (`{ id, position, normal, joint? }`, lettered by
+ * their place in the list) or normalised ones (`apart: { hold }`); a cut that
+ * is not straight is left out. What a cut's dovetail tabs add to the pieces
+ * (`reach`, `w`: see `cellSizes`) is kept; `apart` says it comes apart.
  */
 function readCuts(cuts) {
   const out = [];
   (cuts ?? []).forEach((cut, i) => {
     const plane = cutPlane(cut);
     if (!plane) return;
-    out.push({ id: cut.id ?? `c${i + 1}`, letter: cut.letter ?? letterFor(i), axis: plane.axis, at: plane.at, ...(cut.reach ? { reach: cut.reach, w: cut.w } : {}) });
+    out.push({
+      id: cut.id ?? `c${i + 1}`,
+      letter: cut.letter ?? letterFor(i),
+      axis: plane.axis,
+      at: plane.at,
+      apart: cut.joint === 'apart' || !!cut.apart,
+      ...(cut.reach ? { reach: cut.reach, w: cut.w } : {}),
+    });
   });
   return out;
 }
+
+/** The colour of a cut's plane, edge, handle and badge: teal for one that comes apart, violet for a glued one. */
+const cutColor = (cut) => (cut.apart ? APART_COLOR : CUT_COLOR);
 
 /** Triangle ranges `[start, count]` clipped to the triangles t0 … t0 + tc, relative to t0. */
 function rangesWithin(ranges, t0, tc) {
@@ -309,11 +321,12 @@ function handleGeometry() {
  *    item, dragging the selected item moves it live
  *  - the "final result" mesh can replace the model on screen while picking
  *    still happens on the (hidden) model
- *  - a split for printing draws its cuts as violet planes with a lettered
- *    badge and a handle that drags the plane along its axis; while editing,
- *    the model is coloured by the piece each part of it will go to (clipping
- *    planes on the GPU, so it follows a drag on every frame); the computed
- *    pieces replace the model in the "pieces" view, pulled apart by Spread
+ *  - a split for printing draws its cuts as violet planes (teal for one that
+ *    comes apart) with a lettered badge and a handle that drags the plane
+ *    along its axis; while editing, the model is coloured by the piece each
+ *    part of it will go to (clipping planes on the GPU, so it follows a drag
+ *    on every frame); the computed pieces replace the model in the "pieces"
+ *    view, pulled apart by Spread
  *
  * View modes (`viewMode`): 'model' (the model and the text being edited),
  * 'result' (the final result) and 'pieces' (the computed pieces). Hover and
@@ -641,11 +654,12 @@ export class Viewer {
   /* -------------------------------------------------------- cut planes */
 
   /**
-   * Show the cuts of a split as violet planes across the model, each with
-   * its letter and a handle that drags it, or none for null. Cuts that are
-   * not straight along X, Y or Z are left out. Existing planes are updated
-   * in place, so this is cheap to call on every render.
-   * @param {object[]|null} cuts the document's cuts (`{ id, position, normal }`, lettered by list order) or normalised ones (`{ id, letter, axis, at }`)
+   * Show the cuts of a split as violet planes across the model – teal for
+   * one that comes apart – each with its letter and a handle that drags it,
+   * or none for null. Cuts that are not straight along X, Y or Z are left
+   * out. Existing planes are updated in place, so this is cheap to call on
+   * every render.
+   * @param {object[]|null} cuts the document's cuts (`{ id, position, normal, joint? }`, lettered by list order) or normalised ones (`{ id, letter, axis, at, apart? }`)
    * @param {{ selectedId?: string|null, bounds?: { min: number[], max: number[] }|null }} [options]
    *   `bounds` (model and text, e.g. from the engine's measure) sizes the planes and limits a drag; the model's bounds without it
    */
@@ -660,7 +674,12 @@ export class Viewer {
         o.axis = c.axis;
         this.#orientCut(o);
       }
-      if (o.letter !== c.letter) this.#letterCut(o, c.letter);
+      if (o.letter !== c.letter || o.apart !== c.apart) {
+        o.apart = c.apart;
+        o.fill.material.color.setHex(cutColor(o));
+        o.edge.material.color.setHex(cutColor(o));
+        this.#letterCut(o, c.letter);
+      }
       o.at = this.cutDrag?.id === c.id ? this.cutDrag.at : c.at; // a render during a drag must not snap the plane back
       o.selected = c.id === selectedId;
     }
@@ -702,14 +721,15 @@ export class Viewer {
     return this.cutBoundsGiven ?? this.bounds;
   }
 
-  #addCut({ id, letter, axis, at }) {
-    const fill = new Mesh(this.shapes.quad, new MeshBasicMaterial({ color: CUT_COLOR, transparent: true, opacity: 0.14, side: DoubleSide, depthWrite: false }));
+  #addCut({ id, letter, axis, at, apart = false }) {
+    const color = cutColor({ apart });
+    const fill = new Mesh(this.shapes.quad, new MeshBasicMaterial({ color, transparent: true, opacity: 0.14, side: DoubleSide, depthWrite: false }));
     fill.raycast = () => {}; // the model behind a plane stays clickable: only the handle picks a cut
     fill.renderOrder = 6;
-    const edge = new LineSegments(this.shapes.edges, new LineBasicMaterial({ color: CUT_COLOR, transparent: true, opacity: 0.6, depthTest: false }));
+    const edge = new LineSegments(this.shapes.edges, new LineBasicMaterial({ color, transparent: true, opacity: 0.6, depthTest: false }));
     edge.raycast = () => {};
     edge.renderOrder = 11;
-    const handle = new Mesh(this.shapes.handle, new MeshBasicMaterial({ color: CUT_COLOR, side: DoubleSide, depthTest: false, transparent: true }));
+    const handle = new Mesh(this.shapes.handle, new MeshBasicMaterial({ color, side: DoubleSide, depthTest: false, transparent: true }));
     handle.raycast = () => {};
     handle.renderOrder = 12;
     // a larger, invisible ball around the handle is what picks it, so a thin arrow is easy to grab
@@ -719,7 +739,7 @@ export class Viewer {
     const group = new Group();
     group.add(fill, edge, handle, pick);
     this.cutGroup.add(group);
-    const c = { id, letter: null, axis, at, selected: false, group, fill, edge, handle, pick, badge: null };
+    const c = { id, letter: null, axis, at, apart, selected: false, group, fill, edge, handle, pick, badge: null };
     this.cuts.set(id, c);
     this.#orientCut(c);
     this.#letterCut(c, letter);
@@ -749,7 +769,7 @@ export class Viewer {
       disposeSprite(c.badge);
     }
     c.letter = letter;
-    c.badge = labelSprite(letter, { fill: cssColor(CUT_COLOR), ring: '#ffffff' });
+    c.badge = labelSprite(letter, { fill: cssColor(cutColor(c)), ring: '#ffffff' });
     c.badge.scale.setScalar(this.#spriteScale(c.badge.userData.px));
     c.group.add(c.badge);
   }
@@ -796,7 +816,7 @@ export class Viewer {
       const active = c.id === this.hoverCutId || c.id === this.cutDrag?.id;
       c.fill.material.opacity = c.selected ? 0.28 : 0.14;
       c.edge.material.opacity = c.selected ? 1 : 0.6;
-      c.handle.material.color.setHex(active ? COLORS.cutHover : CUT_COLOR);
+      c.handle.material.color.setHex(active ? (c.apart ? COLORS.apartHover : COLORS.cutHover) : cutColor(c));
       c.handle.material.opacity = c.selected || active ? 1 : 0.8;
       c.badge.userData.px = c.selected ? 27 : 22;
       c.badge.scale.setScalar(this.#spriteScale(c.badge.userData.px));

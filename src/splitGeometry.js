@@ -1,11 +1,12 @@
 /**
  * Split for printing, the solid half: the Manifold builders behind it. Holes,
- * pins, built-in square pegs and their sockets, the fit test, dovetail tabs
- * through thin plates, cutting the model into one piece per cell, finding
- * room for pins, pegs and labels on each cut face, and drilling the pieces.
- * Every function takes Manifolds and plain specs and returns Manifolds or
- * plain data; the rules themselves (sizes, frames, where pins and pegs go,
- * how pieces lie, notes) live in split.js.
+ * pins, built-in square pegs and their sockets, the lips and grooves of the
+ * cuts that come apart, the fit test, dovetail tabs through thin plates,
+ * cutting the model into one piece per cell, finding room for lips, pins,
+ * pegs and labels on each cut face, and drilling the pieces. Every function
+ * takes Manifolds and plain specs and returns Manifolds or plain data; the
+ * rules themselves (sizes, frames, where pins and pegs go, how pieces lie,
+ * notes) live in split.js.
  *
  * Ownership: a Manifold or CrossSection passed in is borrowed and never
  * deleted; one returned belongs to the caller, who must `.delete()` it.
@@ -19,9 +20,11 @@ import {
   AUTO_DIAMETERS,
   AUTO_PEGS,
   AXES,
+  CLIP,
   CUT_TOLERANCE,
   FILAMENT,
   HOLE_SEGMENTS,
+  LIP,
   POLYGON_K,
   PLATE_THICKNESS,
   SPLIT_DEFAULTS,
@@ -32,14 +35,19 @@ import {
   applyMat4,
   axisCuts,
   boxesBeside,
+  catchSizes,
   cellOf,
   cellOfPoint,
   cellSupport,
   chooseCentres,
   gridPoints,
   liesFlat,
+  lipReach,
+  lipSizesFor,
   localFrame,
   mergeStats,
+  mulMat4,
+  oppositeDir,
   orientationStats,
   pegSizeOf,
   pegSizesFor,
@@ -52,6 +60,7 @@ import {
   smallPieceNotes,
   splitNote,
   teardropApex,
+  translationMat4,
 } from './split.js';
 
 /** Shells smaller than this (mm³) are dust that a cut along a flat face of the model leaves behind, not material. */
@@ -298,6 +307,11 @@ const LABELS = keptShapes(64, (e) => {
   e?.cs?.delete();
   e?.solid?.delete();
 });
+// a lip's tongue and groove by its plan: drilling each piece again takes them again
+const LIPS = keptShapes(16, (e) => {
+  e?.tongue?.delete();
+  e?.cutters?.delete();
+});
 
 /** Deletes the shapes kept between calls (when the engine lets go of everything it holds). */
 export function clearSplitCaches() {
@@ -305,6 +319,7 @@ export function clearSplitCaches() {
   PINS.clear();
   PEGS.clear();
   LABELS.clear();
+  LIPS.clear();
 }
 
 // ---------- holes and pins ----------
@@ -512,16 +527,21 @@ export function pinSheet({ d, length, count }, U = null) {
  * hole (as on a piece printed on its side) and one pin; for built-in pegs
  * instead a block with one peg and a block with its socket, both lying on
  * their side as a bar's halves print them; for dovetails two small plates
- * with one tab (N = 6). Filament and your own dowels get no pin. In a row
- * with 5 mm gaps, centred, standing on z = 0.
+ * with one tab (N = 6). Filament and your own dowels get no pin. Where a
+ * cut comes apart, a small closed box (60 × 30 × 24 mm, 4 mm walls, a 2 mm
+ * floor and top) cut at 12 mm, with the same lip, clips and key at the same
+ * clearance: the box standing upright, its lid on its cut face, as the
+ * pieces of a lantern print. In a row with 5 mm gaps, centred, standing on
+ * z = 0.
  * @param {object} spec the split settings: diameter (0 = 5 mm; with pegs, the peg's side), depth, clearance, pins, joint
  * @param {number} nozzle
- * @param {{ dovetail?: boolean, pins?: boolean, pegs?: boolean }} options `dovetail` adds the plates (default: when the
- *   joint is set to dovetails); `pins: false` leaves the blocks and the pin out, for a split held by tabs alone;
- *   `pegs` gives the peg and socket blocks in their place (default: when the joint is set to built-in pegs)
+ * @param {{ dovetail?: boolean, pins?: boolean, pegs?: boolean, apart?: string|null }} options `dovetail` adds the
+ *   plates (default: when the joint is set to dovetails); `pins: false` leaves the blocks and the pin out, for a split
+ *   held by tabs or lips alone; `pegs` gives the peg and socket blocks in their place (default: when the joint is set
+ *   to built-in pegs); `apart` the hold of a cut that comes apart, for the box and its lid
  * @returns {Manifold}
  */
-export function fitTestCoupon(spec = {}, nozzle = 0.4, { dovetail = spec.joint === 'dovetail', pins = true, pegs = spec.joint === 'pegs' } = {}) {
+export function fitTestCoupon(spec = {}, nozzle = 0.4, { dovetail = spec.joint === 'dovetail', pins = true, pegs = spec.joint === 'pegs', apart = null } = {}) {
   const { Manifold } = manifold();
   const t = scope();
   try {
@@ -538,7 +558,7 @@ export function fitTestCoupon(spec = {}, nozzle = 0.4, { dovetail = spec.joint =
       shells.push(t.add(male.add(t.add(t.add(pegSolid(p)).transform(frame)))));
       const female = t.add(t.add(Manifold.cube([side, long, side])).translate([-side / 2, 0, 0]));
       shells.push(t.add(female.subtract(t.add(t.add(socketSolid(p)).transform(frame)))));
-    } else if (pins || !dovetail) {
+    } else if (pins || (!dovetail && !apart)) {
       const s = sizesFor(D, c, nozzle, Number(spec.depth) > 0 ? Number(spec.depth) : 0);
       const side = Math.max(24, Math.ceil(2 * s.rhoTear + 2));
       const long = s.h + s.R + s.wall + 2;
@@ -559,6 +579,14 @@ export function fitTestCoupon(spec = {}, nozzle = 0.4, { dovetail = spec.joint =
         t.add(cell.solid);
         shells.push(t.add(plate.intersect(cell.solid)));
       }
+    }
+    if (apart) {
+      const outside = t.add(t.add(Manifold.cube([60, 30, 24])).translate([-30, -15, 0]));
+      const closed = t.add(outside.subtract(t.add(t.add(Manifold.cube([52, 22, 20])).translate([-26, -11, 2]))));
+      const lip = lipOnFace(closed, { id: 'fit', letter: 'A', axis: 2, at: 12 }, { c, hold: apart, nozzle });
+      const box = t.add(closed.trimByPlane([0, 0, -1], -12));
+      const lid = t.add(closed.trimByPlane([0, 0, 1], 12));
+      shells.push(lip ? t.add(box.add(t.add(lipAt(lip)))) : box, lip ? t.add(lid.subtract(t.add(lipCavityAt(lip)))) : lid);
     }
     return rowOf(shells, COUPON_GAP);
   } finally {
@@ -658,6 +686,787 @@ export function pegAt(peg) {
  */
 export function socketAt(peg) {
   return cachedSocket(peg.half, peg.h, peg.ch, peg.tip).transform(pegFrame(peg));
+}
+
+// ---------- lips for the cuts that come apart ----------
+
+// A cut that comes apart joins its pieces with a lip: a tongue standing out of one piece (the male) round the inside
+// edge of its wall, a groove for it in the other (the female), spring clips on the tongue that click into that piece,
+// and a key, a gap in the tongue the groove's piece fills, so the top goes on one way round only. Everything is
+// planned in the plane frame of the cut, the face at w = 0 and the male below it, w pointing into the female: a male
+// above the cut is the same lip mirrored (`lipFrame`). A plan is plain data, so the layout can be kept and the pieces
+// drilled from it again.
+
+/** A ring's signed area: positive for an outline, negative for a hole. */
+const ringArea = (r) => r.reduce((s, p, i) => s + p[0] * r[(i + 1) % r.length][1] - r[(i + 1) % r.length][0] * p[1], 0) / 2;
+const ringLength = (r) => r.reduce((s, p, i) => s + Math.hypot(r[(i + 1) % r.length][0] - p[0], r[(i + 1) % r.length][1] - p[1]), 0);
+
+/** An empty cross-section (new CrossSection([]) throws). */
+const emptySection = () => manifold().CrossSection.square([0, 0]);
+
+/** A cross-section with every part narrower than 2r taken off, the rest as it was with its corners rounded. */
+function openSection(cs, r) {
+  const shrunk = cs.offset(-r, 'Round', 2, 32);
+  try {
+    return shrunk.offset(r, 'Round', 2, 32);
+  } finally {
+    shrunk.delete();
+  }
+}
+
+/**
+ * An outline moved out by d (in for d < 0) keeping its corners sharp: the lip's own bands follow the opening's
+ * corners exactly, and a rounded mouth left slivers on a channel's post and a round tube (a copy for d = 0).
+ */
+const offMiter = (cs, d) => (Math.abs(d) < 1e-9 ? cs.translate(0, 0) : cs.offset(d, 'Miter', 4));
+
+/** An outline as a prism from z0 to z1 (plane frame). */
+function prism(cs, z0, z1) {
+  const m = extrudeSection(cs, z1 - z0);
+  try {
+    return m.translate([0, 0, z0]);
+  } finally {
+    m.delete();
+  }
+}
+
+/** The point, the tangent and the outward normal at arc s along a run of the tongue's outside. */
+function along(run, s) {
+  const e = run.edges.find((x) => s <= x.at + x.l + 1e-9) ?? run.edges[run.edges.length - 1];
+  const f = (s - e.at) / e.l;
+  return { p: [e.a[0] + f * (e.b[0] - e.a[0]), e.a[1] + f * (e.b[1] - e.a[1])], dir: e.dir, out: e.out };
+}
+
+/** How far (degrees) a run turns between arcs s0 and s1. */
+const turning = (run, s0, s1) => run.edges.filter((e) => e.at > s0 && e.at < s1).reduce((s, e) => s + e.turnIn, 0);
+
+/** A strip over arcs s0…s1 of a run, from `outside` mm out of the tongue to `inside` mm into it. */
+function stripSection(run, s0, s1, outside, inside) {
+  const steps = [s0, ...run.edges.map((e) => e.at).filter((a) => a > s0 && a < s1), s1];
+  const outer = steps.map((s) => {
+    const q = along(run, s);
+    return [q.p[0] + outside * q.out[0], q.p[1] + outside * q.out[1]];
+  });
+  const inner = steps.map((s) => {
+    const q = along(run, s);
+    return [q.p[0] - inside * q.out[0], q.p[1] - inside * q.out[1]];
+  });
+  return new (manifold().CrossSection)([[...outer, ...inner.reverse()]], 'Positive');
+}
+
+/**
+ * The tongue's outside in runs: the edges of its outer rings that face the other piece's skin (`Q`, the face less
+ * the tongue; the point 0.3 mm out of each edge's middle lies on it), broken where the outline turns more than 15°
+ * within 1.5 mm. A tongue cut in two by a crossing cut has its cut ends on the same ring: they face no skin. Point
+ * tests, not booleans: a dense outline has thousands of edges.
+ * @param {CrossSection|number[][][]} T the tongue (borrowed), or its polygons
+ * @param {CrossSection|number[][][]} Q the skin (borrowed), or its polygons
+ * @returns {{ edges: { a, b, l, out, dir, onQ, at, turnIn }[], length: number, closed: boolean }[]} `at` each edge's
+ *   arc from the run's start, `turnIn` how far the run turns into it (degrees); `closed` a whole ring with no corner
+ */
+export function lipRuns(T, Q) {
+  const qp = Array.isArray(Q) ? Q : polygonsOf(Q);
+  const tp = Array.isArray(T) ? T : polygonsOf(T);
+  const out = [];
+  for (const ring of tp.filter((r) => ringArea(r) > 0)) {
+    const n = ring.length;
+    const edges = ring.map((a, i) => {
+      const b = ring[(i + 1) % n];
+      const d = [b[0] - a[0], b[1] - a[1]];
+      const l = Math.hypot(d[0], d[1]);
+      const o = [d[1] / l, -d[0] / l];
+      const onQ = insidePolygons(qp, (a[0] + b[0]) / 2 + 0.3 * o[0], (a[1] + b[1]) / 2 + 0.3 * o[1]);
+      return { a, b, l, out: o, dir: [d[0] / l, d[1] / l], onQ };
+    });
+    const turnAt = edges.map((e, i) => {
+      const q = edges[(i - 1 + n) % n].dir;
+      return (Math.abs(Math.atan2(q[0] * e.dir[1] - q[1] * e.dir[0], q[0] * e.dir[0] + q[1] * e.dir[1])) * 180) / Math.PI;
+    });
+    const arcAt = [];
+    let total = 0;
+    for (const e of edges) {
+      arcAt.push(total);
+      total += e.l;
+    }
+    // a vertex is a corner when the turning at the vertices within 1.5 mm of it adds up to more than 15°: two
+    // pointers over the ring laid out three times, so a dense ring takes no longer than its length
+    const corner = new Array(n).fill(false);
+    const ext = [];
+    for (let k = -n; k < 2 * n; k++) ext.push({ arc: arcAt[((k % n) + n) % n] + Math.floor(k / n) * total, turn: turnAt[((k % n) + n) % n] });
+    let lo = 0;
+    let hi = 0;
+    let sum = 0;
+    for (let i = n; i < 2 * n; i++) {
+      while (hi < ext.length && ext[hi].arc <= ext[i].arc + CLIP.cornerReach) sum += ext[hi++].turn;
+      while (ext[lo].arc < ext[i].arc - CLIP.cornerReach) sum -= ext[lo++].turn;
+      corner[i - n] = sum > CLIP.corner;
+    }
+    let start = edges.findIndex((e, i) => !e.onQ || corner[i]);
+    const closed = start < 0;
+    if (closed) start = 0;
+    let cur = null;
+    for (let k = 0; k < n; k++) {
+      const i = (start + k) % n;
+      const e = edges[i];
+      if ((!e.onQ || corner[i]) && cur) {
+        out.push(cur);
+        cur = null;
+      }
+      if (!e.onQ) continue;
+      if (!cur) cur = { edges: [], length: 0, closed };
+      cur.edges.push({ ...e, at: cur.length, turnIn: cur.edges.length ? turnAt[i] : 0 });
+      cur.length += e.l;
+    }
+    if (cur) out.push(cur);
+  }
+  return out;
+}
+
+/**
+ * Where the clips go: `n` windows a clip's span long, spread over the runs long enough for one with its margins,
+ * one per run first, longest run first, each centred in its share of the run; a window is kept only where the run
+ * turns no more than 20° over it and its margins, and `ok(run, window)` holds.
+ */
+function clipWindows(runs, n, ok) {
+  const need = CLIP.span + 2 * CLIP.margin;
+  // a run takes another clip for every span, its margins and 4 mm more between them
+  const cap = runs.map((r) => (r.length >= need ? Math.floor((r.length + 4) / (need + 4)) : 0));
+  const order = runs.map((r, i) => i).sort((i, j) => runs[j].length - runs[i].length);
+  const got = runs.map(() => 0);
+  let left = n;
+  while (left > 0 && order.some((i) => got[i] < cap[i])) {
+    for (const i of order) {
+      if (left > 0 && got[i] < cap[i]) {
+        got[i]++;
+        left--;
+      }
+    }
+  }
+  const windows = [];
+  runs.forEach((run, i) => {
+    for (let k = 0; k < got[i]; k++) {
+      const centre = (run.length * (k + 0.5)) / got[i];
+      const w = { run: i, s0: centre - CLIP.span / 2, s1: centre + CLIP.span / 2 };
+      if (turning(run, w.s0 - CLIP.margin, w.s1 + CLIP.margin) <= CLIP.turn && ok(run, w)) windows.push(w);
+    }
+  });
+  return windows;
+}
+
+/**
+ * Where the key goes: on the tongue's outside only (edges facing the other piece's skin, `Q`), at the middle of the
+ * longest stretch of it that no clip window (with its margin and half the key) takes, across a corner as often as
+ * not. A C-shaped tongue, a face halved by a crossing cut, has its inner face on the same ring: those edges face no
+ * skin and never take it, or the key would cut a clip in two. The point on the tongue's middle line there, the free
+ * stretch's length, or null when there is none.
+ * @param {CrossSection|number[][][]} T the tongue (borrowed), or its polygons
+ * @param {CrossSection|number[][][]} Q the skin (borrowed), or its polygons
+ * @returns {{ s: number, p: number[], len: number }|null}
+ */
+export function keyOn(T, Q, runs, windows, t = LIP.t) {
+  const qp = Array.isArray(Q) ? Q : polygonsOf(Q);
+  const tp = Array.isArray(T) ? T : polygonsOf(T);
+  let best = null;
+  for (const ring of tp.filter((r) => ringArea(r) > 0)) {
+    const n = ring.length;
+    const edges = ring.map((a, i) => {
+      const b = ring[(i + 1) % n];
+      const l = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      const out = [(b[1] - a[1]) / l, -(b[0] - a[0]) / l];
+      return { a, b, l, out, onQ: insidePolygons(qp, (a[0] + b[0]) / 2 + 0.3 * out[0], (a[1] + b[1]) / 2 + 0.3 * out[1]) };
+    });
+    const arc = [0];
+    for (const e of edges) arc.push(arc[arc.length - 1] + e.l);
+    const total = arc[n];
+    const nearest = (p) => {
+      let bestS = 0;
+      let d = Infinity;
+      edges.forEach((e, i) => {
+        const ab = [e.b[0] - e.a[0], e.b[1] - e.a[1]];
+        const f = Math.max(0, Math.min(1, ((p[0] - e.a[0]) * ab[0] + (p[1] - e.a[1]) * ab[1]) / (e.l * e.l)));
+        const q = [e.a[0] + f * ab[0], e.a[1] + f * ab[1]];
+        const dd = Math.hypot(q[0] - p[0], q[1] - p[1]);
+        if (dd < d) {
+          d = dd;
+          bestS = arc[i] + f * e.l;
+        }
+      });
+      return { s: bestS, d };
+    };
+    // the arcs it may not take: edges facing no skin (with half a key either side), each clip window with its margin
+    const blocked = [];
+    edges.forEach((e, i) => {
+      if (!e.onQ) blocked.push([arc[i] - CLIP.key / 2, arc[i + 1] + CLIP.key / 2]);
+    });
+    for (const w of windows) {
+      const a = nearest(along(runs[w.run], w.s0).p);
+      const b = nearest(along(runs[w.run], w.s1).p);
+      if (a.d > 0.1 || b.d > 0.1) continue; // on another ring
+      let [s0, s1] = [a.s, b.s];
+      if (s1 < s0) s1 += total;
+      blocked.push([s0 - CLIP.margin - CLIP.key / 2, s1 + CLIP.margin + CLIP.key / 2]);
+    }
+    if (!blocked.length) {
+      if (!best || total > best.len) best = { len: total, s: total / 2, edges, arc };
+      continue;
+    }
+    // the free stretches between the blocked arcs, round the ring
+    const sorted = blocked.map(([x, y]) => [((x % total) + total) % total, ((x % total) + total) % total + (y - x)]).sort((p, q) => p[0] - q[0]);
+    const merged = [];
+    for (const [x, y] of sorted) {
+      const last = merged[merged.length - 1];
+      if (last && x <= last[1]) last[1] = Math.max(last[1], y);
+      else merged.push([x, y]);
+    }
+    merged.forEach(([, y], i) => {
+      const next = i + 1 < merged.length ? merged[i + 1][0] : merged[0][0] + total;
+      if (next - y > (best?.len ?? 1e-9)) best = { len: next - y, s: ((((y + next) / 2) % total) + total) % total, edges, arc };
+    });
+  }
+  if (!best) return null;
+  const i = best.arc.findIndex((a, k) => k < best.edges.length && best.s >= a && best.s <= best.arc[k + 1]);
+  const e = best.edges[i];
+  const f = (best.s - best.arc[i]) / e.l;
+  const p = [e.a[0] + f * (e.b[0] - e.a[0]) - (t / 2) * e.out[0], e.a[1] + f * (e.b[1] - e.a[1]) - (t / 2) * e.out[1]];
+  return { s: best.s, p, len: best.len };
+}
+
+/**
+ * A clip's catch (c = 0) or the recess for it in the other piece (grown by c), in the plane frame: a convex hull
+ * 6 mm along the clip with a 0.4 mm flat tip standing `p` out of it and 45° flanks on every side, its foot sunk
+ * 0.2 mm into the clip (a recess reaches 0.6 back, into the gap), centred `zc` above the face. Framed on the chord
+ * of the run under it (`chord`: its middle `p`, its way along `dir` and out of the tongue `out`): a curved run bulges
+ * past the chord by its sagitta only, and on the edge its middle falls on the catch would stand further out.
+ * @returns {Manifold}
+ */
+export function catchSolid(chord, { zc, p, c = 0 }) {
+  const grow = c * (Math.SQRT2 - 1);
+  const P = p + c;
+  const tipHalfL = CLIP.length / 2 - p + grow;
+  const tipHalfH = CLIP.flat / 2 + grow;
+  const back = -CLIP.sink - (c ? 0.4 : 0);
+  const at = (a, o, z) => [chord.p[0] + a * chord.dir[0] + o * chord.out[0], chord.p[1] + a * chord.dir[1] + o * chord.out[1], zc + z];
+  const pts = [];
+  for (const sa of [-1, 1]) {
+    for (const sz of [-1, 1]) {
+      pts.push(at(sa * tipHalfL, P, sz * tipHalfH));
+      pts.push(at(sa * (tipHalfL + P - back), back, sz * (tipHalfH + P - back)));
+    }
+  }
+  return manifold().Manifold.hull(pts);
+}
+
+/** The chord a clip's catch is framed on (`catchSolid`): its length either side of the window's middle. */
+function chordOf(run, w) {
+  const mid = (w.s0 + w.s1) / 2;
+  const a = along(run, mid - CLIP.length / 2).p;
+  const b = along(run, mid + CLIP.length / 2).p;
+  const l = Math.hypot(b[0] - a[0], b[1] - a[1]);
+  const dir = [(b[0] - a[0]) / l, (b[1] - a[1]) / l];
+  return { p: [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], dir, out: [dir[1], -dir[0]] };
+}
+
+/**
+ * The regions of a face's island a lip is planned in: its outline filled (`fill`), and the kind. A hole whose
+ * outline is at least a quarter of the island's is an opening, and the tongue hugs the openings (`A`, kind
+ * 'opening'), openings with a wall too thin for two grooves between them taken as one; smaller holes are kept
+ * clear of (`smallHoles`). A face with no opening (a solid post) gets a channel:
+ * the tongue round a core (`A`) a skirt and a tongue in from the outside, and kind 'channel' when there is a core
+ * wider than a wall; null when there is none. Where the holes leave a channel's tongue no room at all, even with
+ * nothing else in the way – a box of many compartments, each too small to be an opening by itself – every hole is an
+ * opening, and the tongue hugs each.
+ * @param {CrossSection} island (borrowed)
+ * @param {number} c clearance per side
+ * @param {{ t: number, tMin: number, wall: number }} sizes `lipSizesFor`'s
+ * @returns {{ kind: 'opening'|'channel'|null, fill: CrossSection, A: CrossSection, g0: number, smallHoles: CrossSection }}
+ *   the cross-sections the caller's; `g0` how far back from A's edge the tongue's inside face stands
+ */
+export function lipRegions(island, c, sizes = lipSizesFor(c)) {
+  const { CrossSection } = manifold();
+  const rings = polygonsOf(island);
+  const outer = rings.filter((r) => ringArea(r) > 0);
+  const holes = rings.filter((r) => ringArea(r) < 0);
+  if (!outer.length) return { kind: null, fill: emptySection(), A: emptySection(), g0: c, smallHoles: emptySection() };
+  const outerLength = outer.reduce((n, r) => n + ringLength(r), 0);
+  const fill = new CrossSection(outer, 'Positive');
+  // openings with a wall between them too thin for a groove each side and a wall between those (a box's dividers)
+  // are one: the tongue runs along the outside wall past the divider, whose end its groove just notches
+  const openingsOf = (list) => {
+    const hollows = list.map((r) => [...r].reverse());
+    const t = scope();
+    try {
+      let kept = hollows;
+      if (hollows.length > 1) {
+        // an opening on its own keeps its own outline exactly; only those run together take the closed one
+        const d = LIP.g0 + sizes.t + c + sizes.wall / 2;
+        const closed = t.add(offMiter(t.add(offMiter(t.add(new CrossSection(hollows, 'Positive')), d)), -d));
+        kept = closed.decompose().map((x) => t.add(x)).flatMap((part) => {
+          const outline = polygonsOf(part);
+          const inside = hollows.filter((r) => {
+            const [x, y] = insidePoint([r], polygonsCentroid([r]));
+            return insidePolygons(outline, x, y);
+          });
+          return inside.length === 1 ? inside : outline;
+        });
+      }
+      const raw = t.add(new CrossSection(kept, 'Positive'));
+      return { kind: 'opening', fill, A: raw.simplify(LIP.eps), g0: LIP.g0, smallHoles: emptySection() };
+    } finally {
+      t.dispose();
+    }
+  };
+  const openings = holes.filter((r) => ringLength(r) >= LIP.opening * outerLength);
+  const small = holes.filter((r) => ringLength(r) < LIP.opening * outerLength);
+  if (openings.length) {
+    const regions = openingsOf(openings);
+    if (small.length) {
+      regions.smallHoles.delete();
+      regions.smallHoles = new CrossSection(small.map((r) => [...r].reverse()), 'Positive');
+    }
+    return regions;
+  }
+  const smallHoles = small.length ? new CrossSection(small.map((r) => [...r].reverse()), 'Positive') : emptySection();
+  const t = scope();
+  try {
+    const inset = t.add(fill.offset(-(LIP.skirt + sizes.t + 2 * c), 'Round', 2, 32));
+    const A = t.add(openSection(inset, sizes.wall / 2)).simplify(LIP.eps);
+    if (!A.isEmpty() && small.length) {
+      // the channel's tongue as `planLip` would lay it with only the holes in the way: none left, and the holes are
+      // the openings
+      const tMin = sizes.tMin ?? LIP.tMin;
+      const d0 = 2 * c + sizes.t;
+      const groove = t.add(t.add(t.add(t.add(offMiter(A, d0)).subtract(A)).intersect(t.add(fill.offset(-sizes.wall, 'Round', 2, 32))))
+        .subtract(t.add(smallHoles.offset(sizes.wall, 'Round', 2, 32))));
+      const band = t.add(t.add(t.add(offMiter(A, c + sizes.t)).subtract(t.add(offMiter(A, c)))).intersect(t.add(fill.offset(-(sizes.wall + c), 'Round', 2, 32))));
+      const tongue = t.add(tidyTongue(t.add(band.intersect(t.add(groove.offset(-c, 'Round', 2, 32)))), tMin));
+      if (tongue.isEmpty()) {
+        A.delete();
+        smallHoles.delete();
+        return openingsOf(holes);
+      }
+    }
+    return { kind: A.isEmpty() ? null : 'channel', fill, A, g0: c, smallHoles };
+  } finally {
+    t.dispose();
+  }
+}
+
+/** A tongue with its parts thinner than the thinnest kept taken off and the pieces under 25 mm² dropped. */
+function tidyTongue(T, tMin) {
+  const { CrossSection } = manifold();
+  const opened = openSection(T, tMin / 2);
+  const parts = opened.decompose();
+  try {
+    const kept = parts.filter((x) => x.area() >= LIP.minPiece);
+    const whole = kept.length ? CrossSection.union(kept) : emptySection();
+    try {
+      return whole.simplify(LIP.eps);
+    } finally {
+      whole.delete();
+    }
+  } finally {
+    opened.delete();
+    parts.forEach((x) => x.delete());
+  }
+}
+
+/**
+ * The 2D plan of one patch's lip at height H, in the plane frame, or null
+ * when no tongue is left. The groove's piece keeps a wall's width (three
+ * lines) from every obstacle on its side: the face's columns that meet air
+ * or something placed within its reach (`block`), its own material over the
+ * island's openings there (`over`: a ceiling just past the cut), and the
+ * face's small holes. Where something stands over the opening the tongue
+ * moves out, a wall and the inside gap away from it. The groove's largest
+ * region is c past the tongue's outside and 0.5 mm into an opening (c round
+ * a channel's core); the tongue keeps c inside it, so it always keeps c from
+ * the other piece's material. Then the clips (a full lip only, at least two
+ * for every 95 mm of the tongue's outside, at most eight): each where its
+ * catch's recess keeps two nozzles of skin from the outside and from every
+ * obstacle (else `why` 'skin'), and where it has room to bow in, the strip
+ * inward of it i + 0.1 deep being the groove's air (an opening) or its
+ * relief (a channel; else 'flex'). Then the key, on the patch that takes
+ * it: where the clips leave it no free stretch, the clip on the shortest run
+ * gives way ('key').
+ * @param {CrossSection} patch the patch, plane frame (borrowed)
+ * @param {{ island?: CrossSection, c?: number, nozzle?: number, H?: number, hold?: string, key?: boolean,
+ *   block?: CrossSection|null, over?: CrossSection|null, clips?: boolean }} options `island` the face's island the patch
+ *   lies in (a face a crossing cut halves takes its openings from the whole island), all borrowed
+ * @returns {object|null} plain data: `{ kind, hasOver, H, c, p, i, t, g0, d0, gIn, hold, zTop, reach, want, why, key:
+ *   { p, len }|null, windows: [{ s0, s1, slot, chord }], area, T, Tc, A }` – `T` the tongue, `Tc` the groove and `A`
+ *   the region its inside follows as polygons, `area` the tongue's (mm²), `slot` the polygon of the slot under each
+ *   clip, `chord` the frame of its catch (`catchSolid`), `want` how many clips were looked for
+ */
+export function planLip(patch, options = {}) {
+  const { island = patch, c = SPLIT_DEFAULTS.clearance, nozzle = 0.4, H = LIP.heights[0], hold = 'snap', key = true, block = null, over = null, clips = true } = options;
+  const { CrossSection } = manifold();
+  const t = scope();
+  try {
+    // clips only on a full lip: under 6 mm there is no room for both the slot and the catch
+    const withClips = clips && H >= LIP.heights[0] && catchSizes(hold, c) !== null;
+    const sizes = lipSizesFor(c, nozzle, withClips ? hold : 'lift');
+    const { t: th, tMin, wall, skin, p, i, gIn } = sizes;
+    const regions = lipRegions(island, c, sizes);
+    const { kind, g0 } = regions;
+    const fill = t.add(regions.fill);
+    const A = t.add(regions.A);
+    const smallHoles = t.add(regions.smallHoles);
+    if (!kind) return null;
+    const obst = [block, over, smallHoles].filter((x) => x && !x.isEmpty());
+    const obstacles = t.add(obst.length ? CrossSection.union(obst) : emptySection());
+    const keepOff = obstacles.isEmpty() ? null : t.add(obstacles.offset(wall, 'Round', 2, 32));
+    const hasOver = kind === 'opening' && Boolean(over) && !over.isEmpty();
+    const Ae = hasOver ? t.add(t.add(A.add(t.add(over.offset(wall + gIn - g0, 'Round', 2, 32)))).simplify(LIP.eps)) : A;
+    const d0 = g0 + th + c;
+    const inner = t.add(kind === 'opening' ? offMiter(A, -LIP.into) : offMiter(A, g0 - c));
+    const walled = t.add(fill.offset(-wall, 'Round', 2, 32));
+    let Tc0 = t.add(t.add(t.add(offMiter(Ae, d0)).subtract(inner)).intersect(walled));
+    if (keepOff) Tc0 = t.add(Tc0.subtract(keepOff));
+    Tc0 = t.add(Tc0.simplify(LIP.eps));
+    const keep = t.add(fill.offset(-(wall + c), 'Round', 2, 32));
+    const bandOf = t.add(t.add(t.add(offMiter(Ae, g0 + th)).subtract(t.add(offMiter(Ae, g0)))).intersect(keep));
+    const band = t.add(bandOf.intersect(patch));
+    const T0 = t.add(tidyTongue(t.add(band.intersect(t.add(Tc0.offset(-c, 'Round', 2, 32)))), tMin));
+    if (T0.isEmpty()) return null;
+    const skinQ = t.add(patch.subtract(T0));
+    const tPolys = polygonsOf(T0);
+    const qPolys = polygonsOf(skinQ);
+    const runs = lipRuns(tPolys, qPolys);
+    const clipLength = runs.reduce((s, r) => s + r.length, 0);
+    const takes = runs.filter((r) => r.length >= CLIP.span + 2 * CLIP.margin).length;
+    const want = withClips ? Math.min(CLIP.most, Math.max(2, takes, Math.round(clipLength / CLIP.every))) : 0;
+    const lidSide = t.add(patch.subtract(obstacles)); // where the other piece's skin is sure to stand over the face
+    const why = new Set();
+    const reliefOf = (run, w) => stripSection(run, w.s0 - 1, w.s1 + 1, -(th - 0.05), th + c + (c + i + 0.3));
+    const grownLittle = withClips ? t.add(T0.offset(0.01, 'Round', 2, 16)) : null;
+    const grownFlex = withClips ? t.add(T0.offset(i + 0.1, 'Round', 2, 16)) : null;
+    const area = (cs) => t.add(cs).area();
+    // the catch's recess keeps two nozzles of skin outside it, from the outline and from every obstacle
+    const skinOk = (run, w) => area(t.add(stripSection(run, w.s0 + 1, w.s1 - 1, c + p + skin, 0)).subtract(lidSide)) < 1e-3;
+    // room to bow in: inward of the clip, i + 0.1 deep, is the groove's air (an opening) or its relief (a channel),
+    // the relief keeping a wall from the outline, the holes and every obstacle
+    const flexOk = (run, w) => {
+      if (kind === 'opening') {
+        const room = t.add(t.add(t.add(stripSection(run, w.s0 + 1, w.s1 - 1, 0, th + 1)).intersect(grownFlex)).subtract(grownLittle));
+        return area(room.subtract(Tc0)) < 1e-3;
+      }
+      const r = t.add(reliefOf(run, w));
+      return !(area(r.subtract(walled)) > 1e-3 || (keepOff && area(r.intersect(keepOff)) > 1e-3));
+    };
+    const ok = (run, w) => {
+      if (!skinOk(run, w)) {
+        why.add('skin');
+        return false;
+      }
+      if (!flexOk(run, w)) {
+        why.add('flex');
+        return false;
+      }
+      return true;
+    };
+    const windows = withClips ? clipWindows(runs, want, ok) : [];
+    if (withClips && !windows.length && !takes) why.add('short');
+    if (!withClips && hold !== 'lift') why.add(H >= LIP.heights[0] ? 'flex' : 'height');
+    // the key always has room: where the clips leave it no free stretch, the clip on the shortest run gives way
+    let keyAt = key ? keyOn(tPolys, qPolys, runs, windows, th) : null;
+    while (key && windows.length && !keyAt) {
+      let drop = 0;
+      windows.forEach((w, k) => {
+        if (runs[w.run].length < runs[windows[drop].run].length) drop = k;
+      });
+      windows.splice(drop, 1);
+      why.add('key');
+      keyAt = keyOn(tPolys, qPolys, runs, windows, th);
+    }
+    // a 32-gon turned half a step: no corner of it lies on a line through its centre along u or v, where a roof
+    // step's edge may run
+    const disc = keyAt ? t.add(t.add(t.add(CrossSection.circle(CLIP.key / 2, 32)).rotate(180 / 32)).translate(keyAt.p[0], keyAt.p[1])) : null;
+    const T = disc ? t.add(t.add(T0.subtract(disc)).simplify(LIP.eps)) : T0;
+    // the groove only where the tongue is, c + 0.6 round the whole tongue (the key's gap not counted, or the groove's
+    // roof would step round it), less the key's plug
+    let Tc = t.add(Tc0.intersect(t.add(T0.offset(c + 0.6, 'Round', 2, 32))));
+    if (disc) Tc = t.add(Tc.subtract(t.add(disc.offset(-c, 'Round', 2, 32))));
+    // a channel's clips bow into reliefs cut into the core behind them, under the same flat roof
+    if (kind === 'channel' && windows.length) Tc = t.add(Tc.add(t.add(CrossSection.union(windows.map((w) => t.add(reliefOf(runs[w.run], w)))))));
+    Tc = t.add(Tc.simplify(LIP.eps));
+    const { zTop, reach } = lipReach(H, kind, c, i, hasOver, nozzle);
+    return {
+      kind, hasOver, H, c, p, i, t: th, g0, d0, gIn, hold, zTop, reach, want, why: [...why],
+      key: keyAt ? { p: keyAt.p, len: keyAt.len } : null,
+      windows: windows.map((w) => ({
+        s0: w.s0, s1: w.s1, slot: polygonsOf(t.add(stripSection(runs[w.run], w.s0, w.s1, 0.5, th + 0.5))), chord: chordOf(runs[w.run], w),
+      })),
+      area: T.area(), T: polygonsOf(T), Tc: polygonsOf(Tc), A: polygonsOf(Ae),
+    };
+  } finally {
+    t.dispose();
+  }
+}
+
+/**
+ * A patch's lip with its fallbacks: 6 mm with clips (on a hold that has
+ * them), 6 mm without (where moving the tongue out for the clips to bow in
+ * leaves none), then 4.5 and 3 mm; the first that leaves a tongue. Each
+ * height's obstacles are taken at the reach a plain opening needs, and only
+ * where something stands over the opening there, again at the reach the
+ * moved-out tongue's roof needs.
+ * @param {CrossSection} patch plane frame (borrowed)
+ * @param {{ island?: CrossSection, c?: number, nozzle?: number, hold?: string, key?: boolean, heights?: number[],
+ *   obstaclesAt?: (R: number) => { block: CrossSection|null, over: CrossSection|null } }} options `obstaclesAt` the
+ *   obstacles on the groove's side within R of the face (borrowed; none when not given)
+ * @returns {{ plan: object|null, kind: string|null, tries: { H, clips, R, area, block, over }[] }} `plan` `planLip`'s
+ */
+export function lipFor(patch, options = {}) {
+  const { island = patch, c = SPLIT_DEFAULTS.clearance, nozzle = 0.4, hold = 'snap', key = true, heights = LIP.heights, obstaclesAt = null } = options;
+  const tries = [];
+  const regions = lipRegions(island, c, lipSizesFor(c, nozzle, 'lift'));
+  const { kind } = regions;
+  for (const cs of [regions.fill, regions.A, regions.smallHoles]) cs.delete();
+  if (!kind) return { plan: null, kind: null, tries };
+  const caught = catchSizes(hold, c);
+  const ladder = heights.flatMap((H) => (H >= LIP.heights[0] && caught ? [[H, true], [H, false]] : [[H, false]]));
+  const at = (H, i, over) => {
+    const R = lipReach(H, kind, c, i, over, nozzle).reach;
+    return { R, ...(obstaclesAt?.(R) ?? { block: null, over: null }) };
+  };
+  for (const [H, clips] of ladder) {
+    const i = clips ? caught.i : 0;
+    let o = at(H, i, false);
+    if (o.over) o = at(H, i, true);
+    const plan = planLip(patch, { island, c, nozzle, H, hold, key, block: o.block, over: o.over, clips });
+    tries.push({ H, clips, R: o.R, area: plan?.area ?? 0, block: Boolean(o.block), over: Boolean(o.over) });
+    if (plan) return { plan, kind, tries };
+  }
+  return { plan: null, kind, tries };
+}
+
+/**
+ * How much room a patch's groove has on its side of the face (mm), in
+ * 0.5 mm steps down from the reach a full lip needs (`R6`): the largest
+ * reach whose obstacles miss the zone the tongue and its groove take, a wall
+ * round it. A cut moved `shift` away from the groove's piece has that reach
+ * – a lantern cut 2 mm under its roof's eaves is moved 1.5 mm down – as long
+ * as the shape between does not change, which the caller checks. Apart from
+ * that, whether something is in the way in the tongue's own foot, the
+ * 0.5 mm it sinks into its piece (`root`: a lantern cut right at the top of
+ * its windows), which no move away from the groove's piece clears.
+ * @param {CrossSection} patch plane frame (borrowed)
+ * @param {{ island?: CrossSection, c?: number, nozzle?: number, hold?: string, obstaclesAt: function,
+ *   rootAt?: () => CrossSection|null }} options as for `lipFor`, `obstaclesAt` those on the groove's side alone, and
+ *   `rootAt` those in the tongue's foot (borrowed)
+ * @returns {{ room: number, R6: number, shift: number, root: boolean }|null} null when the face takes no lip of any
+ *   kind
+ */
+export function lipRoom(patch, { island = patch, c = SPLIT_DEFAULTS.clearance, nozzle = 0.4, hold = 'snap', obstaclesAt, rootAt = null } = {}) {
+  const t = scope();
+  try {
+    const sizes = lipSizesFor(c, nozzle, hold);
+    const regions = lipRegions(island, c, sizes);
+    for (const cs of [regions.fill, regions.A, regions.smallHoles]) t.add(cs);
+    if (!regions.kind) return null;
+    const R6 = lipReach(LIP.heights[0], regions.kind, c, sizes.i, false, nozzle).reach;
+    const near = t.add(patch.offset(1, 'Round', 2, 32));
+    const band = regions.kind === 'opening'
+      ? t.add(t.add(offMiter(regions.A, regions.g0 + sizes.t + c + LIP.mouth)).subtract(t.add(offMiter(regions.A, -LIP.into))))
+      : patch;
+    const zone = t.add(t.add(band.intersect(near)).offset(sizes.wall, 'Round', 2, 32));
+    const meets = (x) => Boolean(x) && t.add(x.intersect(zone)).area() > 1e-3;
+    const root = meets(rootAt?.());
+    const hits = (R) => {
+      const { block, over } = obstaclesAt(R);
+      return meets(block) || meets(over);
+    };
+    // obstacles only grow with the reach, so the largest step clear of them is found by bisection
+    const steps = Math.ceil(R6 / 0.5 - 1e-9); // reaches R6 − 0.5k for k < steps are above 0
+    if (!hits(R6)) return { room: R6, R6, shift: 0, root };
+    let lo = 0; // hits
+    let hi = steps; // clear (no reach at all)
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (hits(R6 - 0.5 * mid)) lo = mid;
+      else hi = mid;
+    }
+    return hi < steps ? { room: R6 - 0.5 * hi, R6, shift: 0.5 * hi, root } : { room: 0, R6, shift: 0.5 * steps, root };
+  } finally {
+    t.dispose();
+  }
+}
+
+/**
+ * What the groove's piece holds over a face's openings within R of it,
+ * projected (plane frame): its material between 0.001 mm and R past the face
+ * on its side, over the island's holes (its outline filled less the island
+ * grown 0.05 mm). A ceiling just above a lantern's cut is such material.
+ * @param {Manifold} band from `bandFor` (borrowed), reaching R + 0.5 past the face
+ * @param {{ axis: number, at: number }} cut
+ * @param {0|1} side the groove's piece: 0 the one below the cut, 1 the one above
+ * @param {number} R
+ * @param {CrossSection} island the face's island, plane frame (borrowed)
+ * @returns {CrossSection|null} the caller's; null when there is none
+ */
+export function overFor(band, cut, side, R, island) {
+  const { CrossSection, Manifold } = manifold();
+  if (band.isEmpty()) return null;
+  const t = scope();
+  try {
+    const { min, max } = band.boundingBox();
+    const [w0, w1] = side === 1 ? [cut.at + 1e-3, cut.at + R] : [cut.at - R, cut.at - 1e-3];
+    const slab = t.add(t.add(Manifold.cube([max[0] - min[0] + 4, max[1] - min[1] + 4, w1 - w0])).translate([min[0] - 2, min[1] - 2, w0]));
+    const upper = t.add(t.add(band.intersect(slab)).project());
+    const outer = polygonsOf(island).filter((r) => ringArea(r) > 0);
+    if (!outer.length) return null;
+    const holes = t.add(t.add(new CrossSection(outer, 'Positive')).subtract(t.add(island.offset(0.05, 'Miter', 4))));
+    const over = upper.intersect(holes);
+    if (over.area() > 1e-3) return over;
+    over.delete();
+    return null;
+  } finally {
+    t.dispose();
+  }
+}
+
+/**
+ * The solids of a lip's plan, in the plane frame (the male below): the
+ * tongue to add to the male and the cutters to take out of the female. The
+ * tongue is one prism from 0.5 mm inside its piece to H, its top edge taken
+ * off 0.6 at 45° by nested cutters, each with its own outline (and the
+ * inside edge too where the other piece has material inside it), a slot
+ * under each clip so that the clip is a bridge held at both ends, and the
+ * catches. The groove is one prism with the other piece's material over its
+ * roof given back in nested 45° steps from the outside in (a channel's roof
+ * is flat), its mouth widened 0.4 and 0.2 over its first two layers, and the
+ * catches' recesses. Every nested prism has a foot and an outline of its
+ * own, so no two faces of the result lie in one plane.
+ * @param {object} lip a plan (`planLip`) or a layout's lip
+ * @returns {{ tongue: Manifold, cutters: Manifold, catches: Manifold[], recesses: Manifold[], zc: number }} the
+ *   caller's; `zc` the catches' height
+ */
+export function lipSolids(lip) {
+  const { CrossSection, Manifold } = manifold();
+  const t = scope();
+  try {
+    const { kind, H, c, p, g0, d0, zTop } = lip;
+    const th = lip.t ?? LIP.t;
+    const S = LIP.step;
+    const T = t.add(new CrossSection(lip.T, 'Positive'));
+    const Tc = t.add(new CrossSection(lip.Tc, 'Positive'));
+    const A = t.add(new CrossSection(lip.A, 'Positive'));
+    let tongue = t.add(prism(T, -LIP.root, H));
+    const leads = [];
+    for (let k = 0; k < Math.round(LIP.lead / S); k++) {
+      const reachOut = t.add(T.offset(1 + 0.05 * k, 'Round', 2, 16));
+      let L = t.add(reachOut.subtract(t.add(offMiter(A, g0 + th - S * (k + 1)))));
+      if (kind === 'channel' || lip.hasOver) L = t.add(L.add(t.add(reachOut.intersect(t.add(offMiter(A, g0 + S * (k + 1)))))));
+      leads.push(t.add(prism(L, H - LIP.lead + S * k, H + 1 + 0.05 * k)));
+    }
+    tongue = t.add(tongue.subtract(t.add(Manifold.union(leads))));
+    let cavity = t.add(prism(Tc, -1, zTop));
+    if (kind === 'opening') {
+      // step 0 would give back nothing (the groove lies within d0) and only lay a face on the groove's own wall
+      const material = [];
+      for (let k = 1; k < Math.round((zTop - H - c) / S); k++) {
+        const M = t.add(t.add(Tc.offset(1 + 0.05 * k, 'Round', 2, 16)).subtract(t.add(offMiter(A, d0 - k * S))));
+        material.push(t.add(prism(M, H + c + k * S, zTop + 1 + 0.05 * k)));
+      }
+      if (material.length) cavity = t.add(cavity.subtract(t.add(Manifold.union(material))));
+    }
+    const mouths = [];
+    for (let j = 0; j < Math.round(LIP.mouth / S); j++) mouths.push(t.add(prism(t.add(Tc.offset(LIP.mouth - S * j, 'Miter', 4)), -1.1 - 0.1 * j, S * (j + 1))));
+    cavity = t.add(cavity.add(t.add(Manifold.union(mouths))));
+    const zc = (CLIP.slot + H - LIP.lead) / 2;
+    const slots = [];
+    const catches = [];
+    const recesses = [];
+    for (const w of lip.windows) {
+      slots.push(t.add(prism(t.add(new CrossSection(w.slot, 'Positive')), -0.6, CLIP.slot)));
+      catches.push(t.add(catchSolid(w.chord, { zc, p })));
+      recesses.push(t.add(catchSolid(w.chord, { zc, p, c })));
+    }
+    if (slots.length) tongue = t.add(t.add(tongue.subtract(t.add(Manifold.union(slots)))).add(t.add(Manifold.union(catches))));
+    const cutters = recesses.length ? Manifold.union([cavity, ...recesses]) : cavity.translate([0, 0, 0]);
+    // copies, as the scope deletes what it holds
+    const copy = (m) => m.translate([0, 0, 0]);
+    return { tongue: copy(tongue), cutters, catches: catches.map(copy), recesses: recesses.map(copy), zc };
+  } finally {
+    t.dispose();
+  }
+}
+
+/** What a lip's solids are built from, as a key: the same plan builds the same solids. */
+const lipKey = (lip) => JSON.stringify([
+  lip.kind, Boolean(lip.hasOver), lip.H, lip.c, lip.p, lip.t, lip.g0, lip.d0, lip.zTop, lip.T, lip.Tc, lip.A, lip.windows.map((w) => [w.slot, w.chord]),
+]);
+
+/** A lip's tongue and cutters, kept: never delete them, transform or copy them. */
+function cachedLip(lip) {
+  return LIPS.get(lipKey(lip), () => {
+    const s = lipSolids(lip);
+    for (const m of [...s.catches, ...s.recesses]) m.delete();
+    return { tongue: s.tongue, cutters: s.cutters };
+  });
+}
+
+/**
+ * A lip's plane frame (male below, w into the female) → world: the cut's
+ * plane coordinates moved to the cut, mirrored in w for a male above it
+ * (`dir` −1): a mirrored solid is as valid as the one it mirrors.
+ * @returns {number[]} column-major 4×4
+ */
+export function lipFrame(axis, at, dir = 1) {
+  const flip = dir < 0 ? [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1] : [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  return mulMat4(TO_WORLD[axis], mulMat4(translationMat4([0, 0, at]), flip));
+}
+
+/**
+ * A lip's tongue where it stands in the assembled model (world), to fuse to
+ * its male piece.
+ * @param {object} lip from `layoutSplit`'s `lips`
+ * @returns {Manifold}
+ */
+export function lipAt(lip) {
+  return cachedLip(lip).tongue.transform(lipFrame(lip.axis, lip.at, lip.dir));
+}
+
+/**
+ * A lip's groove, its mouth and its catches' recesses in place (world), to
+ * take out of its female piece.
+ * @param {object} lip from `layoutSplit`'s `lips`
+ * @returns {Manifold}
+ */
+export function lipCavityAt(lip) {
+  return cachedLip(lip).cutters.transform(lipFrame(lip.axis, lip.at, lip.dir));
+}
+
+/**
+ * The lip of a solid's largest face at a cut, standing out of the piece
+ * below it, as `layoutSplit` lays one out (its plain data), or null when the
+ * face takes none: the fit test's box and lid.
+ */
+function lipOnFace(solid, cut, { c, hold, nozzle }) {
+  const t = scope();
+  try {
+    const band = t.add(bandFor(solid, cut, lipReach(LIP.heights[0], 'opening', c, catchSizes('snap', c).i, true, nozzle).reach));
+    const { face, patches } = patchesFor(band, cut, []);
+    t.add(face);
+    patches.forEach((x) => t.add(x.cs));
+    const largest = patches.reduce((best, x) => (!best || x.area > best.area ? x : best), null);
+    if (!largest) return null;
+    const patch = t.add(largest.cs.simplify(LIP.faceTolerance));
+    const inset = t.add(patch.offset(-0.05, 'Miter', 4));
+    const obstaclesAt = (R) => {
+      const block = t.add(t.add(shadowFor(band, cut, { below: LIP.root, above: R })).intersect(inset));
+      const over = overFor(band, cut, 1, R, patch);
+      return { block: block.isEmpty() ? null : block, over: over ? t.add(over) : null };
+    };
+    const { plan } = lipFor(patch, { c, nozzle, hold, obstaclesAt });
+    if (!plan) return null;
+    return {
+      ...plan, cutId: cut.id, letter: cut.letter, patch: 0, axis: cut.axis, at: cut.at, dir: 1, male: 0, down: `-${AXES[cut.axis]}`,
+      sides: [{ piece: 1, male: true }, { piece: 2, male: false }], clips: plan.windows.length, room: null, suggestedAt: null,
+    };
+  } finally {
+    t.dispose();
+  }
 }
 
 // ---------- labels ----------
@@ -1197,14 +2006,18 @@ export function dovetailCells(plan, cuts, bounds, clearance = SPLIT_DEFAULTS.cle
  * sword's guard the blade would lie on the round grip; such a cut takes
  * pins (or pegs). The dovetail cuts on one axis share one thickness axis w
  * (their cells are extruded along it); cuts on another axis may go through
- * another plate (the two arms of an L).
+ * another plate (the two arms of an L). A cut that comes apart is tested
+ * whatever the Joints are, and is never glued: through a thin plate its
+ * pieces lie flat on unglued tabs, under 2 mm they just rest on each other
+ * (`APART_FLAT`), and anywhere else it gets a lip (`'lip'`); it is never
+ * told it isn't a plate.
  * @param {Manifold} solid (borrowed)
- * @param {{ id, letter, axis, at }[]} cuts normalised, in canonical order
+ * @param {{ id, letter, axis, at, apart? }[]} cuts normalised, in canonical order
  * @param {object} spec the normalised settings (`joint`, `clearance`)
  * @param {{ passthrough?: boolean, frame?: function }} options whether there are unrepaired triangles;
  *   `frame(axis)` lends the solid in that axis's plane frame
  * @returns {{ dove: { ids: string[], w: number|Object<string, number>, clearance: number }|null,
- *   joints: Object<string, 'dowels'|'pegs'|'dovetail'|'none'>, plates: Object<string, object>, tabs: object|null, notes: object[] }}
+ *   joints: Object<string, 'dowels'|'pegs'|'dovetail'|'lip'|'none'>, plates: Object<string, object>, tabs: object|null, notes: object[] }}
  *   `dove` is what the cut stage's key holds: `w` the plates' thickness axis, or each cut's by id when they differ
  */
 export function planDovetails(solid, cuts, spec = {}, { passthrough = false, frame = null } = {}) {
@@ -1212,7 +2025,10 @@ export function planDovetails(solid, cuts, spec = {}, { passthrough = false, fra
   const joints = {};
   const plates = {};
   const notes = [];
-  if (mode === 'none' || mode === 'dowels') {
+  // the glued cuts take tabs under Auto and Dovetails only; a cut that comes apart is always tested, whatever the
+  // Joints say: through a thin plate unglued tabs line its pieces up, anywhere else it gets a lip
+  const glueTabs = mode !== 'none' && mode !== 'dowels';
+  if (!glueTabs && !cuts.some((cut) => cut.apart)) {
     for (const cut of cuts) joints[cut.id] = mode;
     return { dove: null, joints, plates, tabs: null, notes };
   }
@@ -1226,6 +2042,10 @@ export function planDovetails(solid, cuts, spec = {}, { passthrough = false, fra
     const axisW = [null, null, null];
     const ids = [];
     for (const cut of cuts) {
+      if (!glueTabs && !cut.apart) {
+        joints[cut.id] = mode;
+        continue;
+      }
       const face = faceOf(frames, cut);
       // the plate must stay flat out to the next cuts either side, or the model's ends
       const along = by[cut.axis];
@@ -1243,6 +2063,19 @@ export function planDovetails(solid, cuts, spec = {}, { passthrough = false, fra
         if (!boxesBeside(held, cut.axis, i, cut.at).every((s) => liesFlat(s, test.w, thickness))) test = { ...test, joint: 'dowels', reason: 'lying' };
       }
       plates[cut.id] = test;
+      if (cut.apart) {
+        if (test.joint === 'dovetail' && (axisW[cut.axis] === null || axisW[cut.axis] === test.w)) {
+          axisW[cut.axis] = test.w;
+          wOf[cut.id] = test.w;
+          ids.push(cut.id);
+          joints[cut.id] = 'dovetail';
+        } else if (test.joint === 'none') {
+          // under 2 mm a plate takes nothing at all: its pieces just rest on each other
+          joints[cut.id] = 'none';
+          notes.push(splitNote('APART_FLAT', { letter: cut.letter, cutId: cut.id, axis: cut.axis, why: 'thin', wall: 2 }));
+        } else joints[cut.id] = 'lip';
+        continue;
+      }
       if (test.joint === 'none') {
         joints[cut.id] = 'none';
         const n = test.islands.length;
@@ -1265,9 +2098,15 @@ export function planDovetails(solid, cuts, spec = {}, { passthrough = false, fra
     const w = shared ? wOf[ids[0]] : wOf;
     const tabs = dovetailTabs(solid, cuts, { ids, w }, { frame: (axis) => frames.get(axis) });
     const kept = [];
+    const apart = new Set(cuts.filter((cut) => cut.apart).map((cut) => cut.id));
     for (const seam of tabs.seams) {
       if (seam.tabs.length) {
         kept.push(seam.cutId);
+        continue;
+      }
+      // a cut that comes apart with no room for its tabs is given a lip to try instead, which tells what it gets
+      if (apart.has(seam.cutId)) {
+        joints[seam.cutId] = 'lip';
         continue;
       }
       joints[seam.cutId] = 'none';
@@ -1751,7 +2590,19 @@ function roomAround(cut, by, bounds) {
  * sockets, and where both have room, rather the one across from more of it
  * (`prefer`); the other gets the sockets. The model's peg size is sized on
  * the side each face's sockets go into. Labels ("2A") go on each pinned or
- * pegged face, in the same spot on both pieces.
+ * pegged face, in the same spot on both pieces. The cuts that come apart
+ * are laid out first, one after another: each patch of a cut's faces is
+ * planned with the lip on either piece (`lipFor`, the groove's side taking
+ * the air past the face, the lips of the cuts before it, its own material
+ * over the openings and the next cut as obstacles), one piece of each pair
+ * is chosen to carry it (`apartMales`), lying the one way that keeps its
+ * lip standing up – which the teardrops of the other cuts then follow –
+ * unless the cut moved a little would let a piece that prints better carry
+ * it, which the notes then offer; and the tongues and grooves are placed
+ * before any pin, peg or label of the other cuts, which keep clear of them.
+ * A lip short of full is tried at the places the notes would offer, and
+ * only one found to have a full lip there is offered (`suggestedAt`). A
+ * lip's face gets no label and counts towards no cap.
  * @param {Manifold} solid the model (borrowed)
  * @param {{ id, letter, axis, at }[]} cuts normalised, in canonical order
  * @param {{ index: number, cell: number[], up?: string, boxes?: object[] }[]} pieces from `cutPieces`, or `layPieces`, with
@@ -1759,31 +2610,45 @@ function roomAround(cut, by, bounds) {
  *   Where a cell holds more than one, `boxes` (its shells') tell which holds each face
  * @param {object} spec the normalised settings (joint, diameter, depth, clearance, count, labels)
  * @param {{ nozzle?: number, joints?: Object<string, string>, tabs?: object|null, font?: object, bounds?: object,
- *   progress?: function, pegMales?: function|null }} options
- *   `joints` per cut id (from `planDovetails`; dowels when missing, pegs when the joint is built-in pegs); `tabs` its
+ *   progress?: function, pegMales?: function|null, apartMales?: function|null }} options
+ *   `joints` per cut id (from `planDovetails`; dowels when missing, pegs when the joint is built-in pegs, a lip on a cut
+ *   that comes apart); `tabs` its
  *   dovetail tabs, whose sockets reach past their cut right through the model, so the holes of a crossing cut keep out
  *   of them as out of an earlier cut's holes; `font` the labels' (Inter), labels are skipped without it;
  *   `pegMales(pairs, length)` which of the pieces either side of each pegged face carries its pegs (split.js
  *   `pegMales`: for each `{ axis, lo, hi, sockets, prefer }`, 0 the one below the cut, 1 the one above, null neither,
  *   and so glue only; `sockets` which of the two has room for the sockets of the smallest peg the cut may take, [below,
  *   above]; `prefer`, where both have, the one across from more room for them – more of the faces, then larger pegs,
- *   then longer ones – or null; `length` how far the model's pegs stand out at most); when not given the one below, or
- *   the one across from the only one with room for the sockets, or from more of it, or neither when neither has
+ *   then longer ones – or null; `length` how far the model's pegs stand out at most; `forced` the way down of each
+ *   piece a lip stands out of, a Map by its number, for split.js `pegMales`' `forced`); when not given the one below, or
+ *   the one across from the only one with room for the sockets, or from more of it, or neither when neither has;
+ *   `apartMales(pairs, given)` which piece of each pair across a cut that comes apart carries its lip, asked cut by
+ *   cut (split.js `apartMales`: for each `{ axis, lo, hi, quality: [below, above] }`, `quality` the lip each would carry,
+ *   `{ H, clips, area }` or null, `{ male, piece, down, alt? }` or null; `given` the ways down the lips of the cuts
+ *   before have given pieces, a Map by number); when not given the one with the better lip, else the one below
  * @returns {{ diameter: number|null, pegSize: number|null, dowels: object[], pegs: object[], labels: object[],
- *   seams: object[], notes: object[], pinnable: string[] }} `pinnable` the ids of the cuts with pegs whose faces
- *   would take pins instead (3 mm or larger), for the note on pegs printed standing up
+ *   lips: object[], seams: object[], notes: object[], pinnable: string[] }} `pinnable` the ids of the cuts with pegs
+ *   whose faces would take pins instead (3 mm or larger), for the note on pegs printed standing up
  *   dowel `{ cutId, letter, patch, axis, at, centre, uv, d, depth, R, h, ch, cell, sides: [{ piece, tear, apex }, …] }`
  *   (side 0 the lower piece, `cell` the pin's half-cell for the exploded view);
  *   peg `{ cutId, letter, patch, axis, at, centre, uv, s, length, c, half, ch, e, h, tip, a, cell, male, dir, sides:
  *   [{ piece, peg }, …] }` (`male` the side that carries it, `dir` the way it points along the axis, ±1, `sides[k].peg`
  *   whether that side's piece carries it, the other having its socket);
  *   label `{ cutId, letter, patch, axis, at, size, centre, uv, sides: [{ piece, text, outward }, …] }`;
- *   seam `{ cutId, letter, axis, at, pieces: [lo, hi], joint, patches, dowels, pegs, male, labels: [text, text]|null }`
- *   (`male` the number of the piece carrying its pegs, else null)
+ *   lip, plain data, `{ cutId, letter, patch, axis, at, dir, male, down, sides: [{ piece, male }, …], hold, kind, hasOver,
+ *   H, c, p, i, t, g0, d0, zTop, T, Tc, A, windows: [{ s0, s1, slot, chord }], key, clips, why, room, root,
+ *   suggestedAt }` (`male` the side that carries it, `dir` the way it points along the axis, ±1, `down` the way its male
+ *   lies, `T`, `Tc` and `A` its plan's polygons, `planLip`; `room`, `root` and `suggestedAt` where a full lip did not
+ *   fit: the room its groove has, whether something stands in its tongue's foot, and where the cut was tried and has a
+ *   full lip, or null);
+ *   seam `{ cutId, letter, axis, at, pieces: [lo, hi], joint, patches, dowels, pegs, male, labels: [text, text]|null,
+ *   apart? }` (`male` the number of the piece carrying its pegs or its lip, else null; `apart` on a cut that comes
+ *   apart, `{ hold, lip, clips, height, key, faces, flat, tabs? }`: whether it has a lip, its clips, its height, whether
+ *   it has the key, how many of the pair's faces have a lip and how many just rest, and its dovetail tabs' count)
  */
 export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
   const { CrossSection, Manifold } = manifold();
-  const { nozzle = 0.4, joints = {}, tabs = null, font = null, progress = null, pegMales = null } = options;
+  const { nozzle = 0.4, joints = {}, tabs = null, font = null, progress = null, pegMales = null, apartMales = null } = options;
   const bounds = options.bounds ?? boxOf(solid);
   const by = axisCuts(cuts);
   const c = Number.isFinite(spec.clearance) ? spec.clearance : SPLIT_DEFAULTS.clearance;
@@ -1791,8 +2656,10 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
   const manual = Number(spec.diameter) > 0 ? Number(spec.diameter) : 0;
   const wanted = Number(spec.count) > 0 ? Math.round(Number(spec.count)) : 0;
   const labelsOn = spec.labels !== false && Boolean(font);
+  // copies: a piece a lip stands out of is given its way up here, and the caller's stay as they were
+  const own = pieces.map((p) => ({ ...p }));
   const inCell = new Map();
-  for (const p of pieces) {
+  for (const p of own) {
     const key = p.cell.join(',');
     if (!inCell.has(key)) inCell.set(key, []);
     inCell.get(key).push(p);
@@ -1826,13 +2693,16 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
   const PEG = {
     auto: AUTO_PEGS, full: (d, dep) => pegSizesFor(d, c, nozzle, dep), room: (d, dep, room) => pegSizesForRoom(d, c, nozzle, dep, room), reach: pegReach,
   };
-  const jointOf = (cut) => joints[cut.id] ?? (spec.joint === 'none' ? 'none' : spec.joint === 'pegs' ? 'pegs' : 'dowels');
+  const jointOf = (cut) => joints[cut.id] ?? (cut.apart ? 'lip' : spec.joint === 'none' ? 'none' : spec.joint === 'pegs' ? 'pegs' : 'dowels');
+  // a lip's band reaches as far as the tallest groove with clips over a ceiling may need (10.3 mm at 0.5 clearance)
+  const lipBand = lipReach(LIP.heights[0], 'opening', c, catchSizes('snap', c).i, true, nozzle).reach;
   const notes = [];
   const dowels = [];
   const pegs = [];
   const labels = [];
   const contexts = [];
   const placed = []; // { m, side, box }: every half-hole placed so far, world
+  const lipForced = new Map(); // piece -> the letter of the cut whose lip says how it lies
   const keep = scope(); // bands, patches, shadows and obstacles that live until the layout is done
 
   /** A cut's shadow at a reach (as `shadowFor`), kept for the layout: the air's once per reach, the earlier holes' added on top. */
@@ -2253,9 +3123,260 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     }
   }
 
+  /**
+   * The obstacles on the groove's side of a patch of a cut that comes apart, the lip standing out of side k (0 the
+   * piece below the cut), within R of the face: its columns that meet air there or a lip of a cut that came apart
+   * before it (`ctx.obstacles`: two crossing cuts' tongues would fill one corner), and `root` the other way, where the
+   * tongue's foot sinks into its own piece; and the groove's piece's own material over the island's openings
+   * (`overFor`). Past the next cut on the groove's side its piece ends, so a reach beyond that meets the whole face (a
+   * groove there would cut through to the next cut's lip). Kept for the layout, by reach.
+   */
+  const lipObstacles = (ctx, patch, k, root = LIP.root) => {
+    const seen = new Map();
+    return (R) => {
+      const key = R.toFixed(4);
+      if (!seen.has(key)) {
+        patch.lipInset ??= keep.add(patch.lip.offset(-0.05, 'Miter', 4));
+        const reach = k === 0 ? { below: root, above: R } : { below: R, above: root };
+        const block = R > ctx.rooms[1 - k] + 1e-9 ? patch.lipInset : keep.add(shadowAt(ctx, reach, true).intersect(patch.lipInset));
+        const over = R > 0 ? overFor(ctx.band, ctx.cut, 1 - k, R, patch.island) : null;
+        if (over) keep.add(over);
+        seen.set(key, { block: block.isEmpty() ? null : block, over });
+      }
+      return seen.get(key);
+    };
+  };
+  /** What stands in the tongue's foot on side k of a patch: the air, and earlier lips, in the 0.5 mm it sinks in. */
+  const lipRootAt = (ctx, patch, k) => () => {
+    patch.lipRoot ??= new Map();
+    if (!patch.lipRoot.has(k)) {
+      patch.lipInset ??= keep.add(patch.lip.offset(-0.05, 'Miter', 4));
+      const reach = k === 0 ? { below: LIP.root, above: 0 } : { below: 0, above: LIP.root };
+      const r = keep.add(shadowAt(ctx, reach, true).intersect(patch.lipInset));
+      patch.lipRoot.set(k, r.isEmpty() ? null : r);
+    }
+    return patch.lipRoot.get(k);
+  };
+
+  /** Each patch of a cut that comes apart planned with its lip on either piece (`lipFor`), the largest taking the key. */
+  function planLipSides(ctx) {
+    const hold = ctx.cut.apart?.hold ?? 'snap';
+    const live = ctx.patches.filter((patch) => !patch.skip);
+    const largest = live.reduce((best, patch) => (!best || patch.area > best.area ? patch : best), null);
+    for (const patch of live) {
+      patch.lipSides = [0, 1].map((k) => {
+        const obstaclesAt = lipObstacles(ctx, patch, k);
+        const { plan, kind } = lipFor(patch.lip, { island: patch.island, c, nozzle, hold, key: patch === largest, obstaclesAt });
+        return { plan, kind, obstaclesAt, roomAt: lipObstacles(ctx, patch, k, 0), rootAt: lipRootAt(ctx, patch, k) };
+      });
+    }
+  }
+
+  // the lip each piece of a pair would carry, the better first in order: one at all, with clips, taller, more clips,
+  // more tongue; the one below when they are as good
+  const lipRank = (q) => (q ? [1, q.clips > 0 ? 1 : 0, q.H, q.clips, q.area] : [0, 0, 0, 0, 0]);
+  const qualityOfPlan = (plan) => (plan ? { H: plan.H, clips: plan.windows.length, area: plan.area } : null);
+  const betterLip = (pair) => {
+    const [r0, r1] = pair.quality.map(lipRank);
+    const i = r0.findIndex((x, n) => Math.abs(x - r1[n]) > 1e-6);
+    const k = i < 0 || r0[i] > r1[i] ? 0 : 1;
+    return pair.quality[k] ? { male: k, piece: k === 0 ? pair.lo : pair.hi, down: `${k === 0 ? '-' : '+'}${AXES[pair.axis]}` } : null;
+  };
+
+  /**
+   * A cut that comes apart moved to `at` (kept, once a place): its band and its face's patches there, each with its
+   * island, as the layout first takes a face, for trying the lip there.
+   */
+  const movedTo = (ctx, at) => {
+    ctx.movedTo ??= new Map();
+    const key = at.toFixed(6);
+    if (!ctx.movedTo.has(key)) {
+      const cut = { ...ctx.cut, at };
+      const band = keep.add(bandFor(solid, cut, lipBand, bounds));
+      const { face, patches } = patchesFor(band, cut, cuts);
+      const islands = [];
+      for (const raw of face.decompose()) {
+        const cs = keep.add(raw.simplify(LIP.faceTolerance));
+        raw.delete();
+        islands.push({ cs, polygons: polygonsOf(cs) });
+      }
+      face.delete();
+      for (const patch of patches) {
+        keep.add(patch.cs);
+        patch.uv = insidePoint(patch.polygons, patch.centroid);
+        patch.lip = keep.add(patch.cs.simplify(LIP.faceTolerance));
+        patch.island = (islands.find((isl) => insidePolygons(isl.polygons, patch.uv[0], patch.uv[1])) ?? islands[0])?.cs ?? patch.lip;
+      }
+      const d = at - ctx.cut.at;
+      ctx.movedTo.set(key, { cut, band, patches, shadows: new Map(), obstacles: ctx.obstacles, rooms: [ctx.rooms[0] + d, ctx.rooms[1] - d] });
+    }
+    return ctx.movedTo.get(key);
+  };
+
+  /**
+   * Where a cut that comes apart would give side k of a patch a full lip –
+   * nothing in the way of a 6 mm lip, so as good a lip as the face takes
+   * there, and better than the one it has (at least as good, for a move of
+   * at least `least` mm) – each place tried as the cut there would have it,
+   * in 0.5 mm steps. Something in the tongue's own foot (a cut right at the
+   * top of a lantern's windows) is cleared a step or two towards the
+   * groove's piece; anything else by moving away from it, as far as the room
+   * at each place says, until a place has the room: a cut under a roof's
+   * eaves, or in a jar's shoulder, where the move takes more of the slope
+   * into the groove's piece and the next place says how much further. Null
+   * when no place within six moves has it, or a move would leave the model
+   * or reach another cut.
+   */
+  const moveFor = (ctx, patch, k, least = 0) => {
+    ctx.moveFor ??= new Map();
+    const key = `${ctx.patches.indexOf(patch)}|${k}|${least}`;
+    if (ctx.moveFor.has(key)) return ctx.moveFor.get(key);
+    const hold = ctx.cut.apart?.hold ?? 'snap';
+    const toward = k === 0 ? 1 : -1; // along the axis, the way to the groove's piece
+    const now = lipRank(qualityOfPlan(patch.lipSides[k].plan)).slice(0, 4);
+    const clear = (at) => {
+      const d = at - ctx.cut.at;
+      return ctx.rooms[0] + d > CUT_TOLERANCE && ctx.rooms[1] - d > CUT_TOLERANCE;
+    };
+    const roomOf = (where, there) => lipRoom(there.lip, {
+      island: there.island, c, nozzle, hold, obstaclesAt: lipObstacles(where, there, k, 0), rootAt: lipRootAt(where, there, k),
+    });
+    // a place with nothing in the way, where the lip is better than this one (or as good, moved for another reason)
+    const full = (where, there, r) => {
+      if (!r || r.shift > 0 || r.root) return false;
+      const { plan } = lipFor(there.lip, { island: there.island, c, nozzle, hold, key: true, obstaclesAt: lipObstacles(where, there, k), heights: [LIP.heights[0]] });
+      const rank = lipRank(qualityOfPlan(plan)).slice(0, 4);
+      const n = rank.findIndex((x, i) => Math.abs(x - now[i]) > 1e-6);
+      return n < 0 ? least > 0 && rank[0] > 0 : rank[n] > now[n];
+    };
+    const tryAt = (at) => {
+      if (!clear(at)) return null;
+      const where = movedTo(ctx, at);
+      const [u, v] = patch.uv;
+      const there = where.patches.find((x) => insidePolygons(x.polygons, u, v)) ?? where.patches.reduce((b, x) => (!b || x.area > b.area ? x : b), null);
+      if (!there) return null;
+      const r = roomOf(where, there);
+      return { at, r, ok: full(where, there, r) };
+    };
+    const step = (at, d) => Math.round((at + d) * 1e6) / 1e6;
+    const r0 = roomOf(ctx, patch);
+    let found = null;
+    if (r0?.root && !(least > 0)) {
+      for (const d of [0.5, 1]) {
+        const t = tryAt(step(ctx.cut.at, toward * d));
+        if (t?.ok) {
+          found = t.at;
+          break;
+        }
+      }
+    }
+    if (found == null && r0) {
+      // a sloping wall leaves no foot anywhere near: half a step on at a time, as far as the six moves go
+      let at = ctx.cut.at;
+      let shift = Math.max(r0.shift, least, r0.root ? 0.5 : 0);
+      for (let n = 0; n < 6 && shift > 0; n++) {
+        const t = tryAt(step(at, -toward * Math.ceil(shift / 0.5 - 1e-9) * 0.5));
+        if (!t?.r) break;
+        if (t.ok) {
+          found = t.at;
+          break;
+        }
+        at = t.at;
+        shift = t.r.shift > 0 ? t.r.shift : t.r.root ? 0.5 : 0;
+      }
+    }
+    ctx.moveFor.set(key, found);
+    return found;
+  };
+
+  /**
+   * The notes of a cut that comes apart: how it goes together, or why its
+   * lip has no clips, or why it has no lip at all – its faces too small (it
+   * runs through openings), its walls too thin, no piece that may lie with
+   * the lip standing up, no room in the groove's piece past the cut, or the
+   * piece that prints as well with it too tall then for the printer – with
+   * where the cut would have one.
+   */
+  function lipNotes(ctx) {
+    const { cut } = ctx;
+    const hold = cut.apart?.hold ?? 'snap';
+    const caught = catchSizes(hold, c);
+    const base = { letter: cut.letter, cutId: cut.id, axis: cut.axis };
+    const live = ctx.patches.filter((patch) => !patch.skip);
+    if (!live.length) return;
+    const one = (set) => {
+      const list = [...set].sort((x, y) => x - y);
+      return list.length === 1 ? list[0] : list;
+    };
+    const here = live.filter((patch) => patch.lipOn).map((patch) => patch.lipOn);
+    // the faces with a lip on offer that no piece may carry, lying as it must already, and those with none
+    const lying = live.filter((patch) => !patch.lipPair?.male && !patch.lipPair?.moved && patch.lipPair?.pair.quality.some(Boolean));
+    if (here.length) {
+      const male = new Set(here.map((l) => l.sides[l.male].piece));
+      const female = new Set(here.map((l) => l.sides[1 - l.male].piece));
+      const clips = here.reduce((n, l) => n + l.clips, 0);
+      const height = Math.max(...here.map((l) => l.H));
+      notes.push(splitNote('APART', {
+        ...base, above: here.some((l) => l.male === 1), male: one(male), female: one(female), hold, clips, height, faces: here.length,
+        flat: live.length - here.length - lying.length, lying: lying.length,
+      }));
+      if (caught && !clips) {
+        const main = here.reduce((x, y) => (y.area > x.area ? y : x));
+        let why = main.H < LIP.heights[0] ? 'height' : ['flex', 'skin', 'short'].find((w) => main.why.includes(w)) ?? 'short';
+        // a tongue cut short by an opening right under the cut, not by the outline's shape
+        if (why === 'short' && main.root) why = 'edge';
+        notes.push(splitNote('APART_NO_CLIPS', {
+          ...base, female: one(female), why, height, need: lipReach(LIP.heights[0], main.kind, c, caught.i, false, nozzle).reach,
+          ...(main.suggestedAt != null ? { suggestedAt: main.suggestedAt } : {}),
+        }));
+      }
+      return;
+    }
+    const flat = { ...base, pieces: [one(new Set(live.map((patch) => patch.lo.index))), one(new Set(live.map((patch) => patch.hi.index)))] };
+    const sized = live.filter((patch) => patch.lipSides[0].kind);
+    if (!sized.length) {
+      notes.push(splitNote('APART_FLAT', { ...flat, why: 'small' }));
+      return;
+    }
+    // the piece that prints as well would carry it, moved: where to
+    const moved = live.map((patch) => patch.lipPair?.moved).find(Boolean);
+    if (moved) {
+      const main = sized.reduce((x, y) => (y.area > x.area ? y : x));
+      notes.push(splitNote('APART_FLAT', {
+        ...flat, why: moved.why, need: lipReach(LIP.heights[LIP.heights.length - 1], main.lipSides[moved.k].kind, c, 0, false, nozzle).reach,
+        ...(moved.why === 'tall' ? { piece: moved.piece, other: moved.other } : {}), suggestedAt: moved.at,
+      }));
+      return;
+    }
+    if (lying.length) {
+      // pieces another cut's lip already lies one way, by that cut's letter
+      const by = [...new Set(lying.flatMap((patch) => [patch.lo.index, patch.hi.index]).filter((i) => lipForced.has(i)).map((i) => lipForced.get(i)))].sort();
+      const fixed = [...new Set(lying.flatMap((patch) => [patch.lo.index, patch.hi.index]).filter((i) => lipForced.has(i)))].sort((x, y) => x - y);
+      notes.push(splitNote('APART_FLAT', { ...flat, why: 'lying', ...(by.length ? { by, fixed: one(fixed) } : {}) }));
+      return;
+    }
+    // walls too thin take no lip even with nothing in the way; else what is in the way is why, on the side the groove
+    // was to go (beyond the cut, unless its piece was chosen to carry the lip)
+    const main = sized.reduce((x, y) => (y.area > x.area ? y : x));
+    const k = main.lipPair?.male?.male ?? 0;
+    const lowest = LIP.heights[LIP.heights.length - 1];
+    const bare = planLip(main.lip, { island: main.island, c, nozzle, H: lowest, hold: 'lift', key: false });
+    if (!bare) {
+      const sizes = lipSizesFor(c, nozzle, 'lift');
+      notes.push(splitNote('APART_FLAT', { ...flat, why: 'thin', wall: Math.ceil((LIP.g0 + sizes.tMin + sizes.wall + c) * 10 - 1e-6) / 10 }));
+      return;
+    }
+    const suggestedAt = moveFor(ctx, main, k);
+    notes.push(splitNote('APART_FLAT', {
+      ...flat, why: 'room', need: lipReach(lowest, main.lipSides[k].kind, c, 0, false, nozzle).reach, ...(suggestedAt != null ? { suggestedAt } : {}),
+    }));
+  }
+
   // the stage is told from the start: on a dense model the bands and the sizing pass take seconds before any pin is placed
   const joined = cuts.filter((cut) => jointOf(cut) === 'dowels' || jointOf(cut) === 'pegs');
-  const stage = joined.length && joined.every((cut) => jointOf(cut) === 'pegs') ? 'Finding room for pegs…' : 'Finding room for pins…';
+  const stage = !joined.length && cuts.some((cut) => jointOf(cut) === 'lip')
+    ? 'Fitting the lip…'
+    : joined.length && joined.every((cut) => jointOf(cut) === 'pegs') ? 'Finding room for pegs…' : 'Finding room for pins…';
   const steps = cuts.length + 1 + joined.length;
   try {
     // ---- every cut's face, its patches and the pieces either side ----
@@ -2263,14 +3384,25 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
       progress?.(stage, { done: contexts.length, total: steps });
       const joint = jointOf(cut);
       const kind = joint === 'pegs' ? PEG : PIN;
-      const band = keep.add(bandFor(solid, cut, joint === 'dowels' || joint === 'pegs' ? kind.reach : 0.5, bounds));
+      const band = keep.add(bandFor(solid, cut, joint === 'dowels' || joint === 'pegs' ? kind.reach : joint === 'lip' ? lipBand : 0.5, bounds));
       const { face, patches } = patchesFor(band, cut, cuts);
+      // a lip takes its openings from the face's whole island (a crossing cut halves it), the outlines eased by
+      // 0.02 mm, so a dense one plans in a moment
+      const islands = [];
+      if (joint === 'lip') {
+        for (const raw of face.decompose()) {
+          const cs = keep.add(raw.simplify(LIP.faceTolerance));
+          raw.delete();
+          islands.push({ cs, polygons: polygonsOf(cs) });
+        }
+      }
       face.delete();
       const a = cut.axis;
       const lo = by[a].indexOf(cut.at);
       for (const patch of patches) {
         keep.add(patch.cs);
         const [u, v] = insidePoint(patch.polygons, patch.centroid);
+        patch.uv = [u, v];
         const point = applyMat4(TO_WORLD[a], [u, v, cut.at]);
         const cell = cellOfPoint(point, by);
         cell[a] = lo;
@@ -2286,6 +3418,10 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
         patch.fit = [null, null];
         patch.label = null;
         patch.alloc = 0;
+        if (joint === 'lip') {
+          patch.lip = keep.add(patch.cs.simplify(LIP.faceTolerance));
+          patch.island = (islands.find((isl) => insidePolygons(isl.polygons, u, v)) ?? islands[0])?.cs ?? patch.lip;
+        }
       }
       // a pin's holes go into both pieces and take the nearer room; a peg's socket only that of its own side
       const room = roomAround(cut, by, bounds);
@@ -2294,7 +3430,121 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     const pinned = contexts.filter((x) => x.joint === 'dowels');
     const pegged = contexts.filter((x) => x.joint === 'pegs');
     const connected = contexts.filter((x) => x.joint === 'dowels' || x.joint === 'pegs');
+    const lipped = contexts.filter((x) => x.joint === 'lip');
     const sockets = connected.length && tabs?.seams?.some((x) => x.tabs.length) ? keep.add(socketsOf(tabs, cuts, bounds, c)) : null;
+
+    // ---- the lips of the cuts that come apart, first: which piece carries each decides how that piece lies, which
+    // the other cuts' teardrops then follow, and every pin, peg and label keeps clear of them ----
+    const forced = new Map();
+    const lips = [];
+    if (lipped.length) {
+      const byIndex = new Map(own.map((p) => [p.index, p]));
+      // the lip each piece of a pair would carry over all the pair's faces: the tallest, every clip, all the tongue
+      const qualityOf = (list, k) => {
+        const plans = list.map((patch) => patch.lipSides[k].plan).filter(Boolean);
+        if (!plans.length) return null;
+        return { H: Math.max(...plans.map((x) => x.H)), clips: plans.reduce((n, x) => n + x.windows.length, 0), area: plans.reduce((n, x) => n + x.area, 0) };
+      };
+      // cut by cut, each keeping clear of the lips placed before it, as of air (two crossing cuts' tongues would fill
+      // one corner), and of the ways their pieces must lie
+      lipped.forEach((ctx, done) => {
+        progress?.('Fitting the lip…', { done, total: lipped.length });
+        const near = placed.filter((x) => x.box.max[ctx.cut.axis] > ctx.cut.at - lipBand && x.box.min[ctx.cut.axis] < ctx.cut.at + lipBand);
+        ctx.obstacles = near.length ? [keep.add(Manifold.compose(near.map((x) => x.m)))] : [];
+        planLipSides(ctx);
+        const lipPairs = new Map();
+        for (const patch of ctx.patches) {
+          if (patch.skip) continue;
+          const key = `${patch.lo.index}|${patch.hi.index}`;
+          if (!lipPairs.has(key)) lipPairs.set(key, { ctx, patches: [] });
+          lipPairs.get(key).patches.push(patch);
+        }
+        const groups = [...lipPairs.values()];
+        const list = groups.map(({ patches }) => ({
+          axis: ctx.cut.axis, lo: patches[0].lo.index, hi: patches[0].hi.index, quality: [qualityOf(patches, 0), qualityOf(patches, 1)],
+        }));
+        const chosen = apartMales ? apartMales(list, forced) : list.map(betterLip);
+        groups.forEach((g, n) => {
+          g.pair = list[n];
+          g.male = chosen[n] ?? null;
+          for (const patch of g.patches) patch.lipPair = g;
+          // a piece that would print worse with the lip, where the other would print as well carrying it once the
+          // cut moves: no lip here, and the note says where
+          const alt = g.male?.alt;
+          if (alt) {
+            const main = g.patches.reduce((x, y) => (y.area > x.area ? y : x));
+            const at = moveFor(ctx, main, alt.k, alt.why === 'tall' ? alt.over : 0);
+            if (at != null) {
+              g.moved = { at, why: alt.why, k: alt.k, piece: alt.piece, other: g.male.piece };
+              g.male = null;
+            }
+          }
+          if (!g.male) return;
+          forced.set(g.male.piece, g.male.down);
+          lipForced.set(g.male.piece, ctx.cut.letter);
+          byIndex.get(g.male.piece).up = oppositeDir(g.male.down);
+        });
+        const hold = ctx.cut.apart?.hold ?? 'snap';
+        for (const g of groups) {
+          if (!g.male) continue;
+          const k = g.male.male;
+          for (const patch of g.patches) {
+            const side = patch.lipSides[k];
+            const plan = side.plan;
+            if (!plan) continue;
+            // short of a full lip (6 mm, with clips on a hold that has them): how much room the groove has, and where
+            // the cut would have enough
+            const full = plan.H >= LIP.heights[0] && (plan.windows.length > 0 || !catchSizes(hold, c));
+            const r = full ? null : lipRoom(patch.lip, { island: patch.island, c, nozzle, hold, obstaclesAt: side.roomAt, rootAt: side.rootAt });
+            const lip = {
+              cutId: ctx.cut.id,
+              letter: ctx.cut.letter,
+              patch: ctx.patches.indexOf(patch),
+              axis: ctx.cut.axis,
+              at: ctx.cut.at,
+              dir: k === 0 ? 1 : -1,
+              male: k,
+              down: g.male.down,
+              sides: [patch.lo, patch.hi].map((piece, j) => ({ piece: piece.index, male: j === k })),
+              hold,
+              kind: plan.kind,
+              hasOver: plan.hasOver,
+              H: plan.H,
+              c,
+              p: plan.p,
+              i: plan.i,
+              t: plan.t,
+              g0: plan.g0,
+              d0: plan.d0,
+              zTop: plan.zTop,
+              T: plan.T,
+              Tc: plan.Tc,
+              A: plan.A,
+              windows: plan.windows,
+              key: plan.key,
+              clips: plan.windows.length,
+              why: plan.why,
+              area: plan.area,
+              room: r ? r.room : null,
+              root: Boolean(r?.root),
+              suggestedAt: r ? moveFor(ctx, patch, k) : null,
+            };
+            patch.lipOn = lip;
+            lips.push(lip);
+            // the tongue is its male's and the groove its female's: placed apart, as a hole's two halves are
+            const tongue = keep.add(lipAt(lip));
+            const groove = keep.add(lipCavityAt(lip));
+            placed.push({ m: tongue, side: k, box: boxOf(tongue) }, { m: groove, side: 1 - k, box: boxOf(groove) });
+          }
+        }
+      });
+      for (const ctx of contexts) {
+        for (const patch of ctx.patches) {
+          if (!patch.skip) patch.apex = [teardropApex(patch.lo.up ?? '+z', ctx.cut.axis), teardropApex(patch.hi.up ?? '+z', ctx.cut.axis)];
+        }
+      }
+      for (const ctx of lipped) lipNotes(ctx);
+    }
 
     // ---- which side of each pegged face has room for its sockets at all: the smallest peg the cut may fall back to,
     // as short as it may be, fits there. A plate under a thick top has none, and carries the pegs instead ----
@@ -2376,7 +3626,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     const longest = PEG.full(pegManual || (better.length ? Math.min(...better) : AUTO_PEGS[AUTO_PEGS.length - 1]), depth).length;
     const list = [...pairs.values()].map((x) => x.pair);
     const males = pegMales
-      ? pegMales(list, longest)
+      ? pegMales(list, longest, forced)
       : list.map((pair) => (!pair.sockets[1] ? (pair.sockets[0] ? 1 : null) : !pair.sockets[0] ? 0 : pair.prefer ?? 0));
     const maleOf = new Map([...pairs.keys()].map((key, i) => [key, males[i]]));
     for (const ctx of pegged) {
@@ -2462,26 +3712,47 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     const seams = [];
     for (const ctx of contexts) {
       const pairs = new Map();
+      const lipsOf = new Map();
       for (const patch of ctx.patches) {
         if (patch.skip) continue;
         const key = `${patch.lo.index}|${patch.hi.index}`;
         if (!pairs.has(key)) {
           const { id: cutId, letter, axis, at } = ctx.cut;
           pairs.set(key, { cutId, letter, axis, at, pieces: [patch.lo.index, patch.hi.index], joint: ctx.joint, patches: 0, dowels: [], pegs: [], male: null, labels: null });
+          lipsOf.set(key, []);
         }
         const seam = pairs.get(key);
         seam.patches++;
         seam.dowels.push(...patch.dowels);
         seam.pegs.push(...patch.pegs);
         if (patch.pegs.length) seam.male = seam.pieces[patch.male];
+        if (patch.lipOn) {
+          seam.male = patch.lipOn.sides[patch.lipOn.male].piece;
+          lipsOf.get(key).push(patch.lipOn);
+        }
         if (patch.label && !seam.labels) seam.labels = patch.label.sides.map((s) => s.text);
       }
-      for (const seam of pairs.values()) {
-        if ((seam.joint === 'dowels' && !seam.dowels.length) || (seam.joint === 'pegs' && !seam.pegs.length)) seam.joint = 'none';
+      for (const [key, seam] of pairs) {
+        const here = lipsOf.get(key);
+        const empty = { dowels: !seam.dowels.length, pegs: !seam.pegs.length, lip: !here.length };
+        if (empty[seam.joint]) seam.joint = 'none';
+        if (ctx.cut.apart) {
+          // a cut that comes apart is never glued: how it holds instead, for the glue sheet and the pieces list
+          const hold = ctx.cut.apart.hold ?? 'snap';
+          if (seam.joint === 'dovetail') {
+            const tabCount = tabs?.seams?.find((x) => x.cutId === seam.cutId)?.tabs.length ?? 0;
+            seam.apart = { hold, lip: false, clips: 0, height: 0, key: false, faces: 0, flat: 0, tabs: tabCount };
+          } else {
+            seam.apart = {
+              hold, lip: here.length > 0, clips: here.reduce((n, l) => n + l.clips, 0), height: here.length ? Math.max(...here.map((l) => l.H)) : 0,
+              key: here.some((l) => Boolean(l.key)), faces: here.length, flat: seam.patches - here.length,
+            };
+          }
+        }
         seams.push(seam);
       }
     }
-    return { diameter: D, pegSize: P, dowels, pegs, labels, seams, notes, pinnable: pegged.filter((ctx) => ctx.pinnable).map((ctx) => ctx.cut.id) };
+    return { diameter: D, pegSize: P, dowels, pegs, labels, lips, seams, notes, pinnable: pegged.filter((ctx) => ctx.pinnable).map((ctx) => ctx.cut.id) };
   } finally {
     keep.dispose();
   }
@@ -2490,12 +3761,13 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
 // ---------- drilling ----------
 
 /**
- * A piece with its own built-in pegs added and its half-holes, sockets and
- * labels taken out: one boolean each, the pegs and the cutters being
- * disjoint by construction (pin and peg spacing, label room). A piece with
- * nothing to drill comes back as a copy.
+ * A piece with its own built-in pegs and lip tongues added and its
+ * half-holes, sockets, grooves and labels taken out: one boolean each, the
+ * pegs and tongues and the cutters being disjoint by construction (pin and
+ * peg spacing, label room, the other cuts keeping clear of the lips). A
+ * piece with nothing to drill comes back as a copy.
  * @param {Manifold} solid the piece (borrowed)
- * @param {{ dowels: object[], pegs?: object[], labels: object[] }} layout from `layoutSplit`
+ * @param {{ dowels: object[], pegs?: object[], lips?: object[], labels: object[] }} layout from `layoutSplit`
  * @param {number} pieceIndex the piece's number (1-based)
  * @param {{ font?: object }} options the labels' font (needed when the piece has labels)
  * @returns {Manifold}
@@ -2514,6 +3786,9 @@ export function drillPiece(solid, layout, pieceIndex, { font = null } = {}) {
     }
     for (const peg of layout.pegs ?? []) {
       for (const s of peg.sides) if (s.piece === pieceIndex) (s.peg ? grown : cutters).push(t.add(s.peg ? pegAt(peg) : socketAt(peg)));
+    }
+    for (const lip of layout.lips ?? []) {
+      for (const s of lip.sides) if (s.piece === pieceIndex) (s.male ? grown : cutters).push(t.add(s.male ? lipAt(lip) : lipCavityAt(lip)));
     }
     for (const label of layout.labels ?? []) {
       for (const s of label.sides) {

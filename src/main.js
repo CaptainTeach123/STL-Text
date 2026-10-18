@@ -1227,6 +1227,12 @@ function cutLetter(id) {
   return i >= 0 ? letterFor(i) : null;
 }
 
+/** "A", "A and C", "A, B and C". */
+const listOf = (items) => (items.length > 1 ? `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}` : String(items[0] ?? ''));
+
+/** The letters of the cuts that come apart: never glued, so the joint settings are not theirs. */
+const apartLetters = () => (doc.split?.cuts ?? []).map((c, i) => (c.joint === 'apart' ? letterFor(i) : null)).filter(Boolean);
+
 let splitWork = 0;
 let splitPendingTimer = 0;
 /** "working…" on the card while split requests run (only when one takes a moment, so quick ones do not flicker). */
@@ -1237,8 +1243,16 @@ function setSplitPending(on) {
   else $('splitCard').classList.remove('pending');
 }
 
-/** What a fit is planned for besides the text: the model, the printer and the split's settings (not its cuts: they are replaced). */
-const fitSettings = () => ({ base: version(), printing, bed: usableBed(bed), split: { ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split, cuts: [] } });
+/**
+ * What a fit is planned for besides the text: the model, the printer and the split's settings, and the cuts that come
+ * apart, which it keeps where they are (the others are replaced), so that ticking one plans the fit again.
+ */
+const fitSettings = () => ({
+  base: version(),
+  printing,
+  bed: usableBed(bed),
+  split: { ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split, cuts: (doc.split?.cuts ?? []).filter((c) => c.joint === 'apart') },
+});
 
 /** What a fit is planned for: the model and its text, the printer and the split's settings. */
 const planKey = () => stableKey({ items: doc.items, ...fitSettings() });
@@ -1304,7 +1318,9 @@ function scheduleOffer() {
 /**
  * Fit to my printer: the engine works out the fewest pieces that fit and
  * where their cuts go; they replace any cuts as one undo step, and the
- * pieces are shown. A model that fits already loses its cuts the same way.
+ * pieces are shown. A model that fits already loses its cuts the same way –
+ * all but those that come apart, which the plan keeps where they are and
+ * plans the others round (its notes, in the card, say so).
  */
 async function autoSplit() {
   if (!canSplit()) return;
@@ -1334,6 +1350,9 @@ async function autoSplit() {
     // a split already there keeps its settings; a new one starts from those used last
     doc.setSplit(doc.split ? { cuts: r.cuts } : { ...splitDefaults, cuts: r.cuts });
     selectedCutId = null;
+    // the cuts that come apart were kept, or are all it needs: said in the card for the split as it now is (the render
+    // above has made its key the current one)
+    if (r.notes.length) planNotes = { key: lastSplitKey, content: lastContentKey, notes: r.notes };
     if ($('toastText').textContent === offered) $('toast').hidden = true; // done what it offered
     $('resultToggle').checked = true;
     showResult(true, { keep: true });
@@ -1408,6 +1427,16 @@ function removeCut(id) {
   if (!letter) return;
   doc.removeCut(id);
   undoToast(`Removed cut ${letter}.`);
+}
+
+/** Make a cut one that comes apart (with the hold it had, Clicks on at first), or a glued one again. */
+function setCutApart(id, on) {
+  doc.setCutJoint(id, on ? {} : null);
+}
+
+/** How a cut that comes apart holds: 'snap' (Clicks on), 'light' (Light click) or 'lift' (Lifts off). */
+function setCutHold(id, hold) {
+  doc.setCutJoint(id, { hold });
 }
 
 /** The settings of the split in force are the ones used last (an undone change is not), and start the next model's split. */
@@ -1550,7 +1579,10 @@ function renderSplit() {
   viewer.setCuts(cuts, { selectedId: selectedCutId, bounds: measuredBounds() });
   viewer.setCellPreview(cuts && cutsWithTabs(), { tooBig: cellTooBig });
   viewer.setCutSnap(nudgeStep(), 5 * nudgeStep()); // Shift moves five times as far, as with the arrow keys
-  $('legendCut').hidden = $('legendPieces').hidden = !cuts;
+  // the planes of cuts that come apart are teal, the others violet
+  $('legendPieces').hidden = !cuts;
+  $('legendCut').hidden = !cuts?.some((c) => c.joint !== 'apart');
+  $('legendApart').hidden = !cuts?.some((c) => c.joint === 'apart');
   const n = piecesToDownload();
   relabel($('downloadBtn'), n > 1 ? `Download ${n} pieces (.zip)` : 'Download STL');
   $('downloadBtn').parentElement.classList.toggle('pieces', n > 1); // the longer label takes room from Undo and Redo
@@ -1560,6 +1592,11 @@ function renderSplit() {
 
 /** Settings that mean nothing for a glue-only split: nothing is drilled, socketed or engraved on its faces. */
 const PIN_SETTINGS = new Set(['diameter', 'pins', 'count', 'depth', 'labels', 'clearance']);
+/**
+ * Settings that are only the glued cuts': a cut that comes apart has its lip whatever the joints, and no labels. The
+ * clearance is its groove's too, and how firmly it clicks; how the pieces lie is every piece's.
+ */
+const GLUED_SETTINGS = new Set(['joint', 'diameter', 'pins', 'count', 'depth', 'labels']);
 
 /** Fill the split card from the document (with no split yet, from the settings used last), never writing the box being typed in. */
 function fillSplit() {
@@ -1569,6 +1606,8 @@ function fillSplit() {
   const settings = { ...SPLIT_DEFAULTS, ...splitDefaults, ...(split ?? {}) };
   const filament = Number(settings.diameter) === FILAMENT;
   const glueOnly = settings.joint === 'none';
+  const apart = active ? apartLetters() : [];
+  const allApart = apart.length > 0 && apart.length === split.cuts.length;
   // built-in pegs are printed on their piece: there are no pins to print or buy, and the size is the side of a square
   // peg, which filament can't be (the engine reads it as the smallest peg)
   const pegs = settings.joint === 'pegs';
@@ -1585,11 +1624,22 @@ function fillSplit() {
       else if (el.type === 'number') {
         if (el !== document.activeElement && Number.parseFloat(el.value) !== value) el.value = value;
       } else if (el.value !== String(value)) el.value = String(value);
-      el.disabled = !usable || (glueOnly && PIN_SETTINGS.has(key)) || ((filament || pegs) && key === 'pins');
+      el.disabled =
+        !usable ||
+        (allApart && GLUED_SETTINGS.has(key)) ||
+        (glueOnly && PIN_SETTINGS.has(key) && !(key === 'clearance' && apart.length)) ||
+        ((filament || pegs) && key === 'pins');
     });
   } finally {
     filling = false;
   }
+  const jointsHint = !apart.length
+    ? ''
+    : allApart
+      ? 'Every cut here comes apart – Joints are for glued cuts.'
+      : `Joints are for the glued cuts; ${apart.length > 1 ? `cuts ${listOf(apart)} come apart` : `cut ${apart[0]} comes apart`}.`;
+  relabel($('splitJointsHint'), jointsHint);
+  $('splitJointsHint').hidden = !jointsHint;
   const filamentOption = document.querySelector(`[data-split="diameter"] option[value="${FILAMENT}"]`);
   filamentOption.hidden = filamentOption.disabled = pegs;
   // the pin settings size the pegs: their names say which
@@ -1603,13 +1653,13 @@ function fillSplit() {
       : 'Open a model or add raised text to split it.'
     : active
       ? ''
-      : 'Too big for your printer? Cut it into pieces that print one by one and glue together on pins.';
+      : "Too big for your printer, or want the top to come off – a lantern's, a box's lid? Cut it into pieces that print one by one.";
   $('splitHint').textContent = hint;
   $('splitHint').hidden = !hint;
   $('splitBedText').textContent = `Your printer: ${formatSize(bedSize(bed))}`;
   const bounds = cutBounds();
   $('splitFitBtn').disabled = !usable;
-  $('splitFitTestBtn').disabled = !usable || glueOnly; // nothing to try the fit of
+  $('splitFitTestBtn').disabled = !usable || (glueOnly && !apart.length); // nothing to try the fit of, but a lip's
   $('addCutBtn').disabled = !usable || (!!bounds && !nextCut(bounds, split?.cuts ?? []));
   $('splitClearBtn').hidden = !active;
   $('splitSettings').hidden = !active;
@@ -1638,6 +1688,18 @@ function renderCuts() {
     const letter = letterFor(i);
     li.classList.toggle('selected', cut.id === selectedCutId);
     li.querySelector('.badge').textContent = letter;
+    // a cut that comes apart: its row and badge teal, as its plane, and how it holds beside the box
+    const apart = cut.joint === 'apart';
+    li.classList.toggle('apart', apart);
+    const box = li.querySelector('[data-cut-apart]');
+    box.checked = apart;
+    box.disabled = !usable;
+    box.setAttribute('aria-label', `Cut ${letter} comes apart`);
+    li.querySelector('.cut-hold').hidden = !apart;
+    li.querySelectorAll('[data-cut-hold]').forEach((r) => {
+      r.checked = apart && r.value === cut.hold;
+      r.disabled = !usable;
+    });
     li.querySelectorAll('[data-cut-axis]').forEach((r) => {
       r.checked = Number(r.value) === plane?.axis;
       r.disabled = !usable;
@@ -1656,7 +1718,20 @@ function renderCuts() {
   });
 }
 
-/** One cut's row: letter, the axis it runs across, where it is, ×; what it cuts goes on a line below. */
+/** How a cut that comes apart holds, as its row offers it: the value, its name and what it means. */
+const CUT_HOLD_CHOICES = [
+  ['snap', 'Clicks on', 'Spring clips click the top on: it stays on when the model is carried by its top, and pulls off by hand'],
+  ['light', 'Light click', 'Smaller catches: it clicks on lightly and comes off more easily – for a top that is taken off often'],
+  ['lift', 'Lifts off', 'No clips: the top sits on its lip, one way round, and lifts straight off'],
+];
+
+/** A row's control that only switches what the cut is: a press keeps the arrow keys for the cut, not the control. */
+const keepKeysForCut = (input) => input.addEventListener('focus', () => !input.matches(':focus-visible') && input.blur());
+
+/**
+ * One cut's row: letter, the axis it runs across, where it is, ×; on a line
+ * below whether it comes apart, and how it holds; what it cuts under that.
+ */
 function cutRow(id) {
   const li = document.createElement('li');
   li.dataset.id = id;
@@ -1676,7 +1751,7 @@ function cutRow(id) {
     radio.dataset.cutAxis = id;
     radio.addEventListener('change', () => radio.checked && setCutAxis(id, axis));
     // pressing the row selects the cut for the arrow keys: a segment clicked must not keep them, turning the cut instead
-    radio.addEventListener('focus', () => !radio.matches(':focus-visible') && radio.blur());
+    keepKeysForCut(radio);
     const span = document.createElement('span');
     span.textContent = name;
     label.append(radio, span);
@@ -1703,9 +1778,41 @@ function cutRow(id) {
   remove.title = 'Remove this cut';
   remove.setAttribute('aria-label', 'Remove this cut');
   remove.addEventListener('click', () => removeCut(id));
+  // a joint that is never glued: the box, and next to it how the top holds once it is ticked
+  const joint = document.createElement('div');
+  joint.className = 'cut-joint';
+  const apart = document.createElement('label');
+  apart.className = 'check cut-apart';
+  apart.title = "A joint that comes apart and goes back on – a lantern's top, a box's lid. One piece gets a lip, the other clicks onto it; never glued.";
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.dataset.cutApart = id;
+  box.addEventListener('change', () => setCutApart(id, box.checked));
+  keepKeysForCut(box);
+  apart.append(box, ' Comes apart');
+  const holds = document.createElement('fieldset');
+  holds.className = 'seg cut-hold';
+  holds.setAttribute('aria-label', 'How the top holds');
+  holds.hidden = true;
+  for (const [value, name, title] of CUT_HOLD_CHOICES) {
+    const label = document.createElement('label');
+    label.title = title;
+    const radio = document.createElement('input');
+    radio.type = 'radio';
+    radio.name = `cutHold-${id}`;
+    radio.value = value;
+    radio.dataset.cutHold = id;
+    radio.addEventListener('change', () => radio.checked && setCutHold(id, value));
+    keepKeysForCut(radio);
+    const span = document.createElement('span');
+    span.textContent = name;
+    label.append(radio, span);
+    holds.append(label);
+  }
+  joint.append(apart, holds);
   const meta = document.createElement('span');
   meta.className = 'meta';
-  li.append(badge, axes, where, remove, meta);
+  li.append(badge, axes, where, remove, joint, meta);
   // selected on press, not on click: re-rendering in the middle of a click on an axis would undo the axis just clicked
   li.addEventListener('pointerdown', (e) => selectedCutId !== id && !e.target.closest('.cut-remove') && selectCut(id));
   return li;
@@ -1714,13 +1821,30 @@ function cutRow(id) {
 /**
  * The joint each cut got in a worked-out split, from its seams: pins or
  * built-in pegs when some face of it takes one (its note tells of those left
- * flat), tabs on a dovetail cut that had room for them, otherwise none.
+ * flat), tabs on a dovetail cut that had room for them, otherwise none. A cut
+ * that comes apart says how it holds, every face of it counted: "clicks on
+ * (4 clips)", "light click (4 clips)", "lifts off" (a lip with no clips), or
+ * tabs or none.
  */
 function jointsOfSeams(seams = []) {
   const joints = new Map();
+  const lips = new Map(); // cutId -> { hold, lip, clips, tabs } over the cut's seams that come apart
   for (const s of seams) {
+    if (s.apart) {
+      const l = lips.get(s.cutId) ?? { hold: s.apart.hold, lip: false, clips: 0, tabs: false };
+      l.lip ||= !!s.apart.lip;
+      l.clips += s.apart.lip ? s.apart.clips ?? 0 : 0;
+      l.tabs ||= s.joint === 'dovetail' && !!s.tabs;
+      lips.set(s.cutId, l);
+      continue;
+    }
     const got = s.joint === 'dovetail' && s.tabs ? 'dovetail' : s.pegs?.length ? 'pegs' : s.dowels?.length ? 'dowels' : 'none';
     if ((joints.get(s.cutId) ?? 'none') === 'none') joints.set(s.cutId, got);
+  }
+  for (const [cutId, l] of lips) {
+    const clips = `${l.clips} ${l.clips === 1 ? 'clip' : 'clips'}`;
+    const held = l.clips > 0 && l.hold !== 'lift' ? `${l.hold === 'light' ? 'light click' : 'clicks on'} (${clips})` : 'lifts off';
+    joints.set(cutId, l.lip ? held : l.tabs ? 'dovetail' : 'none');
   }
   return joints;
 }
@@ -1733,7 +1857,9 @@ function rememberJoints(key, content, joints) {
 
 /**
  * What a cut's row says it cuts, from the last measure – its joint from the
- * split once worked out: "800 mm² · pins", "misses the model", "through “HELLO”".
+ * split once worked out: "800 mm² · pins", "misses the model", "through “HELLO”";
+ * a cut that comes apart says so, and once worked out how it holds:
+ * "1,728 mm² · comes apart: clicks on (4 clips)".
  */
 function cutMeta(cut, plane) {
   if (!plane) return "isn't straight along X, Y or Z";
@@ -1745,7 +1871,11 @@ function cutMeta(cut, plane) {
   const parts = [`${Math.round(m.area).toLocaleString()} mm²${m.islands > 1 ? ` in ${m.islands} parts` : ''}`];
   // the measure plans pins (or pegs) wherever there are no tabs; once the split is worked out, a cut none fits is glue only
   const got = joined?.key === lastSplitKey && joined.content === lastContentKey ? joined.joints.get(cut.id) : null;
-  parts.push({ dovetail: 'dovetails', pegs: 'pegs', none: 'glue only' }[got ?? m.joint] ?? 'pins');
+  // the box decides at once, whatever the measure before it said: the joint the cut gets is the split's to tell. A cut
+  // that another one in the same place was merged into comes apart when that one does
+  const apart = cut.joint === 'apart' || (doc.split?.cuts ?? []).some((c) => c.joint === 'apart' && measured.cuts.get(c.id)?.merged === cut.id);
+  if (apart) parts.push(got ? `comes apart: ${{ dovetail: 'dovetails', none: 'no lip' }[got] ?? got}` : 'comes apart');
+  else parts.push({ dovetail: 'dovetails', pegs: 'pegs', none: 'glue only' }[got ?? m.joint] ?? 'pins');
   const through = (m.crosses ?? []).map((itemId) => doc.items.find((i) => i.id === itemId)).filter(Boolean);
   if (through.length) parts.push(`through ${through.map((i) => `“${itemLabel(i)}”`).join(', ')}`);
   return parts.join(' · ');
@@ -1775,6 +1905,9 @@ function renderPieces() {
         // which piece carries a face's built-in pegs, and which has their sockets
         p.pegs ? `${p.pegs} ${p.pegs === 1 ? 'peg' : 'pegs'}` : '',
         p.sockets ? `${p.sockets} ${p.sockets === 1 ? 'socket' : 'sockets'}` : '',
+        // which piece a take-apart cut's lip stands out of, and which comes off it
+        ...(p.lips ?? []).map((l) => `lip at ${l.letter}${l.clips ? `, ${l.clips} ${l.clips === 1 ? 'clip' : 'clips'}` : ''}`),
+        p.lids?.length ? `comes off at ${listOf(p.lids)}` : '',
       ].filter(Boolean),
     }));
   } else if (active) {
@@ -1818,7 +1951,17 @@ const splitNoteActions = (() => {
   const select = (n) => cutLetter(n.cutId) && { label: `Select cut ${cutLetter(n.cutId)}`, run: () => selectCut(n.cutId) };
   const remove = (n) => cutLetter(n.cutId) && { label: `Remove cut ${cutLetter(n.cutId)}`, run: () => removeCut(n.cutId) };
   const smaller = (n) => n.suggestedDiameter && { label: `Use Ø${n.suggestedDiameter} mm`, run: () => setSplitSetting('diameter', n.suggestedDiameter) };
+  // a lip short of room: where the cut has it, when there is such a place
+  const moveTo = (n) =>
+    Number.isFinite(n.suggestedAt) && cutLetter(n.cutId)
+      ? { label: `Move cut ${cutLetter(n.cutId)} to ${round(n.suggestedAt)} mm`, run: () => moveCut(n.cutId, n.suggestedAt) }
+      : select(n);
+  // clips too light for what hangs below them: the full click holds more
+  const firmer = (n) => doc.split?.cuts.find((c) => c.id === n.cutId)?.hold === 'light' && { label: 'Use Clicks on', run: () => setCutHold(n.cutId, 'snap') };
   return {
+    APART_NO_CLIPS: moveTo,
+    APART_FLAT: moveTo,
+    APART_HEAVY: firmer,
     PIECE_TOO_BIG: () => canSplit() && { label: 'Fit to my printer', run: autoSplit },
     SMALL_PIECE: select,
     CUT_THROUGH_TEXT: select,
@@ -1906,7 +2049,9 @@ function offerSplit() {
 /**
  * A small print to try the joints before printing the pieces: the engine
  * works out the split as it stands, so the coupon has the pin or peg size
- * Auto picks and a dovetail when a cut gets one (whatever the Joints setting).
+ * Auto picks and a dovetail when a cut gets one (whatever the Joints setting),
+ * and where a cut comes apart on a lip, a small box and its lid with the same
+ * lip, held as that cut is.
  */
 async function downloadFitTest() {
   const active = activeSplit();
@@ -1918,10 +2063,12 @@ async function downloadFitTest() {
     if (!(await syncBase())) return setStatus('The model is still being updated – try again in a moment.', '');
     const r = await client.fitTest(doc.items, version(), { printing, split, bed: usableBed(bed), name: exportName() });
     if (!r) return;
-    // it worked the split out and found no pins (or no pegs) in it: the cuts planned to have them have none (nor tabs,
-    // with no file)
+    // it worked the split out and found no pins (or no pegs, or no lip) in it: the cuts planned to have them have none
+    // (nor tabs, with no file)
     const planned = (c) => measured?.cuts.get(c.id)?.joint;
-    const none = active ? split.cuts.filter((c) => !r.stl || (planned(c) === 'dowels' && !r.pins) || (planned(c) === 'pegs' && !r.pegs)) : [];
+    const none = active
+      ? split.cuts.filter((c) => !r.stl || (planned(c) === 'dowels' && !r.pins) || (planned(c) === 'pegs' && !r.pegs) || (planned(c) === 'lip' && !r.apart))
+      : [];
     if (none.length) {
       rememberJoints(splitFor, requestedFor, none.map((c) => [c.id, 'none']));
       renderCuts();
@@ -1930,7 +2077,16 @@ async function downloadFitTest() {
       // cuts between the letters of a sign cross no material: nothing is joined, not even with glue
       const apart = split.cuts.length > 0 && split.cuts.every((c) => measured?.cuts.get(c.id)?.islands === 0);
       const joints = split.joint === 'pegs' ? 'pegs' : 'pins';
-      return setStatus(apart ? 'Nothing to try: these cuts cross no material, so nothing is joined.' : `Nothing to try: these cuts get no ${joints} or tabs, only glue.`, '');
+      // a cut that comes apart is never glued: with no lip its pieces just rest on each other
+      const lips = split.cuts.filter((c) => c.joint === 'apart').length;
+      const why = apart
+        ? 'these cuts cross no material, so nothing is joined'
+        : lips === split.cuts.length
+          ? 'these cuts get no lip or tabs, so the pieces just rest on each other'
+          : lips
+            ? `these cuts get no ${joints}, tabs or lip`
+            : `these cuts get no ${joints} or tabs, only glue`;
+      return setStatus(`Nothing to try: ${why}.`, '');
     }
     const file = save(r.stl, r.name);
     const own = split.pins === 'own';
@@ -1941,7 +2097,14 @@ async function downloadFitTest() {
     }
     if (r.pegs) checks.push(`the ${r.pegSize} mm peg pushes into its socket`);
     if (r.dovetail) checks.push('the tab drops into its socket');
-    setStatus(`Downloaded ${file.name} (${file.kb} KB). Print it and check that ${checks.join(' and that ')} by hand – too tight: raise Clearance by 0.05 mm.`, 'ok');
+    // the box and lid of a cut that comes apart: clips that click (lightly), or none
+    const clicks = r.apart === 'snap' || r.apart === 'light';
+    if (clicks) checks.push(`the lid clicks${r.apart === 'light' ? ' lightly' : ''} onto the box and pulls off again`);
+    else if (r.apart) checks.push('the lid drops onto the box and lifts off freely');
+    setStatus(
+      `Downloaded ${file.name} (${file.kb} KB). Print it and check that ${checks.join(' and that ')} by hand – too tight: raise Clearance by 0.05 mm${clicks ? '; no click or too loose: lower it by 0.05 mm' : ''}.`,
+      'ok',
+    );
   } catch (err) {
     setStatus(friendly(err), 'error');
   } finally {

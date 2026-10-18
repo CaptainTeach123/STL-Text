@@ -1,9 +1,12 @@
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
-import { FILAMENT, PIN_DIAMETERS, TO_PLANE, chooseOrientation, isSymmetric, normaliseSplit, pegMales, pegSizesFor, sizesFor } from '../src/split.js';
+import {
+  AXES, FILAMENT, PIN_DIAMETERS, TO_PLANE, apartMales, applyMat4, chooseOrientation, isSymmetric, normaliseSplit, pegMales, pegSizesFor, sizesFor,
+} from '../src/split.js';
 import {
   bandFor,
   buildSplitDisplay,
+  clearSplitCaches,
   cutPieces,
   dovetailCells,
   dovetailTabs,
@@ -13,6 +16,13 @@ import {
   halfHole,
   labelSolid,
   layoutSplit,
+  lipAt,
+  lipCavityAt,
+  lipFor,
+  lipFrame,
+  lipRegions,
+  lipSolids,
+  overFor,
   pegAt,
   pegSolid,
   pinAt,
@@ -26,6 +36,7 @@ import {
   socketSolid,
 } from '../src/splitGeometry.js';
 import { inter, setup } from './helpers.js';
+import { box as boxAt, gothicSolid, lanternSolid, lift, overhangs, stlCheck } from './lanternFixture.js';
 
 let wasm;
 let font;
@@ -1145,5 +1156,819 @@ describe('the pieces view', () => {
     const [, second] = d.ranges;
     expect(d.passthroughRanges).toEqual([[second[0] + second[1] - 1, 1]]);
     expect(d.passthroughStart).toBe(second[0] + second[1] - 1);
+  });
+});
+
+// ---------- cuts that come apart ----------
+
+/**
+ * Cuts through the stage chain as the engine runs it, each coming apart unless it is `[axis, at, false]`: the pieces
+ * lie on `bed`, and the piece that carries each lip is split.js's choice (`apartMales`), or the one on side `male` (0
+ * the one below the cut) when asked. `pairs` are what the layout asked about, with both sides' lips.
+ */
+function apartSplit(solid, list, { hold = 'snap', clearance = 0.15, joint = 'auto', orient = null, male = null, bed = BED, labels = false, progress = null } = {}) {
+  const stored = list.map(([axis, at, apart = true], i) => {
+    const position = [0, 0, 0];
+    const normal = [0, 0, 0];
+    position[axis] = at;
+    normal[axis] = 1;
+    return { id: `c${i + 1}`, position, normal, ...(apart ? { joint: 'apart', hold } : {}) };
+  });
+  const { spec, cuts } = normaliseSplit({ cuts: stored, clearance, joint, labels, ...(orient ? { orient } : {}) }, boxOf(solid));
+  const plan = planDovetails(solid, cuts, spec);
+  const cut = cutPieces(solid, cuts, { dove: plan.dove, tabs: plan.tabs });
+  cut.pieces.forEach((p) => own(p.solid));
+  const pieces = cut.pieces.map((p) => {
+    const lying = chooseOrientation(p.stats, bed, spec.orient, { pieceIndex: p.index });
+    return { ...p, lying, up: lying.up };
+  });
+  const pairs = [];
+  const forcedSeen = [];
+  const chooser = apartMales(pieces, bed, spec.orient);
+  const side = (pair, k) => ({ male: k, piece: k === 0 ? pair.lo : pair.hi, down: `${k === 0 ? '-' : '+'}${AXES[pair.axis]}` });
+  const layout = layoutSplit(solid, cuts, pieces, spec, {
+    joints: plan.joints,
+    tabs: plan.tabs,
+    font: labels ? font : null,
+    progress,
+    apartMales: (asked, given) => {
+      pairs.push(...asked);
+      return male === null ? chooser(asked, given) : asked.map((pair) => side(pair, male));
+    },
+    pegMales: spec.joint === 'pegs'
+      ? (asked, length, forced) => {
+        forcedSeen.push(forced);
+        return pegMales(pieces, bed, spec.orient, { forced })(asked, length);
+      }
+      : null,
+  });
+  const drilled = pieces.map((p) => own(drillPiece(p.solid, layout, p.index, { font })));
+  return { spec, cuts, plan, pieces, layout, drilled, pairs, forcedSeen, notes: [...plan.notes, ...layout.notes] };
+}
+
+/** A lip's solids where they stand (world), and its frame. */
+function lipParts(lip) {
+  const s = lipSolids(lip);
+  const frame = lipFrame(lip.axis, lip.at, lip.dir);
+  const placed = (m) => own(own(m).transform(frame));
+  return { tongue: placed(s.tongue), cutters: placed(s.cutters), catches: s.catches.map(placed), recesses: s.recesses.map(placed), frame };
+}
+
+/** What of a solid lies within `below` and `above` of a cut along its axis: the lip's neighbourhood, quick to test. */
+function nearCut(m, axis, at, below, above) {
+  const b = boxOf(m);
+  const min = b.min.map((v) => v - 1);
+  const max = b.max.map((v) => v + 1);
+  min[axis] = at - below;
+  max[axis] = at + above;
+  return own(m.intersect(own(boxAt(min, max))));
+}
+
+const positiveShells = (m) => shells(m).filter((x) => x.volume() > 0).length;
+const near = (x, want, tol) => Math.abs(x - want) <= tol;
+
+/**
+ * The most the lips' catches, moved in by s (as the clips bow to let go), meet the female piece lifted 0…top off
+ * them: 0 means it comes off. Only the female round each catch is tested, which is all a catch can meet.
+ */
+function release(lips, female, s, { top = 9, step = 0.25, early = false } = {}) {
+  const { Manifold } = wasm;
+  const moved = [];
+  const around = [];
+  for (const lip of lips) {
+    const parts = lipParts(lip);
+    const o = applyMat4(parts.frame, [0, 0, 0]);
+    lip.windows.forEach((w, k) => {
+      const out = applyMat4(parts.frame, [w.chord.out[0], w.chord.out[1], 0]).map((v, a) => v - o[a]);
+      moved.push(own(parts.catches[k].translate(out.map((v) => -s * v))));
+      const b = boxOf(parts.catches[k]);
+      const min = b.min.map((v) => v - 1.5);
+      const max = b.max.map((v) => v + 1.5);
+      if (lip.dir > 0) min[lip.axis] -= top + 1;
+      else max[lip.axis] += top + 1;
+      around.push(own(boxAt(min, max)));
+    });
+  }
+  if (!moved.length) return 0;
+  const catches = own(Manifold.union(moved));
+  const crop = own(female.intersect(own(Manifold.union(around))));
+  let worst = 0;
+  for (let dz = 0; dz <= top + 1e-9; dz += step) {
+    const d = [0, 0, 0];
+    d[lips[0].axis] = dz * lips[0].dir;
+    worst = Math.max(worst, lift(catches, crop, d));
+    if (early && worst > 1e-6) break;
+  }
+  return worst;
+}
+
+/**
+ * The most each whole clip of a lip (the bridge over its slot, with its catch), bowed in by the interference and a
+ * little, meets the female lifted 0…8 mm: 0 means the clips have room to bow and let go.
+ */
+function bowed(lip, female) {
+  const parts = lipParts(lip);
+  const o = applyMat4(parts.frame, [0, 0, 0]);
+  const bridges = lip.windows.map((w) => {
+    const slot = own(new wasm.CrossSection(w.slot, 'Positive'));
+    const column = own(own(own(wasm.Manifold.extrude(slot, 17)).translate([0, 0, 3.001])).transform(parts.frame));
+    const out = applyMat4(parts.frame, [w.chord.out[0], w.chord.out[1], 0]).map((v, a) => v - o[a]);
+    return own(own(parts.tongue.intersect(column)).translate(out.map((v) => -(lip.i + 0.05) * v)));
+  });
+  const bent = own(wasm.Manifold.union(bridges));
+  let worst = 0;
+  for (let dz = 0; dz <= 8; dz += 0.5) {
+    const d = [0, 0, 0];
+    d[lip.axis] = dz * lip.dir;
+    worst = Math.max(worst, lift(bent, female, d));
+  }
+  return worst;
+}
+
+/** How far the catches must move in before the female comes off (bisection, to 0.002 mm). */
+function deflection(lips, female) {
+  let lo = 0;
+  let hi = 0.8;
+  for (let k = 0; k < 9; k++) {
+    const mid = (lo + hi) / 2;
+    if (release(lips, female, mid, { top: 7, step: 0.1, early: true }) > 1e-6) lo = mid;
+    else hi = mid;
+  }
+  return hi;
+}
+
+/** How far the female lifts off the male before they meet (0.01 mm steps up to 1 mm). */
+function freePlay(male, female, dir) {
+  let free = 0;
+  for (let k = 1; k <= 100; k++) {
+    if (lift(male, female, dir.map((v) => (v * k) / 100)) > 1e-6) break;
+    free = k / 100;
+  }
+  return free;
+}
+
+/** A slicer's overhangs (`overhangs`) over 0.05 mm², as width × length @ height above `z0`. */
+const overhangList = (m, from, to, z0) => overhangs(m, from, to, 0.2).filter((o) => o.area > 0.05).map((o) => ({ width: o.width, long: o.long, z: +(o.z - z0).toFixed(2) }));
+
+/** A hollow box open at the top: outside `size` (centred on x and y), walls `wall` thick, a floor `floor` thick. */
+function tray(size, wall, floor = 2) {
+  const [x, y, z] = size;
+  return own(own(boxAt([-x / 2, -y / 2, 0], [x / 2, y / 2, z])).subtract(own(boxAt([-x / 2 + wall, -y / 2 + wall, floor], [x / 2 - wall, y / 2 - wall, z + 1]))));
+}
+
+describe('take-apart lips', () => {
+  it('the lantern fixture is the model the lip\'s numbers were measured on', () => {
+    const lantern = own(lanternSolid());
+    expect(lantern.volume()).toBeCloseTo(303965.2, 0);
+    expect(lantern.genus()).toBe(8);
+    expect(lantern.numTri()).toBe(808);
+    expect(boxOf(lantern)).toMatchObject({ min: [-55, -55, 0], max: [55, 55, 291] });
+    const face = own(lantern.slice(190));
+    expect(face.area()).toBeCloseTo(1728, 3);
+    expect(shells(face)).toHaveLength(1);
+    expect(stlCheck(lantern)).toEqual({ degenerate: 0, open: 0 });
+  });
+
+  it('the lantern\'s top clicks onto a 6 mm lip with 4 clips and a key, sits tight, holds and pulls off again', () => {
+    const lantern = own(lanternSolid());
+    const r = apartSplit(lantern, [[2, 190]]);
+    expect(r.plan.joints).toEqual({ c1: 'lip' });
+    expect(r.layout.lips).toHaveLength(1);
+    const [lip] = r.layout.lips;
+    expect(lip).toMatchObject({ kind: 'opening', H: 6, clips: 4, male: 0, dir: 1, down: '-z', hold: 'snap', p: 0.4, i: 0.25, zTop: 8.15, why: [] });
+    expect(lip.sides).toEqual([{ piece: 1, male: true }, { piece: 2, male: false }]);
+    const middles = lip.windows.map((w) => w.chord.p);
+    for (const want of [[47.7, 0], [0, 47.7], [-47.7, 0], [0, -47.7]]) expect(middles.some((m) => near(m[0], want[0], 0.05) && near(m[1], want[1], 0.05))).toBe(true);
+    expect(near(lip.key.p[0], -46.91, 0.1) && near(lip.key.p[1], -47.02, 0.1)).toBe(true);
+    expect(lip.area).toBeCloseTo(590.83, 0);
+
+    const [body, lid] = r.drilled;
+    expect([body.genus(), lid.genus()]).toEqual([12, 1]);
+    for (const piece of [body, lid]) {
+      expect(piece.status()).toBe('NoError');
+      expect(positiveShells(piece)).toBe(1);
+      expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+    }
+    const b = nearCut(body, 2, 190, 2, 10);
+    const l = nearCut(lid, 2, 190, 2, 14);
+    const parts = lipParts(lip);
+    // seated: touching nowhere, with the clearance all round, and no room to slide
+    expect(lift(b, l)).toBeLessThan(1e-9);
+    expect(parts.tongue.minGap(lid, 1)).toBeGreaterThanOrEqual(0.149);
+    expect(lift(b, l, [0.14, 0, 0])).toBeLessThan(1e-6);
+    expect(lift(b, l, [0.16, 0, 0])).toBeGreaterThan(1);
+    // held: lifted, the catches meet their recesses' tops
+    expect(lift(b, l, [0, 0, 0.2])).toBeLessThan(1e-6);
+    expect(near(lift(b, l, [0, 0, 0.25]), 0.206, 0.01)).toBe(true);
+    expect(near(lift(b, l, [0, 0, 0.5]), 1.569, 0.03)).toBe(true);
+    expect(near(freePlay(b, l, [0, 0, 1]), 0.21, 0.01)).toBe(true);
+    // released: with the clips bowed in by the interference and a little, it lifts all the way off
+    expect(release(r.layout.lips, lid, lip.i + 0.05)).toBeLessThan(1e-6);
+    expect(near(deflection(r.layout.lips, lid), 0.25, 0.01)).toBe(true);
+    // and each whole clip has room to bow in that far
+    expect(bowed(lip, l)).toBeLessThan(1e-6);
+    // the key: turned a quarter, a half or three quarters, the top doesn't go on
+    for (const turn of [90, 180, 270]) expect(lift(b, own(l.rotate([0, 0, turn])))).toBeGreaterThan(40);
+
+    // printing: the body upright has only the four clips' bridges over their slots; the lid prints on its cut face,
+    // or upside down, as the plain lid does
+    const bodyOver = overhangList(body, 190.1, 198, 190);
+    expect(bodyOver).toHaveLength(4);
+    for (const o of bodyOver) {
+      expect(near(o.width, 1.6, 0.05) && near(o.long, 39.6, 0.2)).toBe(true);
+      expect(o.z).toBeCloseTo(3.1, 5);
+    }
+    const plainLid = r.pieces[1].solid;
+    const top = 190 + lip.zTop + 1.5;
+    expect(overhangList(lid, 190.1, top, 190)).toEqual(overhangList(plainLid, 190.1, top, 190));
+    expect(overhangList(own(lid.rotate([180, 0, 0])), -top, -190.1, -190)).toEqual(overhangList(own(plainLid.rotate([180, 0, 0])), -top, -190.1, -190));
+    // an elephant's foot on the lid's first layers still clears the lip
+    const first = own(lid.slice(190.1));
+    for (const e of [0.1, 0.2, 0.3]) {
+      const foot = own(own(wasm.Manifold.extrude(own(own(first.offset(e, 'Round', 2, 32)).subtract(first)), 0.3)).translate([0, 0, 190]));
+      expect(lift(foot, body)).toBeLessThan(1e-6);
+    }
+    // nothing changes outside the face's own columns: the outside and the opening are as they were
+    const columns = own(own(wasm.Manifold.extrude(own(own(lantern.slice(190)).offset(0.06, 'Round', 2, 32)), 40)).translate([0, 0, 170]));
+    expect(own(own(body.subtract(r.pieces[0].solid)).subtract(columns)).volume()).toBeLessThan(1e-4);
+    expect(own(own(plainLid.subtract(lid)).subtract(columns)).volume()).toBeLessThan(1e-4);
+  });
+
+  it('the clearance tunes the click: the catch stands 0.4 mm out of the clip, at least 0.1 more than the clearance', () => {
+    for (const [c, p, i, bend] of [[0.05, 0.4, 0.35, 0.35], [0.3, 0.4, 0.1, 0.1], [0.45, 0.55, 0.1, 0.1]]) {
+      const r = apartSplit(own(lanternSolid()), [[2, 190]], { clearance: c });
+      const [lip] = r.layout.lips;
+      expect(lip).toMatchObject({ H: 6, clips: 4, c });
+      expect(lip.p).toBeCloseTo(p, 9);
+      expect(lip.i).toBeCloseTo(i, 9);
+      expect(near(deflection(r.layout.lips, r.drilled[1]), bend, 0.01)).toBe(true);
+      if (c === 0.45) expect(near(lift(nearCut(r.drilled[0], 2, 190, 2, 10), nearCut(r.drilled[1], 2, 190, 2, 14), [0, 0, 1]), 0.727, 0.02)).toBe(true);
+    }
+  });
+
+  it('Light click has smaller catches; Lifts off has none, and the top lifts straight off', () => {
+    const light = apartSplit(own(lanternSolid()), [[2, 190]], { hold: 'light' });
+    expect(light.layout.lips[0]).toMatchObject({ hold: 'light', clips: 4, p: 0.25 });
+    expect(near(deflection(light.layout.lips, light.drilled[1]), 0.1, 0.01)).toBe(true);
+    expect(near(lift(nearCut(light.drilled[0], 2, 190, 2, 10), nearCut(light.drilled[1], 2, 190, 2, 14), [0, 0, 0.25]), 0.085, 0.01)).toBe(true);
+    const off = apartSplit(own(lanternSolid()), [[2, 190]], { hold: 'lift' });
+    expect(off.layout.lips[0]).toMatchObject({ hold: 'lift', H: 6, clips: 0, windows: [], why: [] });
+    expect(off.layout.lips[0].key).not.toBeNull();
+    expect(off.drilled[0].genus()).toBe(8);
+    const b = nearCut(off.drilled[0], 2, 190, 2, 10);
+    const l = nearCut(off.drilled[1], 2, 190, 2, 14);
+    let worst = 0;
+    for (let dz = 0; dz <= 9; dz += 0.25) worst = Math.max(worst, lift(b, l, [0, 0, dz]));
+    expect(worst).toBeLessThan(1e-6);
+    expect(off.notes.map((n) => n.code)).toEqual(['APART']);
+    expect(off.notes[0].text).toBe('Cut A comes apart: the top (piece 2) sits on a 6 mm lip on piece 1 and lifts straight off.');
+  });
+
+  it('a lip on the piece above the cut is the same lip mirrored: the lantern upside down', () => {
+    const r = apartSplit(own(own(lanternSolid()).rotate([180, 0, 0])), [[2, -190]]);
+    const [lip] = r.layout.lips;
+    // the body is above the cut now, and lies on its floor with the lip standing up out of it
+    expect(lip).toMatchObject({ male: 1, dir: -1, down: '+z', H: 6, clips: 4 });
+    expect(lip.area).toBeCloseTo(590.83, 0);
+    const [roof, body] = r.drilled;
+    expect([roof.genus(), body.genus()]).toEqual([1, 12]);
+    for (const piece of [roof, body]) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+    const b = nearCut(body, 2, -190, 10, 2);
+    const l = nearCut(roof, 2, -190, 14, 2);
+    expect(lift(b, l)).toBeLessThan(1e-9);
+    expect(near(lift(b, l, [0, 0, -0.25]), 0.206, 0.01)).toBe(true);
+    expect(release(r.layout.lips, roof, lip.i + 0.05)).toBeLessThan(1e-6);
+    expect(r.layout.seams[0]).toMatchObject({ joint: 'lip', male: 2, apart: { lip: true, clips: 4 } });
+  });
+
+  it('a cut too near the roof gets a shorter lip, or none, and says where a lip with clips would fit', () => {
+    const at192 = apartSplit(own(lanternSolid()), [[2, 192]]);
+    expect(at192.layout.lips[0]).toMatchObject({ H: 4.5, clips: 0, why: ['height'], room: 7.85, suggestedAt: 190.5 });
+    expect(at192.notes.map((n) => n.code)).toEqual(['APART', 'APART_NO_CLIPS']);
+    expect(at192.notes[1]).toMatchObject({ why: 'height', height: 4.5, suggestedAt: 190.5 });
+    expect(at192.notes[1].text).toBe('Cut A\'s lip is only 4.5 mm tall, so it has no clips and the top just lifts off: a lip that clicks on needs 9.4 mm of plain wall in piece 2 past the cut. Move the cut to 190.5 mm.');
+    expect(apartSplit(own(lanternSolid()), [[2, 190.5]]).layout.lips[0]).toMatchObject({ H: 6, clips: 4 });
+    // on the body the groove's piece has no room at all. The top would take the lip, but only standing on its handle:
+    // the body prints as well, so the cut has no lip here and the note says where the body has one
+    for (const at of [194, 196]) {
+      const r = apartSplit(own(lanternSolid()), [[2, at]]);
+      expect(r.layout.lips).toEqual([]);
+      expect(r.pairs[0].quality[0]).toBeNull();
+      expect(r.pairs[0].quality[1]).toMatchObject({ H: 6, clips: 4 });
+      expect(r.notes.map((n) => n.code)).toEqual(['APART_FLAT']);
+      expect(r.notes[0]).toMatchObject({ why: 'room', suggestedAt: 190.5 });
+      expect(r.notes[0].text).toBe('Cut A has no room for a lip – piece 2 has under 6.4 mm of plain wall past the cut before a roof, a ledge or an opening. Move the cut to 190.5 mm.');
+      expect(r.layout.seams[0]).toMatchObject({ joint: 'none', male: null, apart: { lip: false, faces: 0, flat: 1 } });
+    }
+    // on a printer 195 mm tall the body fits, but not with a lip standing 6 mm out of it, and the top would carry it
+    // standing on its handle: no lip, and the note says where the body has room to carry it
+    const short = apartSplit(own(lanternSolid()), [[2, 190]], { bed: [210, 210, 195] });
+    expect(short.layout.lips).toEqual([]);
+    expect(short.notes.map((n) => [n.code, n.why, n.suggestedAt])).toEqual([['APART_FLAT', 'tall', 189]]);
+    expect(short.notes[0].text).toBe('Cut A has no lip: piece 1 would be too tall for your printer standing up with one, and piece 2 would need supports carrying it. Move the cut to 189 mm.');
+    expect(apartSplit(own(lanternSolid()), [[2, 189]], { bed: [210, 210, 195] }).layout.lips[0]).toMatchObject({ male: 0, H: 6, clips: 4 });
+    // with nowhere to move to (the windows below), the top carries it, on its handle, rather than none at all
+    const low = apartSplit(own(lanternSolid()), [[2, 190]], { bed: [210, 210, 150] });
+    expect(low.layout.lips[0]).toMatchObject({ male: 1, down: '+z', H: 6, clips: 4 });
+  });
+
+  it('a move the notes offer is tried there first: past the roof\'s slope, or up off the top of the windows', () => {
+    // in the roof the slope is in the way wherever the cut goes down to the eaves: the move goes on to below them
+    for (const at of [203, 205]) {
+      const r = apartSplit(own(lanternSolid()), [[2, at]]);
+      expect(r.notes.map((n) => [n.code, n.why, n.suggestedAt])).toEqual([['APART_FLAT', 'room', 190.5]]);
+    }
+    // right at the top of the windows the tongue's foot stands over them, broken into short stretches; down only goes
+    // into the windows, half a millimetre up the wall is whole
+    const edge = apartSplit(own(lanternSolid()), [[2, 160]]);
+    expect(edge.layout.lips[0]).toMatchObject({ H: 6, clips: 0, why: ['short'], root: true, suggestedAt: 160.5 });
+    expect(edge.notes[1]).toMatchObject({ code: 'APART_NO_CLIPS', why: 'edge', suggestedAt: 160.5 });
+    expect(edge.notes[1].text).toBe('Cut A runs along the edge of an opening or a ledge, which breaks its lip into short stretches, so it has no clips and the top just lifts off. Move the cut to 160.5 mm.');
+    expect(apartSplit(own(lanternSolid()), [[2, 160.5]]).layout.lips[0]).toMatchObject({ H: 6, clips: 4, root: false, suggestedAt: null });
+    // a jar cut in its shoulder: a move by the room the shoulder leaves takes more of it into the top, so it goes on to
+    // below the shoulder, as far as the room there says
+    const jar = () => {
+      const { Manifold } = wasm;
+      const outer = own(Manifold.union([own(Manifold.cylinder(100, 45, 45, 96)), own(own(Manifold.cylinder(20, 45, 18, 96)).translate([0, 0, 100])), own(own(Manifold.cylinder(25, 18, 18, 96)).translate([0, 0, 120]))]));
+      const inner = own(Manifold.union([own(own(Manifold.cylinder(97, 42, 42, 96)).translate([0, 0, 3])), own(own(Manifold.cylinder(20, 42, 15, 96)).translate([0, 0, 100])), own(own(Manifold.cylinder(27, 15, 15, 96)).translate([0, 0, 120]))]));
+      return own(outer.subtract(inner));
+    };
+    for (const at of [110, 100.5]) expect(apartSplit(jar(), [[2, at]]).notes.map((n) => [n.code, n.why, n.suggestedAt])).toEqual([['APART_FLAT', 'room', 90.5]]);
+    expect(apartSplit(jar(), [[2, 91]]).notes.map((n) => [n.code, n.why, n.suggestedAt])).toEqual([['APART', undefined, undefined], ['APART_NO_CLIPS', 'height', 90.5]]);
+    // there it has as good a lip as a round wall takes – no straight stretch for a clip – and no more move
+    expect(apartSplit(jar(), [[2, 90.5]]).notes.map((n) => [n.code, n.why, n.suggestedAt])).toEqual([['APART', undefined, undefined], ['APART_NO_CLIPS', 'short', undefined]]);
+  });
+
+  it('a cut through the windows has only small faces: no lip, and the note says to cut through a solid band', () => {
+    const r = apartSplit(own(lanternSolid()), [[2, 100]]);
+    expect(r.layout.lips).toEqual([]);
+    expect(r.notes.map((n) => [n.code, n.why])).toEqual([['APART_FLAT', 'small']]);
+    expect(r.layout.seams[0]).toMatchObject({ joint: 'none', labels: null, apart: { hold: 'snap', lip: false, clips: 0, faces: 0, flat: 8 } });
+  });
+
+  it('crossed by a glued cut, each half of the face gets its own lip with 3 clips, and the cut one key', () => {
+    const r = apartSplit(own(lanternSolid()), [[0, 0, false], [2, 190]]);
+    expect(r.layout.lips).toHaveLength(2);
+    expect(r.layout.lips.map((l) => l.clips)).toEqual([3, 3]);
+    expect(r.layout.lips.filter((l) => l.key)).toHaveLength(1);
+    for (const piece of r.drilled) {
+      expect(piece.status()).toBe('NoError');
+      expect(positiveShells(piece)).toBe(1);
+      expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+    }
+    const lower = r.drilled.filter((d, k) => r.pieces[k].cell[2] === 0);
+    const upper = r.drilled.filter((d, k) => r.pieces[k].cell[2] === 1);
+    const body = own(lower[0].add(lower[1]));
+    const lid = own(upper[0].add(upper[1]));
+    expect(lift(body, lid)).toBeLessThan(1e-9);
+    expect(release(r.layout.lips, lid, r.layout.lips[0].i + 0.05)).toBeLessThan(1e-6);
+    expect(r.notes.find((n) => n.code === 'APART').text).toBe('Cut B comes apart: the top (pieces 3 and 4) clicks onto a 6 mm lip on pieces 1 and 2 – 6 clips hold it, and it pulls off again by hand.');
+  });
+
+  it('the fit test for a cut that comes apart is a small box and its lid with the same lip and clips', () => {
+    const coupon = own(fitTestCoupon({ clearance: 0.15 }, 0.4, { pins: false, apart: 'snap' }));
+    const parts = shells(coupon);
+    expect(parts).toHaveLength(2);
+    const sizes = parts.map((p) => boxOf(p).size.map((v) => +v.toFixed(2)));
+    const k = sizes.findIndex((x) => x[2] > 15);
+    expect(sizes[k]).toEqual([60, 30, 18]);
+    expect(sizes[1 - k]).toEqual([60, 30, 12]);
+    for (const p of parts) expect(stlCheck(p)).toEqual({ degenerate: 0, open: 0 });
+    // the lid put back on the box: seated, and held by the clips
+    const lid = own(parts[1 - k].translate([boxOf(parts[k]).min[0] - boxOf(parts[1 - k]).min[0], 0, 12]));
+    expect(lift(parts[k], lid)).toBeLessThan(1e-9);
+    expect(near(lift(parts[k], lid, [0, 0, 0.25]), 0.103, 0.01)).toBe(true);
+    // with pins too, they come first in the row
+    expect(shells(own(fitTestCoupon({ clearance: 0.15 }, 0.4, { apart: 'lift' })))).toHaveLength(5);
+  });
+});
+
+describe('take-apart lips on other shapes', () => {
+  it('a wall needs 2.7 mm for a lip; the catches\' recesses keep two nozzles of skin, and every lip lets go', () => {
+    const { Manifold } = wasm;
+    const outside = own(own(boxAt([-80, -80, 30], [80, 80, 70])).subtract(own(boxAt([-50, -50, 20], [50, 50, 80]))));
+    const thin = apartSplit(tray([100, 100, 100], 2.6), [[2, 50]]);
+    expect(thin.layout.lips).toEqual([]);
+    expect(thin.notes.map((n) => [n.code, n.why, n.wall])).toEqual([['APART_FLAT', 'thin', 2.7]]);
+    expect(thin.notes[0].text).toBe('Cut A has no room for a lip – its walls are under 2.7 mm thick – so the top just rests on piece 1, with nothing to line it up or hold it.');
+    for (const [wall, skin, area] of [[2.7, 0.8, null], [3, null, 584.4], [6, 3.75, null]]) {
+      const r = apartSplit(tray([100, 100, 100], wall), [[2, 50]]);
+      const [lip] = r.layout.lips;
+      expect(lip).toMatchObject({ kind: 'opening', H: 6, clips: 4 });
+      if (skin !== null) expect(own(Manifold.union(lipParts(lip).recesses)).minGap(outside, 5)).toBeCloseTo(skin, 2);
+      if (area !== null) expect(near(lip.area, area, 0.5)).toBe(true);
+      expect(release(r.layout.lips, r.drilled[1], lip.i + 0.05)).toBeLessThan(1e-6);
+      for (const piece of r.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+    }
+  });
+
+  it('a solid face gets a channel round a core: clips with room to bow in, and the groove\'s piece has only its roof to bridge', () => {
+    const { Manifold } = wasm;
+    const post = own(boxAt([-30, -30, 0], [30, 30, 100]));
+    const holed = own(own(post.subtract(own(own(Manifold.cylinder(120, 4, 4, 32)).translate([10, 10, -10])))).subtract(own(own(Manifold.cylinder(120, 2, 2, 32)).translate([-15, 5, -10]))));
+    for (const solid of [post, holed]) {
+      const r = apartSplit(solid, [[2, 50]]);
+      const [lip] = r.layout.lips;
+      expect(lip).toMatchObject({ kind: 'channel', H: 6, clips: 4 });
+      expect(lip.key).not.toBeNull();
+      const [body, lid] = r.drilled;
+      for (const piece of r.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+      expect(lift(body, lid)).toBeLessThan(1e-9);
+      expect(lipParts(lip).tongue.minGap(lid, 1)).toBeGreaterThanOrEqual(0.147);
+      expect(release(r.layout.lips, lid, lip.i + 0.05)).toBeLessThan(1e-6);
+      // the core inside the tongue is relieved behind each clip, so it has room to bow in
+      expect(bowed(lip, lid)).toBeLessThan(1e-6);
+      const over = overhangList(lid, 50.1, 50 + lip.zTop + 1.5, 50);
+      expect(over).toHaveLength(1);
+      expect(over[0].width).toBeLessThanOrEqual(2.6);
+    }
+    expect(apartSplit(own(boxAt([-6, -30, 0], [6, 30, 100])), [[2, 50]]).layout.lips[0]).toMatchObject({ kind: 'channel', clips: 2 });
+  });
+
+  it('a clip gives way where its catch\'s recess would leave under two nozzles of skin, or its relief would come near a hole', () => {
+    const { Manifold } = wasm;
+    // at 0.45 mm clearance a 3 mm wall has room for the lip, not for the catches' recesses outside it
+    const tight = apartSplit(tray([100, 100, 100], 3), [[2, 50]], { clearance: 0.45 });
+    expect(tight.layout.lips[0]).toMatchObject({ H: 6, clips: 0, why: ['skin'] });
+    expect(tight.notes[1]).toMatchObject({ code: 'APART_NO_CLIPS', why: 'skin' });
+    expect(tight.notes[1].text).toBe('Cut A\'s walls are too thin for the clips\' catches, so the top just lifts off.');
+    expect(apartSplit(tray([100, 100, 100], 3), [[2, 50]], { clearance: 0.3 }).layout.lips[0].clips).toBe(4);
+    // a solid post with a Ø2 hole 6 mm in from one side: that side's clip would bow into a relief too near the hole
+    const hole = own(own(Manifold.cylinder(120, 1, 1, 32)).translate([24, 0, -10]));
+    const post = own(own(boxAt([-30, -30, 0], [30, 30, 100])).subtract(hole));
+    const r = apartSplit(post, [[2, 50]]);
+    expect(r.layout.lips[0]).toMatchObject({ kind: 'channel', clips: 3, why: ['flex'] });
+    expect(own(lipCavityAt(r.layout.lips[0])).minGap(hole, 3)).toBeGreaterThanOrEqual(1.2 - 1e-3);
+    for (const piece of r.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+  });
+
+  it('a move the notes offer stays on the model: a box 10 mm tall cut 4 mm up has nowhere to move to', () => {
+    const closed = own(own(boxAt([-40, -40, 0], [40, 40, 10])).subtract(own(boxAt([-36, -36, 2], [36, 36, 8]))));
+    const r = apartSplit(closed, [[2, 4]], { male: 0 });
+    expect(r.notes.map((n) => [n.code, n.why])).toEqual([['APART_FLAT', 'room']]);
+    expect(r.notes[0].suggestedAt).toBeUndefined();
+    expect(r.notes[0].text).toBe('Cut A has no room for a lip – piece 2 has under 6.4 mm of plain wall past the cut before a roof, a ledge or an opening.');
+  });
+
+  it('a box of compartments: its dividers are passed over, and keep their full height and width up to the rim', () => {
+    // a box 120 × 120 × 40 with 4 mm walls, 3 mm dividers and a closed top, 16 compartments each too small to be an
+    // opening by itself: with no room for a channel's tongue the compartments are the openings, and the thin dividers
+    // between them run together, so the tongue hugs the outside wall
+    const compartments = (size, wall, divider, n, m) => {
+      const [X, Y, Z] = size;
+      const cw = (X - 2 * wall - (n - 1) * divider) / n;
+      const ch = (Y - 2 * wall - (m - 1) * divider) / m;
+      const cells = [];
+      for (let i = 0; i < n; i++) {
+        for (let j = 0; j < m; j++) {
+          const x0 = -X / 2 + wall + i * (cw + divider);
+          const y0 = -Y / 2 + wall + j * (ch + divider);
+          cells.push(own(boxAt([x0, y0, 2], [x0 + cw, y0 + ch, Z - 2])));
+        }
+      }
+      return own(own(boxAt([-X / 2, -Y / 2, 0], [X / 2, Y / 2, Z])).subtract(own(wasm.Manifold.union(cells))));
+    };
+    const r = apartSplit(compartments([120, 120, 40], 4, 3, 4, 4), [[2, 34]]);
+    expect(r.layout.lips).toHaveLength(1);
+    expect(r.layout.lips[0]).toMatchObject({ kind: 'opening', H: 6, clips: 5 });
+    expect(r.notes.map((n) => n.code)).toEqual(['APART']);
+    for (const piece of r.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+    expect(lift(r.drilled[0], r.drilled[1])).toBeLessThan(1e-9);
+    const face = own(compartments([120, 120, 40], 4, 3, 4, 4).slice(34));
+    const regions = lipRegions(face, 0.15);
+    [regions.fill, regions.A, regions.smallHoles].forEach(own);
+    expect(regions.kind).toBe('opening');
+    expect(regions.A.area()).toBeCloseTo(112 * 112, 0); // the 16 compartments and the dividers between them
+    // two compartments with a divider under two grooves and a wall (4.9 mm): the box's divider is only notched at its
+    // ends, its full width every way up to the rim, where the grooves once left it a 0.3 mm fin or took its top off
+    const across = (piece, d, z) => {
+      const window = own(wasm.CrossSection.square([d + 4, 60], true));
+      return own(own(piece.slice(z)).intersect(window)).area() / 60;
+    };
+    for (const d of [2, 4]) {
+      const two = apartSplit(compartments([160, 80, 60], 3, d, 2, 1), [[2, 50]]);
+      // the lid carries the lip, and the box below has the grooves
+      expect(two.layout.lips[0]).toMatchObject({ male: 1, H: 6, clips: 5 });
+      const box = two.drilled[0];
+      for (const z of [44, 46, 48, 49.5]) expect(across(box, d, z)).toBeCloseTo(d, 3);
+    }
+    // a 5 mm divider takes a groove each side and keeps a wall between them
+    const wide = apartSplit(compartments([160, 80, 60], 3, 5, 2, 1), [[2, 50]]);
+    expect(wide.layout.lips[0]).toMatchObject({ male: 1, H: 6, clips: 8 });
+    const box = wide.drilled[0];
+    for (const z of [44, 46, 48, 49.5]) expect(across(box, 5, z)).toBeGreaterThanOrEqual(1.2 - 1e-3);
+  });
+
+  it('round and many-sided tubes: clips only where the outline turns little, framed on its chord; a hexagon\'s key lets it on one way only', () => {
+    const { Manifold } = wasm;
+    const round = (D, wall, h, n) => own(own(Manifold.cylinder(h, D / 2, D / 2, n)).subtract(own(own(Manifold.cylinder(h + 2, D / 2 - wall, D / 2 - wall, n)).translate([0, 0, 2]))));
+    const small = apartSplit(round(100, 4, 100, 96), [[2, 50]]);
+    expect(small.layout.lips[0]).toMatchObject({ clips: 0 });
+    expect(small.layout.lips[0].key).not.toBeNull();
+    expect(small.notes.find((n) => n.code === 'APART_NO_CLIPS').text).toBe('Cut A\'s lip has no straight stretch 46 mm long for a clip, so the top just lifts off.');
+    for (const piece of small.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+    const big = apartSplit(round(300, 4, 60, 256), [[2, 30]]);
+    expect(big.layout.lips[0].clips).toBe(8);
+    for (const piece of big.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+    expect(near(deflection(big.layout.lips, big.drilled[1]), 0.245, 0.02)).toBe(true);
+    expect(release(big.layout.lips, big.drilled[1], big.layout.lips[0].i + 0.05)).toBeLessThan(1e-6);
+    const hex = own(own(Manifold.cylinder(80, 60, 60, 6)).subtract(own(own(Manifold.cylinder(82, 56, 56, 6)).translate([0, 0, 2]))));
+    const r = apartSplit(hex, [[2, 40]]);
+    expect(r.layout.lips[0].clips).toBe(6);
+    for (const piece of r.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+    const b = nearCut(r.drilled[0], 2, 40, 2, 10);
+    const l = nearCut(r.drilled[1], 2, 40, 2, 14);
+    for (const turn of [60, 120, 180, 240, 300]) expect(near(lift(b, own(l.rotate([0, 0, turn]))), 51.5, 1)).toBe(true);
+  });
+
+  it('a ceiling just past the cut moves the tongue out: with a 4 mm wall it has no room for clips, with 5 mm it has', () => {
+    const ceiling = own(own(lanternSolid()).add(own(boxAt([-46, -46, 194], [46, 46, 196]))));
+    const r = apartSplit(ceiling, [[2, 190]]);
+    expect(r.layout.lips[0]).toMatchObject({ H: 6, clips: 0, why: ['flex'], hasOver: true });
+    expect(near(r.layout.lips[0].area, 507.9, 1)).toBe(true);
+    expect(r.notes[1]).toMatchObject({ code: 'APART_NO_CLIPS', why: 'flex' });
+    for (const piece of r.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+    expect(lift(r.drilled[0], r.drilled[1])).toBeLessThan(1e-9);
+    const wall5 = own(own(own(boxAt([-50, -50, 0], [50, 50, 200])).subtract(own(boxAt([-45, -45, 4], [45, 45, 194])))).subtract(own(boxAt([-45, -45, 196], [45, 45, 201]))));
+    const thick = apartSplit(wall5, [[2, 190]]);
+    expect(thick.layout.lips[0]).toMatchObject({ H: 6, clips: 4, hasOver: true });
+    expect(release(thick.layout.lips, thick.drilled[1], thick.layout.lips[0].i + 0.05)).toBeLessThan(1e-6);
+  });
+
+  it('a box with an 8 mm lid: the lid carries the lip with 4 clips, where the box would have a 4.5 mm lip and none', () => {
+    const closed = own(own(boxAt([-40, -40, 0], [40, 40, 60])).subtract(own(boxAt([-36, -36, 2], [36, 36, 58]))));
+    const r = apartSplit(closed, [[2, 52]]);
+    expect(r.pairs[0].quality[0]).toMatchObject({ H: 4.5, clips: 0 });
+    expect(r.pairs[0].quality[1]).toMatchObject({ H: 6, clips: 4 });
+    expect(r.layout.lips[0]).toMatchObject({ male: 1, dir: -1, down: '+z', H: 6, clips: 4 });
+    expect(r.notes[0].text).toBe('Cut A comes apart: the top (piece 2) clicks into piece 1 on a 6 mm lip – 4 clips hold it, and it pulls off again by hand.');
+    for (const piece of r.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+    expect(release(r.layout.lips, r.drilled[0], r.layout.lips[0].i + 0.05)).toBeLessThan(1e-6);
+  });
+
+  it('a Gothic lantern: a lip with clips through its band, and under its roof a note to move the cut to where one fits', () => {
+    const at158 = apartSplit(own(gothicSolid()), [[2, 158]]);
+    expect(at158.layout.lips[0]).toMatchObject({ H: 6, clips: 4 });
+    for (const piece of at158.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+    expect(release(at158.layout.lips, at158.drilled[1], at158.layout.lips[0].i + 0.05)).toBeLessThan(1e-6);
+    const at166 = apartSplit(own(gothicSolid()), [[2, 166]]);
+    expect(at166.layout.lips).toEqual([]);
+    expect(at166.notes.map((n) => n.code)).toEqual(['APART_FLAT']);
+    expect(at166.notes[0]).toMatchObject({ code: 'APART_FLAT', why: 'room', suggestedAt: 160.5 });
+    expect(apartSplit(own(gothicSolid()), [[2, 160.5]]).layout.lips[0]).toMatchObject({ H: 6, clips: 4 });
+  });
+});
+
+describe('take-apart lips in the layout', () => {
+  it('a cut that comes apart through a thin plate keeps unglued dovetail tabs, under 2 mm nothing, anywhere else a lip', () => {
+    const sign = cube([300, 80, 4], [0, 0, 2]);
+    const tabs = apartSplit(sign, [[0, 0]]);
+    expect(tabs.plan.joints).toEqual({ c1: 'dovetail' });
+    expect(tabs.plan.dove.ids).toEqual(['c1']);
+    expect(tabs.notes).toEqual([]);
+    expect(tabs.layout.lips).toEqual([]);
+    expect(tabs.layout.seams).toHaveLength(1);
+    expect(tabs.layout.seams[0]).toMatchObject({ joint: 'dovetail', apart: { hold: 'snap', lip: false, clips: 0 } });
+    expect(tabs.layout.seams[0].apart.tabs).toBeGreaterThan(0);
+    // the Joints are for the glued cuts only: with none, a glued cut gets nothing and the one that comes apart its tabs
+    const { spec, cuts } = normaliseSplit({
+      joint: 'none',
+      cuts: [{ id: 'c1', position: [-50, 0, 0], normal: [1, 0, 0], joint: 'apart', hold: 'snap' }, { id: 'c2', position: [50, 0, 0], normal: [1, 0, 0] }],
+    }, boxOf(sign));
+    expect(planDovetails(sign, cuts, spec).joints).toEqual({ c1: 'dovetail', c2: 'none' });
+    const foil = apartSplit(cube([300, 80, 1.5], [0, 0, 0.75]), [[0, 0]]);
+    expect(foil.plan.joints).toEqual({ c1: 'none' });
+    expect(foil.notes.map((n) => [n.code, n.why, n.wall])).toEqual([['APART_FLAT', 'thin', 2]]);
+    expect(foil.layout.seams[0]).toMatchObject({ joint: 'none', apart: { lip: false } });
+    // through a box it gets a lip whatever the Joints say, and is never told it isn't a plate
+    const block = tray([120, 60, 60], 4);
+    for (const joint of ['dovetail', 'dowels', 'none', 'pegs']) {
+      const r = apartSplit(block, [[2, 30]], { joint });
+      expect(r.plan.joints).toEqual({ c1: 'lip' });
+      expect(r.notes.map((n) => n.code)).toEqual(['APART']);
+      expect(r.layout.lips[0]).toMatchObject({ H: 6, clips: 4 });
+    }
+  });
+
+  it('a piece a lip stands out of lies with it standing up, and the teardrops of the other cuts on it follow', () => {
+    const { Manifold } = wasm;
+    const thick = own(own(own(Manifold.cube([160, 80, 60])).translate([-80, -40, 0])).subtract(own(own(Manifold.cube([136, 56, 60])).translate([-68, -28, 10]))));
+    const glued = apartSplit(thick, [[0, 0, false], [2, 45, false]], { orient: 'cut' });
+    const r = apartSplit(thick, [[0, 0, false], [2, 45]], { orient: 'cut' });
+    // laid on a cut face, the two lower pieces would lie upside down, their X face's holes pointing down
+    expect(r.pieces.filter((p) => p.cell[2] === 0).map((p) => p.up)).toEqual(['-z', '-z']);
+    expect(r.layout.lips.map((l) => l.down)).toEqual(['-z', '-z']);
+    const lowerSides = (layout) => layout.dowels.filter((d) => d.axis === 0 && d.centre[2] < 45).flatMap((d) => d.sides);
+    expect(lowerSides(glued.layout).length).toBeGreaterThan(0);
+    for (const s of lowerSides(glued.layout)) expect(s.apex).toEqual([0, 0, -1]);
+    expect(lowerSides(r.layout).length).toBeGreaterThan(0);
+    for (const s of lowerSides(r.layout)) expect(s).toMatchObject({ tear: true, apex: [0, 0, 1] });
+    expect(r.pieces.map((p) => p.up)).toEqual(glued.pieces.map((p) => p.up)); // the caller's pieces are left alone
+  });
+
+  it('the other cuts\' pins, pegs and labels keep clear of the lips, and built-in pegs know which pieces a lip holds', () => {
+    const { Manifold } = wasm;
+    const thick = own(own(own(Manifold.cube([160, 80, 60])).translate([-80, -40, 0])).subtract(own(own(Manifold.cube([136, 56, 60])).translate([-68, -28, 10]))));
+    const seen = [];
+    const r = apartSplit(thick, [[0, 0, false], [2, 45]], { labels: true, progress: (stage) => seen.push(stage) });
+    expect(seen).toContain('Fitting the lip…');
+    expect(r.layout.lips).toHaveLength(2);
+    const lips = r.layout.lips.flatMap((l) => [{ m: own(lipAt(l)), side: l.male }, { m: own(lipCavityAt(l)), side: 1 - l.male }]);
+    expect(r.layout.dowels.length).toBeGreaterThan(0);
+    for (const d of r.layout.dowels) {
+      const { wall } = sizesFor(d.d);
+      for (const side of [0, 1]) {
+        const hole = own(dowelHole(d, side));
+        for (const l of lips) expect(hole.minGap(l.m, wall + 1)).toBeGreaterThanOrEqual(wall - 1e-3);
+      }
+    }
+    // the lip's face has no label and is never said to lack one
+    expect(r.layout.labels.every((x) => x.letter === 'A')).toBe(true);
+    expect(r.notes.filter((n) => n.code === 'LABELS_SKIPPED').every((n) => !n.letters.includes('B'))).toBe(true);
+    expect(r.layout.seams.filter((x) => x.letter === 'B').every((x) => x.labels === null && x.joint === 'lip')).toBe(true);
+    for (const piece of r.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+    const pegged = apartSplit(thick, [[0, 0, false], [2, 45]], { joint: 'pegs' });
+    expect(pegged.forcedSeen).toHaveLength(1);
+    expect([...pegged.forcedSeen[0]].sort()).toEqual([[1, '-z'], [2, '-z']]);
+    expect(pegged.layout.pegs.length).toBeGreaterThan(0);
+    const lipsHere = pegged.layout.lips.flatMap((l) => [own(lipAt(l)), own(lipCavityAt(l))]);
+    for (const g of pegged.layout.pegs) {
+      for (const m of [own(pegAt(g)), own(socketAt(g))]) for (const l of lipsHere) expect(lift(m, l)).toBeLessThan(1e-6);
+    }
+  });
+
+  it('a lip neither piece can lie under on the printer, standing up, is left out, and the note says why', () => {
+    // a tube cut in two halves 100 mm tall, on a printer 103 mm tall: each fits, but not with a 6 mm lip standing up
+    const r = apartSplit(tray([60, 60, 200], 4), [[2, 100]], { bed: [200, 200, 103] });
+    expect(r.pairs[0].quality.every(Boolean)).toBe(true);
+    expect(r.layout.lips).toEqual([]);
+    expect(r.notes.map((n) => [n.code, n.why])).toEqual([['APART_FLAT', 'lying']]);
+    expect(r.notes[0].text).toBe('Cut A has no lip: neither piece fits your printer lying with the lip standing up out of it, so the pieces just rest on each other.');
+    expect(r.layout.seams[0]).toMatchObject({ joint: 'none', male: null, apart: { lip: false, flat: 1 } });
+  });
+
+  it('two cuts that come apart across each other: the later one\'s lips keep clear of the earlier one\'s, and no two pieces meet', () => {
+    // a closed box 200 × 100 × 80 cut across X and Z, both coming apart: the four pieces fit together with nothing of
+    // two of them in one place (the two cuts' tongues stood in one corner before)
+    const closed = own(own(boxAt([-100, -50, 0], [100, 50, 80])).subtract(own(boxAt([-96, -46, 4], [96, 46, 76]))));
+    const r = apartSplit(closed, [[2, 60], [0, 0]]);
+    expect(r.layout.lips.map((l) => l.letter).sort()).toEqual(['A', 'B', 'B']);
+    for (let i = 0; i < r.drilled.length; i++) {
+      expect(shells(r.drilled[i])).toHaveLength(1);
+      for (let j = i + 1; j < r.drilled.length; j++) expect(lift(r.drilled[i], r.drilled[j])).toBeLessThan(1e-6);
+    }
+    // the face of the Z cut whose two pieces already lie on their sides for the X cut's lips says so
+    expect(r.notes.map((n) => n.text)).toEqual([
+      'Cut B comes apart: pieces 2 and 4 click onto a 6 mm lip on pieces 1 and 3 – 4 clips hold them, and they pull off again by hand.',
+      'Cut A comes apart: the top (piece 4) clicks onto a 6 mm lip on piece 2 – 3 clips hold it, and it pulls off again by hand. On 1 other face neither piece can lie with a lip standing up, so the pieces there just rest on each other.',
+    ]);
+  });
+
+  it('two cuts that come apart 6 mm apart: a groove never reaches past the next cut, so no lip is left loose', () => {
+    const closed = own(own(boxAt([-50, -50, 0], [50, 50, 160])).subtract(own(boxAt([-46, -46, 4], [46, 46, 156]))));
+    // the piece between them lies on its top for the first cut's lip, so the second has none, and says why
+    const r = apartSplit(closed, [[2, 60], [2, 66]]);
+    expect(r.layout.lips).toHaveLength(1);
+    expect(r.layout.lips[0]).toMatchObject({ letter: 'A', male: 1, H: 6, clips: 4 });
+    for (const piece of r.drilled) expect(shells(piece)).toHaveLength(1);
+    expect(r.notes[1]).toMatchObject({ code: 'APART_FLAT', why: 'lying', by: ['A'], fixed: 2 });
+    expect(r.notes[1].text).toBe('Cut B has no lip: piece 2 already lies another way for cut A\'s lip, and the other piece can\'t carry one, so the pieces just rest on each other.');
+    // 8 mm apart the second cut's groove has room for a 3 mm lip in the piece between, its roof clear of the first's tongue
+    const eight = apartSplit(closed, [[2, 60], [2, 68]]);
+    expect(eight.layout.lips.map((l) => [l.letter, l.male, l.H])).toEqual([['A', 1, 6], ['B', 1, 3]]);
+    for (const piece of eight.drilled) expect(shells(piece)).toHaveLength(1);
+    for (let i = 0; i < 3; i++) for (let j = i + 1; j < 3; j++) expect(lift(eight.drilled[i], eight.drilled[j])).toBeLessThan(1e-6);
+  });
+
+  it('lays out lips, drills the pieces and builds the fit test without leaving a solid behind', () => {
+    // a ceiling over the opening, so the groove's piece holds material over it too
+    const lantern = own(own(lanternSolid()).add(own(boxAt([-46, -46, 194], [46, 46, 196]))));
+    const run = () => {
+      apartSplit(lantern, [[0, 0, false], [2, 190]], { labels: true });
+      own(fitTestCoupon({ clearance: 0.15 }, 0.4, { apart: 'snap' }));
+    };
+    run();
+    clearSplitCaches();
+    // every Manifold and CrossSection made from here on, as `trackSolids` in split.test.js sees them
+    const tracked = new Set();
+    const restore = [];
+    const remember = (v) => {
+      if (Array.isArray(v)) v.forEach(remember);
+      else if (v instanceof wasm.Manifold || v instanceof wasm.CrossSection) tracked.add(v);
+      return v;
+    };
+    for (const Class of [wasm.Manifold, wasm.CrossSection]) {
+      for (const target of new Set([Class, Class.prototype, Object.getPrototypeOf(Class.prototype)])) {
+        for (const key of Object.getOwnPropertyNames(target)) {
+          const d = Object.getOwnPropertyDescriptor(target, key);
+          if (typeof d.value !== 'function' || !d.writable || /^(constructor|delete|deleteLater|isDeleted|isAliasOf)$/.test(key)) continue;
+          const fn = d.value;
+          target[key] = function remembered(...args) {
+            return remember(fn.apply(this, args));
+          };
+          restore.push(() => {
+            target[key] = fn;
+          });
+        }
+      }
+    }
+    try {
+      const kept = made.length;
+      run();
+      for (const m of made.splice(kept)) m.delete();
+      clearSplitCaches();
+      expect(tracked.size).toBeGreaterThan(500);
+      expect([...tracked].filter((m) => !m.isDeleted())).toHaveLength(0);
+    } finally {
+      restore.forEach((r) => r());
+    }
+  });
+
+  it('obstacles on the groove\'s side: the air past the face, and the groove\'s own piece over the openings', () => {
+    const lantern = own(own(lanternSolid()).add(own(boxAt([-46, -46, 194], [46, 46, 196]))));
+    const cut = { axis: 2, at: 190 };
+    const band = own(bandFor(lantern, cut, 10.5));
+    const island = own(own(band.slice(190)).simplify(0.02));
+    // the ceiling 4 mm up is over the opening within 9.35 mm above the cut, not within 3 mm, and never below it
+    expect(own(overFor(band, cut, 1, 9.35, island)).area()).toBeCloseTo(91.9 * 91.9, 0);
+    expect(overFor(band, cut, 1, 3, island)).toBeNull();
+    expect(overFor(band, cut, 0, 9.35, island)).toBeNull();
+    const shadow = own(shadowFor(band, cut, { below: 0.5, above: 9.35 }));
+    const block = own(shadow.intersect(own(island.offset(-0.05, 'Miter', 4))));
+    const { plan, tries } = lipFor(island, { obstaclesAt: () => ({ block: block.isEmpty() ? null : block, over: own(overFor(band, cut, 1, 9.55, island)) }) });
+    expect(tries.map((x) => [x.H, x.clips, x.over])).toEqual([[6, true, true], [6, false, true]]);
+    expect(plan).toMatchObject({ H: 6, hasOver: true, why: ['flex'] });
+  });
+});
+
+describe('take-apart lips over a sweep of outlines', () => {
+  /** The outlines the lip was swept over: rings 2.7–6 mm, polygons of 5–128 sides, rectangles, an L tube and solids. */
+  function sweepModels() {
+    const { Manifold } = wasm;
+    const poly = (n, r, w, h) => own(own(own(Manifold.cylinder(h, r, r, n)).subtract(own(own(Manifold.cylinder(h + 2, r - w, r - w, n)).translate([0, 0, 2])))).rotate([0, 0, 7]));
+    const list = [];
+    for (let k = 0; k <= 33; k++) list.push(tray([100, 100, 60], +(2.7 + k / 10).toFixed(2)));
+    for (const n of [5, 6, 7, 8, 12, 24, 48, 64, 96, 128]) for (const w of [3, 4, 5]) list.push(poly(n, 60, w, 60));
+    for (const [a, b] of [[80, 40], [120, 60], [70, 70], [160, 80], [45, 200]]) list.push(tray([a, b, 60], 3.5));
+    const L = own(own(own(own(boxAt([-50, -50, 0], [50, 50, 60])).subtract(own(boxAt([0, 0, -1], [60, 60, 70])))).subtract(own(boxAt([-46, -46, 2], [-4, 46, 61])))).subtract(own(boxAt([-46, -46, 2], [46, -4, 61]))));
+    list.push(L, own(boxAt([-15, -15, 0], [15, 15, 60])), own(Manifold.cylinder(60, 12.5, 12.5, 48)), own(boxAt([-40, -10, 0], [40, 10, 60])));
+    return list;
+  }
+
+  it('every lip built over 73 outlines, at clearances 0.1, 0.15 and 0.2 in turn, is clean, seated and keeps its clearance', () => {
+    const models = sweepModels();
+    expect(models).toHaveLength(73);
+    let built = 0;
+    models.forEach((m, k) => {
+      const c = [0.1, 0.15, 0.2][k % 3];
+      const r = apartSplit(m, [[2, 30]], { clearance: c });
+      // walls under the least a lip needs (2.7 mm, and more with more clearance; a hexagon's 3 mm across its corners)
+      // take none, and say so
+      if (!r.layout.lips.length) {
+        expect(r.notes.map((n) => [n.code, n.why])).toEqual([['APART_FLAT', 'thin']]);
+        return;
+      }
+      built++;
+      const [body, lid] = r.drilled;
+      for (const piece of [body, lid]) {
+        expect(piece.status()).toBe('NoError');
+        expect(positiveShells(piece)).toBe(1);
+        expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+      }
+      expect(lift(body, lid)).toBeLessThan(1e-6);
+      expect(lipParts(r.layout.lips[0]).tongue.minGap(lid, 1)).toBeGreaterThanOrEqual(c - 0.005);
+    });
+    expect(built).toBeGreaterThanOrEqual(70);
+  });
+});
+
+describe('take-apart lips on dense faces', () => {
+  it('a dense face is eased before its lip is planned: a 4096-sided wobbly tube plans in under a second and builds clean', () => {
+    const { Manifold, CrossSection } = wasm;
+    const n = 4096;
+    const ring = (r) => Array.from({ length: n }, (_, k) => {
+      const t = (2 * Math.PI * k) / n;
+      const q = r + 0.3 * Math.sin(37 * t) + 0.2 * Math.sin(91 * t);
+      return [q * Math.cos(t), q * Math.sin(t)];
+    });
+    const tube = own(Manifold.extrude(own(new CrossSection([ring(60), ring(56).reverse()], 'Positive')), 60));
+    // a straight tube has nothing in the way of its lip: the plan alone is timed
+    const face = own(own(tube.slice(30)).simplify(0.02));
+    const t0 = performance.now();
+    const { plan } = lipFor(face);
+    expect(performance.now() - t0).toBeLessThan(1000);
+    expect(plan).toMatchObject({ kind: 'opening', H: 6 });
+    const s = lipSolids(plan);
+    [s.tongue, s.cutters, ...s.catches, ...s.recesses].forEach(own);
+    const body = own(own(own(tube.trimByPlane([0, 0, -1], -30)).translate([0, 0, -30])).add(s.tongue));
+    const lid = own(own(own(tube.trimByPlane([0, 0, 1], 30)).translate([0, 0, -30])).subtract(s.cutters));
+    for (const piece of [body, lid]) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+    expect(lift(body, lid)).toBeLessThan(1e-6);
+    // the layout eases every lip's face the same way: a 512-sided tube's tongue keeps under 300 corners, not 1,015
+    const round = own(own(Manifold.cylinder(60, 60, 60, 512)).subtract(own(own(Manifold.cylinder(62, 56, 56, 512)).translate([0, 0, -1]))));
+    const r = apartSplit(round, [[2, 30]]);
+    expect(r.layout.lips).toHaveLength(1);
+    for (const outline of r.layout.lips[0].T) expect(outline.length).toBeLessThan(300);
+    for (const piece of r.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
   });
 });

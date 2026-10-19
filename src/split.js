@@ -3306,15 +3306,18 @@ export function lipSides(laid, cuts, U, orient = 'auto', { flat = null, clearanc
  * mm – give way to a slope moving `bend` mm per mm or more, or a slope to
  * straight sides: a roof flush with its walls, a jar's shoulder; where the
  * outline narrows and widens again within `groove` mm, a groove (round a
- * lid). A spot is looked for within `look` mm of a seam, on the 0.5 mm steps
- * the move suggestions take (`step`); spots are `apart` mm apart at least, at
- * most `most` of them, and each scores more than `floor`. A cut being placed
- * snaps to a target within `snap` mm, or the caller's tolerance when larger
- * (a few pixels on screen).
+ * lid). How well a seam hides a cut is read from the outline seen from
+ * outside with openings narrower than twice `bridge` mm bridged over: the
+ * tips of a row of narrow windows are no line the outside shows, however far
+ * the slice's own outline moves there. A spot is looked for within `look` mm
+ * of a seam, on the 0.5 mm steps the move suggestions take (`step`); spots
+ * are `apart` mm apart at least, at most `most` of them, and each scores more
+ * than `floor`. A cut being placed snaps to a target within `snap` mm, or the
+ * caller's tolerance when larger (a few pixels on screen).
  */
 export const SPOT = Object.freeze({
-  sharp: 0.5, peak: 1.25, tolerance: 0.002, least: 0.25, touch: 0.01, steady: 0.1, bend: 0.25, groove: 6, look: 20, step: 0.5, apart: 8, most: 5, floor: 0,
-  snap: 3,
+  sharp: 0.5, peak: 1.25, tolerance: 0.002, least: 0.25, touch: 0.01, steady: 0.1, bend: 0.25, groove: 6, bridge: 8, look: 20, step: 0.5, apart: 8, most: 5,
+  floor: 0, snap: 3,
 });
 
 /**
@@ -3439,22 +3442,26 @@ export function locateSeam(lo, hi, { shift, count = null, by = 'shift', toleranc
  * What a seam is, from the slices either side of it (`below` towards −axis):
  * islands come ('opens': openings or fretwork start past it) or go
  * ('closes'), holes come ('walls': a solid floor gives way to walls) or go
- * ('top': the walls close over), or the outline seen from outside – each
- * island with its holes filled – widens past it ('widens': a roof's eaves, a
- * lid that overhangs) or narrows ('narrows': a shoulder, a cap), by whether
- * it gains more than it loses; where only the inside changes, the outline
- * the same, the walls thicken ('thickens') or thin ('thins').
+ * ('top': the walls close over) – a hole that comes over solid floor, or
+ * goes under a solid top, is walls starting or closing over however many
+ * other holes there are (`floored`, `capped`: one of two boxes side by side
+ * closing over) – or the outline seen from outside – each island with its
+ * holes filled – widens past it ('widens': a roof's eaves, a lid that
+ * overhangs) or narrows ('narrows': a shoulder, a cap), by whether it gains
+ * more than it loses; where only the inside changes, the outline the same,
+ * the walls thicken ('thickens') or thin ('thins').
  * @param {{ below: { islands: number, holes: number }, above: { islands: number, holes: number }, gained: number,
- *   lost: number, outer?: { shift: number, gained: number, lost: number } }} sides `gained` the area of the slice above
- *   that the one below lacks, `lost` the other way (mm²); `outer` the same of the outlines seen from outside, and how far
- *   they move (mm) – without it the slices' own are read as the outline's
+ *   lost: number, outer?: { shift: number, gained: number, lost: number }, floored?: boolean, capped?: boolean }} sides
+ *   `gained` the area of the slice above that the one below lacks, `lost` the other way (mm²); `outer` the same of the
+ *   outlines seen from outside, and how far they move (mm) – without it the slices' own are read as the outline's;
+ *   `floored` whether a hole above stands over solid below, `capped` whether one below goes under solid above
  * @returns {'opens'|'closes'|'walls'|'top'|'widens'|'narrows'|'thickens'|'thins'}
  */
-export function seamKind({ below, above, gained = 0, lost = 0, outer = null }) {
+export function seamKind({ below, above, gained = 0, lost = 0, outer = null, floored = false, capped = false }) {
   if (above.islands > below.islands) return 'opens';
   if (above.islands < below.islands) return 'closes';
-  if (above.holes > below.holes) return below.holes === 0 ? 'walls' : 'opens';
-  if (above.holes < below.holes) return above.holes === 0 ? 'top' : 'closes';
+  if (above.holes > below.holes) return below.holes === 0 || floored ? 'walls' : 'opens';
+  if (above.holes < below.holes) return above.holes === 0 || capped ? 'top' : 'closes';
   if (outer && !(outer.shift >= SPOT.least)) return gained >= lost ? 'thickens' : 'thins';
   return (outer ? outer.gained >= outer.lost : gained >= lost) ? 'widens' : 'narrows';
 }
@@ -3613,21 +3620,23 @@ const clamp01 = (v) => Math.min(1, Math.max(0, v));
 
 /**
  * How good a spot for a cut that comes apart is, higher better. A full lip
- * counts most (3 with clips, 2 without), then the seam it hides in – up to
- * 1 for an outline that moves 3 mm or more there, and up to 0.5 more the
- * closer the cut is to it, all of it only for a seam that shows on the
- * outside (where the walls close over inside, the cut runs across plain wall
- * and hides nowhere) – and a sensible part coming off: a top or a lid of up
+ * counts most (3 with clips, 2 without, 1 less where its tongue comes in
+ * stretches: an opening's edge in its foot cuts it), then the seam it hides
+ * in – up to 1 for an outline that moves 3 mm or more there, and up to 0.5
+ * more the closer the cut is to it, all of it only for a seam that shows on
+ * the outside (where the walls close over inside, or at the tips of a row of
+ * narrow windows, the cut runs across plain wall and hides nowhere) – and a
+ * sensible part coming off: a top or a lid of up
  * to 30 % of the model scores 1, less towards a sliver (nothing under 2 %)
  * and towards 60 %, and past that the more of the model the worse. Each
  * island beyond one takes off 0.5 (a cut through fretwork, posts or a
  * handle's legs), and cutting through letters 2.
- * @param {{ full?: boolean, clips?: number, shift?: number, distance?: number, fraction?: number, islands?: number,
- *   crosses?: number }} spot `shift` how far the outline seen from outside moves at its seam (mm), `distance` from it
- *   (mm), `fraction` the share that comes off, `crosses` how many text items it cuts
+ * @param {{ full?: boolean, clips?: number, broken?: boolean, shift?: number, distance?: number, fraction?: number,
+ *   islands?: number, crosses?: number }} spot `shift` how far the outline the outside shows moves at its seam (mm),
+ *   `distance` from it (mm), `fraction` the share that comes off, `crosses` how many text items it cuts
  */
-export function spotScore({ full = true, clips = 0, shift = 0, distance = 0, fraction = 0, islands = 1, crosses = 0 }) {
-  const lip = full ? (clips > 0 ? 3 : 2) : 0;
+export function spotScore({ full = true, clips = 0, broken = false, shift = 0, distance = 0, fraction = 0, islands = 1, crosses = 0 }) {
+  const lip = full ? (clips > 0 ? 3 : 2) - (broken ? 1 : 0) : 0;
   const shows = clamp01(shift / SPOT.sharp);
   const seam = Math.min(1, Math.max(0, shift) / 3) + 0.5 * clamp01(1 - distance / SPOT.look) * shows;
   let part;
@@ -3665,12 +3674,35 @@ export function pickSpots(candidates, { apart = SPOT.apart, most = SPOT.most, fl
  * before the model is cut: only when the model ends on that side in
  * something flat of 25 mm² or more, and at least half as big as the face it
  * could lie on instead. A lantern's body stands on its foot; its top would
- * stand on its handle. `apartMales` judges the pieces themselves.
+ * stand on its handle. Given how long each piece is along the axis
+ * (`lengths`), also only when standing on that end with the lip is about as
+ * steady as it stands without one – on that end or on its cut face, the
+ * slenderness `orientationScore` counts, each over the box its bed spans
+ * (`spans`, `faceSpan`): a slender tower's top 220 mm tall would stand on a
+ * small flat roof, and a lip 6 mm taller can tip a slender tower on its
+ * foot past what it costs without one. `apartMales` judges the pieces
+ * themselves.
  * @param {number[]} beds the flat area the model ends in on each side, [towards −axis, towards +axis] (mm²)
  * @param {number} face the cut face's area (mm²)
+ * @param {{ lengths?: number[]|null, spans?: number[], faceSpan?: number }} [options] `lengths` each piece's along
+ *   the axis, [below, above] (mm); `spans` the area of the box each end's bed spans, `faceSpan` the face's (mm²)
  * @returns {boolean[]} [the piece below, the one above]
  */
-export const endsAsWell = (beds, face) => [0, 1].map((k) => (beds[k] ?? 0) >= Math.max(STEADY, 0.5 * face));
+export function endsAsWell(beds, face, { lengths = null, spans = [0, 0], faceSpan = 0 } = {}) {
+  const standing = (tall, bed, span) => {
+    const base = Math.max(bed, span, 1);
+    return (bed < STEADY ? 1e4 : 0) + slenderCost(tall / Math.sqrt(base), base);
+  };
+  return [0, 1].map((k) => {
+    const bed = beds[k] ?? 0;
+    if (!(bed >= Math.max(STEADY, 0.5 * face))) return false;
+    if (!lengths) return true;
+    const onEnd = standing(lengths[k], bed, spans[k] ?? 0);
+    const onCut = standing(lengths[k], face, faceSpan);
+    const [was, wasBed] = onEnd <= onCut ? [onEnd, bed] : [onCut, face];
+    return standing(lengths[k] + LIP_ALLOWANCE, bed, spans[k] ?? 0) <= was + Math.max(STEADY, 0.1 * wasBed);
+  });
+}
 
 /**
  * The flat area a model ends in at each end of each axis, as `cellSupport`
@@ -3679,7 +3711,17 @@ export const endsAsWell = (beds, face) => [0, 1].map((k) => (beds[k] ?? 0) >= Ma
  * @param {{ vertProperties: Float32Array|number[], numProp: number, triVerts: Uint32Array|number[] }} mesh
  * @returns {number[][]} per axis, [towards −axis, towards +axis] (mm²)
  */
-export function endBeds(mesh) {
+export const endBeds = (mesh) => endShape(mesh).beds;
+
+/**
+ * The flat area a model ends in at each end of each axis (`endBeds`), and
+ * the area of the box that flat area spans across the other two axes
+ * (`spans`, as `orientationStats`' footprint): a ring's whole outline holds
+ * it as steady as a disc.
+ * @param {{ vertProperties: Float32Array|number[], numProp: number, triVerts: Uint32Array|number[] }} mesh
+ * @returns {{ beds: number[][], spans: number[][] }} per axis, [towards −axis, towards +axis] (mm²)
+ */
+export function endShape(mesh) {
   const { vertProperties: P, numProp, triVerts: T } = mesh;
   const min = [Infinity, Infinity, Infinity];
   const max = [-Infinity, -Infinity, -Infinity];
@@ -3690,6 +3732,8 @@ export function endBeds(mesh) {
     }
   }
   const beds = [[0, 0], [0, 0], [0, 0]];
+  // the box each end's bed spans across the other two axes, in their cyclic order: [u0, v0, u1, v1]
+  const boxes = [0, 1, 2].map(() => [0, 1].map(() => [Infinity, Infinity, -Infinity, -Infinity]));
   const n = [0, 0, 0];
   for (let t = 0; t + 2 < T.length; t += 3) {
     const a = T[t] * numProp;
@@ -3706,9 +3750,17 @@ export function endBeds(mesh) {
     if (!(Math.abs(n[axis]) / len > FLAT)) continue;
     // its corner furthest from the bed it would lie on must be at the model's end
     const [p0, p1, p2] = [P[a + axis], P[b + axis], P[c + axis]];
-    if (n[axis] < 0 ? Math.max(p0, p1, p2) - min[axis] <= 0.1 : max[axis] - Math.min(p0, p1, p2) <= 0.1) beds[axis][n[axis] < 0 ? 0 : 1] += len / 2;
+    if (!(n[axis] < 0 ? Math.max(p0, p1, p2) - min[axis] <= 0.1 : max[axis] - Math.min(p0, p1, p2) <= 0.1)) continue;
+    const k = n[axis] < 0 ? 0 : 1;
+    beds[axis][k] += len / 2;
+    const box = boxes[axis][k];
+    [(axis + 1) % 3, (axis + 2) % 3].forEach((w, i) => {
+      box[i] = Math.min(box[i], P[a + w], P[b + w], P[c + w]);
+      box[2 + i] = Math.max(box[2 + i], P[a + w], P[b + w], P[c + w]);
+    });
   }
-  return beds;
+  const spans = boxes.map((ends) => ends.map(([u0, v0, u1, v1]) => (u1 > u0 && v1 > v0 ? (u1 - u0) * (v1 - v0) : 0)));
+  return { beds, spans };
 }
 
 /**

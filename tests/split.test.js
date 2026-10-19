@@ -13,7 +13,7 @@ import {
 } from '../src/split.js';
 import { clearSplitCaches, dowelHole, halfHole, pegAt, pinAt, pinSolid, socketAt } from '../src/splitGeometry.js';
 import { setup, soupOf as soupGeometry } from './helpers.js';
-import { box, gothicSolid, lanternSolid, lidBoxSolid, lift, loggiaSolid, stlCheck } from './lanternFixture.js';
+import { box, gothicSolid, lanternSolid, lidBoxSolid, lift, loggiaSolid, roundLanternSolid, slenderTowerSolid, stlCheck } from './lanternFixture.js';
 
 const fontBytes = (pkg, file) => {
   const buf = fs.readFileSync(path.resolve('node_modules/@fontsource', pkg, 'files', file));
@@ -2082,11 +2082,12 @@ describe('placing a cut that comes apart', () => {
 
   // a box 80 × 80 × 60 (3 mm walls, a flush top) with its lid line modelled as a groove 1 mm deep and `h` tall round
   // it at z 45
-  const grooveBox = (h = 1) => {
+  // (`at` the groove's middle, `top` the box's height, `w` its width along X)
+  const grooveBox = (h = 1, { at = 45, top = 60, w = 80 } = {}) => {
     const { Manifold } = wasm;
-    const outer = own(Manifold.cube([80, 80, 60])).translate([-40, -40, 0]);
-    const hollow = own(Manifold.cube([74, 74, 54])).translate([-37, -37, 3]);
-    const ring = own(own(Manifold.cube([82, 82, h])).translate([-41, -41, 45 - h / 2])).subtract(own(own(Manifold.cube([78, 78, h + 2])).translate([-39, -39, 44 - h / 2])));
+    const outer = own(Manifold.cube([w, 80, top])).translate([-w / 2, -40, 0]);
+    const hollow = own(Manifold.cube([w - 6, 74, top - 6])).translate([-w / 2 + 3, -37, 3]);
+    const ring = own(own(Manifold.cube([w + 2, 82, h])).translate([-w / 2 - 1, -41, at - h / 2])).subtract(own(own(Manifold.cube([w - 2, 78, h + 2])).translate([-w / 2 + 1, -39, at - 1 - h / 2])));
     return own(own(own(outer).subtract(own(hollow))).subtract(own(ring)));
   };
   // a 100 mm square tower (4 mm walls and floor) with a hollow pyramid roof flush with its walls at z 200, apex at 260
@@ -2191,6 +2192,120 @@ describe('placing a cut that comes apart', () => {
     expect(await probe(192)).toMatchObject({ suggestedAt: 190.5, suggestedLip: { H: 6, clips: 4 } });
   });
 
+  it('the user\'s round lantern: its roof\'s rim comes first, slim or none; the tips of its narrow windows are no line to hide in', async () => {
+    for (const eaveR of [50, 47, 0]) {
+      await load(own(roundLanternSolid({ eaveR })), `round-${eaveR}`);
+      const r = await spots();
+      // where the roof stands on the body, its eave ring 5 mm or 2 mm over it or none: a lip without clips under it
+      expect([eaveR, r.spots[0]]).toMatchObject([eaveR, { seam: 148, why: 'under a ledge where the shape widens', lip: { H: 6, clips: 0 }, islands: 1 }]);
+      // over the windows' pointed tips the outline the outside shows does not move: a spot there gets nothing for it
+      const tips = r.spots.find((s) => Math.abs(s.seam - 124.66) < 0.01);
+      if (tips) expect(tips.score).toBeLessThan(r.spots[0].score - 1);
+    }
+  });
+
+  it('just over the tips of a row of windows the tongue comes in stretches: the spot there is half a step higher, where it is whole', async () => {
+    await load(own(roundLanternSolid({ eaveR: 47 })), 'round');
+    expect((await probe(125)).lip).toMatchObject({ H: 6, clips: 0, why: 'edge', broken: true });
+    expect((await probe(125.5)).lip).toEqual({ H: 6, clips: 0, why: 'short' });
+    for (const hold of ['lock', 'lift']) {
+      const tips = (await spots({ hold })).spots.find((s) => Math.abs(s.seam - 124.66) < 0.01);
+      expect([hold, tips]).toMatchObject([hold, { at: 125.5, why: 'above the openings', lip: { H: 6 } }]);
+    }
+  });
+
+  it('a slender tower\'s top would stand on its small flat roof to carry a lip: the probe and the spots say the lip the download makes', async () => {
+    await load(own(slenderTowerSolid()), 'slender');
+    const lipOf = (p) => (p.lip ? { H: p.lip.H, clips: p.lip.clips } : null);
+    const madeOf = async (at) => {
+      const a = (await exportSplit(S({ cuts: [apartAt(at)] }))).seams[0].apart;
+      return a.lip ? { H: a.height, clips: a.clips } : null;
+    };
+    for (const at of [31, 35, 39.5]) expect([at, lipOf(await probe(at))]).toEqual([at, await madeOf(at)]);
+    const r = await spots();
+    expect(r.spots.length).toBeGreaterThan(0);
+    for (const s of r.spots) expect([s.at, s.lip]).toEqual([s.at, await madeOf(s.at)]);
+  });
+
+  it('on a small round part Locks offers the full lip without clips that Lifts off finds, though no island there is wide enough for a clip', async () => {
+    // a pawn: a base r 18, a body narrowing to r 7 at z 30, a collar r 11 to 33, a neck and a ball for a head
+    const { Manifold } = wasm;
+    const frustum = ([z0, r0], [z1, r1]) => own(own(Manifold.cylinder(z1 - z0, r0, r1, 96)).translate([0, 0, z0]));
+    const outline = [[0, 18], [4, 18], [6, 16], [12, 12], [30, 7]];
+    const body = outline.slice(1).map((ring, k) => frustum(outline[k], ring));
+    const head = own(own(Manifold.sphere(9, 96)).translate([0, 0, 44]));
+    await load(own(Manifold.union([...body, frustum([30, 11], [33, 11]), frustum([33, 6], [37, 6]), head])), 'pawn');
+    const lifted = (await spots({ hold: 'lift' })).spots;
+    const locked = (await spots({ hold: 'lock' })).spots;
+    expect(lifted.length).toBeGreaterThan(0);
+    expect(locked.map((s) => [s.at, s.lip])).toEqual(lifted.map((s) => [s.at, { H: 6, clips: 0 }]));
+    expect((await exportSplit(S({ cuts: [apartAt(locked[0].at)] }))).seams[0].apart).toMatchObject({ lip: true, height: 6, clips: 0 });
+  });
+
+  it('two separate parts side by side: where the shorter one ends is no seam of the taller, whose lid line comes first', async () => {
+    // canisters with lids overhanging them, 80 mm tall (the lid from 60) and 50 mm (the lid from 35), closed 3 mm thick
+    const { Manifold } = wasm;
+    const can = (x, h, lid) => own(Manifold.union([
+      own(own(box([x - 25, -25, 0], [x + 25, 25, lid + 0.5])).subtract(own(box([x - 22, -22, 3], [x + 22, 22, h - 3])))),
+      own(own(box([x - 26, -26, lid], [x + 26, 26, h])).subtract(own(box([x - 22, -22, 3], [x + 22, 22, h - 3])))),
+    ]));
+    await load(own(Manifold.union([can(-35, 80, 60), can(35, 50, 35)])), 'two');
+    const t = await targets();
+    expect(t.seams.filter((s) => Math.abs(s.at - 50) < 0.5)).toEqual([]);
+    // where the short one closes over is its top, not where openings end
+    expect(t.seams.find((s) => Math.abs(s.at - 47) < 0.5)).toMatchObject({ kind: 'top' });
+    const r = await spots();
+    expect(r.spots[0]).toMatchObject({ at: 59.5, seam: 60, why: 'under a ledge where the shape widens' });
+    expect(r.spots.filter((s) => /openings/.test(s.why))).toEqual([]);
+  });
+
+  it('a lid groove on a box taller than 200 mm is found though it falls between two samples, and so is its spot', async () => {
+    await load(grooveBox(1, { at: 201, top: 240, w: 120 }), 'tall');
+    expect((await targets()).seams.map((s) => [s.at, s.kind])).toEqual([[3, 'walls'], [200.5, 'narrows'], [201.5, 'widens'], [237, 'top']]);
+    const near = (await spots()).spots.filter((s) => Math.abs(s.at - 201) < 3);
+    expect(near).toMatchObject([{ why: expect.stringMatching(/groove/), lip: { H: 6, clips: 4 } }]);
+  });
+
+  it('a groove whose first step under it has no lip: the next step is tried before a place 10 mm away, which is never offered', async () => {
+    for (const at of [45.8, 45.9]) {
+      await load(grooveBox(1, { at }), 'groove');
+      const r = await spots();
+      expect([at, r.spots.filter((s) => /groove/.test(s.why) && Math.abs(s.at - s.seam) > 3)]).toEqual([at, []]);
+      expect([at, r.spots[0]]).toMatchObject([at, { why: 'above a groove', lip: { H: 6, clips: 4 } }]);
+    }
+    // 0.8 mm under the groove at 45.8 the lip is full, where the step just under it has no room
+    expect((await probe(44.5)).lip).toMatchObject({ H: 6, clips: 4 });
+  });
+
+  it('at clearance 0.3 a ledge at the very end of the groove\'s reach is read as the download reads it', async () => {
+    await load(own(gothicSolid({ roof: 'hollow' })), 'gothic');
+    const split = { ...SPLIT_DEFAULTS, clearance: 0.3 };
+    // 174.5 + 9.5 is the underside of the roof's shelf, at 184
+    const p = await probe(174.5, { split });
+    expect(p).toMatchObject({ lip: { H: 4.5, clips: 0, why: 'height' }, suggestedAt: 174 });
+    expect(noteOf(await exportSplit({ ...split, cuts: [apartAt(174.5)] }), 'APART_NO_CLIPS')).toMatchObject({ why: 'height', height: 4.5, suggestedAt: 174 });
+    for (const s of (await spots({ split })).spots) expect([s.at, (await exportSplit({ ...split, cuts: [apartAt(s.at)] })).seams[0].apart]).toMatchObject([s.at, { lip: true, height: s.lip.H, clips: s.lip.clips }]);
+  });
+
+  it('spots are looked for a slice of time at a time: a probe asked meanwhile is answered first, and they are the spots found in one go', async () => {
+    await load(own(roundLanternSolid()), 'round');
+    await targets();
+    const order = [];
+    const found = spots().then((r) => {
+      order.push('spots');
+      return r;
+    });
+    const tried = probe(142.5).then((r) => {
+      order.push('probe');
+      return r;
+    });
+    const [r, p] = await Promise.all([found, tried]);
+    expect(order).toEqual(['probe', 'spots']);
+    expect(p).toMatchObject({ at: 142.5, lip: { H: 6, clips: 0 } });
+    const whole = await client.call('split.plan', { items: [], baseVersion: version, ...options({ axis: 'z', hold: 'lock' }), mode: 'spots' });
+    expect(r.spots).toEqual(whole.spots);
+  });
+
   it('tries a cut as the download makes it: a full lip at 190, a short one at 192, none at 196, and where the notes move it', async () => {
     await lantern();
     const at190 = await probe(190);
@@ -2276,17 +2391,17 @@ describe('placing a cut that comes apart', () => {
     };
     await lantern();
     await round(0);
-    // never more than 384 slices kept
-    expect(await aimed()).toBe(384);
+    // never more than 640 slices kept
+    expect(await aimed()).toBe(640);
     const watch = trackSolids();
     try {
       // what stays alive is the kept slices (the older ones going as newer come) and the X axis's copy of the model
       for (let i = 1; i < 6; i++) {
         await round(i);
-        expect(watch.live()).toBeLessThanOrEqual(384 + 4);
+        expect(watch.live()).toBeLessThanOrEqual(640 + 4);
       }
       expect(watch.made()).toBeGreaterThan(5000);
-      expect(await aimed()).toBe(384);
+      expect(await aimed()).toBe(640);
       // and none of the lantern's once another model is loaded
       const kept = watch.live();
       await load(cube([20, 20, 20]), 'small');

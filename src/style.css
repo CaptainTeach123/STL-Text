@@ -1085,9 +1085,9 @@ ul.plan li select {
   color: var(--muted);
   font-weight: 500;
 }
-/* placed with a touch: its buttons place the cut or stop – and only they, so a pinch or a touch on its words still
-   reaches the view under it */
-.cut-readout.pinned .readout-actions {
+/* placed with a touch: its buttons place the cut or stop – and only they, not the row they sit in, so a pinch or a touch
+   on its words or beside the buttons still reaches the view under it */
+.cut-readout.pinned .readout-actions button {
   pointer-events: auto;
 }
 .cut-readout .readout-actions {
@@ -1136,5 +1136,15 @@ ul.plan li select {
   }
   .actions.pieces #downloadBtn {
     white-space: normal;
+  }
+}
+/* the narrowest phones: a cut row's columns close up a little, so that beside the crosshair and the remove button the
+   position box still shows its number in full ("-38.25") */
+@media (max-width: 360px) {
+  #cutList li {
+    column-gap: 4px;
+  }
+  #cutList .seg span {
+    padding: 2px 6px;
   }
 }

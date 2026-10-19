@@ -11,7 +11,7 @@ import {
   sizesFor, sizesForRoom, soupCells, splitActive, splitNote, teardropApex, usableBed, yawMat4, zipFileName, triangleInBox, baseAxis,
   outlineColumns, pieceHolding, textNotes, AUTO_PEGS, SMALLEST_PEG, layPegged, pegAllowance, pegMales, pegSides, pegSizeOf, pegSizesFor,
   pegSizesForRoom, statsWithPegs, uprightPegNotes, APART_COLOR, APART_HOLDS, CLIP, LIP, LIP_ALLOWANCE, apartMales, catchSizes,
-  clipHold, clipPush, clipShape, layGrown, lipReach, lipSides, lipSizesFor, statsWithLip, SPOT, comesOffOf, endBeds, endsAsWell, keepsTo, lipMale,
+  clipHold, clipPush, clipShape, layGrown, lipReach, lipSides, lipSizesFor, statsWithLip, SPOT, comesOffOf, endBeds, endShape, endsAsWell, keepsTo, lipMale,
   locateBend, locateSeam, pickSpots, profileSeams, seamKind, seamWords, snapTarget, spotScore, spotSide, spotStart, spotWhy,
 } from '../src/split.js';
 
@@ -2636,6 +2636,10 @@ describe('placing a cut that comes apart', () => {
     expect(seamKind({ below: side(4, 4), above: side(4, 4), gained: 0, lost: 1472, outer: still })).toBe('thins');
     // a tube stepping out 1 mm while its walls thin from 4 to 1.5 mm: more is lost than gained, yet the outside widens
     expect(seamKind({ below: side(1, 1), above: side(1, 1), gained: 320, lost: 790, outer: { shift: 1, gained: 320, lost: 0 } })).toBe('widens');
+    // two boxes side by side, one closing over: a hole under solid is walls closing over, though another hole goes on
+    expect(seamKind({ below: side(2, 2), above: side(2, 1) })).toBe('closes');
+    expect(seamKind({ below: side(2, 2), above: side(2, 1), capped: true })).toBe('top');
+    expect(seamKind({ below: side(2, 1), above: side(2, 2), floored: true })).toBe('walls');
     expect(spotWhy('widens', -1, 2)).toBe('under a ledge where the shape widens');
     expect(spotWhy('narrows', 1, 2)).toBe('at a ledge where the shape narrows');
     expect(spotWhy('narrows', -1, 2, { cap: true })).toBe('under a cap');
@@ -2713,6 +2717,8 @@ describe('placing a cut that comes apart', () => {
     // through fretwork or posts, cutting letters, a sliver or most of the model: worse
     expect(spotScore({ clips: 4, shift: 3.92, distance: 9.5, fraction: 0.28, islands: 8 })).toBeCloseTo(roof - 3.5, 9);
     expect(spotScore({ clips: 4, shift: 3.92, distance: 9.5, fraction: 0.28, crosses: 1 })).toBeCloseTo(roof - 2, 9);
+    // a tongue an opening's edge cuts into stretches: a lip, but a worse one
+    expect(spotScore({ clips: 0, broken: true, shift: 3.92, distance: 9.5, fraction: 0.28 })).toBeCloseTo(roof - 2, 9);
     expect(spotScore({ clips: 4, shift: 3.92, distance: 9.5, fraction: 0.01 })).toBeCloseTo(roof - 1, 9);
     expect(spotScore({ clips: 4, shift: 3.92, distance: 9.5, fraction: 0.95 })).toBeLessThan(roof - 2.5);
     const spots = pickSpots([{ at: 160.5, score: 4.5 }, { at: 190.5, score: 5.3 }, { at: 185, score: 5.1 }, { at: 30.5, score: 3.1 }, { at: 4.5, score: 2.5 }, { at: 60, score: 2 }, { at: 100, score: 1 }, { at: 120, score: 0.5 }]);
@@ -2740,6 +2746,15 @@ describe('placing a cut that comes apart', () => {
     expect(endsAsWell([10000, 0], 1728)).toEqual([true, false]);
     expect(endsAsWell([800, 20], 1728)).toEqual([false, false]);
     expect(endsAsWell([20, 30], 10)).toEqual([false, true]);
+    // how slender it would stand with the lip: a 70 mm tower's top 222.5 mm tall on its 40 × 40 flat roof prints far
+    // worse than on its cut face; its foot 39.5 mm tall is fine
+    const tower = { lengths: [39.5, 222.5], spans: [4900, 1600], faceSpan: 4900 };
+    expect(endsAsWell([4900, 1600], 804, tower)).toEqual([true, false]);
+    // a 60 mm tower 170.5 mm tall on its foot: a 6 mm lip on top tips it past what it costs without one; its 30 mm roof
+    // stands on its flat top as well with one
+    expect(endsAsWell([3600, 900], 684, { lengths: [170.5, 35], spans: [3600, 900], faceSpan: 3600 })).toEqual([false, true]);
+    // the lantern's body, 190.5 mm on 100 × 100, is fine either way
+    expect(endsAsWell([10000, 0], 1728, { lengths: [190.5, 100.5], spans: [10000, 0], faceSpan: 10000 })).toEqual([true, false]);
   });
 
   it('reads the flat area a model ends in on each side of each axis', () => {
@@ -2754,5 +2769,9 @@ describe('placing a cut that comes apart', () => {
     expect(pyramid[2][0]).toBeCloseTo(100, 6);
     expect(pyramid[2][1]).toBe(0);
     expect(pyramid[0]).toEqual([0, 0]);
+    // and the box each end's bed spans: the box's own sides; nothing where nothing lies flat
+    const { spans } = endShape(mesh(corners, faces));
+    [[600, 600], [300, 300], [200, 200]].forEach((want, a) => want.forEach((v, k) => expect(spans[a][k]).toBeCloseTo(v, 6)));
+    expect(endShape(mesh([[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0], [5, 5, 12]], [[0, 2, 1], [0, 3, 2], [0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]])).spans[2]).toEqual([100, 0]);
   });
 });

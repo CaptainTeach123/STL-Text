@@ -2741,19 +2741,21 @@ function lipKit({ solid, cuts, bounds, c, nozzle, keep, lipBand, source = null }
    * eaves, or in a jar's shoulder, where the move takes more of the slope
    * into the groove's piece and the next place says how much further. Null
    * when no place within six moves has it, or a move would leave the model
-   * or reach another cut. The lip the place gives, as that one patch would
-   * have it, is kept for `movedLip`.
+   * or reach another cut – or go past `within` ([lo, hi] along the axis,
+   * where the caller has no use for a place beyond). The lip the place gives,
+   * as that one patch would have it, is kept for `movedLip`.
    */
-  const moveFor = (ctx, patch, k, least = 0) => {
+  const moveFor = (ctx, patch, k, least = 0, within = null) => {
     ctx.moveFor ??= new Map();
     ctx.movedLips ??= new Map();
-    const key = `${ctx.patches.indexOf(patch)}|${k}|${least}`;
+    const key = `${ctx.patches.indexOf(patch)}|${k}|${least}${within ? `|${within.join('/')}` : ''}`;
     if (ctx.moveFor.has(key)) return ctx.moveFor.get(key);
     const hold = ctx.cut.apart?.hold ?? 'snap';
     const toward = k === 0 ? 1 : -1; // along the axis, the way to the groove's piece
     const now = lipRank(qualityOfPlan(patch.lipSides[k].plan)).slice(0, 4);
     const clear = (at) => {
       const d = at - ctx.cut.at;
+      if (within && !(at >= within[0] - 1e-9 && at <= within[1] + 1e-9)) return false;
       return ctx.rooms[0] + d > CUT_TOLERANCE && ctx.rooms[1] - d > CUT_TOLERANCE;
     };
     const roomOf = (where, there) => lipRoom(there.lip, {
@@ -2812,7 +2814,9 @@ function lipKit({ solid, cuts, bounds, c, nozzle, keep, lipBand, source = null }
   };
 
   /** The lip the place `moveFor` found gives that patch (`{ H, clips, area }`), or null: what a move there is for. */
-  const movedLip = (ctx, patch, k, least = 0) => (moveFor(ctx, patch, k, least) == null ? null : ctx.movedLips.get(`${ctx.patches.indexOf(patch)}|${k}|${least}`));
+  const movedLip = (ctx, patch, k, least = 0, within = null) => (moveFor(ctx, patch, k, least, within) == null
+    ? null
+    : ctx.movedLips.get(`${ctx.patches.indexOf(patch)}|${k}|${least}${within ? `|${within.join('/')}` : ''}`));
 
   return { shadowAt, lipObstacles, lipRootAt, planLipSides, lipRank, qualityOfPlan, betterLip, movedTo, moveFor, movedLip };
 }
@@ -2823,36 +2827,73 @@ function lipKit({ solid, cuts, bounds, c, nozzle, keep, lipBand, source = null }
  * far as slices every `step` mm show them, and slices just inside each end of
  * a reach. A face's column meets air within a reach where some slice there
  * lacks it, and the groove's piece holds something over an opening where
- * some slice has it. A slice of a dense model costs a millisecond and the
- * caller keeps them, where a band of a million triangles and each shadow of
- * it is a boolean of the lot: a cut tried here and there while it is being
- * placed reads a few dozen slices. As close as the slices are: a ledge
- * thinner than `step` between two of them is missed, a slope read to within
- * its rise over `step`.
+ * some slice has it – or where it starts at the reach's very end, as the band
+ * has it (a roof's shelf whose underside is exactly as far from the cut as
+ * the groove reaches), so where the model has a face square to the axis
+ * there (`flats`), a slice just past that end is read too. A slice of
+ * a dense model costs a millisecond and the caller keeps them, where a band
+ * of a million triangles and each shadow of it is a boolean of the lot: a
+ * cut tried here and there while it is being placed reads a few dozen
+ * slices. The step slices met or joined from the cut outwards are kept
+ * (`keep`) as they are worked out, so a reach a little further meets only
+ * the slices it adds. As close as the slices are: a ledge thinner than
+ * `step` between two of them is missed, a slope read to within its rise
+ * over `step`.
  * @param {(t: number) => CrossSection} sliceAt the model's slice at t, in the cut axis's plane frame (borrowed: the
  *   caller keeps them)
+ * @param {{ step?: number, keep: { add: function }, flats?: number[] }} options `keep` holds what is worked out on the
+ *   way, until the caller is done with the source; `flats` the heights of the model's faces square to the axis
  * @returns {{ band: function, shadow: function, over: function }} `lipKit`'s `source`: a stand-in for the band that
  *   gives only its slices, the shadow of the air at a reach within the face, and what is over the island's openings
  */
-export function slicedSource(sliceAt, { step = 0.5 } = {}) {
+export function slicedSource(sliceAt, { step = 0.5, keep, flats = [] } = {}) {
   const { CrossSection } = manifold();
   const inside = 1e-4;
-  // the slices from lo to hi: every step on the way, and just inside each end
-  const heights = (lo, hi) => {
-    const out = [lo + inside];
-    for (let k = Math.ceil((lo + inside) / step + 1e-9); k * step < hi - inside - 1e-9; k++) out.push(k * step);
-    out.push(hi - inside);
-    return out;
+  const flatAt = (t) => flats.some((f) => Math.abs(f - t) < 1e-3);
+  // the step heights strictly between lo and hi, a hair inside each: the first and the last
+  const first = (lo) => Math.ceil((lo + inside) / step + 1e-9);
+  const last = (hi) => {
+    let k = Math.floor((hi - inside) / step);
+    while (k * step >= hi - inside - 1e-9) k--;
+    while ((k + 1) * step < hi - inside - 1e-9) k++;
+    return k;
+  };
+  // the slices on the step heights from k0 on, one way (`dir`), met one after another from `seed` (a face) or joined
+  const runs = new Map();
+  const run = (key, k0, dir, seed) => {
+    if (!runs.has(key)) runs.set(key, { k0, dir, seed, made: [] });
+    return runs.get(key);
+  };
+  const upTo = (r, n) => {
+    while (r.made.length < n) {
+      const k = r.k0 + r.dir * r.made.length;
+      const prev = r.made.length ? r.made[r.made.length - 1] : r.seed;
+      const cs = sliceAt(k * step);
+      r.made.push(keep.add(prev ? (r.seed ? prev.intersect(cs) : prev.add(cs)) : cs.translate(0, 0)));
+    }
+    return n ? r.made[n - 1] : r.seed;
   };
   return {
     band: () => ({ slice: (t) => sliceAt(t).translate(0, 0), delete() {} }),
     shadow(ctx, reach) {
       const { below, above } = typeof reach === 'number' ? { below: reach, above: reach } : reach;
-      const face = sliceAt(ctx.cut.at);
+      const at = ctx.cut.at;
+      const face = sliceAt(at);
+      const [lo, hi] = [at - below, at + above];
+      const [k0, k1] = [first(lo), last(hi)];
+      // the step heights at or under the cut, down from it, and over it, up from it
+      const kd = Math.floor(at / step + 1e-9);
+      const [top, bottom] = [Math.min(kd, k1), Math.max(kd + 1, k0)];
+      const down = Math.max(0, top - k0 + 1);
+      const up = Math.max(0, k1 - bottom + 1);
       const t = scope();
       try {
-        let solid = face;
-        for (const h of heights(ctx.cut.at - below, ctx.cut.at + above)) solid = t.add(solid.intersect(sliceAt(h)));
+        let solid = down ? upTo(run(`m|${at}|-1|${top}`, top, -1, face), down) : face;
+        if (up) {
+          const over = upTo(run(`m|${at}|1|${bottom}`, bottom, 1, face), up);
+          solid = down ? t.add(solid.intersect(over)) : over;
+        }
+        for (const h of [lo + inside, hi - inside]) solid = t.add(solid.intersect(sliceAt(h)));
         return face.subtract(solid);
       } finally {
         t.dispose();
@@ -2863,10 +2904,14 @@ export function slicedSource(sliceAt, { step = 0.5 } = {}) {
       const [lo, hi] = side === 1 ? [at + 1e-3, at + R] : [at - R, at - 1e-3];
       const outer = polygonsOf(island).filter((r) => ringArea(r) > 0);
       if (!outer.length || !(hi > lo)) return null;
+      const [k0, k1] = [first(lo), last(hi)];
+      const n = Math.max(0, k1 - k0 + 1);
       const t = scope();
       try {
-        let held = null;
-        for (const h of heights(lo, hi)) held = held ? t.add(held.add(sliceAt(h))) : sliceAt(h);
+        let held = side === 1 ? upTo(run(`j|1|${k0}`, k0, 1, null), n) : upTo(run(`j|-1|${k1}`, k1, -1, null), n);
+        // the near end read a hair from the face, as the shadows read it: nothing ends between the two
+        const ends = side === 1 ? [at + inside, hi - inside, ...(flatAt(hi) ? [hi + inside] : [])] : [...(flatAt(lo) ? [lo - inside] : []), lo + inside, at - inside];
+        for (const h of ends) held = held ? t.add(held.add(sliceAt(h))) : sliceAt(h);
         const holes = t.add(t.add(new CrossSection(outer, 'Positive')).subtract(t.add(island.offset(0.05, 'Miter', 4))));
         const over = held.intersect(holes);
         if (over.area() > 1e-3) return over;
@@ -2888,28 +2933,33 @@ export function slicedSource(sliceAt, { step = 0.5 } = {}) {
  * full lip, where the layout's moves find one (`suggestedAt`, as the notes
  * offer it). Where the piece that prints as well has no room for the lip and
  * a move gives it room, the cut has no lip here, as in the download. No
- * lip is built, nor the band round the cut when slices are given.
+ * lip is built, nor the band round the cut when slices are given. Where
+ * the caller has no use for a move (`moves` false), or none beyond
+ * `within`, none is looked for that far.
  * @param {Manifold} solid (borrowed)
  * @param {{ axis: number, at: number }} cut
  * @param {{ c?: number, nozzle?: number, hold?: string, bounds?: { min: number[], max: number[] }, asWell?: boolean[],
- *   sliceAt?: (t: number) => CrossSection }} options `bounds` the model's, as the layout has them; `sliceAt` the
- *   model's slices along the cut's axis (plane frame, borrowed, kept by the caller), to read what stands round the cut
- *   from (`slicedSource`) – without it, the band round the cut and its booleans, as the layout reads them
- * @returns {{ patches: number, male: 0|1|null, lip: { H: number, clips: number, why: string|null, kind: string }|null,
+ *   sliceAt?: (t: number) => CrossSection, flats?: number[], moves?: boolean, within?: number[]|null }} options
+ *   `bounds` the model's, as the layout has them;
+ *   `sliceAt` the model's slices along the cut's axis (plane frame, borrowed, kept by the caller), to read what stands
+ *   round the cut from (`slicedSource`, with `flats` the heights of the model's faces square to the axis) – without it,
+ *   the band round the cut and its booleans, as the layout reads them
+ * @returns {{ patches: number, male: 0|1|null, lip: { H: number, clips: number, why: string|null, kind: string, broken: boolean }|null,
  *   noLip: 'miss'|'small'|'thin'|'room'|null, suggestedAt: number|null, suggestedLip: { H: number, clips: number }|null,
  *   quality: object[] }} `lip` over all the faces (the tallest, every clip; `why` as APART_NO_CLIPS has it, null with
- *   clips or on a hold with none), `noLip` why there is none: the cut misses the model, its faces are too small (it
+ *   clips or on a hold with none; `broken` whether its main face's tongue comes in more than one stretch), `noLip`
+ *   why there is none: the cut misses the model, its faces are too small (it
  *   runs through openings, or a small solid part), its walls too thin, or the piece past it has no room;
  *   `suggestedLip` the lip the move gives its main face – taller, or with clips; `quality` the lip each piece would
  *   carry, [below, above]
  */
-export function probeLip(solid, cut, { c = SPLIT_DEFAULTS.clearance, nozzle = 0.4, hold = 'snap', bounds = null, asWell = [true, true], sliceAt = null } = {}) {
+export function probeLip(solid, cut, { c = SPLIT_DEFAULTS.clearance, nozzle = 0.4, hold = 'snap', bounds = null, asWell = [true, true], sliceAt = null, flats = [], moves = true, within = null } = {}) {
   const b = bounds ?? boxOf(solid);
   const one = { id: 'probe', letter: 'A', axis: cut.axis, at: cut.at, apart: { hold } };
   const keep = scope();
   try {
     const lipBand = lipReach(LIP.heights[0], 'opening', c, catchSizes('snap', c).i, true, nozzle).reach;
-    const kit = lipKit({ solid, cuts: [one], bounds: b, c, nozzle, keep, lipBand, source: sliceAt ? slicedSource(sliceAt) : null });
+    const kit = lipKit({ solid, cuts: [one], bounds: b, c, nozzle, keep, lipBand, source: sliceAt ? slicedSource(sliceAt, { keep, flats }) : null });
     // the cut's face, its patches and islands, as a cut moved here has them
     const ctx = kit.movedTo({ cut: one, obstacles: [], rooms: [one.at - b.min[one.axis], b.max[one.axis] - one.at] }, one.at);
     const live = ctx.patches;
@@ -2920,6 +2970,9 @@ export function probeLip(solid, cut, { c = SPLIT_DEFAULTS.clearance, nozzle = 0.
     });
     if (!live.length) return none('miss');
     kit.planLipSides(ctx);
+    // where the moves would give a full lip, for the readout: none asked (`moves`), or none past `within`
+    const suggest = (patch, k) => (moves ? kit.moveFor(ctx, patch, k, 0, within) : null);
+    const suggested = (patch, k) => (moves ? kit.movedLip(ctx, patch, k, 0, within) : null);
     const qualityOf = (k) => {
       const plans = live.map((patch) => patch.lipSides[k].plan).filter(Boolean);
       if (!plans.length) return null;
@@ -2949,9 +3002,11 @@ export function probeLip(solid, cut, { c = SPLIT_DEFAULTS.clearance, nozzle = 0.
         why = plan.H < LIP.heights[0] ? 'height' : ['flex', 'skin', 'short'].find((w) => plan.why.includes(w)) ?? 'short';
         if (why === 'short' && r?.root) why = 'edge';
       }
+      // a tongue in more than one stretch: an opening's edge in its foot cuts it (just over a row of windows' tips)
+      const broken = plan.T.filter((ring) => ringArea(ring) > 0).length > 1;
       return {
-        patches: live.length, male: k, lip: { H: quality[k].H, clips, why, kind: plan.kind }, noLip: null,
-        suggestedAt: r ? kit.moveFor(ctx, main, k) : null, suggestedLip: r ? lipOf(kit.movedLip(ctx, main, k)) : null, quality,
+        patches: live.length, male: k, lip: { H: quality[k].H, clips, why, kind: plan.kind, broken }, noLip: null,
+        suggestedAt: r ? suggest(main, k) : null, suggestedLip: r ? lipOf(suggested(main, k)) : null, quality,
       };
     }
     // no lip on offer: the faces too small for one, the walls too thin even with nothing in the way, or no room
@@ -2960,7 +3015,7 @@ export function probeLip(solid, cut, { c = SPLIT_DEFAULTS.clearance, nozzle = 0.
     const main = largest(sized);
     const bare = planLip(main.lip, { island: main.island, c, nozzle, H: LIP.heights[LIP.heights.length - 1], hold: 'lift', key: false });
     if (!bare) return none('thin', null, null, quality);
-    return none('room', kit.moveFor(ctx, main, 0), null, quality, kit.movedLip(ctx, main, 0));
+    return none('room', suggest(main, 0), null, quality, suggested(main, 0));
   } finally {
     keep.dispose();
   }

@@ -10,7 +10,7 @@ import { unzipSync, strFromU8 } from 'three/examples/jsm/libs/fflate.module.js';
 import { initManifold, manifold } from '../src/manifold.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold, manifoldToSoup } from '../src/mesh.js';
-import { box as boxAt, lanternSolid } from '../tests/lanternFixture.js';
+import { box as boxAt, lanternSolid, lidBoxSolid } from '../tests/lanternFixture.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const out = path.join(root, 'e2e', 'out');
@@ -2809,6 +2809,406 @@ try {
     await aimContext.close();
   }
 
+  console.log('\nplacing: glued cuts, handles dragged, and the pieces view');
+  {
+    // a page of its own that notes the split.plan requests sent (window.__plans: their modes, in order) and every
+    // progress message shown
+    const glueContext = await browser.newContext({ viewport: { width: 1400, height: 850 } });
+    await glueContext.addInitScript(() => {
+      const getContext = HTMLCanvasElement.prototype.getContext;
+      HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+        if (type === 'webgl' || type === 'webgl2') attrs = { ...attrs, preserveDrawingBuffer: true };
+        return getContext.call(this, type, attrs);
+      };
+      const plans = (window.__plans = { sent: [], stages: [] });
+      const Native = window.Worker;
+      window.Worker = class extends Native {
+        postMessage(message, transfer) {
+          if (message?.type === 'split.plan') plans.sent.push(message.mode);
+          return super.postMessage(message, transfer);
+        }
+      };
+      setInterval(() => {
+        const el = document.querySelector('#progress');
+        const text = document.querySelector('#progressText')?.textContent;
+        if (el && !el.hidden && text && plans.stages.at(-1) !== text) plans.stages.push(text);
+      }, 10);
+    });
+    const g = await glueContext.newPage();
+    const glueProblems = [];
+    g.on('pageerror', (e) => glueProblems.push(`pageerror: ${e.message}`));
+    g.on('console', (m) => m.type() === 'error' && glueProblems.push(`console: ${m.text()}`));
+    const settle = async () => {
+      await g.waitForTimeout(80);
+      await g.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+      await g.waitForTimeout(80);
+      await g.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    };
+    const read = () =>
+      g.evaluate(() => {
+        const el = document.querySelector('#cutReadout');
+        return el.hidden ? null : { lines: [...el.children].map((c) => c.textContent), verdict: el.dataset.verdict };
+      });
+    const cutRows = () =>
+      g.evaluate(() =>
+        [...document.querySelectorAll('#cutList li')].map((li) => ({
+          at: li.querySelector('[data-cut-at]').value,
+          apart: li.querySelector('[data-cut-apart]').checked,
+          selected: li.classList.contains('selected'),
+        })),
+      );
+    const plans = () => g.evaluate(() => ({ sent: [...window.__plans.sent], stages: [...window.__plans.stages] }));
+    const forget = () => g.evaluate(() => window.__plans.sent.splice(0) && window.__plans.stages.splice(0));
+    const teal = ([r, gr, b]) => g.evaluate(([r, gr, b]) => {
+      const c = document.querySelector('#stage canvas');
+      const probe = document.createElement('canvas');
+      probe.width = c.width;
+      probe.height = c.height;
+      const ctx = probe.getContext('2d');
+      ctx.drawImage(c, 0, 0);
+      const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+      let n = 0;
+      for (let i = 0; i < d.length; i += 4) if (Math.abs(d[i] - r) + Math.abs(d[i + 1] - gr) + Math.abs(d[i + 2] - b) < 30) n++;
+      return n;
+    }, [r, gr, b]);
+    /** Every place on a cut's handle in the view – a pixel in its colour where the pointer gets the grab cursor – lowest on screen last. */
+    const handles = async (colors) => {
+      const found = await g.evaluate((colors) => {
+        const c = document.querySelector('#stage canvas');
+        const rect = c.getBoundingClientRect();
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        const out = [];
+        for (let y = 0; y < c.height; y += 2) {
+          for (let x = 0; x < c.width; x += 2) {
+            const i = (y * c.width + x) * 4;
+            if (colors.some(([r, gr, b]) => Math.abs(d[i] - r) + Math.abs(d[i + 1] - gr) + Math.abs(d[i + 2] - b) < 30)) out.push([rect.left + (x * rect.width) / c.width, rect.top + (y * rect.height) / c.height]);
+          }
+        }
+        return out;
+      }, colors);
+      const tried = [];
+      const grips = [];
+      for (const [x, y] of found) {
+        if (tried.some(([a, b]) => Math.hypot(a - x, b - y) < 10)) continue;
+        tried.push([x, y]);
+        if (tried.length > 200) break;
+        await g.mouse.move(x, y);
+        await g.waitForTimeout(30);
+        if ((await g.evaluate(() => document.querySelector('#stage canvas').style.cursor)) === 'grab' && !grips.some(([a, b]) => Math.hypot(a - x, b - y) < 12)) grips.push([x, y]);
+      }
+      return grips.sort((p, q) => p[1] - q[1]);
+    };
+    const VIOLET = [139, 92, 246];
+    const TEAL = [13, 148, 136];
+    /** A point on cut `letter`'s handle (teal: it comes apart): one where a press and a little drag read that letter. */
+    const gripOf = async (letter) => {
+      for (const grip of await handles([TEAL, [45, 212, 191]])) {
+        await g.mouse.move(...grip);
+        await g.mouse.down();
+        await g.mouse.move(grip[0], grip[1] - 6, { steps: 3 });
+        await g.waitForTimeout(40);
+        const who = (await read())?.lines[0]?.[0];
+        await g.keyboard.press('Escape');
+        await g.mouse.up();
+        await settle();
+        if (who === letter) return grip;
+      }
+      return null;
+    };
+    const setAt = async (row, v) => {
+      await g.fill(`#cutList li:nth-child(${row}) [data-cut-at]`, String(v));
+      await g.press(`#cutList li:nth-child(${row}) [data-cut-at]`, 'Enter');
+      await settle();
+    };
+    await g.goto(url);
+    await g.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    await g.setInputFiles('#stlFile', path.join(out, 'lantern.stl'));
+    await g.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('lantern:'), null, { timeout: 60000 });
+    await settle();
+    await g.evaluate(() => (document.querySelector('#toast').hidden = true));
+    const stage = await g.locator('#stage canvas').boundingBox();
+    const x = stage.x + stage.width / 2 + 10;
+    // the height under each row down the middle of the view, Alt held, while a removable part is placed
+    await g.click('#addApartBtn');
+    await settle();
+    await g.keyboard.down('Alt');
+    const heights = [];
+    for (let y = stage.y + 40; y < stage.y + stage.height - 30; y += 6) {
+      await g.mouse.move(x, y);
+      await g.waitForTimeout(40);
+      const z = (await read())?.lines[0].match(/^Z (-?[\d.]+) mm/)?.[1];
+      if (z) heights.push([y, Number(z)]);
+    }
+    await g.keyboard.up('Alt');
+    await g.keyboard.press('Escape');
+    await settle();
+    const yAt = (z) => heights.reduce((best, h) => (Math.abs(h[1] - z) < Math.abs(best[1] - z) ? h : best), [0, Infinity])[0];
+
+    // a glued cut added, and turned across X and Y: nothing reads the shape for snapping, its measure only
+    await forget();
+    await g.click('#addCutBtn');
+    await settle();
+    for (const axis of ['X', 'Y', 'Z']) {
+      await g.click(`#cutList li:first-child .seg label:has-text("${axis}")`);
+      await settle();
+    }
+    await g.waitForFunction(() => window.__plans.sent.includes('measure'), null, { timeout: 10000 }).catch(() => null);
+    await settle();
+    const glued = await plans();
+    check(
+      glued.sent.length > 0 && glued.sent.every((m) => m === 'measure') && !glued.stages.includes('Reading the shape…'),
+      'a glued cut added and turned asks the engine for its measure only, and nothing says the shape is being read',
+      JSON.stringify(glued),
+    );
+
+    // its handle dragged goes by the step, onto every millimetre: never pulled onto a ledge or a spot of a cut that
+    // comes apart
+    await setAt(1, 140);
+    const [violetGrip] = await handles([VIOLET, [167, 139, 250]]);
+    const gluedAt = [];
+    let gluedSnapped = 0;
+    if (violetGrip) {
+      await g.mouse.move(...violetGrip);
+      await g.mouse.down();
+      for (let dy = 0; dy >= -140; dy -= 2) {
+        await g.mouse.move(violetGrip[0], violetGrip[1] + dy);
+        await g.waitForTimeout(25);
+        const r = await read();
+        const z = r?.lines[0].match(/^A · Z = ([\d.]+) mm/)?.[1];
+        if (z) gluedAt.push(Number(z));
+        if (r?.lines.some((l) => l.startsWith('snapped'))) gluedSnapped++;
+        if (Number(z) >= 165) break;
+      }
+      await g.mouse.up();
+      await settle();
+    }
+    const reached = [...new Set(gluedAt)];
+    check(
+      !!violetGrip && gluedSnapped === 0 && [...Array(15).keys()].map((k) => 145 + k).every((z) => reached.includes(z)),
+      "a glued cut's handle dragged goes by the step onto every height, never snapping to the ledges or spots of a cut that comes apart",
+      JSON.stringify({ violetGrip, reached, gluedSnapped }),
+    );
+
+    // a glued cut where a spot is: clicking the spot makes that cut come apart, as the list offers
+    await setAt(1, 190.5);
+    await g.click('#suggestSpotsBtn');
+    await settle();
+    const gluedSpot = (await g.locator('#spotList .spot').allInnerTexts())[0] ?? '';
+    await g.click('#spotList li:first-child .spot');
+    await settle();
+    const madeApart = { rows: await cutRows(), status: await g.locator('#status').innerText() };
+    check(
+      /^Z 190\.5 mm – .* · cut A is here$/.test(gluedSpot) && JSON.stringify(madeApart.rows) === JSON.stringify([{ at: '190.5', apart: true, selected: true }]) &&
+        madeApart.status === 'Cut A is there: it comes apart now.',
+      'a click on a spot where a glued cut is makes that cut come apart there, as the list says it will',
+      JSON.stringify({ gluedSpot, madeApart }),
+    );
+
+    // cut B placed freely under it; dragged up past cut A, it never snaps onto A's spot, where it would do nothing
+    await g.click('#addApartBtn');
+    await settle();
+    await g.keyboard.down('Alt');
+    await g.mouse.move(x, yAt(174.5) + 2);
+    await g.mouse.move(x, yAt(174.5));
+    await g.waitForTimeout(100);
+    await g.mouse.click(x, yAt(174.5));
+    await g.keyboard.up('Alt');
+    await settle();
+    const bAt = (await cutRows())[1]?.at;
+    const bGrip = await gripOf('B');
+    const bReadouts = [];
+    if (bGrip) {
+      await g.mouse.move(...bGrip);
+      await g.mouse.down();
+      for (let dy = 0; dy >= -80; dy -= 1) {
+        await g.mouse.move(bGrip[0], bGrip[1] + dy);
+        await g.waitForTimeout(20);
+        const r = await read();
+        if (r) bReadouts.push(r.lines.join(' | '));
+      }
+      await g.keyboard.press('Escape');
+      await g.mouse.up();
+      await settle();
+    }
+    const onA = bReadouts.filter((l) => /^B · Z = 190\.5 mm/.test(l));
+    const afterEscape = await cutRows();
+    check(
+      !!bGrip && bReadouts.length > 30 && bReadouts.some((l) => /^B · Z = (19[1-9]|2\d\d)/.test(l)) && onA.length === 0,
+      "a handle dragged past another cut never snaps onto it, though that cut sits on a spot",
+      JSON.stringify({ bAt, onA, last: bReadouts.slice(-3) }),
+    );
+    check(
+      afterEscape.length === 2 && afterEscape[1].at === bAt,
+      'Escape while a handle is dragged puts the cut back where it was, and the drop that follows moves nothing',
+      JSON.stringify({ bAt, afterEscape }),
+    );
+
+    // dragged, Alt held, onto the very place of another cut: the readout says so, and dropped there it stays put
+    await setAt(1, 192);
+    const bGrip2 = await gripOf('B');
+    let onTop = null;
+    if (bGrip2) {
+      await g.mouse.move(...bGrip2);
+      await g.mouse.down();
+      await g.keyboard.down('Alt');
+      for (let dy = 0; dy >= -120 && !onTop; dy -= 1) {
+        await g.mouse.move(bGrip2[0], bGrip2[1] + dy);
+        await g.waitForTimeout(20);
+        const r = await read();
+        if (r && /^B · Z = 192 mm/.test(r.lines[0])) onTop = r;
+      }
+      await g.mouse.up();
+      await g.keyboard.up('Alt');
+      await settle();
+    }
+    const stayed = { rows: await cutRows(), status: await g.locator('#status').innerText() };
+    check(
+      !!onTop?.lines.includes('cut A is already here') && stayed.rows.length === 2 && stayed.rows[0].at === '192' && stayed.rows[1].at === bAt &&
+        stayed.status === `Cut A is already at 192 mm – cut B stays where it was.`,
+      'a handle dropped where another cut already is: its readout said so, and the cut stays where it was',
+      JSON.stringify({ onTop, stayed }),
+    );
+
+    // where a full lip fits, worked out while a part was being placed, is no target once placing stops: B dragged up to
+    // A's spot snaps to the spot, not to it
+    await g.click('#addApartBtn');
+    await settle();
+    await g.keyboard.down('Alt');
+    await g.mouse.move(x, yAt(218.7) + 2);
+    await g.mouse.move(x, yAt(218.7));
+    await g.waitForTimeout(300);
+    await settle();
+    const lipMove = (await read())?.lines[0] ?? '';
+    await g.keyboard.up('Alt');
+    await g.keyboard.press('Escape');
+    await settle();
+    const moveTo = lipMove.match(/move down to ([\d.]+)/)?.[1];
+    const bGrip3 = await gripOf('B');
+    const toSpot = [];
+    if (bGrip3) {
+      await g.mouse.move(...bGrip3);
+      await g.mouse.down();
+      for (let dy = 0; dy >= -70; dy -= 1) {
+        await g.mouse.move(bGrip3[0], bGrip3[1] + dy);
+        await g.waitForTimeout(20);
+        const r = await read();
+        if (r?.lines.some((l) => l.startsWith('snapped'))) toSpot.push(r.lines.find((l) => l.startsWith('snapped')));
+      }
+      await g.keyboard.press('Escape');
+      await g.mouse.up();
+      await settle();
+    }
+    check(
+      !!moveTo && moveTo !== '190.5' && toSpot.length > 0 && !toSpot.some((l) => l.includes(`where a full lip fits, at ${moveTo} mm`)),
+      'where a full lip fits, found while a removable part was placed, is no target for a handle dragged after',
+      JSON.stringify({ lipMove, toSpot: [...new Set(toSpot)] }),
+    );
+
+    // "Show the pieces" under the piece list stops placing, as the Show pieces box does: in the pieces view the pointer
+    // says nothing and a click places nothing
+    await g.click('#addApartBtn');
+    await settle();
+    await g.mouse.move(x, yAt(120));
+    await g.waitForTimeout(200);
+    const hintShown = await g.isVisible('#showPiecesBtn');
+    await g.click('#showPiecesBtn');
+    await g.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
+    await settle();
+    const rowsBefore = await cutRows();
+    await g.mouse.move(x, yAt(150));
+    await g.waitForTimeout(150);
+    await g.mouse.move(x, yAt(150) + 4);
+    await g.waitForTimeout(150);
+    const piecesRead = await read();
+    await g.mouse.click(x, yAt(150));
+    await settle();
+    check(
+      hintShown && (await g.getAttribute('#addApartBtn', 'aria-pressed')) === 'false' && (await g.isChecked('#resultToggle')) && piecesRead === null &&
+        JSON.stringify(await cutRows()) === JSON.stringify(rowsBefore),
+      '"Show the pieces" stops placing: in the pieces view the pointer reads nothing and a click places nothing',
+      JSON.stringify({ hintShown, piecesRead, rowsBefore }),
+    );
+
+    // with the pieces shown, a spot hovered draws its plane and section on the model, and the pieces come back after
+    const canvasNow = () => g.evaluate(() => {
+      const c = document.querySelector('#stage canvas');
+      const probe = document.createElement('canvas');
+      probe.width = c.width;
+      probe.height = c.height;
+      const ctx = probe.getContext('2d');
+      ctx.drawImage(c, 0, 0);
+      return Array.from(ctx.getImageData(0, 0, probe.width, probe.height).data.filter((_, i) => i % 16 === 0));
+    });
+    const changed = (a, b) => a.filter((v, i) => Math.abs(v - b[i]) > 30).length;
+    await g.mouse.move(stage.x + 30, stage.y + stage.height - 30);
+    await g.waitForTimeout(200);
+    const piecesShown = await canvasNow();
+    await g.hover('#spotList li:first-child .spot');
+    await g.waitForTimeout(300);
+    const hovered = await canvasNow();
+    const hoverTeal = await teal(TEAL);
+    await g.mouse.move(stage.x + 30, stage.y + stage.height - 30);
+    await g.waitForTimeout(300);
+    const left = await canvasNow();
+    check(
+      changed(piecesShown, hovered) > 2000 && hoverTeal > 2000 && changed(piecesShown, left) < 50,
+      'with the pieces shown, hovering a spot draws its plane and section on the model, and the pieces come back after',
+      JSON.stringify({ hoverChanged: changed(piecesShown, hovered), hoverTeal, leftChanged: changed(piecesShown, left) }),
+    );
+    await g.uncheck('#resultToggle');
+    await settle();
+    await g.click('#frameBtn'); // the pieces were framed pulled apart: the view as it was when the lantern opened
+    await g.waitForTimeout(400);
+
+    // a box with a lid, which fits the printer, so nothing builds its final result unasked: the spots listed are found
+    // on the model alone; the final result then built, they are found again once a place tried says so – quietly, the
+    // list staying as it is meanwhile
+    await g.click('#splitClearBtn');
+    await settle();
+    await g.setInputFiles('#stlFile', writeFixture('lidbox.stl', soupOf(lidBoxSolid())));
+    await g.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('lidbox:'), null, { timeout: 60000 });
+    await settle();
+    await g.click('#frameBtn');
+    await g.waitForTimeout(400);
+    await g.click('#suggestSpotsBtn');
+    await settle();
+    await g.check('#resultToggle');
+    await settle();
+    await g.uncheck('#resultToggle');
+    await settle();
+    await forget();
+    await g.click('#addApartBtn');
+    await settle();
+    await g.keyboard.down('Alt'); // free: a place not tried before, so the engine answers it on the final result
+    const boxY = stage.y + stage.height * 0.5;
+    await g.mouse.move(x, boxY + 2);
+    await g.mouse.move(x, boxY);
+    await g.waitForTimeout(300);
+    await settle();
+    const notes = [];
+    for (let k = 0; k < 20; k++) {
+      notes.push(await g.locator('#spotsNote').innerText());
+      await g.waitForTimeout(25);
+    }
+    await settle();
+    const whilePlacing = { read: await read(), plans: await plans() };
+    await g.keyboard.up('Alt');
+    await g.keyboard.press('Escape');
+    check(
+      !!whilePlacing.read?.lines[0].includes(' · ') && whilePlacing.plans.sent.includes('probe') && whilePlacing.plans.sent.includes('spots') &&
+        notes.every((n) => /^Best first/.test(n)) && !whilePlacing.plans.stages.includes('Looking for good spots…'),
+      'spots found on the model alone are found again on the final result, quietly, the list staying as it is meanwhile',
+      JSON.stringify({ whilePlacing, notes: [...new Set(notes)] }),
+    );
+    check(glueProblems.length === 0, 'no page errors on the glued cuts and drags page', glueProblems.join(' | '));
+    await glueContext.close();
+  }
+
   console.log('\nplacing a removable part with a touch');
   {
     // a phone: nothing hovers, so a touch on the model puts the plane there, a slide moves it, and a button places the cut
@@ -2861,6 +3261,18 @@ try {
       return { hidden: el.hidden, first: el.firstElementChild?.textContent, buttons: [...el.querySelectorAll('button')].map((b) => b.textContent), pinned: el.classList.contains('pinned') };
     });
     await phone.screenshot({ path: path.join(out, '9-place-touch.png') });
+    // pinned along the top of the view, the readout sits under the view's own controls: Reset view is still there to tap
+    const controls = await phone.evaluate(() => {
+      const box = (el) => el.getBoundingClientRect();
+      const [r, f, v] = [box(document.querySelector('#cutReadout')), box(document.querySelector('#frameBtn')), box(document.querySelector('#stage'))];
+      const hits = [0.15, 0.5, 0.85].map((u) => document.elementFromPoint(f.left + u * f.width, f.top + f.height / 2)?.closest('#frameBtn') !== null);
+      return { top: r.top < v.top + 0.4 * v.height, overlap: !(r.top >= f.bottom || r.bottom <= f.top || r.left >= f.right || r.right <= f.left), hits };
+    });
+    check(
+      controls.top && !controls.overlap && controls.hits.every(Boolean),
+      "a readout pinned along the top of the view sits under the view's own controls, and Reset view is still there to tap",
+      JSON.stringify(controls),
+    );
     // the spots listed say what comes off as the readout does, once both are worked out on the final result (the spots
     // asked for as the model opened were found on the model alone, without the text on top)
     const firstSpot = await phone.locator('#spotList .spot').first().innerText();
@@ -2943,8 +3355,69 @@ try {
       JSON.stringify({ unzoomed, zoomed, pinched: pinched.first, was: offEdge.first }),
     );
     if (pinched.buttons.includes('Cancel')) await phone.locator('#cutReadout button', { hasText: 'Cancel' }).tap();
+    await phoneIdle();
+    // a cut that comes apart placed again with its crosshair, the plane pinned: its hold changed meanwhile, the readout
+    // says what it gets now
+    await phone.evaluate(() => document.querySelector('#addCutBtn').click());
+    await phoneIdle();
+    await phone.evaluate(() => document.querySelector('#cutList li:last-child [data-cut-apart]').click());
+    await phoneIdle();
+    await phone.evaluate(() => document.querySelector('#cutList li:last-child [data-cut-place]').click());
+    await phoneIdle();
+    await phone.evaluate(() => document.querySelector('#stage').scrollIntoView({ block: 'start' }));
+    await phone.waitForTimeout(300);
+    await finger('touchStart', fx, fy);
+    for (let k = 1; k <= 6; k++) {
+      await phone.waitForTimeout(40);
+      await finger('touchMove', fx, fy + 4 * k);
+    }
+    await finger('touchEnd', fx, fy + 24);
+    await phone.waitForTimeout(300);
+    await phoneIdle();
+    const locking = await pinnedReadout();
+    await phone.evaluate(() => [...document.querySelectorAll('#cutList li:last-child .cut-hold label')].find((l) => l.textContent.includes('Lifts off')).click());
+    await phone.waitForTimeout(300);
+    await phoneIdle();
+    const lifting = await pinnedReadout();
+    check(
+      /locks with \d clips?|lip without clips/.test(locking.first ?? '') && /^Z [\d.]+ mm · 6 mm lip – lifts off/.test(lifting.first ?? '') && lifting.first.match(/^Z [\d.]+/)[0] === locking.first.match(/^Z [\d.]+/)[0] &&
+        lifting.buttons.includes('Cancel'),
+      "with the plane pinned, the cut's hold changed: the readout says the lip it gets now, at the same place",
+      JSON.stringify({ locking, lifting }),
+    );
+    if (lifting.buttons.includes('Cancel')) await phone.locator('#cutReadout button', { hasText: 'Cancel' }).tap();
     check(phoneProblems.length === 0, 'no page errors on the touch screen', phoneProblems.join(' | '));
     await touch.close();
+  }
+
+  console.log('\na cut row on the narrowest phone');
+  {
+    const narrow = await browser.newContext({ viewport: { width: 320, height: 640 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+    const n = await narrow.newPage();
+    await n.goto(url);
+    await n.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    await n.setInputFiles('#stlFile', path.join(out, 'lantern.stl'));
+    await n.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('lantern:'), null, { timeout: 60000 });
+    await n.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    await n.evaluate(() => document.querySelector('#addCutBtn').click());
+    await n.waitForTimeout(500);
+    await n.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    await n.evaluate(() => document.querySelector('[data-cut-apart]').click());
+    await n.waitForTimeout(500);
+    await n.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    const fits = await n.evaluate(() => {
+      const box = document.querySelector('[data-cut-at]');
+      const was = box.value;
+      const cs = getComputedStyle(box);
+      const ctx = document.createElement('canvas').getContext('2d');
+      ctx.font = `${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+      const room = box.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+      const out = [was, '190.5', '-38.25'].map((v) => ({ v, need: Math.round(ctx.measureText(v).width * 10) / 10, room }));
+      box.value = was;
+      return out;
+    });
+    check(fits.every((f) => f.need <= f.room), "on a 320 px phone a cut row's position box shows its number in full beside the crosshair", JSON.stringify(fits));
+    await narrow.close();
   }
 
   check(problems.length === 0, 'no console errors or exceptions (page or worker)', problems.join(' | '));

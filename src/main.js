@@ -64,6 +64,7 @@ const client = createEngineClient({
   createWorker: () => new Worker(new URL('./worker.js', import.meta.url), { type: 'module' }),
   onProgress: ({ stage }) => {
     if (offerBusy && !splitWork) return; // the Model card's offer being planned ahead: nobody is waiting for it
+    if (spots?.busy && spots.quiet && stage === 'Looking for good spots…') return; // the spots listed, asked again quietly
     showProgress(stage);
   },
   onState: (state) => {
@@ -923,9 +924,9 @@ viewer.onSelectCut = (id) => selectCut(id);
 // while a handle is dragged only the view moves (the plane, the colours, the section and the readout); the cut lands
 // when dropped. It snaps as a cut placed on the model does, and a cut that comes apart says what lip it gets there
 viewer.onCutDrag = ({ id, at, target, done, screen }) => {
+  const cut = doc.split?.cuts.find((c) => c.id === id);
+  const axis = cutPlane(cut)?.axis;
   if (!done) {
-    const cut = doc.split?.cuts.find((c) => c.id === id);
-    const axis = cutPlane(cut)?.axis;
     const moved = aimAt?.drag && aimAt.cutId === id ? aimAt.at !== at : true;
     aimAt = { axis, at, target, screen, hold: cut?.joint === 'apart' ? cut.hold : null, cutId: id, drag: true };
     if (moved) probeAim();
@@ -938,8 +939,17 @@ viewer.onCutDrag = ({ id, at, target, done, screen }) => {
   clearTimeout(probeTimer);
   viewer.setAimVerdict(null);
   $('cutReadout').hidden = true;
-  moveCut(id, at, { coalesce: 'split:drag' });
+  dropLipTarget();
+  // dropped onto another cut: one there would do nothing, so it stays where it was
+  const here = axis != null ? cutHere(axis, at, id) : null;
+  if (here) setStatus(`Cut ${cutLetter(here.id)} is already at ${round(at, 1)} mm – cut ${cutLetter(id)} stays where it was.`, 'error');
+  else moveCut(id, at, { coalesce: 'split:drag' });
   doc.endCoalescing();
+  // the box shows where the cut is, as a drag that went nowhere (given up, or onto another cut) changes nothing to say so
+  const box = document.querySelector(`[data-cut-at="${CSS.escape(id)}"]`);
+  const kept = cutPlane(doc.split?.cuts.find((c) => c.id === id));
+  if (box && kept && box !== document.activeElement) box.value = round(kept.at);
+  if (here) renderSplit();
 };
 
 viewer.onDrag = ({ itemId, point, normal, done }) => {
@@ -1599,9 +1609,12 @@ function renderSplit() {
   viewer.setCuts(cuts, { selectedId: selectedCutId, bounds: measuredBounds() });
   viewer.setCellPreview(cuts && cutsWithTabs(), { tooBig: cellTooBig });
   viewer.setCutSnap(nudgeStep(), 5 * nudgeStep()); // Shift moves five times as far, as with the arrow keys
-  // the seams a cut snaps to: along the axis one is being placed on, else the selected cut's, whose handle may be dragged
-  const snapAxis = aiming?.axis ?? cutPlane(doc.split?.cuts.find((c) => c.id === selectedCutId))?.axis ?? null;
+  // the seams a cut that comes apart snaps to: along the axis one is being placed on, else the selected one's, whose
+  // handle may be dragged. A glued cut snaps to none of them, so a glued split never waits for them
+  const selected = doc.split?.cuts.find((c) => c.id === selectedCutId);
+  const snapAxis = aiming ? (holdOf(aiming.cutId) ? aiming.axis : null) : selected?.joint === 'apart' ? cutPlane(selected)?.axis ?? null : null;
   if (snapAxis !== null) loadTargets(snapAxis);
+  refreshAim();
   // the planes of cuts that come apart are teal, the others violet
   $('legendPieces').hidden = !cuts;
   $('legendCut').hidden = !cuts?.some((c) => c.joint !== 'apart');
@@ -2065,7 +2078,8 @@ function piecesBeside(id, axis, at) {
  * The readout by a dragged cut's handle: "A · X = 12 mm · 162 | 138 mm",
  * how long the pieces either side are; for a cut that comes apart, under it
  * the lip it would get there once the engine has said ("locks with 4 clips ·
- * top 101 mm comes off"); and what it snapped to.
+ * top 101 mm comes off"); another cut already there, where a drop leaves it
+ * as it was; and what it snapped to.
  */
 function showReadout(id, at, screen, target = null) {
   const el = $('cutReadout');
@@ -2084,7 +2098,8 @@ function showReadout(id, at, screen, target = null) {
   const probe = hold ? probes.get(probeKey(axis, at, hold)) : null;
   // off the model the first line has said so: the lip's line would only say it again
   const lip = probe && beside ? [lipLine(axis, probe, hold), throughWords(namesOf(probe.crosses))].filter(Boolean).join(' · ') : '';
-  fillReadout([first, lip, snappedWords(target, axis)], hold ? lipVerdict(probe, hold) : null, probe !== undefined);
+  const here = cutHere(axis, at, id);
+  fillReadout([first, lip, here ? `cut ${cutLetter(here.id)} is already here` : '', snappedWords(target, axis)], hold ? lipVerdict(probe, hold) : null, probe !== undefined);
   // by the handle, on whichever side has room
   const right = screen[0] > $('stage').clientWidth - 240;
   el.style.left = `${screen[0]}px`;
@@ -2125,8 +2140,8 @@ let aimAt = null; // { axis, at, target, screen, pinned, hold, cutId, drag } the
 let probeTimer = 0;
 const probes = new Map(); // probe key -> the engine's answer for a place (64 kept): going back to a place answers at once
 let targetsFor = null; // { key, axis, seams, estimate } the model's seams along an axis, which a cut placed or dragged snaps to
-let lipTarget = null; // { axis, at }: where the place tried last gets a full lip, when it had none – a target too
-let spots = null; // { base, key, axis, hold, busy, list, failed, estimate } the spots suggested, while they are shown
+let lipTarget = null; // { axis, at }: where the place tried last gets a full lip, when it had none – a target while it is placed or dragged
+let spots = null; // { base, key, axis, hold, busy, list, failed, estimate, quiet } the spots suggested, while they are shown
 
 /** The split's settings as the engine reads them for a cut tried on its own (the clearance sizes the lip). */
 const aimSplit = () => ({ ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split });
@@ -2204,7 +2219,9 @@ async function loadTargets(axis) {
  * (the engine answers from the model alone until the final result is built,
  * a moment after a model is opened): the places tried, the seams and the
  * spots found on the model alone are asked again, so the lengths they give
- * – which count the raised text – agree with each other.
+ * – which count the raised text – agree with each other. The spots quietly:
+ * nobody asked for them again, and a cut being placed meanwhile still gets
+ * its readout as soon as it would anyway.
  */
 function onBasis(r) {
   if (!r || r.estimate) return;
@@ -2214,6 +2231,7 @@ function onBasis(r) {
     targetsFor = null;
     loadTargets(axis);
   }
+  // quietly: the list stays as it is meanwhile, and the engine answers a place being tried between the spots' slices
   if (spots?.estimate && !spots.busy) suggestSpots({ axis: spots.axis, hold: spots.hold, again: true });
 }
 
@@ -2324,25 +2342,32 @@ function showAimReadout() {
   fillReadout(lines, a.hold ? lipVerdict(probe, a.hold) : null, !!probe);
   el.classList.toggle('pinned', !!a.pinned);
   // beside the pointer where it fits, and always within the view; moved, not laid out again, so following the pointer
-  // over a dense model costs the page nothing but the move. Put there by a finger, along the top of the view (the bottom
-  // when the finger is near the top), clear of the middle where two fingers zoom it
+  // over a dense model costs the page nothing but the move. Put there by a finger, along the top of the view under its own
+  // controls (the bottom when the finger is near the top), clear of the middle where two fingers zoom it
   const [w, h] = [el.offsetWidth, el.offsetHeight];
   const [x, y] = a.screen;
   const [sw, sh] = viewer.viewSize;
   const fit = (v, size, room) => Math.min(Math.max(8, v), Math.max(8, room - size - 8));
   const left = a.pinned ? x - w / 2 : x + 18 + w + 8 > sw ? x - 18 - w : x + 18;
-  const top = a.pinned ? (y > 0.4 * sh ? 8 : sh - h - 8) : y - h / 2;
+  const top = a.pinned ? (y > 0.4 * sh ? controlsBottom() + 8 : sh - h - 8) : y - h / 2;
   el.style.left = '0px';
   el.style.top = '0px';
   el.style.transform = `translate(${Math.round(fit(left, w, sw))}px, ${Math.round(fit(top, h, sh))}px)`;
 }
 
-/** What the page says while a cut is placed on the model. */
+/** How far down the view its own controls reach (the legend, Show result, Reset view): a pinned readout goes under them. */
+function controlsBottom() {
+  const stage = $('stage').getBoundingClientRect();
+  return Math.max(0, ...[...document.querySelectorAll('#stage .legend, #stage .stage-tools')].map((el) => el.getBoundingClientRect().bottom - stage.top));
+}
+
+/** What the page says while a cut is placed on the model: a glued one snaps to nothing. */
 function aimHint() {
   const what = aiming.cutId ? `cut ${cutLetter(aiming.cutId)} should go` : 'it should come apart';
+  const snaps = !!holdOf(aiming.cutId);
   return touchOnly()
-    ? `Touch the model where ${what} and slide to move the plane, then tap ${aiming.cutId ? `Move cut ${cutLetter(aiming.cutId)} here` : 'Place cut here'}. It snaps to ledges and good spots.`
-    : `Click the model where ${what} – it snaps to ledges and good spots; hold Alt to place it freely.${aiming.cutId ? '' : ' Shift+click to place more.'} Esc stops.`;
+    ? `Touch the model where ${what} and slide to move the plane, then tap ${aiming.cutId ? `Move cut ${cutLetter(aiming.cutId)} here` : 'Place cut here'}.${snaps ? ' It snaps to ledges and good spots.' : ''}`
+    : `Click the model where ${what}${snaps ? ' – it snaps to ledges and good spots; hold Alt to place it freely.' : '.'}${aiming.cutId ? '' : ' Shift+click to place more.'} Esc stops.`;
 }
 
 /**
@@ -2367,8 +2392,10 @@ function startAim(cutId = null) {
   if (doc.selected) doc.select(null);
   if (!cutId && selectedCutId) selectCut(null); // a new part: a spot clicked meanwhile adds one too, rather than move this
   aiming = { cutId, axis };
-  viewer.setAim({ axis });
-  loadTargets(axis);
+  // a cut that comes apart snaps to the seams, the spots and where a full lip fits; a glued one to none of them
+  const snaps = !!holdOf(cutId);
+  viewer.setAim({ axis, snap: snaps });
+  if (snaps) loadTargets(axis);
   if (!cutId) suggestSpots({ axis, hold: 'lock' });
   setStatus(aimHint());
   renderSplit();
@@ -2384,7 +2411,15 @@ function endAim() {
   viewer.setAim(null);
   $('cutReadout').hidden = true;
   if ($('status').textContent === hint) setStatus('');
+  dropLipTarget();
   renderSplit();
+}
+
+/** Where the place tried last gets a full lip is a target only while that cut is placed or dragged: it goes with it. */
+function dropLipTarget() {
+  if (!lipTarget) return;
+  lipTarget = null;
+  pushTargets();
 }
 
 /**
@@ -2421,10 +2456,29 @@ viewer.onAim = (h) => {
     return;
   }
   const moved = aimAt?.at !== h.at;
-  aimAt = { axis: aiming.axis, at: h.at, target: h.target, screen: h.screen, pinned: !!h.pinned, hold: holdOf(aiming.cutId), cutId: aiming.cutId };
+  const hold = holdOf(aiming.cutId);
+  aimAt = { axis: aiming.axis, at: h.at, target: h.target, screen: h.screen, pinned: !!h.pinned, hold, cutId: aiming.cutId, key: hold ? probeKey(aiming.axis, h.at, hold) : null };
   if (moved || h.pinned) probeAim();
   showAimReadout();
 };
+
+/**
+ * The place a cut is being placed at, asked about again where what its lip
+ * depends on changed under it – the cut's hold, the clearance, the nozzle,
+ * the model or its text – with the pointer still or the plane pinned by a
+ * finger, which nothing moves until the model is touched again: the readout
+ * and the section say what the cut would get now.
+ */
+function refreshAim() {
+  const a = aimAt;
+  if (!aiming || !a || a.drag) return;
+  const hold = holdOf(aiming.cutId);
+  const key = hold ? probeKey(a.axis, a.at, hold) : null;
+  if (hold === a.hold && key === a.key) return;
+  aimAt = { ...a, hold, key };
+  probeAim();
+  showAimReadout();
+}
 
 viewer.onAimPick = ({ at, shift }) => placeAimed(at, { keep: shift });
 
@@ -2442,8 +2496,9 @@ async function suggestSpots({ axis = null, hold = null, again = false } = {}) {
   const base = aimKey();
   const key = `${base}|${axis}|${hold}`;
   if (spots?.key === key && !spots.failed && !again) return renderSpots();
-  // asked again (see onBasis), the spots found stay listed meanwhile
-  spots = { base, key, axis, hold, busy: true, list: again && spots?.key === key ? spots.list : null, failed: null };
+  // asked again (see onBasis), the spots found stay listed meanwhile, and nothing says they are looked for
+  const kept = again && spots?.key === key ? spots.list : null;
+  spots = { base, key, axis, hold, busy: true, list: kept, failed: null, quiet: !!kept };
   renderSpots();
   try {
     if (!(await syncBase())) {
@@ -2468,7 +2523,7 @@ async function suggestSpots({ axis = null, hold = null, again = false } = {}) {
  * Put the selected cut that comes apart at a spot suggested, or a new one
  * there, as one undo step – along its own axis only, as the list is asked
  * for again when the cut turns. A spot another cut already takes selects
- * that cut instead.
+ * that cut instead, and a glued one there comes apart.
  */
 function applySpot(spot, hold) {
   const axis = AXES.indexOf(spot.axis);
@@ -2478,7 +2533,10 @@ function applySpot(spot, hold) {
   const here = cutHere(axis, spot.at, sel?.id);
   if (here) {
     selectCut(here.id);
-    return setStatus(`Cut ${cutLetter(here.id)} is already there.`);
+    if (here.joint === 'apart') return setStatus(`Cut ${cutLetter(here.id)} is already there.`);
+    // a glued cut there: it comes apart now, as the list offers, holding as the spots were found for
+    doc.setCutJoint(here.id, { hold });
+    return setStatus(`Cut ${cutLetter(here.id)} is there: it comes apart now.`);
   }
   if (sel) {
     if (cutPlane(sel).axis === axis) doc.updateCut(sel.id, cutAcross(axis, spot.at));
@@ -2523,7 +2581,7 @@ function renderSpots() {
   const found = spots?.list?.length ? spots.list : null;
   const text = !spots
     ? ''
-    : spots.busy
+    : spots.busy && !spots.quiet
       ? 'Looking for good spots…'
       : spots.failed
         ? spots.failed
@@ -2544,7 +2602,7 @@ function renderSpots() {
   spotsSignature = signature;
   note.replaceChildren(text);
   note.hidden = !text;
-  note.classList.toggle('busy', !!spots?.busy);
+  note.classList.toggle('busy', !!spots?.busy && !spots.quiet);
   if (spots && !spots.busy && !spots.failed && !found && !aiming) {
     // nothing to suggest: the model is where to say, so offer to pick there (a click on it would otherwise place text)
     const pick = document.createElement('button');
@@ -2699,6 +2757,7 @@ function bindSplit() {
   });
   $('splitFitTestBtn').addEventListener('click', downloadFitTest);
   $('showPiecesBtn').addEventListener('click', () => {
+    endAim(); // as the Show pieces box does: the pieces are drawn pulled apart, away from where a click lands
     $('resultToggle').checked = true;
     showResult(true);
   });
@@ -3380,6 +3439,8 @@ function bindControls() {
       doc.redo();
       return;
     }
+    // a handle being dragged goes back where it was, as a cancelled drag does
+    if (e.key === 'Escape' && viewer.cancelCutDrag()) return;
     if (e.key === 'Escape' && aiming) {
       endAim();
       return;

@@ -14,6 +14,9 @@
 
 export const CHANNELS = ['font', 'base', 'preview', 'result', 'export', 'split', 'misc'];
 
+/** How long the engine looks for spots at a go (ms) before it answers how far it has got and is asked to carry on. */
+export const SPOTS_SLICE = 150;
+
 export class EngineError extends Error {
   constructor({ code = 'INTERNAL', message = 'Unknown error', details } = {}) {
     super(message);
@@ -32,12 +35,14 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
     if (!channels.has(name)) channels.set(name, { inFlight: null, waiting: null }); // e.g. preview:item-7
     return channels.get(name);
   };
+  let spotsAsked = 0; // the spots asked for so far: only the latest carries on
   const fonts = new Map(); // fontId -> ArrayBuffer (kept for rehydration)
   const parts = new Map(); // partId -> { bytes, name } (kept for rehydration)
   let base = null; // { kind, bytes, name, version, transforms, simplify, enhance, spots }
   let fatalError = null;
 
-  const state = () => (live.size ? 'busy' : worker ? 'idle' : 'stopped');
+  let chained = 0; // requests worked out a slice at a time, between their slices: busy all the same
+  const state = () => (live.size || chained ? 'busy' : worker ? 'idle' : 'stopped');
   const notify = () => onState(state());
 
   function spawn() {
@@ -297,11 +302,25 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
     /**
      * The best places along an axis for a cut that comes apart (`{ axis,
      * hold, printing, split }`, mode 'spots'), best first. Seconds on a dense
-     * model, so on a channel of its own: a newer request replaces one still
-     * waiting, and no probe replaces it.
+     * model, so on a channel of its own, and asked for a slice of time at a
+     * time (`SPOTS_SLICE` ms) until they are all found: a probe or a measure
+     * asked for meanwhile is answered between two slices, not after the lot.
+     * A newer request replaces one still under way (which resolves to
+     * undefined), and no probe replaces it.
      */
-    cutSpots(items, baseVersion, options = {}) {
-      return request('split.spots', 'split.plan', { items, baseVersion, ...options, mode: 'spots' });
+    async cutSpots(items, baseVersion, options = {}) {
+      const mine = ++spotsAsked;
+      chained++;
+      try {
+        for (;;) {
+          const r = await request('split.spots', 'split.plan', { items, baseVersion, ...options, mode: 'spots', budget: SPOTS_SLICE });
+          if (mine !== spotsAsked) return undefined; // asked again since: that answer is the one wanted
+          if (!r?.partial) return r;
+        }
+      } finally {
+        chained--;
+        notify();
+      }
     },
 
     /**

@@ -646,8 +646,13 @@ export class Viewer {
     return this.resultMesh ? 'result' : 'model';
   }
 
+  /** What is drawn: as `viewMode`, but the model while a suggestion's plane is previewed on it (`previewAim`). */
+  #shownMode() {
+    return this.aimPreview ? 'model' : this.viewMode;
+  }
+
   #applyVisibility() {
-    const mode = this.viewMode;
+    const mode = this.#shownMode();
     const cells = mode === 'model' && this.cellMeshes.size > 0;
     if (this.baseMesh) this.baseMesh.visible = mode === 'model' && !cells; // hidden under the preview, but still what clicks land on
     this.cellGroup.visible = cells;
@@ -682,7 +687,7 @@ export class Viewer {
     o.mesh.material.wireframe = !!o.detached;
     o.mesh.material.transparent = true;
     o.mesh.renderOrder = o.mode === 'engrave' ? 5 : 0;
-    o.mesh.visible = this.viewMode === 'model';
+    o.mesh.visible = this.#shownMode() === 'model';
   }
 
   /**
@@ -907,7 +912,7 @@ export class Viewer {
     if (!this.cuts.size) return;
     const list = [...this.cuts.values()];
     const byAxis = axisCuts(list, boxArrays(this.#cutBounds()));
-    const exploded = this.viewMode === 'pieces';
+    const exploded = this.#shownMode() === 'pieces';
     const gap = exploded ? this.#explodeGap() : 0;
     // exploded pieces spread out by one gap per cut, so the planes grow with them
     const { centre, diag, extent } = this.#planeLayout(byAxis.map((l) => l.length * gap));
@@ -968,9 +973,11 @@ export class Viewer {
     const step = event.shiftKey ? this.cutSnap.shift : this.cutSnap.step;
     const box = this.#cutBounds();
     let at = drag.start + (t - drag.t0);
-    // the model's seams and the spots suggested pull it in from a few pixels away, as when a cut is placed on the model;
-    // Alt drags it freely
-    const list = !event.altKey && this.aimTargets.axis === c.axis ? this.aimTargets.list : [];
+    // the model's seams and the spots suggested pull a cut that comes apart in from a few pixels away, as when it is
+    // placed on the model – never onto another cut across the axis, where it would do nothing; Alt drags it freely, and
+    // a glued cut always goes by the steps
+    const others = [...this.cuts.values()].filter((o) => o.id !== c.id && o.axis === c.axis).map((o) => o.at);
+    const list = !event.altKey && c.apart && this.aimTargets.axis === c.axis ? this.aimTargets.list.filter((tg) => !others.some((o) => Math.abs(o - tg.at) < 0.05)) : [];
     const near = [...drag.p];
     near[c.axis] = at;
     const target = list.length ? snapTarget(list, at, snapTolerance(this.#pxPerMm(near, c.axis))) : null;
@@ -1028,11 +1035,13 @@ export class Viewer {
    * calls `onAimPick` instead of `onPick`, and never selects or drags an item
    * or a handle. On a touch screen, where nothing hovers, a touch on the
    * model puts the plane there and a slide moves it; when the finger lifts
-   * it stays (`pinned`), for the caller to place the cut there.
-   * @param {{ axis: number }|null} aim null ends it
+   * it stays (`pinned`), for the caller to place the cut there. Only in the
+   * model view: the pieces are drawn pulled apart, away from the model the
+   * pointer would be read on.
+   * @param {{ axis: number, snap?: boolean }|null} aim null ends it; `snap` false places it freely (a glued cut)
    */
   setAim(aim) {
-    this.aim = aim ? { axis: aim.axis } : null;
+    this.aim = aim ? { axis: aim.axis, snap: aim.snap !== false } : null;
     this.#aimTouchEnd();
     this.aimHover = null;
     this.aimVerdict = null;
@@ -1060,10 +1069,25 @@ export class Viewer {
     this.#syncAim();
   }
 
-  /** Show a plane and the section across `axis` at `at` (a suggestion hovered), coloured by `verdict`, over the pointer's; null hides it. */
+  /**
+   * Show a plane and the section across `axis` at `at` (a suggestion
+   * hovered), coloured by `verdict`, over the pointer's; null hides it. With
+   * the pieces or the final result shown, the model is drawn instead while
+   * it is shown: the pieces are pulled apart, away from where the plane is.
+   */
   previewAim(spec) {
+    const was = this.#shownMode();
     this.aimPreview = spec ? { axis: spec.axis, at: spec.at, verdict: spec.verdict ?? null } : null;
-    this.#syncAim();
+    if (this.#shownMode() !== was) this.#applyVisibility();
+    else this.#syncAim();
+  }
+
+  /**
+   * Give up a handle being dragged, as a cancelled pointer does: the plane
+   * goes back where it was. Whether one was being dragged.
+   */
+  cancelCutDrag() {
+    return this.cancelDrag?.() ?? false;
   }
 
   /** How many pixels a millimetre along `axis` spans on screen at `point`. */
@@ -1076,13 +1100,14 @@ export class Viewer {
     return Math.hypot(((b.x - a.x) * w) / 2, ((b.y - a.y) * h) / 2);
   }
 
-  /** The place under the pointer while picking: on the model, snapped (Alt: freely, to 0.1 mm), or null off it. */
+  /** The place under the pointer while picking: on the model, snapped (Alt: freely, to 0.1 mm), or null off it or in the pieces view. */
   #aimPoint(event, alt = event.altKey) {
+    if (this.viewMode !== 'model') return null;
     const hit = this.#pickModel(event);
     if (!hit) return null;
     const axis = this.aim.axis;
     const raw = hit.point[axis];
-    const list = alt || this.aimTargets.axis !== axis ? [] : this.aimTargets.list;
+    const list = alt || !this.aim.snap || this.aimTargets.axis !== axis ? [] : this.aimTargets.list;
     const target = list.length ? snapTarget(list, raw, snapTolerance(this.#pxPerMm(hit.point, axis))) : null;
     const rect = this.renderer.domElement.getBoundingClientRect();
     return { at: placedAt(raw, target), raw, target, point: hit.point, screen: [event.clientX - rect.left, event.clientY - rect.top] };
@@ -1142,7 +1167,7 @@ export class Viewer {
       this.aimPreview ??
       (this.aim && this.aimHover ? { axis: this.aim.axis, at: this.aimHover.at, verdict: this.aimVerdict } : null) ??
       (drag ? { axis: drag.axis, at: this.cutDrag.at, verdict: this.aimVerdict, handle: true } : null);
-    const model = this.viewMode === 'model';
+    const model = this.#shownMode() === 'model';
     p.plane.visible = !!shown && !shown.handle && model; // a dragged cut has its own plane
     p.section.visible = !!shown && model && !!this.baseMesh;
     p.dot.visible = !this.aimPreview && !!this.aim && !!this.aimHover && model;
@@ -1822,23 +1847,28 @@ export class Viewer {
       if (hit) this.onPick?.(hit);
     };
     el.addEventListener('pointerup', finish);
-    el.addEventListener('pointercancel', () => {
+    // a press given up: by the browser (the pointer cancelled), or a handle's drag by Escape (`cancelCutDrag`)
+    const cancel = ({ dragOnly = false } = {}) => {
       const dr = drag;
+      if (dragOnly && !(dr?.cutId && dr.active)) return false;
       down = null;
       drag = null;
       this.controls.enabled = true;
       el.style.cursor = '';
-      if (dr?.cutId) {
-        // the plane goes back where it was, and the caller hears the drag is over
-        this.cutDrag = null;
-        this.dragTarget = null;
-        if (dr.active) {
-          this.setCutOffset(dr.cutId, dr.start);
-          this.onCutDrag?.({ id: dr.cutId, at: dr.start, target: null, done: true, screen: this.cutScreenPosition(dr.cutId) });
-        }
-        this.#styleCuts();
+      if (!dr?.cutId) return false;
+      // the plane goes back where it was, and the caller hears the drag is over
+      this.cutDrag = null;
+      this.dragTarget = null;
+      if (dr.active) {
+        this.setCutOffset(dr.cutId, dr.start);
+        this.onCutDrag?.({ id: dr.cutId, at: dr.start, target: null, done: true, screen: this.cutScreenPosition(dr.cutId) });
       }
-    });
+      this.#styleCuts();
+      this.#syncAim(); // the section under the handle goes
+      return dr.active;
+    };
+    el.addEventListener('pointercancel', () => cancel());
+    this.cancelDrag = () => cancel({ dragOnly: true });
     el.addEventListener('pointerleave', () => {
       this.marker.visible = false;
       if (this.hoverCutId) {

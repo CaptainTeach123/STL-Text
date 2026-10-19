@@ -18,7 +18,7 @@ import {
   planCost, planGrid, planSamples, plateAxis, safeFileName, slabAxis, sizesFor, smallPieceNotes, soupCells, splitActive, splitNote, usableBed,
   zipFileName, cellSupport, flatProbes, outlineColumns, textNotes, baseAxis, modelPlates, layGrown, pegAllowance, pegMales, pegSizeOf, pegSizesFor,
   pegSides, cellFits, uprightPegNotes, apartMales, cellSizes, clipHold, clipShape, lipSides, APART_HOLDS, LIP_ALLOWANCE,
-  AXES, CLIP, LIP, SPOT, catchSizes, comesOffOf, endBeds, endsAsWell, keepsTo, locateBend, locateSeam, pickSpots, profileSeams, seamKind, spotScore, spotSide,
+  AXES, CLIP, LIP, SPOT, catchSizes, comesOffOf, endShape, endsAsWell, keepsTo, locateBend, locateSeam, pickSpots, profileSeams, seamKind, spotScore, spotSide,
   spotStart, spotWhy,
 } from './split.js';
 import {
@@ -62,11 +62,14 @@ import {
  *                                                          comesOff: { side, length, fraction }, crosses, seams,
  *                                                          notes, estimate? }: a cut that comes apart tried there
  *                                                          on its own (`aimAt`)
- *               mode: 'spots' { axis = 'z', hold = 'lock' }
+ *               mode: 'spots' { axis = 'z', hold = 'lock', budget? }
  *                                                       -> { axis, spots: [{ axis, at, why, lip: { H, clips },
  *                                                          comesOff, score, seam, islands, crosses? }], seams, notes,
  *                                                          estimate? }: the best places for one, best first
- *                                                          (`spotsOf`); `crosses` the text items one runs through
+ *                                                          (`spotSteps`); `crosses` the text items one runs through.
+ *                                                          With a `budget` (ms), short of done in that time
+ *                                                          { axis, partial: true, done, total, notes }: the same
+ *                                                          request again carries on (`spotsFor`)
  *               mode: 'targets' { axis }                -> { axis, lo, hi, seams: [{ at, kind, shift }], notes,
  *                                                          estimate? }: where the shape changes along the axis,
  *                                                          for snapping a cut being placed (`aimProfile`)
@@ -100,9 +103,10 @@ const LOD_TRIANGLES = 400_000;
 const LOD_TOLERANCE = 0.02;
 // Placing a cut that comes apart reads slices of the model: this many are kept per result, each simplified this
 // much (mm), and this many answers.
-const AIM_SLICES = 384;
+const AIM_SLICES = 640;
 const AIM_TOLERANCE = 0.01;
 const AIM_PROBES = 64;
+const AIM_EXTRA = 64; // samples the profile takes between faces square to its axis, at most
 // A bend is found to within the slices' noise over its slope (a few hundredths of a millimetre): the model's corner is
 // looked for this far (mm) either side of it.
 const BEND_CORNER = 0.1;
@@ -3108,6 +3112,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   function releaseAim(final) {
     const aim = final?.split?.aim;
     if (!aim) return;
+    aim.spotJob?.steps.return(); // a search for spots under way lets go of what it holds
     for (const cs of aim.slices.values()) cs.delete();
     final.split.aim = null;
   }
@@ -3138,13 +3143,13 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   }
 
   /**
-   * The flat area the model ends in at each end of each axis (`endBeds`), for
-   * which piece would print as well with a lip; read once, from `mesh` when
-   * the caller has it.
+   * The flat area the model ends in at each end of each axis, and the box
+   * it spans (`endShape`), for which piece would print as well with a lip;
+   * read once, from `mesh` when the caller has it.
    */
   function aimEnds(final, mesh = null) {
     const aim = aimState(final);
-    aim.ends ??= endBeds(mesh ?? final.solid.getMesh());
+    aim.ends ??= endShape(mesh ?? final.solid.getMesh());
     return aim.ends;
   }
 
@@ -3180,8 +3185,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   }
 
   /** A slice's area, perimeter, islands and holes (1 mm² or more) and the outline length of its widest island. */
-  function sectionFacts(cs) {
-    const polygons = polygonsOf(cs);
+  function sectionFacts(cs, polygons = polygonsOf(cs)) {
     let islands = 0;
     let holes = 0;
     let widest = 0;
@@ -3205,28 +3209,178 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   }
 
   /** A slice as it is seen from outside: each island with its holes filled (the caller deletes it). */
-  function outsideOf(cs) {
-    const outer = polygonsOf(cs).filter((ring) => twiceArea(ring) > 0);
+  function outsideOf(cs, polygons = polygonsOf(cs)) {
+    const outer = polygons.filter((ring) => twiceArea(ring) > 0);
     return new wasm.CrossSection(outer, 'Positive');
   }
 
   /**
+   * A slice as the outside shows it, for how well a seam hides a cut: its
+   * openings narrower than twice `SPOT.bridge` closed over, then each
+   * island's holes filled – twelve posts between narrow windows and the ring
+   * over their tips are one outline, as the lantern's silhouette is (the
+   * caller deletes it).
+   */
+  function seenOf(cs) {
+    const grown = cs.offset(SPOT.bridge, 'Round', 2, 32);
+    const closed = grown.offset(-SPOT.bridge, 'Round', 2, 32);
+    grown.delete();
+    const seen = outsideOf(closed);
+    closed.delete();
+    return seen;
+  }
+
+  /**
+   * The islands of slice `p` that the slice `q` beside it also holds
+   * something of: one that ends there with nothing past it is a shell of its
+   * own coming to its end (a second box beside the first, its lid printed
+   * alongside), no seam of the others. Null when every island goes on (the
+   * caller deletes what it gets).
+   */
+  function goingOn(p, q) {
+    const parts = p.decompose();
+    try {
+      const kept = parts.filter((x) => {
+        const both = x.intersect(q);
+        const shared = both.area();
+        both.delete();
+        return shared > Math.max(1e-3, 1e-3 * x.area());
+      });
+      return kept.length === parts.length ? null : wasm.CrossSection.compose(kept);
+    } finally {
+      parts.forEach((x) => x.delete());
+    }
+  }
+
+  /** Whether some hole of slice `p` has solid over at least half of it in slice `q`: walls starting from a floor, or closing over. */
+  function holeCovered(p, q) {
+    return polygonsOf(p).some((ring) => {
+      if (!(twiceArea(ring) <= -2)) return false;
+      const hole = new wasm.CrossSection([ring], 'NonZero');
+      const both = hole.intersect(q);
+      const covered = both.area() >= 0.5 * hole.area();
+      both.delete();
+      hole.delete();
+      return covered;
+    });
+  }
+
+  /**
+   * The heights where the model has a face square to the axis, in order, and
+   * which ways the faces there look: up (towards +axis) and down. A groove
+   * round a lid is a face looking up with one looking down just over it, a
+   * rib the other way round.
+   * @returns {{ at: number, up: boolean, down: boolean }[]}
+   */
+  function flatSides(mesh, axis) {
+    const { vertProperties: P, numProp, triVerts: T } = mesh;
+    const [u, v] = [(axis + 1) % 3, (axis + 2) % 3];
+    const seen = new Map();
+    for (let t = 0; t + 2 < T.length; t += 3) {
+      const a = T[t] * numProp;
+      const b = T[t + 1] * numProp;
+      const c = T[t + 2] * numProp;
+      const du = [P[b] - P[a], P[b + 1] - P[a + 1], P[b + 2] - P[a + 2]];
+      const dv = [P[c] - P[a], P[c + 1] - P[a + 1], P[c + 2] - P[a + 2]];
+      const len = Math.hypot(du[1] * dv[2] - du[2] * dv[1], du[2] * dv[0] - du[0] * dv[2], du[0] * dv[1] - du[1] * dv[0]);
+      const n = du[u] * dv[v] - du[v] * dv[u];
+      if (!(len > 0) || !(Math.abs(n) / len > 0.999)) continue;
+      const at = Math.round(P[a + axis] * 1000) / 1000;
+      const side = seen.get(at) ?? { at, up: false, down: false };
+      side[n > 0 ? 'up' : 'down'] = true;
+      seen.set(at, side);
+    }
+    return [...seen.values()].sort((p, q) => p.at - q.at);
+  }
+
+  /**
+   * The span along an axis of each shell of a mesh – each set of triangles
+   * joined by their corners – as [min, max]: one of two boxes printed side by
+   * side ends where it ends, which says nothing of the other.
+   */
+  function shellSpans(mesh, axis) {
+    const { vertProperties: P, numProp, triVerts: T, mergeFromVert, mergeToVert } = mesh;
+    const n = P.length / numProp;
+    const parent = new Int32Array(n).map((_, i) => i);
+    const root = (i) => {
+      while (parent[i] !== i) i = parent[i] = parent[parent[i]];
+      return i;
+    };
+    const join = (i, j) => {
+      const [a, b] = [root(i), root(j)];
+      if (a !== b) parent[a] = b;
+    };
+    for (let t = 0; t + 2 < T.length; t += 3) {
+      join(T[t], T[t + 1]);
+      join(T[t], T[t + 2]);
+    }
+    for (let k = 0; k < (mergeFromVert?.length ?? 0); k++) join(mergeFromVert[k], mergeToVert[k]);
+    const spans = new Map();
+    for (let t = 0; t < T.length; t++) {
+      const r = root(T[t]);
+      const h = P[T[t] * numProp + axis];
+      const span = spans.get(r);
+      if (span) {
+        span[0] = Math.min(span[0], h);
+        span[1] = Math.max(span[1], h);
+      } else spans.set(r, [h, h]);
+    }
+    return [...spans.values()];
+  }
+
+  /**
+   * What a seam between two slices `below` and `above` (a hair apart) is,
+   * and how far the outline the outside shows moves there (`outer`, mm,
+   * `seenOf`). Where a shell of the model ends or starts there (`ends`), it
+   * is judged on the islands that go on past it (`goingOn`), and is null
+   * where those are the same on both sides: a box beside them only ended.
+   * @returns {{ kind: string, outer: number }|null}
+   */
+  function seamOf(below, above, { ends = false } = {}) {
+    const t = scope();
+    try {
+      const lower = ends ? goingOn(below, above) : null;
+      const upper = ends ? goingOn(above, below) : null;
+      const [p, q] = [lower ? t.add(lower) : below, upper ? t.add(upper) : above];
+      const [fp, fq] = [sectionFacts(p), sectionFacts(q)];
+      if ((lower || upper) && fp.islands === fq.islands && fp.holes === fq.holes && !(shiftOf(p, fp, q, fq) >= SPOT.least)) return null;
+      const gone = (x, y) => t.add(x.subtract(y)).area();
+      const facts = (x) => ({ area: x.area(), perimeter: perimeterOf(polygonsOf(x)) });
+      const change = (x, y) => ({ shift: shiftOf(x, facts(x), y, facts(y)), gained: gone(y, x), lost: gone(x, y) });
+      // what changes, from the outline seen from outside; how well it hides, from the one the outside shows
+      const outer = change(t.add(outsideOf(p)), t.add(outsideOf(q)));
+      const seen = change(t.add(seenOf(p)), t.add(seenOf(q)));
+      const holes = fp.holes !== fq.holes ? { floored: holeCovered(q, p), capped: holeCovered(p, q) } : {};
+      return { kind: seamKind({ below: fp, above: fq, gained: gone(q, p), lost: gone(p, q), outer, ...holes }), outer: Math.round(seen.shift * 1000) / 1000 };
+    } finally {
+      t.dispose();
+    }
+  }
+
+  /**
    * The model's profile along an axis, for placing a cut that comes apart:
-   * slices where the planner samples (`planSamples`), each with its area,
-   * perimeter, islands, holes and widest island and how far the outline
-   * moves on to the next – the slice's own outline, or as seen from outside
-   * where that moves further (a groove round a thin wall moves only the
-   * outside of the slice's two rings); and its seams, where the outline moves
-   * at once or its islands or holes change (`profileSeams`), each narrowed
-   * down to 0.002 mm (`locateSeam`), or where straight sides bend into a
-   * slope or out of one (`locateBend`), and put on a corner of the model when
-   * one lies there – a ledge's face is the seam itself, not a hair beside it
-   * – with the kind of change it is (`seamKind`, or 'slopes' and
-   * 'straightens' for a bend), how far the outline moves there, and how far
-   * as seen from outside (`outer`, which says how well a cut there hides).
-   * Kept with the result, per axis.
+   * slices as far apart as the planner samples (`planSamples`), on the
+   * half-millimetre steps cuts are tried on, and one between two faces
+   * square to the axis that look at each other or away from each other where
+   * none of those lies between them – a groove 1 mm tall round a tall box's
+   * lid, or a rib, would otherwise fall between two samples (`flatSides`) –
+   * each with its area, perimeter, islands, holes
+   * and widest island and how far the outline moves on to the next – the
+   * slice's own outline, or as seen from outside where that moves further (a
+   * groove round a thin wall moves only the outside of the slice's two
+   * rings); and its seams, where the outline moves at once or its islands or
+   * holes change (`profileSeams`), each narrowed down to 0.002 mm
+   * (`locateSeam`), or where straight sides bend into a slope or out of one
+   * (`locateBend`), and put on a corner of the model when one lies there – a
+   * ledge's face is the seam itself, not a hair beside it – with the kind of
+   * change it is (`seamKind`, or 'slopes' and 'straightens' for a bend), how
+   * far the outline moves there, and how far the outline the outside shows
+   * moves (`outer`, `seenOf`, which says how well a cut there hides). Where
+   * one shell of a model of several ends or starts, its islands are no seam
+   * of the shells beside it, which are judged without them (`seamOf`). Kept
+   * with the result, per axis.
    * @returns {{ lo: number, hi: number, samples: object[], seams: { at: number, kind: string, shift: number,
-   *   outer: number }[] }}
+   *   outer: number }[], flats: number[] }} `flats` the heights of the model's faces square to the axis
    */
   function aimProfile(final, axis, progress) {
     const aim = aimState(final);
@@ -3235,19 +3389,32 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const lo = box.min[axis];
     const hi = box.max[axis];
     const frame = frameOf(final, axis);
-    // slices a little simplified: a dense model's outline has thousands of corners along each straight edge
-    const readAt = (t) => {
-      const raw = frame.slice(t);
-      const cs = raw.simplify(AIM_TOLERANCE);
-      raw.delete();
-      const out = outsideOf(cs);
-      return { cs, out, facts: sectionFacts(cs), outside: { area: out.area(), perimeter: perimeterOf(polygonsOf(out)) } };
+    // slices a little simplified: a dense model's outline has thousands of corners along each straight edge. The
+    // samples' are the ones trying cuts reads (`aimSlice`), kept for the cuts tried next; the outline seen from
+    // outside only once it is asked for: narrowing a seam down where islands change needs none
+    const readAt = (t, kept = false) => {
+      let cs;
+      if (kept) cs = aimSlice(final, axis, t);
+      else {
+        const raw = frame.slice(t);
+        cs = raw.simplify(AIM_TOLERANCE);
+        raw.delete();
+      }
+      const rings = polygonsOf(cs);
+      return { cs, kept, rings, facts: sectionFacts(cs, rings), out: null, outside: null };
+    };
+    const seen = (r) => {
+      if (!r.out) {
+        r.out = outsideOf(r.cs, r.rings);
+        r.outside = { area: r.out.area(), perimeter: perimeterOf(polygonsOf(r.out)) };
+      }
+      return r;
     };
     const release = (r) => {
-      r.cs.delete();
-      r.out.delete();
+      if (!r.kept) r.cs.delete();
+      r.out?.delete();
     };
-    const moved = (p, q) => Math.max(shiftOf(p.cs, p.facts, q.cs, q.facts), shiftOf(p.out, p.outside, q.out, q.outside));
+    const moved = (p, q) => Math.max(shiftOf(p.cs, p.facts, q.cs, q.facts), shiftOf(seen(p).out, p.outside, seen(q).out, q.outside));
     // the outline seen from outside, from one slice to the next: how far it moves, and the area it gains and loses
     const outsideChange = (p, q) => {
       const gone = (x, y) => {
@@ -3256,15 +3423,33 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         d.delete();
         return area;
       };
+      [p, q].forEach(seen);
       return { shift: shiftOf(p.out, p.outside, q.out, q.outside), gained: gone(q.out, p.out), lost: gone(p.out, q.out) };
     };
-    const heights = planSamples(lo, hi, 0);
+    // the mesh once: the faces square to the axis, the seams onto its corners, and how flat its ends are
+    const mesh = final.solid.getMesh();
+    aimEnds(final, mesh);
+    // samples as far apart as the planner's (a millimetre, or a two-hundredth of the model), on the half-millimetre
+    // steps cuts are tried on, so the cuts tried next find them read; and one between each face looking up and the
+    // next one, looking down, over it (a groove) – or the other way round (a rib) – where none lies between them
+    const spacing = SPOT.step * Math.ceil(Math.max(1, (hi - lo) / 200) / SPOT.step - 1e-9);
+    const planned = [];
+    for (let k = Math.floor(lo / spacing) + 1; k * spacing < hi - 1e-9; k++) if (k * spacing > lo + 1e-9) planned.push(k * spacing);
+    const flats = flatSides(mesh, axis);
+    const extra = [];
+    for (let k = 0; k + 1 < flats.length && extra.length < AIM_EXTRA; k++) {
+      const [p, q] = [flats[k], flats[k + 1]];
+      if (!((p.up && q.down) || (p.down && q.up))) continue;
+      if (planned.some((t) => t > p.at && t < q.at)) continue;
+      extra.push(Math.round(((p.at + q.at) / 2) * 1e6) / 1e6);
+    }
+    const heights = [...planned, ...extra].sort((p, q) => p - q);
     const samples = [];
     let prev = null;
     try {
       heights.forEach((t, i) => {
         progress?.('Reading the shape…', { done: i + 1, total: heights.length });
-        const r = readAt(t);
+        const r = readAt(t, true);
         if (prev) samples[samples.length - 1].shift = moved(prev, r);
         if (prev) release(prev);
         prev = r;
@@ -3274,6 +3459,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       if (prev) release(prev);
     }
     const found = [];
+    let spans = null; // each shell's span along the axis, once a seam needs it
     for (const near of profileSeams(samples)) {
       const read = new Map(); // the slices this seam is narrowed down with, by height
       const at = (t) => {
@@ -3296,39 +3482,25 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         }
         const seam = locateSeam(near.lo, near.hi, { by: near.by, shift, count: (x) => `${at(x).facts.islands}|${at(x).facts.holes}` });
         if (!seam) continue;
-        const [below, above] = [at(seam.lo), at(seam.hi)];
-        const gone = (p, q) => {
-          const d = p.cs.subtract(q.cs);
-          const area = d.area();
-          d.delete();
-          return area;
-        };
-        const outer = outsideChange(below, above);
-        found.push({
-          lo: seam.lo - SPOT.tolerance,
-          hi: seam.hi + SPOT.tolerance,
-          kind: seamKind({ below: below.facts, above: above.facts, gained: gone(above, below), lost: gone(below, above), outer }),
-          shift: Math.round(seam.shift * 1000) / 1000,
-          outer: Math.round(outer.shift * 1000) / 1000,
-        });
+        // a shell of its own ending or starting here: as the profile's samples do not know which island is which
+        spans ??= shellSpans(mesh, axis);
+        const ends = spans.length > 1 && spans.some(([s0, s1]) => [s0, s1].some((e) => e >= seam.lo - 0.01 && e <= seam.hi + 0.01));
+        const judged = seamOf(at(seam.lo).cs, at(seam.hi).cs, { ends });
+        if (!judged) continue;
+        found.push({ lo: seam.lo - SPOT.tolerance, hi: seam.hi + SPOT.tolerance, ...judged, shift: Math.round(seam.shift * 1000) / 1000 });
       } finally {
         for (const r of read.values()) release(r);
       }
     }
-    // the mesh once: the seams onto its corners, and how flat its ends are while it is at hand
-    if (found.length || !aim.ends) {
-      const mesh = final.solid.getMesh();
-      aimEnds(final, mesh);
-      onCorners(mesh, axis, found.map((f) => [f.lo, f.hi])).forEach((t, k) => {
-        const { kind, shift, outer } = found[k];
-        found[k] = { at: t, kind, shift, outer };
-      });
-    }
+    onCorners(mesh, axis, found.map((f) => [f.lo, f.hi])).forEach((t, k) => {
+      const { kind, shift, outer } = found[k];
+      found[k] = { at: t, kind, shift, outer };
+    });
     // one seam where two samples' intervals found the same one, the sharper kept
     const seams = [];
     for (const s of found.sort((p, q) => q.shift - p.shift)) if (!seams.some((x) => Math.abs(x.at - s.at) < SPOT.step)) seams.push(s);
     seams.sort((p, q) => p.at - q.at);
-    const made = { lo, hi, samples, seams };
+    const made = { lo, hi, samples, seams, flats: flats.map((f) => f.at) };
     aim.profiles.set(axis, made);
     return made;
   }
@@ -3336,12 +3508,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   /**
    * A cut that comes apart tried at `at` on an axis (`probeLip` on the
    * model's slices): the face there, the lip it would get or why none, where
-   * a full lip fits when this is short of one, and what comes off. Kept by
-   * place and settings, so going back to a place answers at once.
+   * a full lip fits when this is short of one, and what comes off. Which
+   * piece would print as well carrying the lip is guessed from the model's
+   * ends and how slender each piece would stand (`endsAsWell`). Kept by
+   * place and settings, so going back to a place answers at once. Where
+   * the caller has no use for a move (`moves` false, `within`: see
+   * `probeLip`), the answer says none that it has not looked for.
    */
-  function aimAt(final, a, at, { hold, c, nozzle }, progress = null) {
+  function aimAt(final, a, at, { hold, c, nozzle }, progress = null, { moves = true, within = null } = {}) {
     const aim = aimState(final);
-    const key = `${a}|${at.toFixed(4)}|${hold}|${c}|${nozzle}`;
+    const key = `${a}|${at.toFixed(4)}|${hold}|${c}|${nozzle}${moves ? '' : '|still'}${within ? `|${within.join('/')}` : ''}`;
     if (aim.probes.has(key)) {
       const kept = aim.probes.get(key);
       aim.probes.delete(key);
@@ -3352,19 +3528,24 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const face = frameOf(final, a).slice(at);
     let area;
     let islands;
+    let span = 0;
     try {
       area = face.area();
       const parts = face.decompose();
       islands = parts.filter((p) => p.area() >= 1).length;
       parts.forEach((p) => p.delete());
+      if (!face.isEmpty()) {
+        const { min, max } = face.bounds();
+        span = (max[0] - min[0]) * (max[1] - min[1]);
+      }
     } finally {
       face.delete();
     }
-    const r = probeLip(final.solid, { axis: a, at }, {
-      c, nozzle, hold, bounds: boxOf(final.solid), asWell: endsAsWell(aimEnds(final)[a], area), sliceAt: (t) => aimSlice(final, a, t),
-    });
+    const ends = aimEnds(final);
+    const asWell = endsAsWell(ends.beds[a], area, { lengths: [at - profile.lo, profile.hi - at], spans: ends.spans[a], faceSpan: span });
+    const r = probeLip(final.solid, { axis: a, at }, { c, nozzle, hold, bounds: boxOf(final.solid), asWell, sliceAt: (t) => aimSlice(final, a, t), flats: profile.flats, moves, within });
     const answer = {
-      axis: AXES[a], at, area, islands, lip: r.lip ? { H: r.lip.H, clips: r.lip.clips, why: r.lip.why } : null, noLip: r.noLip,
+      axis: AXES[a], at, area, islands, lip: r.lip ? { H: r.lip.H, clips: r.lip.clips, why: r.lip.why, ...(r.lip.broken ? { broken: true } : {}) } : null, noLip: r.noLip,
       suggestedAt: r.suggestedAt, suggestedLip: r.suggestedLip,
       comesOff: at > profile.lo && at < profile.hi ? comesOffOf(profile.samples, { lo: profile.lo, hi: profile.hi, axis: a, at, area }) : null,
     };
@@ -3379,28 +3560,43 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   /**
    * The best places along an axis for a cut that comes apart (`mode:
    * 'spots'`): beside each seam, on the side that leaves its shape whole with
-   * its own piece (`spotSide`) where some island is wide enough for a clip,
-   * the first 0.5 mm step away from it is tried; short of a full lip there,
-   * the place the layout's moves give one, if that keeps to the seam – on its
-   * side, within 20 mm of it and with no other seam between (`keepsTo`) – and
-   * tried there. A place that runs through letters is tried again just clear
-   * of them, on either side, if that keeps to the seam too. A groove round
-   * the model – where it narrows and widens again within 6 mm, the two
-   * seams' sides facing – that holds no spot of its own (a lip needs more
-   * wall than a groove leaves) is kept whole with one piece: its spots are
-   * tried just under and just over it, in the plain wall either side. A wider
-   * band (the wall between a band of gargoyles and a roof's eaves) is no
-   * groove: a cut just past it would leave a thin plate of what stands out. Each found is scored (`spotScore`: the lip, the
-   * seam it hides in as seen from outside, what comes off, its islands, the
-   * letters it cuts), and the best kept, 8 mm apart (`pickSpots`); one that
-   * would take off three quarters of the model or more is no spot for a top
-   * or a lid. On a hold with clips, where no place takes clips at all – a
-   * round wall has no straight stretch for one – the places with a full 6 mm
-   * lip without them are the spots.
+   * its own piece (`spotSide`), the first 0.5 mm step away from it is tried,
+   * and the next step out where that one's lip is short even of a full one
+   * without clips, or its tongue comes in stretches (just over the tips of a
+   * row of windows an opening's edge in the tongue's foot cuts it between
+   * them; half a step further it is whole), or where it has none and the
+   * moves would go further than that (just under a groove the first step may
+   * leave the piece past it no room, the next a full lip); short of a full
+   * lip in one piece at either, the place the layout's moves give one, if
+   * that keeps to the seam – on its side, within 20 mm of it and with no
+   * other seam between (`keepsTo`) – and tried there. Of those the nearest
+   * with a full lip in one piece is kept, else the nearest with one in
+   * stretches, which scores less. A place that runs
+   * through letters is tried again just clear of them, on either side, if
+   * that keeps to the seam too. A groove round the model – where it narrows
+   * and widens again within 6 mm, the two seams' sides facing – that holds no
+   * spot of its own (a lip needs more wall than a groove leaves) is kept
+   * whole with one piece: its spots are tried just under and just over it,
+   * in the plain wall either side. A wider band (the wall between a band of
+   * gargoyles and a roof's eaves) is no groove: a cut just past it would leave
+   * a thin plate of what stands out. Each found is scored (`spotScore`: the
+   * lip, the seam it hides in as seen from outside, what comes off, its
+   * islands, the letters it cuts), and the best kept, 8 mm apart
+   * (`pickSpots`); one that would take off three quarters of the model or
+   * more is no spot for a top or a lid. On a hold with clips, a seam is tried
+   * at first only where some island near it is wide enough for a clip; where
+   * no place takes clips at all – a round wall has no straight stretch for
+   * one, a small part none long enough – every seam is tried, and the places
+   * with a full 6 mm lip without them are the spots.
+   *
+   * A generator: it yields before each place it has not tried yet, with how
+   * far it has got (`{ done, total }`), so that the caller can hand the
+   * engine to a cut being placed meanwhile and carry on after; it returns
+   * the spots.
    */
-  function spotsOf(final, items, a, { hold, c, nozzle }, progress) {
-    progress?.('Looking for good spots…');
-    const profile = aimProfile(final, a, progress && ((_, d) => progress('Looking for good spots…', d)));
+  function* spotSteps(final, items, a, { hold, c, nozzle }, say) {
+    say('Looking for good spots…');
+    const profile = aimProfile(final, a, (_, d) => say('Looking for good spots…', d));
     const caught = catchSizes(hold, c);
     const room = caught ? 2 * (CLIP.span + 2 * CLIP.margin) : 0;
     const wide = (side, seam) => profile.samples.some((p) => (side < 0 ? p.t < seam.at && p.t >= seam.at - SPOT.look : p.t > seam.at && p.t <= seam.at + SPOT.look) && p.widest >= room);
@@ -3408,6 +3604,12 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const letters = final.itemBounds.filter((b) => !b.part);
     const candidates = [];
     const temps = scope();
+    const tried = new Map(); // the places tried, by height: what the probe said there
+    let done = 0;
+    const total = () => profile.seams.length;
+    // a place that would take off three quarters of the model or more is no spot, so it is not tried: as the profile
+    // tells it, with a little to spare for the face's own area there
+    const tooMuch = (x) => comesOffOf(profile.samples, { lo: profile.lo, hi: profile.hi, axis: a, at: x, area: aimSlice(final, a, x).area() }).fraction >= 0.76;
 
     /** A spot tried at a place (the probe's answer there) kept as a candidate, unless it takes off too much: the letters it runs through. */
     const add = (r, seam, side, why) => {
@@ -3417,61 +3619,128 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       candidates.push({
         axis: AXES[a], at: r.at, why: cap ? spotWhy(seam.kind, side, a, { cap }) : why, lip: { H: r.lip.H, clips: r.lip.clips }, comesOff: r.comesOff,
         score: Math.round(spotScore({
-          full: true, clips: r.lip.clips, shift: seam.outer, distance: Math.abs(r.at - seam.at), fraction: r.comesOff.fraction, islands: r.islands, crosses: crosses.length,
+          full: true, clips: r.lip.clips, broken: !!r.lip.broken, shift: seam.outer, distance: Math.abs(r.at - seam.at), fraction: r.comesOff.fraction, islands: r.islands,
+          crosses: crosses.length,
         }) * 1000) / 1000,
         seam: seam.at, islands: r.islands, ...(crosses.length ? { crosses } : {}),
       });
       return crosses;
     };
 
-    /** The spots beside a seam on one side, said to be `why`: whether there were any. */
-    const around = (seam, side, why = spotWhy(seam.kind, side, a)) => {
-      if (!wide(side, seam)) return false;
+    /** The spots beside a seam on one side, said to be `why`, clips or no clips (`bare`): whether there were any. */
+    const around = function* (seam, side, why = spotWhy(seam.kind, side, a), bare = false) {
       const before = candidates.length;
       const on = (x) => x != null && (x - seam.at) * side > 0 && Math.abs(x - seam.at) <= SPOT.look + 1e-9 && x > profile.lo && x < profile.hi && keepsTo(places, seam.at, side, x);
-      const probe = (x) => (on(x) ? aimAt(final, a, x, { hold, c, nozzle }) : null);
-      // the first place with a full lip, of the step beside the seam and where its moves say; else one with a bare 6 mm
-      // lip, for a hold whose clips fit nowhere
-      const tried = [];
-      const first = probe(spotStart(seam.at, side));
-      if (first) tried.push(first);
-      if (first && !fullLip(first.lip, hold, c)) {
-        const moved = probe(first.suggestedAt);
-        if (moved) tried.push(moved);
+      // a place tried for its lip alone, or (`moves`) for where the moves go too, as far as they keep to the seam's side
+      const within = side > 0 ? [seam.at + 1e-6, Math.min(profile.hi, seam.at + SPOT.look)] : [Math.max(profile.lo, seam.at - SPOT.look), seam.at - 1e-6];
+      const probe = function* (x, moves = false) {
+        if (!on(x) || tooMuch(x)) return null;
+        const key = `${x.toFixed(4)}|${moves ? within.join('/') : ''}`;
+        if (!tried.has(key)) {
+          yield { done, total: total() };
+          tried.set(key, aimAt(final, a, x, { hold, c, nozzle }, null, moves ? { within } : { moves: false }));
+        }
+        return tried.get(key);
+      };
+      const full = (r) => fullLip(r?.lip, hold, c, bare);
+      const whole = (r) => full(r) && !r.lip.broken;
+      // the step beside the seam; the next one out where that one's lip is short of a full one even without clips, or
+      // in stretches, or where it has none and the moves go further than that; and where the moves say: the nearest
+      // with a full lip in one piece, else one in stretches
+      const start = spotStart(seam.at, side);
+      const first = yield* probe(start, true);
+      if (!first) return false;
+      const steps = [first];
+      const further = first.lip ? !fullLip(first.lip, hold, c, true) || first.lip.broken : on(first.suggestedAt) && Math.abs(first.suggestedAt - start) > SPOT.step + 1e-9;
+      if (further) {
+        const next = yield* probe(start + side * SPOT.step);
+        if (next) steps.push(next);
       }
-      const found = tried.find((r) => fullLip(r.lip, hold, c)) ?? tried.find((r) => fullLip(r.lip, hold, c, true));
+      if (!steps.some(whole)) {
+        const moved = yield* probe(first.suggestedAt);
+        if (moved) steps.push(moved);
+      }
+      const found = steps.find(whole) ?? steps.find(full);
       if (!found) return false;
       const crosses = add(found, seam, side, why);
       if (crosses?.length) {
         // through letters: the steps just clear of them, below and above, with as good a lip there
         const over = letters.filter((b) => crosses.includes(b.id));
         for (const x of [spotStart(Math.min(...over.map((b) => b.min[a])), -1), spotStart(Math.max(...over.map((b) => b.max[a])), 1)]) {
-          const r = probe(x);
-          if (r && fullLip(r.lip, hold, c, !(found.lip.clips > 0))) add(r, seam, side, why);
+          const r = yield* probe(x);
+          if (r && fullLip(r.lip, hold, c, !(found.lip.clips > 0)) && !(r.lip.broken && !found.lip.broken)) add(r, seam, side, why);
         }
       }
       return candidates.length > before;
     };
 
     try {
-      const held = new Set(); // the seams with spots of their own
-      profile.seams.forEach((seam, n) => {
-        progress?.('Looking for good spots…', { done: n + 1, total: profile.seams.length });
-        if (around(seam, spotSide(seam.kind))) held.add(seam);
-      });
-      // a groove with no spot inside: just under it and just over it
-      profile.seams.forEach((seam, k) => {
-        const next = profile.seams[k + 1];
-        if (seam.kind !== 'narrows' || next?.kind !== 'widens' || next.at - seam.at > SPOT.groove || held.has(seam) || held.has(next)) return;
-        around(seam, -1, spotWhy('groove', -1, a));
-        around(next, 1, spotWhy('groove', 1, a));
-      });
+      /** Every seam's spots, and a groove's with no spot inside just under and just over it: those with clips first. */
+      const all = function* (bare) {
+        const held = new Set(); // the seams with spots of their own
+        for (const [n, seam] of profile.seams.entries()) {
+          say('Looking for good spots…', { done: n + 1, total: total() });
+          if (bare || wide(spotSide(seam.kind), seam)) if (yield* around(seam, spotSide(seam.kind), undefined, bare)) held.add(seam);
+          done = n + 1;
+        }
+        for (const [k, seam] of profile.seams.entries()) {
+          const next = profile.seams[k + 1];
+          if (seam.kind !== 'narrows' || next?.kind !== 'widens' || next.at - seam.at > SPOT.groove || held.has(seam) || held.has(next)) continue;
+          if (bare || wide(-1, seam)) yield* around(seam, -1, spotWhy('groove', -1, a), bare);
+          if (bare || wide(1, next)) yield* around(next, 1, spotWhy('groove', 1, a), bare);
+        }
+      };
+      yield* all(!caught);
+      // on a hold with clips, places without them only where none takes clips: then at every seam, however narrow
+      const clipped = candidates.filter((s) => s.lip.clips > 0);
+      if (caught && clipped.length) return pickSpots(clipped);
+      if (caught) {
+        candidates.length = 0;
+        yield* all(true);
+      }
+      return pickSpots(candidates);
     } finally {
       temps.dispose();
     }
-    // on a hold with clips, places without them only where none takes clips
-    const clipped = candidates.filter((s) => s.lip.clips > 0);
-    return pickSpots(caught && clipped.length ? clipped : candidates);
+  }
+
+  /**
+   * The spots along an axis (`spotSteps`): in one go, or with a `budget`
+   * (ms) as far as that takes them, then `{ partial: { done, total } }`; the
+   * next request for the same spots carries on where this one stopped (the
+   * search is kept with the result, one at a time), and a probe or a measure
+   * asked for meanwhile goes in between.
+   */
+  function spotsFor(final, items, a, settings, progress, budget = null) {
+    const aim = aimState(final);
+    const key = `${a}|${settings.hold}|${settings.c}|${settings.nozzle}|${stableKey(items)}`;
+    if (aim.spotJob?.key !== key) {
+      aim.spotJob?.steps.return();
+      const job = { key, say: null, at: null };
+      job.steps = spotSteps(final, items, a, settings, (stage, d) => {
+        job.at = d ?? job.at;
+        job.say?.(stage, d);
+      });
+      aim.spotJob = job;
+    } else if (aim.spotJob.at) progress?.('Looking for good spots…', aim.spotJob.at);
+    const job = aim.spotJob;
+    job.say = progress;
+    const until = Date.now() + (budget > 0 ? budget : Infinity);
+    try {
+      for (;;) {
+        const step = job.steps.next();
+        if (step.done) {
+          aim.spotJob = null;
+          return { spots: step.value };
+        }
+        if (Date.now() >= until) return { partial: step.value };
+      }
+    } catch (err) {
+      aim.spotJob = null;
+      throw err;
+    } finally {
+      job.say = null;
+    }
   }
 
   /**
@@ -3485,7 +3754,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * it reads is kept with the result (`aimState`), so a place tried again,
    * or near one tried before, answers at once.
    */
-  function aimRequest({ items, baseVersion, printing, split = null, mode, axis = 'z', at = null, hold = 'lock' }, progress) {
+  function aimRequest({ items, baseVersion, printing, split = null, mode, axis = 'z', at = null, hold = 'lock', budget = null }, progress) {
     const a = typeof axis === 'number' ? axis : AXES.indexOf(String(axis).toLowerCase());
     if (!(a >= 0 && a <= 2)) fail('INTERNAL', `Unknown axis "${axis}"`);
     const estimate = sketchWill(items, baseVersion);
@@ -3507,7 +3776,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         return { message: { axis: AXES[a], lo: profile.lo, hi: profile.hi, seams: seamsOf(profile), notes, ...extra }, transfer: [] };
       }
       if (mode === 'spots') {
-        const spots = spotsOf(final, items, a, settings, progress);
+        const { spots, partial } = spotsFor(final, items, a, settings, progress, budget);
+        if (partial) return { message: { axis: AXES[a], partial: true, ...partial, notes, ...extra }, transfer: [] };
         return { message: { axis: AXES[a], spots, seams: seamsOf(aimProfile(final, a)), notes, ...extra }, transfer: [] };
       }
       if (!Number.isFinite(at)) fail('INTERNAL', 'A probe needs a place along the axis (at)');

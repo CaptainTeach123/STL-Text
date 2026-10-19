@@ -214,3 +214,89 @@ export function loggiaSolid() {
     for (const m of temps) m.delete();
   }
 }
+
+/**
+ * A round Gothic lantern like the user's: a plinth (r 50 to z 5, r 47.5 to 8.5), a fretwork body – a tube r 45, 3 mm
+ * walls, from z 8 to 148, two tiers of 12 pointed windows 10 wide (z 20–58 and 80–116, their tips 8.66 higher) and a
+ * row of 12 round holes between – an eave ring r `eaveR` from 148 to 152 (none when `eaveR` is 0, the dome then on
+ * the body), a hollow dome r 47 (3 mm) on it, spikes round its rim, a columned cap with a finial on top and an arched
+ * handle on two bosses. `seg` sides to every circle.
+ */
+export function roundLanternSolid({ seg = 96, eaveR = 50 } = {}) {
+  const { Manifold, CrossSection } = manifold();
+  const temps = [];
+  const t = (m) => {
+    temps.push(m);
+    return m;
+  };
+  try {
+    const cyl = (r0, r1, z0, z1, n = seg) => t(t(Manifold.cylinder(z1 - z0, r0, r1, n)).translate([0, 0, z0]));
+    const b = (min, max) => t(box(min, max));
+    const parts = [cyl(50, 50, 0, 5), cyl(47.5, 47.5, 5, 8.5)];
+    let body = t(cyl(45, 45, 8, 148).subtract(cyl(42, 42, 7.9, 148.1)));
+    // a pointed window: two circles of its width's radius either side of its middle, springing at z1
+    const lancet = (z0, z1) => {
+      const arc = (y) => t(t(t(Manifold.cylinder(40, 10, 10, 48, true)).rotate([0, 90, 0])).translate([45, y, z1]));
+      const arch = t(t(arc(5).intersect(arc(-5))).intersect(b([30, -10, z1], [60, 10, z1 + 10])));
+      return t(b([30, -5, z0], [60, 5, z1]).add(arch));
+    };
+    const cutters = [];
+    for (let k = 0; k < 12; k++) {
+      cutters.push(t(lancet(20, 58).rotate([0, 0, k * 30])), t(lancet(80, 116).rotate([0, 0, k * 30])));
+      cutters.push(t(t(t(t(Manifold.cylinder(40, 3.5, 3.5, 24, true)).rotate([0, 90, 0])).translate([45, 0, 73])).rotate([0, 0, k * 30 + 15])));
+    }
+    body = t(body.subtract(t(Manifold.union(cutters))));
+    parts.push(body);
+    const foot = eaveR ? 152 : 148; // where the dome stands
+    if (eaveR) parts.push(t(cyl(eaveR, eaveR, 148, 152).subtract(cyl(42, 42, 147.9, 152.1))));
+    const dome = t(t(t(Manifold.sphere(47, seg)).translate([0, 0, foot])).subtract(t(t(Manifold.sphere(44, seg)).translate([0, 0, foot]))));
+    parts.push(t(dome.intersect(b([-60, -60, foot], [60, 60, 260]))));
+    const ring = eaveR ? eaveR - 2.2 : 45.5;
+    for (let k = 0; k < 16; k++) {
+      const a = (2 * Math.PI * k) / 16;
+      parts.push(t(t(Manifold.cylinder(14, 2, 0.3, 24)).translate([ring * Math.cos(a), ring * Math.sin(a), foot])));
+    }
+    // the cap on the dome's top: a plinth, six columns, a cap disc, a dome and a finial
+    const top = foot + 47;
+    parts.push(cyl(11, 11, top - 3, top + 1.5, 48));
+    for (let k = 0; k < 6; k++) parts.push(t(t(Manifold.cylinder(10, 1.6, 1.6, 16)).translate([8 * Math.cos((k * Math.PI) / 3), 8 * Math.sin((k * Math.PI) / 3), top + 1.4])));
+    parts.push(cyl(12, 12, top + 11.3, top + 14.5, 48));
+    parts.push(t(t(t(Manifold.sphere(8, 48)).translate([0, 0, top + 14.4])).intersect(b([-9, -9, top + 14.4], [9, 9, top + 23]))));
+    parts.push(t(t(Manifold.cylinder(18, 2.6, 0.4, 24)).translate([0, 0, top + 21])));
+    // the handle: two bosses on the dome and an arch over the cap
+    const boss = foot + Math.sqrt(47 * 47 - 34 * 34);
+    for (const x of [-34, 34]) parts.push(t(cyl(5, 5, boss - 3.4, boss + 5.1, 32).translate([x, 0, 0])));
+    const tube = t(t(CrossSection.circle(3.2, 24)).translate([34, 0]));
+    parts.push(t(t(t(Manifold.revolve(tube, 64, 180)).rotate([90, 0, 0])).translate([0, 0, boss + 5])));
+    return Manifold.union(parts);
+  } finally {
+    for (const m of temps) m.delete();
+  }
+}
+
+/**
+ * A slender square lantern: a 70 × 70 tower (3 mm walls, a 4 mm floor) up to z 230 with two windows 16 wide a side
+ * from z 40 to 190, eaves 80 × 80 from 230 to 234 and a hollow hipped roof (5 mm) up to a flat top 40 × 40 at 262,
+ * closed. Its top would stand on that small flat roof to carry a lip, 220 mm tall.
+ */
+export function slenderTowerSolid() {
+  const { Manifold } = manifold();
+  const temps = [];
+  const t = (m) => {
+    temps.push(m);
+    return m;
+  };
+  try {
+    const b = (min, max) => t(box(min, max));
+    let tower = t(b([-35, -35, 0], [35, 35, 230]).subtract(b([-32, -32, 4], [32, 32, 231])));
+    const windows = [];
+    for (const x of [-17.5, 17.5]) windows.push(b([x - 8, -40, 40], [x + 8, 40, 190]), b([-40, x - 8, 40], [40, x + 8, 190]));
+    tower = t(tower.subtract(t(Manifold.union(windows))));
+    const eaves = t(b([-40, -40, 230], [40, 40, 234]).subtract(b([-32, -32, 229], [32, 32, 235])));
+    const frustum = (s0, s1, z0, z1) => t(Manifold.hull([[-s0, -s0, z0], [s0, -s0, z0], [s0, s0, z0], [-s0, s0, z0], [-s1, -s1, z1], [s1, -s1, z1], [s1, s1, z1], [-s1, s1, z1]]));
+    const roof = t(frustum(40, 20, 234, 262).subtract(frustum(35, 15, 233.99, 258)));
+    return Manifold.union([tower, eaves, roof]);
+  } finally {
+    for (const m of temps) m.delete();
+  }
+}

@@ -38,11 +38,16 @@ import {
   WebGLRenderer,
 } from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { MeshBVH, acceleratedRaycast } from 'three-mesh-bvh';
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
+import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
+import { INTERSECTED, MeshBVH, NOT_INTERSECTED, acceleratedRaycast } from 'three-mesh-bvh';
+import { placedAt, snapTolerance } from './aim.js';
 import { geometryFromBuffers } from './mesh.js';
 import { clickRadius, surfaceNormalAt } from './surfaceNormal.js';
 import {
-  APART_COLOR, CUT_COLOR, PIECE_COLORS, PIN_COLOR, TOO_BIG_COLOR, axisCuts, cellSizes, cutPlane, explodeOffset, letterFor, offsetAlongRay, pieceColorIndex, triangleInBox,
+  APART_COLOR, CUT_COLOR, PIECE_COLORS, PIN_COLOR, TOO_BIG_COLOR, axisCuts, cellSizes, cutPlane, explodeOffset, letterFor, offsetAlongRay, pieceColorIndex, snapTarget,
+  triangleInBox,
 } from './split.js';
 
 Mesh.prototype.raycast = acceleratedRaycast;
@@ -59,6 +64,16 @@ const COLORS = {
   apartHover: 0x2dd4bf, // the same for a cut that comes apart
   tooBig: 0xd6294b, // the number of a piece too big for the printer (the page's --err)
 };
+
+/**
+ * The model's section under a cut being placed, by the lip the engine finds
+ * there: teal where a full lip with clips fits, amber where only a shorter or
+ * clipless one does, red where none does; light while it is worked out, and
+ * for a glued cut.
+ */
+const AIM_COLORS = { full: APART_COLOR, short: 0xf59e0b, none: COLORS.tooBig, neutral: 0xf8fafc };
+/** The ticks beside it where it snaps: a seam of the model's, a spot suggested, where a full lip fits, and the one it snapped to. */
+const TICK_COLORS = { seam: 0x64748b, spot: APART_COLOR, lip: 0xf59e0b, snapped: 0xff7a1a };
 
 const CLICK_PX = 5;
 const CLICK_MS = 500;
@@ -228,6 +243,66 @@ function readCuts(cuts) {
   return out;
 }
 
+/**
+ * The section of a mesh by the plane across `axis` at `at`: a segment for
+ * each triangle that crosses it, as pairs of points, read through the mesh's
+ * BVH so that only the triangles by the plane are looked at – a dense model's
+ * section follows the pointer on every frame. A corner on the plane counts as
+ * above it, so a face lying in the plane is outlined once, by the walls below
+ * it, and never crossed itself.
+ * @param {BufferGeometry} geometry indexed, with its `boundsTree`
+ * @param {number} axis 0, 1 or 2
+ * @param {number} at
+ * @param {Float32Array|null} [out] reused when it is big enough (it is grown otherwise: the result says which array holds the points)
+ * @returns {{ positions: Float32Array, count: number }} `count` segments, six numbers each
+ */
+export function sectionSegments(geometry, axis, at, out = null) {
+  let positions = out ?? new Float32Array(6 * 1024);
+  let count = 0;
+  const bvh = geometry?.boundsTree;
+  const index = geometry?.index?.array;
+  if (!bvh || !index) return { positions, count };
+  const pos = geometry.attributes.position.array;
+  const key = ['x', 'y', 'z'][axis];
+  const [u, v] = [(axis + 1) % 3, (axis + 2) % 3];
+  const put = (o, i, j, d0, d1) => {
+    // where the edge from corner i (d0 from the plane) to corner j (d1) crosses it
+    const t = d0 / (d0 - d1);
+    positions[o + axis] = at;
+    positions[o + u] = pos[i + u] + (pos[j + u] - pos[i + u]) * t;
+    positions[o + v] = pos[i + v] + (pos[j + v] - pos[i + v]) * t;
+  };
+  bvh.shapecast({
+    intersectsBounds: (box) => (box.min[key] <= at && box.max[key] >= at ? INTERSECTED : NOT_INTERSECTED),
+    intersectsRange: (offset, n) => {
+      for (let k = offset; k < offset + n; k++) {
+        const tri = bvh.resolveTriangleIndex(k) * 3;
+        const a = index[tri] * 3;
+        const b = index[tri + 1] * 3;
+        const c = index[tri + 2] * 3;
+        const da = pos[a + axis] - at;
+        const db = pos[b + axis] - at;
+        const dc = pos[c + axis] - at;
+        const sa = da >= 0;
+        const sb = db >= 0;
+        if (sa === sb && sb === dc >= 0) continue;
+        if (count * 6 + 6 > positions.length) {
+          const grown = new Float32Array(positions.length * 2);
+          grown.set(positions);
+          positions = grown;
+        }
+        // the corner alone on its side, and the two edges from it
+        const [lone, dl, p, dp, q, dq] = sa === sb ? [c, dc, a, da, b, db] : sa === dc >= 0 ? [b, db, c, dc, a, da] : [a, da, b, db, c, dc];
+        put(count * 6, lone, p, dl, dp);
+        put(count * 6 + 3, lone, q, dl, dq);
+        count++;
+      }
+      return false;
+    },
+  });
+  return { positions, count };
+}
+
 /** The colour of a cut's plane, edge, handle and badge: teal for one that comes apart, violet for a glued one. */
 const cutColor = (cut) => (cut.apart ? APART_COLOR : CUT_COLOR);
 
@@ -291,6 +366,27 @@ function disposeSprite(sprite) {
   sprite.material.dispose();
 }
 
+/** A small white dot ringed in dark, `px` CSS pixels across whatever the zoom: the point under the pointer while a cut is placed. */
+function dotSprite(px = 11) {
+  const size = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.beginPath();
+  ctx.arc(size / 2, size / 2, size / 2 - 9, 0, Math.PI * 2);
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+  ctx.lineWidth = 10;
+  ctx.strokeStyle = '#1b2230';
+  ctx.stroke();
+  const map = new CanvasTexture(canvas);
+  map.colorSpace = SRGBColorSpace;
+  const sprite = new Sprite(new SpriteMaterial({ map, sizeAttenuation: false, depthTest: false, transparent: true }));
+  sprite.raycast = () => {};
+  sprite.userData.px = px;
+  return sprite;
+}
+
 /**
  * A double arrow one unit long along +z: a cut's handle, pointing the two
  * ways the cut can be dragged.
@@ -351,7 +447,11 @@ export class Viewer {
     this.camera.position.set(60, -90, 70);
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
-    this.controls.addEventListener('change', () => this.requestRender());
+    // a view zoomed or turned under a still pointer while a cut is placed: the plane goes where the pointer now is
+    this.controls.addEventListener('change', () => {
+      this.requestRender();
+      this.#aimAgain();
+    });
 
     this.scene.add(new HemisphereLight(0xffffff, 0x445066, 1.1));
     this.scene.add(new AmbientLight(0xffffff, 0.35));
@@ -414,6 +514,21 @@ export class Viewer {
     this.pieceHighlight = null;
     this.scene.add(this.cutGroup, this.cellGroup, this.pieceGroup, this.pieceLabelGroup);
 
+    // placing a cut from the view (see setAim): a plane that follows the pointer, the model's section on it, the point
+    // under the pointer and ticks where it snaps
+    this.aim = null; // { axis } while a place for a cut is being picked on the model
+    this.aimTargets = { axis: null, list: [] }; // what a cut across that axis snaps to, picked or dragged
+    this.aimVerdict = null; // 'full' | 'short' | 'none' from the engine, or null: the section's colour
+    this.aimHover = null; // { at, raw, target, point, screen, pinned } the place under the pointer while picking
+    this.aimPreview = null; // { axis, at, verdict } a place shown with no pointer on the model (a suggestion hovered)
+    this.aimLast = null; // the pointer and its keys at the last move while picking or dragging, for Alt pressed or let go
+    this.aimTouch = null; // { pointerId, before } the finger sliding the plane on a touch screen, and the plane before it
+    this.dragTarget = null; // what a dragged handle snapped to
+    this.sectionKey = null;
+    this.sectionBuffer = null;
+    this.ticksKey = null;
+    this.#buildAim();
+
     this.grid = null;
     this.bounds = new Box3(new Vector3(-50, -50, 0), new Vector3(50, 50, 10));
     this.#buildGrid();
@@ -424,7 +539,9 @@ export class Viewer {
     this.onSelectItem = null; // (itemId) clicked an item
     this.onDrag = null; // ({ itemId, point, normal, done })
     this.onSelectCut = null; // (cutId) pressed a cut's handle
-    this.onCutDrag = null; // ({ id, at, done, screen }) dragged a cut's handle
+    this.onCutDrag = null; // ({ id, at, target, done, screen }) dragged a cut's handle; `target` what it snapped to
+    this.onAim = null; // ({ at, raw, target, point, screen, pinned }) the place under the pointer while picking, or ({ at: null }) none
+    this.onAimPick = null; // ({ at, target, shift }) clicked the model while picking
     this.hoverEnabled = true;
     this.#bindPointer();
     this.#applyVisibility();
@@ -539,6 +656,7 @@ export class Viewer {
     for (const o of this.overlays.values()) o.mesh.visible = mode === 'model';
     if (mode === 'pieces') this.marker.visible = false;
     this.#layoutCuts(); // the planes sit in the gaps between exploded pieces
+    this.#syncAim(); // only drawn on the model, which may have new bounds
     this.requestRender();
   }
 
@@ -774,20 +892,26 @@ export class Viewer {
     c.group.add(c.badge);
   }
 
-  /** Sizes and places every plane: the bounds' face plus a margin, the handle just outside it, clear of the model. */
-  #layoutCuts() {
-    if (!this.cuts.size) return;
+  /** How big the planes across the bounds are drawn: the bounds' faces plus a margin, grown by `gaps[a]` mm along each axis. */
+  #planeLayout(gaps = [0, 0, 0]) {
     const box = this.#cutBounds();
     const size = box.getSize(new Vector3()).toArray();
     const centre = box.getCenter(new Vector3()).toArray();
     const diag = Math.max(Math.hypot(...size), 1);
-    const handle = clamp(0.09 * diag, 3, 80);
+    const extent = size.map((s, a) => s + 2 * Math.max(0.075 * s, 0.03 * diag) + gaps[a]);
+    return { box, centre, diag, extent };
+  }
+
+  /** Sizes and places every plane: the bounds' face plus a margin, the handle just outside it, clear of the model. */
+  #layoutCuts() {
+    if (!this.cuts.size) return;
     const list = [...this.cuts.values()];
-    const byAxis = axisCuts(list, boxArrays(box));
+    const byAxis = axisCuts(list, boxArrays(this.#cutBounds()));
     const exploded = this.viewMode === 'pieces';
     const gap = exploded ? this.#explodeGap() : 0;
     // exploded pieces spread out by one gap per cut, so the planes grow with them
-    const extent = size.map((s, a) => s + 2 * Math.max(0.075 * s, 0.03 * diag) + byAxis[a].length * gap);
+    const { centre, diag, extent } = this.#planeLayout(byAxis.map((l) => l.length * gap));
+    const handle = clamp(0.09 * diag, 3, 80);
     for (const c of list) {
       const [u, v] = CUT_UV[c.axis];
       const onAxis = byAxis[c.axis];
@@ -840,17 +964,282 @@ export class Viewer {
     const { origin, direction } = this.raycaster.ray;
     const t = offsetAlongRay(origin.toArray(), direction.toArray(), drag.p, drag.n);
     if (t === null) return; // looking straight along the axis: this move says nothing about where the plane goes
+    this.aimLast = { clientX: event.clientX, clientY: event.clientY, shiftKey: event.shiftKey, altKey: event.altKey };
     const step = event.shiftKey ? this.cutSnap.shift : this.cutSnap.step;
     const box = this.#cutBounds();
     let at = drag.start + (t - drag.t0);
-    if (step > 0) at = Math.round(at / step) * step;
+    // the model's seams and the spots suggested pull it in from a few pixels away, as when a cut is placed on the model;
+    // Alt drags it freely
+    const list = !event.altKey && this.aimTargets.axis === c.axis ? this.aimTargets.list : [];
+    const near = [...drag.p];
+    near[c.axis] = at;
+    const target = list.length ? snapTarget(list, at, snapTolerance(this.#pxPerMm(near, c.axis))) : null;
+    if (target) at = target.at;
+    else if (step > 0) at = Math.round(at / step) * step;
     at = clamp(at, box.min.getComponent(c.axis) - 1, box.max.getComponent(c.axis) + 1);
     at = Math.round(at * 1e4) / 1e4;
-    if (at === drag.at) return;
+    if (at === drag.at && target === drag.target) return;
     drag.at = at;
+    drag.target = target;
+    this.dragTarget = target;
     this.cutDrag = { id: c.id, at };
-    this.setCutOffset(c.id, at);
-    this.onCutDrag?.({ id: c.id, at, done: false, screen: this.cutScreenPosition(c.id) });
+    this.setCutOffset(c.id, at); // and the section under it, with the ticks
+    this.onCutDrag?.({ id: c.id, at, target, done: false, screen: this.cutScreenPosition(c.id) });
+  }
+
+  /* -------------------------------------------- placing a cut from the view */
+
+  #buildAim() {
+    const pr = this.renderer.getPixelRatio();
+    // the plane is turned like a cut's group (see #orientCut); the section and the ticks are in world space
+    const plane = new Group();
+    const fill = new Mesh(this.shapes.quad, new MeshBasicMaterial({ color: AIM_COLORS.neutral, transparent: true, opacity: 0.18, side: DoubleSide, depthWrite: false }));
+    fill.raycast = () => {};
+    fill.renderOrder = 6;
+    const edge = new LineSegments(this.shapes.edges, new LineBasicMaterial({ color: AIM_COLORS.neutral, transparent: true, opacity: 0.9, depthTest: false }));
+    edge.raycast = () => {};
+    edge.renderOrder = 11;
+    plane.add(fill, edge);
+    // wide lines (in device pixels), drawn over the model so the whole section shows
+    const lines = (material) => {
+      const line = new LineSegments2(new LineSegmentsGeometry(), new LineMaterial({ depthTest: false, transparent: true, ...material }));
+      line.frustumCulled = false; // their points change as the pointer moves: no bounds are kept up to date
+      line.raycast = () => {};
+      line.visible = false;
+      return line;
+    };
+    const section = lines({ color: AIM_COLORS.neutral, linewidth: 3 * pr });
+    section.renderOrder = 14;
+    const ticks = lines({ vertexColors: true, linewidth: 2.5 * pr });
+    ticks.renderOrder = 13;
+    const dot = dotSprite();
+    dot.renderOrder = 15;
+    dot.scale.setScalar(this.#spriteScale(dot.userData.px));
+    plane.visible = dot.visible = false;
+    this.aimParts = { plane, fill, edge, section, ticks, dot };
+    this.scene.add(plane, section, ticks, dot);
+  }
+
+  /**
+   * Pick a place for a cut on the model: while on, a plane across `axis`
+   * follows the point under the pointer (snapped to the targets given with
+   * `setAimTargets`, unless Alt is held), with the model's section on it and
+   * a dot on the point, and `onAim` hears of each move; a click on the model
+   * calls `onAimPick` instead of `onPick`, and never selects or drags an item
+   * or a handle. On a touch screen, where nothing hovers, a touch on the
+   * model puts the plane there and a slide moves it; when the finger lifts
+   * it stays (`pinned`), for the caller to place the cut there.
+   * @param {{ axis: number }|null} aim null ends it
+   */
+  setAim(aim) {
+    this.aim = aim ? { axis: aim.axis } : null;
+    this.#aimTouchEnd();
+    this.aimHover = null;
+    this.aimVerdict = null;
+    this.ticksKey = null;
+    this.marker.visible = false;
+    this.renderer.domElement.style.cursor = '';
+    this.#syncAim();
+  }
+
+  /**
+   * What a cut across `axis` snaps to while it is placed or its handle
+   * dragged: `[{ at, kind: 'seam'|'spot'|'lip', … }]` (see aim.js
+   * `aimTargets`), drawn as ticks beside the plane.
+   */
+  setAimTargets(axis, list) {
+    this.aimTargets = { axis, list: list ?? [] };
+    this.#syncAim();
+    this.#aimAgain(); // a target that comes up beside the pointer (where a full lip fits, a spot) pulls the plane to it now
+  }
+
+  /** The colour of the section: 'full', 'short' or 'none' from the lip the engine finds there, or null while it is not known. */
+  setAimVerdict(verdict) {
+    if (this.aimVerdict === (verdict ?? null)) return;
+    this.aimVerdict = verdict ?? null;
+    this.#syncAim();
+  }
+
+  /** Show a plane and the section across `axis` at `at` (a suggestion hovered), coloured by `verdict`, over the pointer's; null hides it. */
+  previewAim(spec) {
+    this.aimPreview = spec ? { axis: spec.axis, at: spec.at, verdict: spec.verdict ?? null } : null;
+    this.#syncAim();
+  }
+
+  /** How many pixels a millimetre along `axis` spans on screen at `point`. */
+  #pxPerMm(point, axis) {
+    this.camera.updateMatrixWorld();
+    const a = new Vector3(...point).project(this.camera);
+    const b = new Vector3(...point);
+    b.setComponent(axis, b.getComponent(axis) + 1).project(this.camera);
+    const [w, h] = this.viewSize;
+    return Math.hypot(((b.x - a.x) * w) / 2, ((b.y - a.y) * h) / 2);
+  }
+
+  /** The place under the pointer while picking: on the model, snapped (Alt: freely, to 0.1 mm), or null off it. */
+  #aimPoint(event, alt = event.altKey) {
+    const hit = this.#pickModel(event);
+    if (!hit) return null;
+    const axis = this.aim.axis;
+    const raw = hit.point[axis];
+    const list = alt || this.aimTargets.axis !== axis ? [] : this.aimTargets.list;
+    const target = list.length ? snapTarget(list, raw, snapTolerance(this.#pxPerMm(hit.point, axis))) : null;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    return { at: placedAt(raw, target), raw, target, point: hit.point, screen: [event.clientX - rect.left, event.clientY - rect.top] };
+  }
+
+  /**
+   * The pointer moved while picking: the plane follows it, and the caller
+   * hears where it is. A finger sliding off the model (`keep`) leaves the
+   * plane where it last was on it, and lifted there it stays (`pinned`).
+   */
+  #aimMove(event, { pinned = false, keep = false } = {}) {
+    if (pinned) this.aimNext = null; // a move still waiting for its frame must not unpin it
+    this.aimLast = { clientX: event.clientX, clientY: event.clientY, shiftKey: event.shiftKey, altKey: event.altKey, pointerType: event.pointerType };
+    const h = this.#aimPoint(event);
+    this.aimHover = h ? { ...h, pinned } : (pinned || keep) && this.aimHover ? { ...this.aimHover, pinned } : null;
+    this.renderer.domElement.style.cursor = h ? 'crosshair' : '';
+    this.#syncAim();
+    this.onAim?.(this.aimHover ?? { at: null });
+  }
+
+  /**
+   * The place under a still pointer worked out again, on the next frame:
+   * the view zoomed or turned, or the targets changed, so that the plane, the
+   * readout and what a click places stay the same place. Never for a plane a
+   * finger pinned (it has no pointer), nor while a finger slides one.
+   */
+  #aimAgain() {
+    const last = this.aimLast;
+    if (!this.aim || !last || last.pointerType === 'touch' || this.aimHover?.pinned || this.aimTouch) return;
+    this.#aimFrame(last);
+  }
+
+  /**
+   * A finger that was sliding the plane is done: lifted (`event`), the plane
+   * stays where it last was on the model; or (`cancel`) a second finger came
+   * down for a pinch or a pan of the view, and the plane goes back to what it
+   * was before the finger touched.
+   */
+  #aimTouchEnd({ event = null, cancel = false } = {}) {
+    const t = this.aimTouch;
+    if (!t) return;
+    this.aimTouch = null;
+    this.aimNext = null; // a move still waiting for its frame was the finger's
+    if (cancel) {
+      this.aimHover = t.before;
+      this.#syncAim();
+      this.onAim?.(this.aimHover ?? { at: null });
+    } else if (event && this.aim) this.#aimMove(event, { pinned: true });
+  }
+
+  /** Draw what is being placed: a suggestion hovered, else the place under the pointer while picking, else the section under a dragged handle. */
+  #syncAim() {
+    const p = this.aimParts;
+    if (!p) return;
+    const drag = this.cutDrag ? this.cuts.get(this.cutDrag.id) : null;
+    const shown =
+      this.aimPreview ??
+      (this.aim && this.aimHover ? { axis: this.aim.axis, at: this.aimHover.at, verdict: this.aimVerdict } : null) ??
+      (drag ? { axis: drag.axis, at: this.cutDrag.at, verdict: this.aimVerdict, handle: true } : null);
+    const model = this.viewMode === 'model';
+    p.plane.visible = !!shown && !shown.handle && model; // a dragged cut has its own plane
+    p.section.visible = !!shown && model && !!this.baseMesh;
+    p.dot.visible = !this.aimPreview && !!this.aim && !!this.aimHover && model;
+    if (shown) {
+      const color = AIM_COLORS[shown.verdict] ?? AIM_COLORS.neutral;
+      p.fill.material.color.setHex(color);
+      p.edge.material.color.setHex(color);
+      p.section.material.color.setHex(color);
+      this.#placeAim(shown.axis, shown.at);
+      if (p.section.visible) this.#sectionAt(shown.axis, shown.at);
+    }
+    if (p.dot.visible) p.dot.position.fromArray(this.aimHover.point);
+    const axis = this.aim?.axis ?? drag?.axis ?? null;
+    const ticks = model && axis !== null && this.aimTargets.axis === axis && this.aimTargets.list.length > 0;
+    p.ticks.visible = ticks;
+    if (ticks) this.#layoutTicks(axis, (this.aim ? this.aimHover?.target : this.dragTarget) ?? null);
+    this.requestRender();
+  }
+
+  /** The preview plane across `axis` at `at`, as big as the cut planes. */
+  #placeAim(axis, at) {
+    const { centre, extent } = this.#planeLayout();
+    const [u, v] = CUT_UV[axis];
+    const { plane, fill, edge } = this.aimParts;
+    plane.quaternion.setFromRotationMatrix(new Matrix4().makeBasis(AXIS_VECTORS[u], AXIS_VECTORS[v], AXIS_VECTORS[axis]));
+    centre[axis] = at;
+    plane.position.fromArray(centre);
+    fill.scale.set(extent[u], extent[v], 1);
+    edge.scale.copy(fill.scale);
+  }
+
+  /** The model's section across `axis` at `at` (worked out again only when the place or the model changes). */
+  #sectionAt(axis, at) {
+    const geometry = this.baseMesh?.geometry;
+    const key = geometry ? `${geometry.uuid}|${axis}|${at}` : null;
+    if (key === this.sectionKey) return;
+    this.sectionKey = key;
+    const line = this.aimParts.section;
+    if (!geometry) {
+      line.visible = false;
+      return;
+    }
+    const { positions, count } = sectionSegments(geometry, axis, at, this.sectionBuffer);
+    if (positions !== this.sectionBuffer) {
+      // a bigger array than before: a geometry of its own, as the old one's buffer on the GPU is the old size
+      line.geometry.dispose();
+      line.geometry = new LineSegmentsGeometry().setPositions(positions);
+      this.sectionBuffer = positions;
+    } else {
+      const data = line.geometry.attributes.instanceStart.data;
+      data.clearUpdateRanges();
+      data.addUpdateRange(0, count * 6);
+      data.needsUpdate = true;
+    }
+    line.geometry.instanceCount = count;
+  }
+
+  /**
+   * The ticks where a cut across `axis` snaps: a rail along the axis at a
+   * corner of the plane, as long as the model, with a tick out of it at each
+   * target – longer for a spot – and the one snapped to in orange. The corner
+   * is on the handles' side towards −u: in the usual view the left one, away
+   * from the readout, which sits right of the pointer.
+   */
+  #layoutTicks(axis, snapped) {
+    const { box, centre, diag, extent } = this.#planeLayout();
+    const list = this.aimTargets.list;
+    const key = JSON.stringify([axis, list.map((t) => [t.at, t.kind]), snapped?.at ?? null, snapped?.kind ?? null, boxArrays(box)]);
+    if (key === this.ticksKey) return;
+    this.ticksKey = key;
+    const [u, v] = CUT_UV[axis];
+    const corner = [...centre];
+    corner[u] -= extent[u] / 2;
+    corner[v] += (axis === 2 ? -1 : 1) * (extent[v] / 2); // the side the handles are on
+    const tick = clamp(0.03 * diag, 2, 25);
+    const positions = [];
+    const colors = [];
+    const segment = (t0, t1, out, hex) => {
+      const a = [...corner];
+      const b = [...corner];
+      a[axis] = t0;
+      b[axis] = t1;
+      b[u] += out;
+      positions.push(...a, ...b);
+      const c = new Color(hex);
+      colors.push(c.r, c.g, c.b, c.r, c.g, c.b);
+    };
+    segment(box.min.getComponent(axis), box.max.getComponent(axis), 0, TICK_COLORS.seam);
+    const lengths = { seam: 1, lip: 1.5, spot: 2 };
+    // a spot drawn over a seam or a lip at the same place, and the one snapped to over everything
+    const isSnapped = (t) => !!snapped && t.at === snapped.at && t.kind === snapped.kind;
+    const rank = (t) => (isSnapped(t) ? 3 : { seam: 0, lip: 1, spot: 2 }[t.kind] ?? 0);
+    const ordered = [...list].sort((p, q) => rank(p) - rank(q));
+    for (const t of ordered) segment(t.at, t.at, -tick * (lengths[t.kind] ?? 1), isSnapped(t) ? TICK_COLORS.snapped : TICK_COLORS[t.kind] ?? TICK_COLORS.seam);
+    const line = this.aimParts.ticks;
+    line.geometry.dispose();
+    line.geometry = new LineSegmentsGeometry().setPositions(positions).setColors(colors);
   }
 
   /* -------------------------------------------- live piece preview */
@@ -1298,9 +1687,36 @@ export class Viewer {
     let down = null; // { x, y, t, cut }
     let drag = null; // { itemId } or { cutId, start, at, t0, p, n }
 
+    // picking a place for a cut on a touch screen: a finger on the model puts the plane there and slides it (with nothing
+    // to hover, that is how a touch screen picks), and anywhere else turns the view; a second finger makes the touch a
+    // pinch or a pan of the view instead, and the plane is left as it was. Heard before the view's controls hear the
+    // touch: they keep track of the finger on the model without turning the view, so a second one still zooms it
+    const fingers = new Set();
+    let oneFinger; // what one finger does to the view, put back once every finger is lifted
+    el.addEventListener('pointerdown', (e) => {
+      if (!this.aim || e.pointerType !== 'touch') return;
+      fingers.add(e.pointerId);
+      if (fingers.size === 1 && this.#pickModel(e)) {
+        this.aimTouch = { pointerId: e.pointerId, before: this.aimHover };
+        oneFinger ??= this.controls.touches.ONE;
+        this.controls.touches.ONE = null;
+        el.setPointerCapture(e.pointerId);
+        this.#aimMove(e, { keep: true });
+      } else this.#aimTouchEnd({ cancel: true });
+    }, { capture: true });
+    const lifted = (e) => {
+      if (!fingers.delete(e.pointerId) || fingers.size) return;
+      if (oneFinger !== undefined) this.controls.touches.ONE = oneFinger;
+      oneFinger = undefined;
+    };
+    window.addEventListener('pointerup', lifted, true);
+    window.addEventListener('pointercancel', lifted, true);
+
     el.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
       down = { x: e.clientX, y: e.clientY, t: performance.now(), cut: null };
+      // picking a place for a cut: a press never takes a handle or an item (a touch is heard above)
+      if (this.aim) return;
       // a cut's handle comes first: it is drawn over everything, and pressing it always means that cut
       const cutId = this.#pickCut(e);
       if (cutId) {
@@ -1336,6 +1752,10 @@ export class Viewer {
     });
 
     el.addEventListener('pointermove', (e) => {
+      if (this.aimTouch) {
+        if (e.pointerId === this.aimTouch.pointerId) this.#aimFrame(e, { keep: true });
+        return;
+      }
       if (drag && down) {
         if (!drag.active && Math.hypot(e.clientX - down.x, e.clientY - down.y) > CLICK_PX) {
           drag.active = true;
@@ -1364,10 +1784,25 @@ export class Viewer {
       drag = null;
       this.controls.enabled = true;
       el.style.cursor = '';
+      if (this.aimTouch?.pointerId === e.pointerId) {
+        this.#aimTouchEnd({ event: e }); // the finger lifted: the plane stays for the caller to place the cut
+        return;
+      }
+      if (this.aim) {
+        // a click on the model places the cut where the plane shows it, as the plane follows a still pointer while the
+        // view moves (#aimAgain); a drag turned the view, and a touch places it from the pinned plane
+        const click = d && e.pointerType !== 'touch' && Math.hypot(e.clientX - d.x, e.clientY - d.y) <= CLICK_PX && performance.now() - d.t <= CLICK_MS;
+        const h = click ? this.#aimPoint(e) : null;
+        if (h) this.onAimPick?.({ at: h.at, target: h.target, shift: e.shiftKey });
+        else if (this.aimHover && !this.aimHover.pinned) el.style.cursor = 'crosshair';
+        return;
+      }
       if (dr?.cutId) {
         this.cutDrag = null;
+        this.dragTarget = null;
         this.#styleCuts();
-        if (dr.active) this.onCutDrag?.({ id: dr.cutId, at: dr.at, done: true, screen: this.cutScreenPosition(dr.cutId) });
+        this.#syncAim(); // the section under the handle goes
+        if (dr.active) this.onCutDrag?.({ id: dr.cutId, at: dr.at, target: dr.target ?? null, done: true, screen: this.cutScreenPosition(dr.cutId) });
         return;
       }
       if (d?.cut) return; // a click on a handle selected its cut when it was pressed
@@ -1396,9 +1831,10 @@ export class Viewer {
       if (dr?.cutId) {
         // the plane goes back where it was, and the caller hears the drag is over
         this.cutDrag = null;
+        this.dragTarget = null;
         if (dr.active) {
           this.setCutOffset(dr.cutId, dr.start);
-          this.onCutDrag?.({ id: dr.cutId, at: dr.start, done: true, screen: this.cutScreenPosition(dr.cutId) });
+          this.onCutDrag?.({ id: dr.cutId, at: dr.start, target: null, done: true, screen: this.cutScreenPosition(dr.cutId) });
         }
         this.#styleCuts();
       }
@@ -1409,11 +1845,52 @@ export class Viewer {
         this.hoverCutId = null;
         this.#styleCuts();
       }
+      // the mouse gone from the view takes the plane with it, and a view moved meanwhile (framed from its button) brings
+      // none back; a finger lifted leaves it pinned
+      if (this.aim && !drag && !this.aimTouch && this.aimLast?.pointerType !== 'touch') this.aimLast = null;
+      if (this.aim && this.aimHover && !this.aimHover.pinned && !drag && !this.aimTouch) {
+        this.aimHover = null;
+        this.#syncAim();
+        this.onAim?.({ at: null });
+      }
       this.requestRender();
+    });
+    // Alt pressed or let go places the cut being placed or dragged freely, or snaps it again, where the pointer is
+    const alt = (e) => {
+      if (e.key !== 'Alt' || !this.aimLast) return;
+      const dragging = drag?.cutId && drag.active;
+      if (!dragging && !(this.aim && this.aimHover && !this.aimHover.pinned)) return;
+      e.preventDefault(); // and the browser's menu bar stays shut
+      const at = { ...this.aimLast, altKey: e.type === 'keydown' };
+      if (dragging) this.#dragCut(drag, at);
+      else this.#aimMove(at);
+    };
+    window.addEventListener('keydown', alt);
+    window.addEventListener('keyup', alt);
+  }
+
+  /** A move while picking, once per frame: the section of a dense model is worked out at most that often. */
+  #aimFrame(e, options = {}) {
+    this.aimNext = { e, options };
+    if (this.hoverQueued) return;
+    this.hoverQueued = true;
+    requestAnimationFrame(() => {
+      this.hoverQueued = false;
+      const next = this.aimNext;
+      this.aimNext = null;
+      if (next && this.aim) this.#aimMove(next.e, next.options);
     });
   }
 
   #hover(e) {
+    if (this.aim) {
+      if (e.pointerType === 'touch') return;
+      // over the model the plane follows the pointer (the latest move, once a frame); a press turns the view, and the
+      // plane follows the pointer as it turns (#aimAgain)
+      if (!e.buttons) this.#aimFrame(e);
+      else this.aimLast = { clientX: e.clientX, clientY: e.clientY, shiftKey: e.shiftKey, altKey: e.altKey, pointerType: e.pointerType };
+      return;
+    }
     const model = this.hoverEnabled && !!this.baseMesh;
     if ((!model && !this.cuts.size) || e.buttons || this.hoverQueued) return;
     this.hoverQueued = true;
@@ -1471,6 +1948,7 @@ export class Viewer {
     this.camera.updateProjectionMatrix();
     for (const c of this.cuts.values()) c.badge.scale.setScalar(this.#spriteScale(c.badge.userData.px));
     for (const l of this.pieceLabels) l.sprite.scale.setScalar(this.#spriteScale(l.sprite.userData.px));
+    this.aimParts.dot.scale.setScalar(this.#spriteScale(this.aimParts.dot.userData.px));
     this.requestRender();
   }
 }

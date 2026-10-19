@@ -275,6 +275,36 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
     },
 
     /**
+     * A cut that comes apart tried at one place while it is being placed
+     * (`{ axis, at, hold, printing, split }`, `split.plan` mode 'probe'): the
+     * face there, the lip it would get and what comes off. On a channel of its
+     * own, so a newer probe replaces one still waiting (which resolves to
+     * undefined) and never a measure, a plan or the spots.
+     */
+    probeCut(items, baseVersion, options = {}) {
+      return request('split.probe', 'split.plan', { items, baseVersion, ...options, mode: 'probe' });
+    },
+
+    /**
+     * The seams along an axis (`{ axis }`, mode 'targets'), for snapping a
+     * cut being placed and the ticks beside it: quick once the axis has been
+     * read. On a channel of its own.
+     */
+    cutTargets(items, baseVersion, options = {}) {
+      return request('split.targets', 'split.plan', { items, baseVersion, ...options, mode: 'targets' });
+    },
+
+    /**
+     * The best places along an axis for a cut that comes apart (`{ axis,
+     * hold, printing, split }`, mode 'spots'), best first. Seconds on a dense
+     * model, so on a channel of its own: a newer request replaces one still
+     * waiting, and no probe replaces it.
+     */
+    cutSpots(items, baseVersion, options = {}) {
+      return request('split.spots', 'split.plan', { items, baseVersion, ...options, mode: 'spots' });
+    },
+
+    /**
      * The fit test for a split (`{ printing, split, bed, name }`): made from
      * the pin or peg size and joints the split really uses, so it needs the model,
      * with a box and its lid when a cut comes apart (`apart` in the reply, its hold).

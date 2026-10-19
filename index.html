@@ -423,9 +423,18 @@
           <div class="row">
             <button type="button" id="splitFitBtn" class="btn accent" title="Cut into the fewest pieces that fit your printer, away from letters and thin spots">Fit to my printer</button>
             <button type="button" id="addCutBtn" class="btn" title="Add a cut across the middle of the longest piece">+ Cut</button>
+            <button type="button" id="addApartBtn" class="btn" aria-pressed="false" title="Click the model where it should come apart">+ Removable part</button>
             <button type="button" id="splitClearBtn" class="btn small ghost" hidden>Remove split</button>
           </div>
           <ul class="plan" id="cutList" aria-label="Cuts"></ul>
+          <div class="spots" id="spotsRow" hidden>
+            <div class="row spread">
+              <span class="hint">Where should it come apart?</span>
+              <button type="button" id="suggestSpotsBtn" class="btn small" title="The best places for a cut that comes apart: where a full lip with clips fits, by a ledge or a change of shape, with a sensible part coming off">Suggest spots</button>
+            </div>
+            <p class="hint spots-note" id="spotsNote" aria-live="polite" hidden></p>
+            <ul class="spot-list" id="spotList" aria-label="Good spots for a cut that comes apart"></ul>
+          </div>
           <div class="split-settings" id="splitSettings" hidden>
             <span class="label">Joints</span>
             <fieldset class="seg wide joints" aria-label="Joints">

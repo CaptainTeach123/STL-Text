@@ -165,3 +165,52 @@ export function overhangs(solid, z0, z1, step = 0.2, tol = 0.02) {
   below.delete();
   return out;
 }
+
+/**
+ * A box with a lid that overhangs it: a 100 × 100 box with 4 mm walls and floor, up to z 50.5, and a lid 102 × 102 from
+ * z 50 to 60, closed 4 mm thick at the top (the hollow runs up to 56). Its seam, where the outline widens, is z 50.
+ */
+export function lidBoxSolid() {
+  const parts = [box([-50, -50, 0], [50, 50, 50.5]), box([-51, -51, 50], [51, 51, 60])];
+  const hollow = box([-46, -46, 4], [46, 46, 56]);
+  try {
+    const outside = parts[0].add(parts[1]);
+    try {
+      return outside.subtract(hollow);
+    } finally {
+      outside.delete();
+    }
+  } finally {
+    [...parts, hollow].forEach((m) => m.delete());
+  }
+}
+
+/**
+ * A tower whose middle is a loggia of four hollow corner posts: a 120 mm square with 4 mm walls and floor up to z 100,
+ * four posts 56 mm square from z 99 to 181 (4 mm walls, 6 mm from z 140), a band like the tower from z 180 to 230 and a
+ * hollow pyramid roof (128 mm at its eaves on z 230, 4 mm thick, apex at 290). A cut through the loggia runs through
+ * four separate posts.
+ */
+export function loggiaSolid() {
+  const { Manifold } = manifold();
+  const temps = [];
+  const t = (m) => {
+    temps.push(m);
+    return m;
+  };
+  try {
+    const ring = (h, z0, z1) => t(t(box([-h, -h, z0], [h, h, z1])).subtract(t(box([-h + 4, -h + 4, z0 - 1], [h - 4, h - 4, z1 + 1]))));
+    const parts = [t(box([-60, -60, 0], [60, 60, 4])), ring(60, 2, 100), ring(60, 180, 230)];
+    for (const x0 of [-60, 4]) {
+      for (const y0 of [-60, 4]) {
+        const post = (z0, z1, w) => t(t(box([x0, y0, z0], [x0 + 56, y0 + 56, z1])).subtract(t(box([x0 + w, y0 + w, z0 - 1], [x0 + 56 - w, y0 + 56 - w, z1 + 1]))));
+        parts.push(post(99, 141, 4), post(140, 181, 6));
+      }
+    }
+    const pyramid = (half, z0, h) => t(Manifold.hull([[-half, -half, z0], [half, -half, z0], [half, half, z0], [-half, half, z0], [0, 0, z0 + h]]));
+    parts.push(t(pyramid(64, 230, 60).subtract(pyramid(60, 226, 60))));
+    return Manifold.union(parts);
+  } finally {
+    for (const m of temps) m.delete();
+  }
+}

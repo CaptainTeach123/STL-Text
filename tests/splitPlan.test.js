@@ -11,7 +11,8 @@ import {
   sizesFor, sizesForRoom, soupCells, splitActive, splitNote, teardropApex, usableBed, yawMat4, zipFileName, triangleInBox, baseAxis,
   outlineColumns, pieceHolding, textNotes, AUTO_PEGS, SMALLEST_PEG, layPegged, pegAllowance, pegMales, pegSides, pegSizeOf, pegSizesFor,
   pegSizesForRoom, statsWithPegs, uprightPegNotes, APART_COLOR, APART_HOLDS, CLIP, LIP, LIP_ALLOWANCE, apartMales, catchSizes,
-  clipHold, clipPush, clipShape, layGrown, lipReach, lipSides, lipSizesFor, statsWithLip,
+  clipHold, clipPush, clipShape, layGrown, lipReach, lipSides, lipSizesFor, statsWithLip, SPOT, comesOffOf, endBeds, endsAsWell, keepsTo, lipMale,
+  locateBend, locateSeam, pickSpots, profileSeams, seamKind, seamWords, snapTarget, spotScore, spotSide, spotStart, spotWhy,
 } from '../src/split.js';
 
 const U = [210, 210, 249]; // the default printer's usable bed
@@ -2540,5 +2541,218 @@ describe('cuts that come apart', () => {
       expect(lines.filter((l) => /comes off at cut A/.test(l))).toEqual([expect.stringMatching(/^ {2}piece 3 of 3/)]);
       expect(lines).not.toContain('PUT TOGETHER – nothing is glued');
     });
+  });
+});
+
+describe('placing a cut that comes apart', () => {
+  // a profile of slices every millimetre: the outline steady, then a ledge, a roof's steady slope, and openings that end
+  const profile = (shifts, islands = shifts.map(() => 1), holes = shifts.map(() => 1)) =>
+    shifts.map((shift, i) => ({ t: i, area: 100, islands: islands[i], holes: holes[i], shift }));
+
+  it('finds seams where the outline moves at once or its islands change, not along a slope', () => {
+    const shifts = [0, 0, 0, 4.4, 1.3, 1.3, 1.3, 1.3, 0, 0, 0, 0];
+    const islands = [1, 1, 1, 1, 1, 1, 1, 1, 1, 8, 8, 8];
+    // the slope itself is none, though where it ends in straight sides is a bend
+    expect(profileSeams(profile(shifts, islands))).toEqual([{ lo: 3, hi: 4, by: 'shift' }, { lo: 8, hi: 9, by: 'count' }, { lo: 7, hi: 9, by: 'bend', straight: 1 }]);
+    // a step hardly bigger than the slope beside it, or under half a millimetre, is none; a step at a slope's foot is
+    const steps = (p) => profileSeams(p).filter((s) => s.by !== 'bend');
+    expect(steps(profile([0, 1.3, 1.3, 1.5, 1.3, 0]))).toEqual([]);
+    expect(profileSeams(profile([0, 0, 0.4, 0, 0]))).toEqual([]);
+    expect(profileSeams(profile([0, 0, 2.05, 1.5, 1.5, 1.5]))).toEqual([{ lo: 2, hi: 3, by: 'shift' }]);
+    // holes that start (a floor giving way to walls) are a seam too
+    expect(profileSeams(profile([0, 0, 0, 0], [1, 1, 1, 1], [0, 0, 1, 1]))).toEqual([{ lo: 1, hi: 2, by: 'count' }]);
+    expect(SPOT).toMatchObject({ sharp: 0.5, look: 20, apart: 8, most: 5, snap: 3 });
+  });
+
+  it('finds a groove holding one sample: in and out of it the outline moves alike', () => {
+    // a 1 mm groove round a lid with the sample at 3 in it: neither move is bigger than the other
+    expect(profileSeams(profile([0, 0, 0.52, 0.52, 0, 0]))).toEqual([{ lo: 2, hi: 3, by: 'shift' }, { lo: 3, hi: 4, by: 'shift' }]);
+    // the samples round it may creep a little, not as much
+    expect(profileSeams(profile([0.3, 0.3, 0.52, 0.52, 0.3, 0.3])).filter((s) => s.by === 'shift')).toHaveLength(2);
+    expect(profileSeams(profile([0.45, 0.45, 0.52, 0.52, 0.45, 0.45])).filter((s) => s.by === 'shift')).toEqual([]);
+    // three moves in a row are a slope's (a chamfer): no step, only the bends where it starts and ends
+    expect(profileSeams(profile([0, 0, 0.6, 0.6, 0.6, 0, 0]))).toEqual([{ lo: 1, hi: 3, by: 'bend', straight: -1 }, { lo: 4, hi: 6, by: 'bend', straight: 1 }]);
+  });
+
+  it('finds where straight sides bend into a slope, a roof flush with its walls, and narrows the bend down; a dome is none', () => {
+    // straight sides, the bend inside the sample interval from 3 to 4, then a slope moving 0.8 mm per mm
+    expect(profileSeams(profile([0, 0, 0, 0.5, 0.8, 0.8, 0.8]))).toEqual([{ lo: 2, hi: 4, by: 'bend', straight: -1 }]);
+    // and a slope that turns gently, a little more each millimetre, has no bend
+    expect(profileSeams(profile([0, 0.03, 0.07, 0.12, 0.17, 0.22, 0.27, 0.33]))).toEqual([]);
+    // narrowed down: the outline straight up to 200.37, then moving in 0.8 mm per mm
+    const k = 200.37;
+    const moved = (inset) => (a, b) => Math.abs(inset(b) - inset(a));
+    const roof = (t) => (t > k ? 0.8 * (t - k) : 0);
+    const found = locateBend(199, 201.6, { shift: moved(roof) });
+    expect(found.at).toBeGreaterThan(k);
+    expect(found.at).toBeLessThan(k + 0.03); // the outline has moved no more than the slices' noise there
+    expect(found.shift).toBeCloseTo(2.4, 6);
+    // a slope ending in straight sides, the other way up
+    const shoulder = (t) => (t < k ? 0.8 * (k - t) : 0);
+    expect(locateBend(199, 201.6, { shift: moved(shoulder), straight: 1 }).at).toBeCloseTo(k, 1);
+    // a roof whose inside steps in a little at the bend still bends there: its slope is read a hair away from it
+    expect(locateBend(199, 201.6, { shift: moved((t) => (t > k ? 0.6 + 0.8 * (t - k) : 0)) }).at).toBeCloseTo(k, 2);
+    // a dome rising from straight sides turns gradually: no bend
+    const dome = (t) => (t > 156 ? 54 - Math.sqrt(54 * 54 - (t - 156) ** 2) : 0);
+    expect(locateBend(155, 158, { shift: moved(dome) })).toBeNull();
+    expect(SPOT).toMatchObject({ steady: 0.1, bend: 0.25 });
+  });
+
+  it('narrows a seam down to a step that stays as big, and drops a slope or a touch', () => {
+    const at = 200.1234;
+    // a 3 mm step at 200.1234 on a slope moving 0.9 mm per mm
+    const step = (a, b) => (a < at && b > at ? 3 : 0) + 0.9 * Math.abs(b - a);
+    const found = locateSeam(199.62, 201.08, { shift: step });
+    expect(found.hi - found.lo).toBeLessThanOrEqual(SPOT.tolerance);
+    expect(found.lo).toBeLessThan(at);
+    expect(found.hi).toBeGreaterThan(at);
+    expect(found.shift).toBeCloseTo(3, 2);
+    expect(locateSeam(199.62, 201.08, { shift: (a, b) => 0.9 * Math.abs(b - a) })).toBeNull();
+    // windows that end at 160: eight islands below, one ring above, the outline moving 1.5 mm there
+    const count = (t) => (t < 160 ? '8|0' : '1|1');
+    const ends = locateSeam(159.2, 160.7, { by: 'count', count, shift: (a, b) => (a < 160 && b >= 160 ? 1.5 : 0) });
+    expect(ends.lo).toBeLessThan(160);
+    expect(ends.hi).toBeGreaterThanOrEqual(160);
+    expect(ends.hi - ends.lo).toBeLessThanOrEqual(SPOT.tolerance);
+    // two islands that only touch: the count changes, the outline hardly moves; joined at once by a strip, it is a seam
+    const touching = { by: 'count', count: (t) => (t < 50 ? '2|0' : '1|0') };
+    expect(locateSeam(49, 51, { ...touching, shift: (a, b) => 0.5 * Math.abs(b - a) })).toBeNull();
+    expect(locateSeam(49, 51, { ...touching, shift: (a, b) => (a < 50 && b >= 50 ? 0.08 : 0) }).shift).toBeCloseTo(0.08, 9);
+    expect(SPOT).toMatchObject({ least: 0.25, touch: 0.01 });
+  });
+
+  it('tells what a seam is from the slices either side, and says why a spot is good in plain words', () => {
+    const side = (islands, holes) => ({ islands, holes });
+    expect(seamKind({ below: side(1, 1), above: side(8, 0) })).toBe('opens');
+    // windows ending: the islands are told before the hole the ring above has
+    expect(seamKind({ below: side(8, 0), above: side(1, 1) })).toBe('closes');
+    expect(seamKind({ below: side(1, 0), above: side(1, 1) })).toBe('walls');
+    expect(seamKind({ below: side(1, 1), above: side(1, 0) })).toBe('top');
+    expect(seamKind({ below: side(1, 1), above: side(1, 1), gained: 2100, lost: 1400 })).toBe('widens');
+    expect(seamKind({ below: side(1, 1), above: side(1, 1), gained: 10, lost: 900 })).toBe('narrows');
+    // the outline seen from outside says it: the walls thickening inside, the outside the same, is no ledge
+    const still = { shift: 0, gained: 0, lost: 0 };
+    expect(seamKind({ below: side(4, 4), above: side(4, 4), gained: 1472, lost: 0, outer: still })).toBe('thickens');
+    expect(seamKind({ below: side(4, 4), above: side(4, 4), gained: 0, lost: 1472, outer: still })).toBe('thins');
+    // a tube stepping out 1 mm while its walls thin from 4 to 1.5 mm: more is lost than gained, yet the outside widens
+    expect(seamKind({ below: side(1, 1), above: side(1, 1), gained: 320, lost: 790, outer: { shift: 1, gained: 320, lost: 0 } })).toBe('widens');
+    expect(spotWhy('widens', -1, 2)).toBe('under a ledge where the shape widens');
+    expect(spotWhy('narrows', 1, 2)).toBe('at a ledge where the shape narrows');
+    expect(spotWhy('narrows', -1, 2, { cap: true })).toBe('under a cap');
+    expect(spotWhy('closes', 1, 2)).toBe('above the openings');
+    expect(spotWhy('opens', -1, 2)).toBe('below the openings');
+    expect(spotWhy('walls', 1, 2)).toBe('where the walls start');
+    expect(spotWhy('widens', -1, 0)).toBe('beside a ledge where the shape widens');
+    expect(spotWhy('narrows', -1, 1, { cap: true })).toBe('at a ledge where the shape narrows');
+    expect(spotWhy('narrows', 1, 2, { cap: true })).toBe('at the foot of a cap');
+    expect(spotWhy('thickens', -1, 2)).toBe('below where the walls thicken');
+    expect(spotWhy('slopes', -1, 2)).toBe('below where the sides start to slope');
+    expect(spotWhy('straightens', 1, 2)).toBe('above where the sides straighten');
+    expect([spotWhy('groove', -1, 2), spotWhy('groove', 1, 2), spotWhy('groove', 1, 0)]).toEqual(['under a groove', 'above a groove', 'beside a groove']);
+    // from the shape alone: never what the part might be
+    for (const kind of ['opens', 'closes', 'walls', 'top', 'widens', 'narrows', 'thickens', 'thins', 'slopes', 'straightens', 'groove']) {
+      for (const [s, a] of [[-1, 2], [1, 2], [1, 0]]) expect(spotWhy(kind, s, a)).not.toMatch(/roof|lid|handle|body|base|tower|lantern/i);
+    }
+    expect([seamWords('widens'), seamWords('narrows'), seamWords('closes'), seamWords('opens'), seamWords('opens', 0), seamWords('walls')]).toEqual([
+      'the ledge', 'the ledge', 'the top of the openings', 'the bottom of the openings', 'the edge of the openings', 'where the walls start',
+    ]);
+    expect([seamWords('thickens'), seamWords('thins'), seamWords('slopes'), seamWords('straightens')]).toEqual([
+      'where the walls thicken', 'where the walls thin', 'where the sides start to slope', 'where the sides straighten',
+    ]);
+  });
+
+  it('starts beside a seam on the 0.5 mm steps, never in its face, on the side that keeps its shape whole, and keeps to it', () => {
+    expect([spotStart(200, -1), spotStart(200, 1), spotStart(123.457, -1), spotStart(123.457, 1), spotStart(160.2, -1), spotStart(160.2, 1)])
+      .toEqual([199.5, 200.5, 123, 124, 159.5, 160.5]);
+    // under a ledge the shape widens past and over one it narrows past (a band of gargoyles stays whole either way),
+    // before openings and after them, past a floor and before a top closes over, on the straight side of a bend
+    const sides = ['widens', 'narrows', 'opens', 'closes', 'walls', 'top', 'thickens', 'thins', 'slopes', 'straightens'].map(spotSide);
+    expect(sides).toEqual([-1, 1, -1, 1, 1, -1, -1, 1, -1, 1]);
+    // the Gothic lantern's gargoyles from 150 to 162 under its eaves at 170: a move from the eaves down to 160.5 would
+    // cut through them, one to 165 keeps to the eaves
+    const seams = [150, 162, 170];
+    expect(keepsTo(seams, 170, -1, 160.5)).toBe(false);
+    expect(keepsTo(seams, 170, -1, 165)).toBe(true);
+    expect(keepsTo(seams, 162, 1, 162.5)).toBe(true);
+    expect(keepsTo(seams, 150, -1, 140)).toBe(true);
+    expect(keepsTo([10, 20], 10, 1, 19.9)).toBe(false); // in another seam's face
+  });
+
+  it('snaps to the nearest target within 3 mm, or the caller\'s tolerance when larger, a spot first', () => {
+    const targets = [{ at: 190.5, kind: 'spot' }, { at: 200, kind: 'seam' }, { at: 160, kind: 'seam' }];
+    expect(snapTarget(targets, 192)).toEqual({ at: 190.5, kind: 'spot' });
+    expect(snapTarget(targets, 196)).toBeNull();
+    expect(snapTarget(targets, 196, 4.5)).toEqual({ at: 200, kind: 'seam' });
+    expect(snapTarget(targets, 196, 'x')).toBeNull();
+    expect(snapTarget([{ at: 10, kind: 'seam' }, { at: 12, kind: 'spot' }, { at: 12, kind: 'lip' }], 11)).toEqual({ at: 12, kind: 'spot' });
+    expect(snapTarget([{ at: 12, kind: 'lip' }, { at: 12, kind: 'seam' }], 11)).toEqual({ at: 12, kind: 'lip' });
+    expect(snapTarget([], 5)).toBeNull();
+  });
+
+  it('says what comes off: the top along Z, else the smaller part, its length and its share', () => {
+    // a prism 100 long with a 100 mm² face
+    const prism = Array.from({ length: 99 }, (_, i) => ({ t: i + 1, area: 100 }));
+    expect(comesOffOf(prism, { lo: 0, hi: 100, axis: 2, at: 70, area: 100 })).toEqual({ side: 1, length: 30, fraction: 0.3 });
+    expect(comesOffOf(prism, { lo: 0, hi: 100, axis: 2, at: 20, area: 100 })).toEqual({ side: 1, length: 80, fraction: 0.8 });
+    // across, a lid lying on its side comes off as it does standing: whichever piece carries the lip
+    expect(comesOffOf(prism, { lo: 0, hi: 100, axis: 0, at: 70, area: 100 })).toEqual({ side: 1, length: 30, fraction: 0.3 });
+    expect(comesOffOf(prism, { lo: 0, hi: 100, axis: 0, at: 30, area: 100 })).toEqual({ side: -1, length: 30, fraction: 0.3 });
+    expect(comesOffOf(prism, { lo: 0, hi: 100, axis: 1, at: 20, area: 100 })).toEqual({ side: -1, length: 20, fraction: 0.2 });
+    // the share is the volume's, not the length's: a top half as wide is a smaller share
+    const stepped = Array.from({ length: 99 }, (_, i) => ({ t: i + 1, area: i + 1 < 50 ? 100 : 50 }));
+    expect(comesOffOf(stepped, { lo: 0, hi: 100, axis: 2, at: 50, area: 50 }).fraction).toBeCloseTo(1 / 3, 2);
+  });
+
+  it('scores a full lip by its seam, what comes off, its islands and the letters it cuts, and keeps the best 8 mm apart', () => {
+    // the lantern's spot under its roof, and one just over its windows
+    const roof = spotScore({ clips: 4, shift: 3.92, distance: 9.5, fraction: 0.28, islands: 1 });
+    const windows = spotScore({ clips: 4, shift: 1.54, distance: 0.5, fraction: 0.45, islands: 1 });
+    expect(roof).toBeCloseTo(3 + 1 + 0.5 * (1 - 9.5 / 20) + 1, 9);
+    expect(windows).toBeLessThan(roof);
+    expect(spotScore({ clips: 0, shift: 3.92, distance: 9.5, fraction: 0.28 })).toBeCloseTo(roof - 1, 9);
+    // through fretwork or posts, cutting letters, a sliver or most of the model: worse
+    expect(spotScore({ clips: 4, shift: 3.92, distance: 9.5, fraction: 0.28, islands: 8 })).toBeCloseTo(roof - 3.5, 9);
+    expect(spotScore({ clips: 4, shift: 3.92, distance: 9.5, fraction: 0.28, crosses: 1 })).toBeCloseTo(roof - 2, 9);
+    expect(spotScore({ clips: 4, shift: 3.92, distance: 9.5, fraction: 0.01 })).toBeCloseTo(roof - 1, 9);
+    expect(spotScore({ clips: 4, shift: 3.92, distance: 9.5, fraction: 0.95 })).toBeLessThan(roof - 2.5);
+    const spots = pickSpots([{ at: 160.5, score: 4.5 }, { at: 190.5, score: 5.3 }, { at: 185, score: 5.1 }, { at: 30.5, score: 3.1 }, { at: 4.5, score: 2.5 }, { at: 60, score: 2 }, { at: 100, score: 1 }, { at: 120, score: 0.5 }]);
+    expect(spots.map((s) => s.at)).toEqual([190.5, 160.5, 30.5, 4.5, 60]);
+    expect(pickSpots([{ at: 1, score: 1 }, { at: 9, score: 1 }, { at: 16.99, score: 1 }]).map((s) => s.at)).toEqual([1, 9]);
+    // a seam only the inside shows (where the walls close over within a box) hides the cut nowhere: no credit for it
+    expect(spotScore({ clips: 4, shift: 0, distance: 0.5, fraction: 0.25 })).toBe(4);
+    expect(spotScore({ clips: 4, shift: 0.25, distance: 0, fraction: 0.25 })).toBeCloseTo(4 + 0.25 / 3 + 0.25, 9);
+    // a spot whose flaws outweigh its lip is no suggestion, however short the list: a cut through sixteen posts
+    expect(pickSpots([{ at: 174.5, score: 5.488 }, { at: 110.5, score: -4.456 }, { at: 60, score: 0 }]).map((s) => s.at)).toEqual([174.5]);
+    expect(SPOT.floor).toBe(0);
+  });
+
+  it('gives the lip to the piece that prints as well with it, else names the one that would given room', () => {
+    const full = { H: 6, clips: 4, area: 590 };
+    // the lantern under its eaves: its top would carry it on its handle, its body has no room here
+    expect(lipMale([null, full], [true, false])).toEqual({ male: 1, alt: 0 });
+    expect(lipMale([full, full], [true, false])).toEqual({ male: 0, alt: null });
+    // a box with an 8 mm lid: both stand on their ends, and only the box has room for a groove with clips
+    expect(lipMale([{ H: 4.5, clips: 0, area: 590 }, full], [true, true])).toEqual({ male: 1, alt: null });
+    expect(lipMale([full, full], [true, true])).toEqual({ male: 0, alt: null });
+    expect(lipMale([null, null], [true, true])).toBeNull();
+    expect(lipMale([full, null], [false, false])).toEqual({ male: 0, alt: null });
+    // a piece prints as well with the lip when the model ends flat there, on at least half the face's area
+    expect(endsAsWell([10000, 0], 1728)).toEqual([true, false]);
+    expect(endsAsWell([800, 20], 1728)).toEqual([false, false]);
+    expect(endsAsWell([20, 30], 10)).toEqual([false, true]);
+  });
+
+  it('reads the flat area a model ends in on each side of each axis', () => {
+    // a box 10 × 20 × 30 as a mesh of 12 triangles, and a pyramid on a 10 × 10 base
+    const mesh = (verts, tris) => ({ vertProperties: Float32Array.from(verts.flat()), numProp: 3, triVerts: Uint32Array.from(tris.flat()) });
+    const [w, d, h] = [10, 20, 30];
+    const corners = [[0, 0, 0], [w, 0, 0], [w, d, 0], [0, d, 0], [0, 0, h], [w, 0, h], [w, d, h], [0, d, h]];
+    const faces = [[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5], [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7]];
+    const beds = endBeds(mesh(corners, faces));
+    [[600, 600], [300, 300], [200, 200]].forEach((want, a) => want.forEach((v, k) => expect(beds[a][k]).toBeCloseTo(v, 6)));
+    const pyramid = endBeds(mesh([[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0], [5, 5, 12]], [[0, 2, 1], [0, 3, 2], [0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]]));
+    expect(pyramid[2][0]).toBeCloseTo(100, 6);
+    expect(pyramid[2][1]).toBe(0);
+    expect(pyramid[0]).toEqual([0, 0]);
   });
 });

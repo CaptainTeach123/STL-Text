@@ -12,6 +12,7 @@
   --err: #d6294b;
   --cut: #8b5cf6; /* the violet of the cut planes in the view */
   --apart: #0d9488; /* the teal of a cut that comes apart (split.js APART_COLOR) */
+  --amber: #f59e0b; /* a place where only a shorter or clipless lip fits (viewer.js AIM_COLORS) */
   --stage-top: #eef2fa;
   --stage-bottom: #cfd8e8;
   --radius: 10px;
@@ -288,6 +289,11 @@ input[type='range'] {
   opacity: 0.45;
   cursor: not-allowed;
 }
+/* busy, though still focusable: a press again waits for what it started */
+.btn[aria-disabled='true'] {
+  opacity: 0.45;
+  cursor: progress;
+}
 .btn.small {
   padding: 4px 10px;
   font-size: 12.5px;
@@ -335,7 +341,9 @@ input[type='range'] {
 
 .status {
   margin: 0;
+  /* a line at least, and never squeezed under its text in the panel's column (the placing hint runs to three) */
   min-height: 1.4em;
+  flex-shrink: 0;
   font-size: 12.5px;
   color: var(--muted);
   white-space: pre-line;
@@ -909,7 +917,7 @@ ul.plan li select {
 
 /* one row per cut: its letter, the axis it is across, where it is, remove; what it cuts on a line below */
 #cutList li {
-  grid-template-columns: auto auto 1fr auto;
+  grid-template-columns: auto auto 1fr auto auto;
   cursor: pointer;
 }
 #cutList li.selected {
@@ -929,9 +937,18 @@ ul.plan li select {
   max-width: 96px;
   padding: 3px 6px;
 }
-#cutList .cut-remove {
+#cutList .cut-remove,
+#cutList .cut-place {
   width: 28px;
   padding: 2px 0;
+}
+/* "+ Removable part", or a row's crosshair, while a place for the cut is picked on the model: pressed, in the teal of a
+   cut that comes apart */
+#addApartBtn[aria-pressed='true'],
+#cutList .cut-place[aria-pressed='true'] {
+  background: var(--apart);
+  border-color: var(--apart);
+  color: #fff;
 }
 #cutList li .meta {
   grid-column: 2 / -1;
@@ -970,6 +987,51 @@ ul.plan li select {
   background: color-mix(in srgb, var(--apart) 12%, var(--panel));
 }
 
+/* the spots suggested for a cut that comes apart: a button each, best first */
+.spots {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0.5rem 0;
+}
+.spots-note {
+  margin: 0;
+}
+.spots-note.busy {
+  animation: deriving-pulse 1.2s ease-in-out infinite;
+}
+.spot-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.spot-list:empty {
+  display: none;
+}
+.spot-list .spot {
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  font-size: 0.82rem;
+  line-height: 1.35;
+  padding: 6px 9px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--apart) 35%, var(--border));
+  border-left: 3px solid var(--apart);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+}
+.spot-list .spot:hover,
+.spot-list .spot:focus-visible {
+  background: color-mix(in srgb, var(--apart) 10%, var(--panel));
+  border-color: var(--apart);
+  outline: none;
+}
+
 /* one row per piece: its colour in the view, then what it is */
 #pieceList li {
   grid-template-columns: auto 1fr;
@@ -988,10 +1050,13 @@ ul.plan li select {
   font-weight: 600;
 }
 
-/* where a dragged cut is and how long the pieces either side of it are, next to its handle */
+/* where a dragged cut is and how long the pieces either side of it are, next to its handle; where a cut being placed
+   goes and the lip it gets there, next to the pointer. Its border takes the colour of the section in the view */
 .cut-readout {
   position: absolute;
   transform: translate(30px, -50%);
+  width: max-content;
+  max-width: min(460px, calc(100% - 16px));
   padding: 4px 8px;
   border-radius: 8px;
   border: 1px solid var(--cut);
@@ -999,11 +1064,36 @@ ul.plan li select {
   font-size: 12.5px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
-  white-space: nowrap;
   pointer-events: none;
+}
+.cut-readout[data-verdict='full'] {
+  border-color: var(--apart);
+  box-shadow: inset 3px 0 0 var(--apart);
+}
+.cut-readout[data-verdict='short'] {
+  border-color: var(--amber);
+  box-shadow: inset 3px 0 0 var(--amber);
+}
+.cut-readout[data-verdict='none'] {
+  border-color: var(--err);
+  box-shadow: inset 3px 0 0 var(--err);
 }
 .cut-readout .err {
   color: var(--err);
+}
+.cut-readout .snap {
+  color: var(--muted);
+  font-weight: 500;
+}
+/* placed with a touch: its buttons place the cut or stop – and only they, so a pinch or a touch on its words still
+   reaches the view under it */
+.cut-readout.pinned .readout-actions {
+  pointer-events: auto;
+}
+.cut-readout .readout-actions {
+  display: flex;
+  gap: 6px;
+  margin: 6px 0 2px;
 }
 #spreadField input {
   width: 90px;

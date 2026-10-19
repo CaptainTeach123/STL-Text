@@ -3293,6 +3293,452 @@ export function lipSides(laid, cuts, U, orient = 'auto', { flat = null, clearanc
   return out;
 }
 
+// ---------- where a cut that comes apart goes ----------
+
+/**
+ * How the places for a cut that comes apart are found. A seam is where the
+ * outline moves `sharp` mm or more between two samples, `peak` times what it
+ * moves between the samples either side (a slope creeps on steadily), or
+ * where its islands or holes change; narrowed down to `tolerance` mm, it must
+ * still move `least` mm there (a slope's creep has gone by then), or `touch`
+ * mm where islands or holes change (two that only touch move nothing). A
+ * bend is where straight sides – the outline moving less than `steady` mm per
+ * mm – give way to a slope moving `bend` mm per mm or more, or a slope to
+ * straight sides: a roof flush with its walls, a jar's shoulder; where the
+ * outline narrows and widens again within `groove` mm, a groove (round a
+ * lid). A spot is looked for within `look` mm of a seam, on the 0.5 mm steps
+ * the move suggestions take (`step`); spots are `apart` mm apart at least, at
+ * most `most` of them, and each scores more than `floor`. A cut being placed
+ * snaps to a target within `snap` mm, or the caller's tolerance when larger
+ * (a few pixels on screen).
+ */
+export const SPOT = Object.freeze({
+  sharp: 0.5, peak: 1.25, tolerance: 0.002, least: 0.25, touch: 0.01, steady: 0.1, bend: 0.25, groove: 6, look: 20, step: 0.5, apart: 8, most: 5, floor: 0,
+  snap: 3,
+});
+
+/**
+ * Where seams may lie along a profile of slices: between two samples where
+ * the outline moves at once – at least `sharp`, and `peak` times what it
+ * moves between the samples either side, so the steady creep of a roof's slope
+ * is none, though a step at its foot is; or both intervals of a band two
+ * intervals long that moves that much more than the samples round it (a
+ * groove round a lid holding one sample: in and out of it the outline moves
+ * alike) – or where the slice gains or loses islands or holes. Each is then
+ * narrowed down (`locateSeam`), which tells a step from a slope for good.
+ * And where straight sides give way to a slope or a slope to straight sides
+ * (`by` 'bend', `straight` the side that is straight): an interval that moves
+ * between one that hardly does and one that moves as a slope does, a step
+ * apart from the step seams' own intervals; narrowed down by `locateBend`.
+ * @param {{ t: number, islands: number, holes: number, shift: number }[]} profile the samples in order along the
+ *   axis, `shift` how far the outline moves from each to the next (mm: the area the two slices do not share over
+ *   their mean perimeter)
+ * @returns {{ lo: number, hi: number, by: 'count'|'shift'|'bend', straight?: -1|1 }[]} the samples a seam lies
+ *   between, and what showed it
+ */
+export function profileSeams(profile, { sharp = SPOT.sharp, peak = SPOT.peak, steady = SPOT.steady, bend = SPOT.bend } = {}) {
+  const out = [];
+  const n = profile.length - 1; // intervals
+  const shift = (i) => (i >= 0 && i < n ? profile[i].shift : 0);
+  const rate = (i) => shift(i) / Math.max(1e-9, profile[i + 1].t - profile[i].t);
+  const moving = (i) => i >= 0 && i < n && shift(i) >= sharp;
+  // a run of exactly two moving intervals, j and j + 1, that the samples round it hardly move beside
+  const band = (j) => moving(j) && moving(j + 1) && !moving(j - 1) && !moving(j + 2) && peak * Math.max(shift(j - 1), shift(j + 2)) <= Math.min(shift(j), shift(j + 1));
+  const stepped = new Set();
+  for (let i = 0; i < n; i++) {
+    const p = profile[i];
+    const q = profile[i + 1];
+    const around = Math.max(shift(i - 1), shift(i + 1));
+    if (p.islands !== q.islands || p.holes !== q.holes) out.push({ lo: p.t, hi: q.t, by: 'count' });
+    else if (moving(i) && (p.shift >= peak * around || band(i - 1) || band(i))) out.push({ lo: p.t, hi: q.t, by: 'shift' });
+    else continue;
+    stepped.add(i);
+  }
+  for (let j = 1; j + 1 < n; j++) {
+    if (stepped.has(j)) continue; // a step at a slope's foot is a seam already
+    // straight sides, then a slope: the bend in interval j or at its ends, the sample before it on the straight sides
+    if (rate(j - 1) < steady && rate(j) >= steady && rate(j + 1) >= bend) out.push({ lo: profile[j - 1].t, hi: profile[j + 1].t, by: 'bend', straight: -1 });
+    // a slope, then straight sides
+    if (rate(j + 1) < steady && rate(j) >= steady && rate(j - 1) >= bend) out.push({ lo: profile[j].t, hi: profile[j + 2].t, by: 'bend', straight: 1 });
+  }
+  return out;
+}
+
+/**
+ * A bend narrowed down between `lo` and `hi`: where the outline first moves
+ * from the straight end (`straight` −1 the sides are straight towards −axis),
+ * found by halving to within `tolerance` – the outline having moved no more
+ * than `still` mm there, the slices' own noise – and then checked over a
+ * `step` either side, a hair (`gap`) away from it so that a step in the same
+ * place (a roof's inside a little in from the walls' inside) is left out:
+ * the straight side moving under `steady` mm per mm and the slope `bend` or
+ * more. A curve that turns gradually, as a dome does from its rim, is no
+ * bend.
+ * @param {number} lo
+ * @param {number} hi
+ * @param {{ shift: (a: number, b: number) => number, straight?: -1|1 }} how as for `locateSeam`
+ * @returns {{ at: number, shift: number }|null} `shift` how much further the slope moves the outline than straight
+ *   sides would over 3 mm, which `spotScore` reads as a step's
+ */
+export function locateBend(lo, hi, { shift, straight = -1, tolerance = SPOT.tolerance, steady = SPOT.steady, bend = SPOT.bend, step = SPOT.step, still = 0.02, gap = 0.05 }) {
+  const from = straight < 0 ? lo : hi;
+  let a = lo;
+  let b = hi;
+  while (b - a > tolerance) {
+    const m = (a + b) / 2;
+    const flat = (straight < 0 ? shift(from, m) : shift(m, from)) <= still;
+    // still straight at m: the bend is past it, towards the slope
+    if (flat === straight < 0) a = m;
+    else b = m;
+  }
+  const at = (a + b) / 2;
+  const below = shift(at - gap - step, at - gap) / step;
+  const above = shift(at + gap, at + gap + step) / step;
+  const [flat, slope] = straight < 0 ? [below, above] : [above, below];
+  if (!(flat < steady && slope >= bend)) return null;
+  return { at, shift: Math.round(3 * (slope - flat) * 1000) / 1000 };
+}
+
+/**
+ * A seam narrowed down between two heights by halving: into the half the
+ * outline moves more in (`by` 'shift'), or the half its islands or holes
+ * change in ('count'), down to `tolerance`. A step in the outline stays as
+ * big however close the heights come; a slope's creep shrinks with them, and
+ * so does a change of islands where two just touch: what moves across the
+ * last interval must be `least` or more (`SPOT.least`, or `SPOT.touch` where
+ * the islands or holes change), else it is no seam.
+ * @param {number} lo
+ * @param {number} hi
+ * @param {{ shift: (a: number, b: number) => number, count?: (t: number) => string|number, by?: 'shift'|'count',
+ *   tolerance?: number, least?: number }} how `shift` how far the outline moves between two heights (mm), `count` the
+ *   islands and holes at one, compared for equality
+ * @returns {{ lo: number, hi: number, shift: number }|null} the last interval and how far the outline moves across it
+ */
+export function locateSeam(lo, hi, { shift, count = null, by = 'shift', tolerance = SPOT.tolerance, least = by === 'count' ? SPOT.touch : SPOT.least }) {
+  let a = lo;
+  let b = hi;
+  if (by === 'count' && count) {
+    const first = count(a);
+    while (b - a > tolerance) {
+      const m = (a + b) / 2;
+      if (count(m) === first) a = m;
+      else b = m;
+    }
+  } else {
+    while (b - a > tolerance) {
+      const m = (a + b) / 2;
+      if (shift(a, m) >= shift(m, b)) b = m;
+      else a = m;
+    }
+  }
+  const moved = shift(a, b);
+  return moved >= least ? { lo: a, hi: b, shift: moved } : null;
+}
+
+/**
+ * What a seam is, from the slices either side of it (`below` towards −axis):
+ * islands come ('opens': openings or fretwork start past it) or go
+ * ('closes'), holes come ('walls': a solid floor gives way to walls) or go
+ * ('top': the walls close over), or the outline seen from outside – each
+ * island with its holes filled – widens past it ('widens': a roof's eaves, a
+ * lid that overhangs) or narrows ('narrows': a shoulder, a cap), by whether
+ * it gains more than it loses; where only the inside changes, the outline
+ * the same, the walls thicken ('thickens') or thin ('thins').
+ * @param {{ below: { islands: number, holes: number }, above: { islands: number, holes: number }, gained: number,
+ *   lost: number, outer?: { shift: number, gained: number, lost: number } }} sides `gained` the area of the slice above
+ *   that the one below lacks, `lost` the other way (mm²); `outer` the same of the outlines seen from outside, and how far
+ *   they move (mm) – without it the slices' own are read as the outline's
+ * @returns {'opens'|'closes'|'walls'|'top'|'widens'|'narrows'|'thickens'|'thins'}
+ */
+export function seamKind({ below, above, gained = 0, lost = 0, outer = null }) {
+  if (above.islands > below.islands) return 'opens';
+  if (above.islands < below.islands) return 'closes';
+  if (above.holes > below.holes) return below.holes === 0 ? 'walls' : 'opens';
+  if (above.holes < below.holes) return above.holes === 0 ? 'top' : 'closes';
+  if (outer && !(outer.shift >= SPOT.least)) return gained >= lost ? 'thickens' : 'thins';
+  return (outer ? outer.gained >= outer.lost : gained >= lost) ? 'widens' : 'narrows';
+}
+
+/**
+ * The side of a seam a spot is looked for on (−1 towards −axis): the one that
+ * leaves the seam's shape whole with the piece it belongs to, so a cut never
+ * leaves a thin plate of a ledge, a band or a slope on the other piece –
+ * under a ledge the shape widens past (the overhang goes with the piece past
+ * it) and over one it narrows past, before openings start and after they end,
+ * past a floor and before the walls close over, before walls thicken inside
+ * and after they thin, and on the straight side of a bend.
+ * @param {string} kind from `seamKind`, or 'slopes' / 'straightens' for a bend
+ * @returns {-1|1}
+ */
+export const spotSide = (kind) => ({ narrows: 1, closes: 1, walls: 1, thins: 1, straightens: 1 })[kind] ?? -1;
+
+// a spot's why, said from where it is: [below the seam, above it] along Z, and beside it along X or Y
+const SPOT_WHY = Object.freeze({
+  widens: ['under a ledge where the shape widens', 'above a ledge where the shape widens', 'beside a ledge where the shape widens'],
+  narrows: ['at a ledge where the shape narrows', 'at a ledge where the shape narrows', 'at a ledge where the shape narrows'],
+  cap: ['under a cap', 'at the foot of a cap', 'at a ledge where the shape narrows'],
+  opens: ['below the openings', 'where the openings start', 'beside the openings'],
+  closes: ['where the openings end', 'above the openings', 'beside the openings'],
+  walls: ['where the walls start', 'where the walls start', 'where the walls start'],
+  top: ['where the walls close over', 'above where the walls close over', 'beside a closed end'],
+  thickens: ['below where the walls thicken', 'where the walls thicken', 'beside where the walls thicken'],
+  thins: ['where the walls thin', 'above where the walls thin', 'beside where the walls thin'],
+  groove: ['under a groove', 'above a groove', 'beside a groove'],
+  slopes: ['below where the sides start to slope', 'where the sides start to slope', 'beside where the sides start to slope'],
+  straightens: ['where the sides straighten', 'above where the sides straighten', 'beside where the sides straighten'],
+});
+
+/**
+ * Why a spot is a good place, in a few plain words from the shape alone –
+ * never what the part might be: the kind of seam it sits by (`seamKind`), on
+ * which side, along which axis; a seam that narrows to a small part coming
+ * off (`cap`) is a cap.
+ * @param {string} kind from `seamKind`
+ * @param {-1|1} side −1 the spot is below the seam (towards −axis), 1 above it
+ * @param {number} axis 0, 1 or 2
+ */
+export function spotWhy(kind, side, axis = 2, { cap = false } = {}) {
+  const words = SPOT_WHY[kind === 'narrows' && cap ? 'cap' : kind] ?? SPOT_WHY.narrows;
+  return axis === 2 ? words[side < 0 ? 0 : 1] : words[2];
+}
+
+/**
+ * A seam in a few words, for a cut that snaps to it ("snapped to the ledge
+ * at 200 mm"): what changes there, from the shape alone.
+ * @param {string} kind from `seamKind`
+ * @param {number} axis 0, 1 or 2
+ */
+export function seamWords(kind, axis = 2) {
+  const z = axis === 2;
+  if (kind === 'opens') return z ? 'the bottom of the openings' : 'the edge of the openings';
+  if (kind === 'closes') return z ? 'the top of the openings' : 'the edge of the openings';
+  if (kind === 'walls') return 'where the walls start';
+  if (kind === 'top') return 'where the walls close over';
+  if (kind === 'thickens') return 'where the walls thicken';
+  if (kind === 'thins') return 'where the walls thin';
+  if (kind === 'slopes') return 'where the sides start to slope';
+  if (kind === 'straightens') return 'where the sides straighten';
+  return 'the ledge';
+}
+
+/**
+ * The first spot to try beside a seam, on one side of it: the nearest 0.5 mm
+ * step at least a quarter of a step away, so the cut never lies in the seam's
+ * own face.
+ * @param {number} at the seam
+ * @param {-1|1} side
+ */
+export const spotStart = (at, side, step = SPOT.step) => (side < 0
+  ? Math.floor((at - step / 2) / step + 1e-9) * step
+  : Math.ceil((at + step / 2) / step - 1e-9) * step);
+
+/**
+ * Whether a spot at `at` for the seam at `seam` (on its side `side`) keeps
+ * to that seam: no other seam lies between them, nor within `least` mm of
+ * the spot – a move from under a roof's eaves down past a band of gargoyles
+ * would cut through the band instead.
+ * @param {number[]} seams every seam's place along the axis
+ */
+export const keepsTo = (seams, seam, side, at, least = SPOT.least) => seams.every((s) => Math.abs(s - seam) < 1e-9 || (s - seam) * side <= 0 || (s - at) * side >= least);
+
+/**
+ * The target a cut being placed at `at` snaps to: the nearest within
+ * `SPOT.snap` mm, or within the caller's tolerance (mm) when that is larger
+ * – a few pixels on screen, worked out by the caller. Of two as near, a spot
+ * before a full lip's height before a seam.
+ * @param {{ at: number, kind?: 'spot'|'lip'|'seam' }[]} targets
+ * @param {number} at
+ * @param {number} [tolerance]
+ * @returns {object|null} the target, or null when none is that near
+ */
+export function snapTarget(targets, at, tolerance = 0) {
+  const reach = Math.max(SPOT.snap, Number(tolerance) || 0);
+  const order = { spot: 0, lip: 1, seam: 2 };
+  let best = null;
+  let bestD = Infinity;
+  for (const target of targets ?? []) {
+    const d = Math.abs(target.at - at);
+    if (!(d <= reach + 1e-9)) continue;
+    const nearer = d < bestD - 1e-9;
+    const tie = Math.abs(d - bestD) <= 1e-9 && (order[target.kind] ?? 3) < (order[best?.kind] ?? 3);
+    if (nearer || tie) {
+      best = target;
+      bestD = d;
+    }
+  }
+  return best;
+}
+
+/**
+ * What comes off at a cut that comes apart: the top of a Z cut (the notes'
+ * "the top"), else the smaller part – a box's lid comes off it lying on its
+ * side as it does standing up, whichever piece carries the lip. `side` 1 the
+ * piece towards +axis, −1 the other; its length along the axis; and its share
+ * of the model's volume, from the profile's slices (trapezoids between the
+ * samples, the face itself at the cut, the end samples held to the model's
+ * ends).
+ * @param {{ t: number, area: number }[]} profile in order along the axis
+ * @param {{ lo: number, hi: number, axis: number, at: number, area: number }} cut `lo`, `hi` the model's extent along
+ *   the axis, `area` the face's
+ * @returns {{ side: -1|1, length: number, fraction: number }}
+ */
+export function comesOffOf(profile, { lo, hi, axis, at, area }) {
+  const points = [...profile.filter((p) => p.t > lo && p.t < hi).map((p) => [p.t, p.area])];
+  if (points.length) {
+    points.unshift([lo, points[0][1]]);
+    points.push([hi, points[points.length - 1][1]]);
+  }
+  const inside = points.filter(([t]) => Math.abs(t - at) > 1e-9);
+  const all = [...inside, [at, area]].sort((p, q) => p[0] - q[0]);
+  let below = 0;
+  let above = 0;
+  for (let i = 0; i + 1 < all.length; i++) {
+    const [t0, a0] = all[i];
+    const [t1, a1] = all[i + 1];
+    const v = ((a0 + a1) / 2) * (t1 - t0);
+    if (t1 <= at + 1e-9) below += v;
+    else above += v;
+  }
+  const total = below + above;
+  const side = axis === 2 || above <= below ? 1 : -1;
+  const part = side > 0 ? above : below;
+  return {
+    side,
+    length: Math.round((side > 0 ? hi - at : at - lo) * 100) / 100,
+    fraction: total > 0 ? Math.round((part / total) * 1000) / 1000 : 0,
+  };
+}
+
+const clamp01 = (v) => Math.min(1, Math.max(0, v));
+
+/**
+ * How good a spot for a cut that comes apart is, higher better. A full lip
+ * counts most (3 with clips, 2 without), then the seam it hides in – up to
+ * 1 for an outline that moves 3 mm or more there, and up to 0.5 more the
+ * closer the cut is to it, all of it only for a seam that shows on the
+ * outside (where the walls close over inside, the cut runs across plain wall
+ * and hides nowhere) – and a sensible part coming off: a top or a lid of up
+ * to 30 % of the model scores 1, less towards a sliver (nothing under 2 %)
+ * and towards 60 %, and past that the more of the model the worse. Each
+ * island beyond one takes off 0.5 (a cut through fretwork, posts or a
+ * handle's legs), and cutting through letters 2.
+ * @param {{ full?: boolean, clips?: number, shift?: number, distance?: number, fraction?: number, islands?: number,
+ *   crosses?: number }} spot `shift` how far the outline seen from outside moves at its seam (mm), `distance` from it
+ *   (mm), `fraction` the share that comes off, `crosses` how many text items it cuts
+ */
+export function spotScore({ full = true, clips = 0, shift = 0, distance = 0, fraction = 0, islands = 1, crosses = 0 }) {
+  const lip = full ? (clips > 0 ? 3 : 2) : 0;
+  const shows = clamp01(shift / SPOT.sharp);
+  const seam = Math.min(1, Math.max(0, shift) / 3) + 0.5 * clamp01(1 - distance / SPOT.look) * shows;
+  let part;
+  if (fraction < 0.02) part = 0;
+  else if (fraction < 0.1) part = (fraction - 0.02) / 0.08;
+  else if (fraction <= 0.3) part = 1;
+  else if (fraction <= 0.6) part = (0.6 - fraction) / 0.3;
+  else part = -2 * ((fraction - 0.6) / 0.4);
+  return lip + seam + part - 0.5 * Math.max(0, islands - 1) - (crosses > 0 ? 2 : 0);
+}
+
+
+/**
+ * The best spots, best first: by score, each at least `apart` mm from every
+ * one kept before it, at most `most`, and none scoring `floor` or less – a
+ * spot whose flaws outweigh its lip (through fretwork, sixteen posts at
+ * once) is no suggestion, however short the list.
+ * @param {{ at: number, score: number }[]} candidates
+ */
+export function pickSpots(candidates, { apart = SPOT.apart, most = SPOT.most, floor = SPOT.floor } = {}) {
+  const sorted = [...candidates].sort((p, q) => q.score - p.score || p.at - q.at);
+  const kept = [];
+  for (const c of sorted) {
+    if (kept.length >= most) break;
+    if (!(c.score > floor)) continue;
+    if (kept.some((k) => Math.abs(k.at - c.at) < apart - 1e-9)) continue;
+    kept.push(c);
+  }
+  return kept;
+}
+
+/**
+ * Whether each piece either side of a cut would print about as well lying
+ * with a lip standing up out of its cut face as it does anyway, guessed
+ * before the model is cut: only when the model ends on that side in
+ * something flat of 25 mm² or more, and at least half as big as the face it
+ * could lie on instead. A lantern's body stands on its foot; its top would
+ * stand on its handle. `apartMales` judges the pieces themselves.
+ * @param {number[]} beds the flat area the model ends in on each side, [towards −axis, towards +axis] (mm²)
+ * @param {number} face the cut face's area (mm²)
+ * @returns {boolean[]} [the piece below, the one above]
+ */
+export const endsAsWell = (beds, face) => [0, 1].map((k) => (beds[k] ?? 0) >= Math.max(STEADY, 0.5 * face));
+
+/**
+ * The flat area a model ends in at each end of each axis, as `cellSupport`
+ * counts a box's bed: facets facing that way squarely, wholly within 0.1 mm
+ * of the furthest the model goes. One pass over the mesh, for `endsAsWell`.
+ * @param {{ vertProperties: Float32Array|number[], numProp: number, triVerts: Uint32Array|number[] }} mesh
+ * @returns {number[][]} per axis, [towards −axis, towards +axis] (mm²)
+ */
+export function endBeds(mesh) {
+  const { vertProperties: P, numProp, triVerts: T } = mesh;
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i + 2 < P.length; i += numProp) {
+    for (let a = 0; a < 3; a++) {
+      if (P[i + a] < min[a]) min[a] = P[i + a];
+      if (P[i + a] > max[a]) max[a] = P[i + a];
+    }
+  }
+  const beds = [[0, 0], [0, 0], [0, 0]];
+  const n = [0, 0, 0];
+  for (let t = 0; t + 2 < T.length; t += 3) {
+    const a = T[t] * numProp;
+    const b = T[t + 1] * numProp;
+    const c = T[t + 2] * numProp;
+    const ux = P[b] - P[a], uy = P[b + 1] - P[a + 1], uz = P[b + 2] - P[a + 2];
+    const vx = P[c] - P[a], vy = P[c + 1] - P[a + 1], vz = P[c + 2] - P[a + 2];
+    n[0] = uy * vz - uz * vy;
+    n[1] = uz * vx - ux * vz;
+    n[2] = ux * vy - uy * vx;
+    const len = Math.hypot(n[0], n[1], n[2]);
+    if (!(len > 0)) continue;
+    const axis = Math.abs(n[0]) >= Math.abs(n[1]) && Math.abs(n[0]) >= Math.abs(n[2]) ? 0 : Math.abs(n[1]) >= Math.abs(n[2]) ? 1 : 2;
+    if (!(Math.abs(n[axis]) / len > FLAT)) continue;
+    // its corner furthest from the bed it would lie on must be at the model's end
+    const [p0, p1, p2] = [P[a + axis], P[b + axis], P[c + axis]];
+    if (n[axis] < 0 ? Math.max(p0, p1, p2) - min[axis] <= 0.1 : max[axis] - Math.min(p0, p1, p2) <= 0.1) beds[axis][n[axis] < 0 ? 0 : 1] += len / 2;
+  }
+  return beds;
+}
+
+/**
+ * Which piece carries a cut's lip before the model is cut, chosen as
+ * `apartMales` chooses: of the pieces with a lip on offer, one that prints
+ * as well with it (`asWell`, `endsAsWell`), then the better lip (one with
+ * clips, taller, more clips, more tongue), then the one below. When the one
+ * chosen prints worse with it and the other would print as well but has no
+ * room for one, that one is named (`alt`), so the cut can be moved to where
+ * it can carry it.
+ * @param {({ H: number, clips: number, area: number }|null)[]} quality the lip each would carry, [below, above]
+ * @param {boolean[]} [asWell]
+ * @returns {{ male: 0|1, alt: 0|1|null }|null} null when neither has a lip on offer
+ */
+export function lipMale(quality, asWell = [true, true]) {
+  const rank = (q) => (q ? [1, q.clips > 0 ? 1 : 0, q.H, q.clips ?? 0, q.area ?? 0] : [0, 0, 0, 0, 0]);
+  const options = [0, 1].map((k) => ({ k, asWell: Boolean(asWell[k]), quality: quality[k] ?? null }));
+  const better = (x, y) => {
+    if (x.asWell !== y.asWell) return x.asWell ? -1 : 1;
+    const [rx, ry] = [rank(x.quality), rank(y.quality)];
+    for (let i = 0; i < rx.length; i++) if (Math.abs(rx[i] - ry[i]) > 1e-6 * Math.max(1, Math.abs(rx[i]))) return ry[i] - rx[i];
+    return x.k - y.k;
+  };
+  const lipped = options.filter((o) => o.quality?.H > 0).sort(better);
+  if (!lipped.length) return null;
+  const best = lipped[0];
+  const room = !best.asWell ? options.find((o) => !(o.quality?.H > 0) && o.asWell) : null;
+  return { male: best.k, alt: room ? room.k : null };
+}
+
 /**
  * How the pieces print once their built-in pegs and their lips are placed
  * (`layoutSplit`'s `pegs` and `lips`): each piece that carries some is laid

@@ -1,8 +1,8 @@
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
 import {
-  AXES, CLIP, FILAMENT, LIP, PIN_DIAMETERS, TO_PLANE, apartMales, applyMat4, chooseOrientation, clipHold, clipShape, isSymmetric, normaliseSplit, pegMales,
-  pegSizesFor, sizesFor,
+  AXES, CLIP, FILAMENT, LIP, PIN_DIAMETERS, TO_PLANE, apartMales, applyMat4, chooseOrientation, clipHold, clipShape, endBeds, endsAsWell, isSymmetric,
+  normaliseSplit, pegMales, pegSizesFor, sizesFor,
 } from '../src/split.js';
 import {
   bandFor,
@@ -32,6 +32,7 @@ import {
   pinSpares,
   pinsPerSheet,
   planDovetails,
+  probeLip,
   shadowFor,
   socketAt,
   socketSolid,
@@ -2287,5 +2288,54 @@ describe('take-apart lips on dense faces', () => {
     expect(r.layout.lips).toHaveLength(1);
     for (const outline of r.layout.lips[0].T) expect(outline.length).toBeLessThan(300);
     for (const piece of r.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
+  });
+});
+
+describe('take-apart cuts tried before the model is cut', () => {
+  /** A cut tried on a solid as the engine tries it, from the band round it, or (`sliced`) from its slices, kept. */
+  const tryCut = (solid, at, { hold = 'lock', sliced = false, cache = new Map() } = {}) => {
+    const b = solid.boundingBox();
+    const face = own(solid.slice(at));
+    const sliceAt = (t) => {
+      const key = t.toFixed(6);
+      if (!cache.has(key)) cache.set(key, own(own(solid.slice(t)).simplify(0.01)));
+      return cache.get(key);
+    };
+    const asWell = endsAsWell(endBeds(solid.getMesh())[2], face.area());
+    return probeLip(solid, { axis: 2, at }, { hold, bounds: { min: [...b.min], max: [...b.max] }, asWell, ...(sliced ? { sliceAt } : {}) });
+  };
+  /** What a probe says, in the words the layout's lips and notes use. */
+  const said = (r) => ({ lip: r.lip && [r.lip.H, r.lip.clips, r.lip.why], noLip: r.noLip, suggestedAt: r.suggestedAt });
+
+  it('a cut tried on its own gets the lip and the move the layout gives it, from the band or from slices', () => {
+    for (const hold of ['lock', 'snap']) {
+      for (const at of [190, 192, 194, 196, 160, 203, 100]) {
+        const r = apartSplit(own(lanternSolid()), [[2, at]], { hold });
+        const [lip] = r.layout.lips;
+        const short = r.notes.find((n) => n.code === 'APART_NO_CLIPS');
+        const flat = r.notes.find((n) => n.code === 'APART_FLAT');
+        const want = lip
+          ? { lip: [lip.H, lip.clips, short?.why ?? null], noLip: null, suggestedAt: lip.suggestedAt }
+          : { lip: null, noLip: flat.why, suggestedAt: flat.suggestedAt ?? null };
+        const lantern = own(lanternSolid());
+        expect([hold, at, said(tryCut(lantern, at, { hold }))]).toEqual([hold, at, want]);
+        expect([hold, at, said(tryCut(lantern, at, { hold, sliced: true }))]).toEqual([hold, at, want]);
+        if (lip) expect(tryCut(lantern, at, { hold }).male).toBe(lip.male);
+      }
+    }
+  });
+
+  it('read from slices it agrees with the band all the way up the lantern\'s top and the Gothic one\'s', () => {
+    for (const [solid, from, to, step] of [[own(lanternSolid()), 150, 210, 1], [own(gothicSolid()), 140, 210, 2]]) {
+      const cache = new Map();
+      for (let at = from; at <= to; at += step) expect([at, said(tryCut(solid, at, { sliced: true, cache }))]).toEqual([at, said(tryCut(solid, at))]);
+    }
+  });
+
+  it('a dense copy of the lantern gives the same answers from its slices', () => {
+    const dense = own(own(lanternSolid()).refine(16));
+    expect(dense.numTri()).toBeGreaterThan(200_000);
+    const cache = new Map();
+    for (const at of [190, 192, 196, 203]) expect([at, said(tryCut(dense, at, { sliced: true, cache }))]).toEqual([at, said(tryCut(own(lanternSolid()), at))]);
   });
 });

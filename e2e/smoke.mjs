@@ -10,7 +10,7 @@ import { unzipSync, strFromU8 } from 'three/examples/jsm/libs/fflate.module.js';
 import { initManifold, manifold } from '../src/manifold.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold, manifoldToSoup } from '../src/mesh.js';
-import { box as boxAt, lanternSolid, lidBoxSolid, roundLanternSolid } from '../tests/lanternFixture.js';
+import { batLanternSolid, box as boxAt, lanternSolid, lidBoxSolid, roundLanternSolid } from '../tests/lanternFixture.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const out = path.join(root, 'e2e', 'out');
@@ -225,12 +225,20 @@ try {
   check((await page.inputValue('#posX')) === '0' && (await page.inputValue('#posY')) === '0', 'Top button recentres the text');
 
   console.log('\nraised text');
+  const keyed = () => page.evaluate(() => [...document.querySelectorAll('.legend > span')].filter((x) => !x.hidden).map((x) => x.textContent.trim()));
   const base = await (async () => {
     await setText('');
     return download('plaque.stl');
   })();
   check(base.triangles > 100 && base.sizeOk && base.volume > 0, 'plain plaque downloads as a valid watertight STL', `${base.triangles} triangles`);
+  const plainKeys = await keyed();
   await setText('Hello\nWorld');
+  const textKeys = await keyed();
+  check(
+    plainKeys.includes('model') && !plainKeys.includes('raised text') && textKeys.includes('raised text') && !textKeys.includes('cut text'),
+    'the legend keys raised text once there is some, and no cut text where there is none',
+    JSON.stringify({ plainKeys, textKeys }),
+  );
   const embossed = await download('embossed.stl');
   check(embossed.triangles > base.triangles && embossed.sizeOk, 'raised STL has more triangles', `${embossed.triangles}`);
   check(Math.abs(embossed.max[2] - 5.5) < 0.01, 'text rises 1.5 mm above the 4 mm plaque', `max z ${embossed.max[2].toFixed(3)}`);
@@ -882,6 +890,12 @@ try {
     });
     check(labelLines.lines === 1 && labelLines.fits, 'its label fits on one line', JSON.stringify(labelLines));
     check(await page.isChecked('#resultToggle'), 'the pieces are shown');
+    const pieceKeys = await page.evaluate(() => [...document.querySelectorAll('.legend > span')].filter((x) => !x.hidden).map((x) => x.textContent.trim()));
+    check(
+      pieceKeys.includes('pieces') && !pieceKeys.includes('model') && !pieceKeys.includes('raised text'),
+      'in the pieces view the legend keys the pieces, not the model or its text, which are drawn in the pieces\' colours',
+      JSON.stringify(pieceKeys),
+    );
     await page.screenshot({ path: path.join(out, '8-split.png') });
     const { cool, warm } = await pieceHues();
     check(cool > 500 && warm > 500, 'the pieces are drawn in contrasting colours', `${cool} cool / ${warm} warm pixels`);
@@ -1648,12 +1662,14 @@ try {
       );
       const settings = await page.evaluate(() => ({
         hint: document.querySelector('#splitJointsHint').hidden ? null : document.querySelector('#splitJointsHint').textContent,
-        off: ['joint', 'diameter', 'pins', 'labels', 'depth', 'count'].every((k) => [...document.querySelectorAll(`[data-split="${k}"]`)].every((e) => e.disabled)),
-        on: ['clearance', 'orient'].every((k) => !document.querySelector(`[data-split="${k}"]`).disabled) && !document.querySelector('#splitFitTestBtn').disabled,
+        off: ['joint', 'diameter', 'pins', 'labels', 'depth', 'count'].every((k) => [...document.querySelectorAll(`[data-split="${k}"]`)].every((e) => e.disabled && !!e.closest('[hidden]'))),
+        joints: !document.querySelector('#splitJointsLabel').hidden,
+        on: ['clearance', 'orient'].every((k) => !document.querySelector(`[data-split="${k}"]`).disabled && !document.querySelector(`[data-split="${k}"]`).closest('[hidden]')) &&
+          !document.querySelector('#splitFitTestBtn').disabled,
       }));
       check(
-        settings.hint === 'Every cut here comes apart – Joints are for glued cuts.' && settings.off && settings.on,
-        'with every cut coming apart the joint settings are off and say why; the clearance, how pieces lie and the fit test stay on',
+        settings.hint === null && !settings.joints && settings.off && settings.on,
+        'with every cut coming apart the joint settings go – nothing is glued; the clearance, how pieces lie and the fit test stay',
         JSON.stringify(settings),
       );
       // the box clicked keeps the keys for the cut, as its axis does: Ctrl+Z undoes the tick, Ctrl+Y does it again
@@ -1920,8 +1936,8 @@ try {
       await page.waitForFunction(() => /^Nothing to try/.test(document.querySelector('#status').textContent), null, { timeout: 60000 }).catch(() => null);
       await idle();
       check(
-        (await status()) === 'Nothing to try: these cuts get no lip or tabs, so the pieces just rest on each other.' && /· comes apart: no lip$/.test((await apartRow()).meta),
-        'a cut through the windows comes apart with no lip: the fit test has nothing to try, and the row says no lip',
+        (await status()) === 'Nothing to try: these cuts get no lip or tabs, so the pieces just rest on each other.' && /· comes apart: no lip · no lock fits here$/.test((await apartRow()).meta),
+        'a cut through the windows comes apart with no lip: the fit test has nothing to try, and the row says no lip, and no lock',
         `${await status()} | ${(await apartRow()).meta}`,
       );
       // a glued cut and one that comes apart in the same place are one cut, which comes apart: the glued one's row says
@@ -2072,9 +2088,19 @@ try {
       const tubeMeta = await page.locator('#cutList .meta').allInnerTexts();
       check(
         tubeMixed.hint === 'Joints are for the glued cuts; cut B comes apart.' && !tubeMixed.joints && /· comes apart$/.test(tubeMixed.meta[1]) &&
-          /the tab drops into its socket/.test(tubeTest.status) && !/lid/.test(tubeTest.status) && /· dovetails$/.test(tubeMeta[0]) && /· comes apart: no lip$/.test(tubeMeta[1]),
-        'with a glued cut beside it the joints stay on for that one; the fit test is its dovetail alone, and the tube\'s row then says no lip',
+          /the tab drops into its socket/.test(tubeTest.status) && !/lid/.test(tubeTest.status) && /· dovetails$/.test(tubeMeta[0]) && /· comes apart: no lip · no lock fits here$/.test(tubeMeta[1]),
+        'with a glued cut beside it the joints stay on for that one; the fit test is its dovetail alone, and the tube\'s row then says no lip, and no lock',
         `${JSON.stringify(tubeMixed)} | ${tubeTest.status} | ${tubeMeta.join(' / ')}`,
+      );
+      // its Locks, which got no lock, is struck through, and says what would hold the top
+      const struck = await page.evaluate(() => {
+        const label = [...document.querySelectorAll('#cutList li:nth-child(2) .cut-hold label')].find((l) => l.textContent === 'Locks');
+        return { struck: label.classList.contains('struck'), checked: label.querySelector('input').checked, title: label.title, line: getComputedStyle(label.querySelector('span')).textDecorationLine };
+      });
+      check(
+        struck.struck && struck.checked && struck.line === 'line-through' && struck.title === 'No clip or twist-lock fits this cut here – try a removable part (+ Removable part)',
+        "a cut asked to lock that got no lock has its Locks struck through, saying a removable part would hold",
+        JSON.stringify(struck),
       );
       await page.check('#resultToggle');
       await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
@@ -2783,9 +2809,10 @@ try {
     await releaseSpots();
     await settle();
     const listed = await p.evaluate(() => document.activeElement?.id);
-    // the second spot (the first is cut A's): Enter adds cut B there, and the list, laid out again, keeps the focus
-    await p.keyboard.press('Tab');
-    await p.keyboard.press('Tab');
+    // the second spot (the first is cut A's): Enter adds cut B there, and the list, laid out again, keeps the focus. The
+    // parts card's buttons come first (the lantern's base could twist off underneath at a bigger size)
+    const partButtons = await p.locator('#partsCard button').count();
+    for (let k = 0; k < partButtons + 2; k++) await p.keyboard.press('Tab');
     const tabbed = await p.evaluate(() => document.activeElement?.className);
     await p.keyboard.press('Enter');
     await settle();
@@ -2839,6 +2866,7 @@ try {
     await p.click('#suggestSpotsBtn');
     await settle();
     const none = { note: await p.locator('#spotsNote').innerText(), button: await p.locator('#spotsNote button').innerText().catch(() => null) };
+    const solidCard = { shown: !(await p.locator('#partsCard').isHidden()), note: await p.locator('#partsNote').innerText().catch(() => ''), parts: await p.locator('#partList li').count() };
     await p.click('#spotsNote button').catch(() => {});
     const startedPlacing = await p.getAttribute('#addApartBtn', 'aria-pressed');
     await p.keyboard.press('Escape');
@@ -2846,6 +2874,11 @@ try {
       /^No good spot found – pick one on the model yourself:/.test(none.note) && !/click the model/.test(none.note) && none.button === 'Place on model' && startedPlacing === 'true',
       'with nothing to suggest, the note offers to place a cut on the model with its button, never a click that would move the text',
       JSON.stringify({ none, startedPlacing }),
+    );
+    check(
+      solidCard.shown && solidCard.note === "This model is solid all through – there's no inside to open." && solidCard.parts === 0,
+      'Suggest spots on a solid block: the parts card says there is no inside to open',
+      JSON.stringify(solidCard),
     );
     check(aimProblems.length === 0, 'no page errors while placing on its own page', aimProblems.join(' | '));
     await aimContext.close();
@@ -3432,6 +3465,961 @@ try {
     await touch.close();
   }
 
+  console.log("\nparts that come off: the bat lantern's dome and cap twist-lock inside its handle");
+  {
+    // the fixture modelled on the user's lantern, 25 × 25 × 50 mm as downloaded: at 100 % no lock fits its dome
+    const batFile = writeFixture('batlantern.stl', soupOf(batLanternSolid()));
+    const batContext = await browser.newContext({ viewport: { width: 1400, height: 850 }, acceptDownloads: true });
+    await batContext.addInitScript(() => {
+      const getContext = HTMLCanvasElement.prototype.getContext;
+      HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+        if (type === 'webgl' || type === 'webgl2') attrs = { ...attrs, preserveDrawingBuffer: true };
+        return getContext.call(this, type, attrs);
+      };
+      // what the page asks the engine, in order: the split's modes ('parts', 'targets', …) and the previews
+      const Native = window.Worker;
+      const posts = (window.__posts = []);
+      window.Worker = class extends Native {
+        postMessage(message, transfer) {
+          if (message?.type) posts.push(message.type === 'split.plan' ? `split.plan:${message.mode}` : message.type);
+          return super.postMessage(message, transfer);
+        }
+      };
+    });
+    const posts = () => b.evaluate(() => window.__posts.slice());
+    const clearPosts = () => b.evaluate(() => (window.__posts.length = 0));
+    const b = await batContext.newPage();
+    const batProblems = [];
+    b.on('pageerror', (e) => batProblems.push(`pageerror: ${e.message}`));
+    b.on('console', (m) => m.type() === 'error' && batProblems.push(`console: ${m.text()}`));
+    const settle = async () => {
+      await b.waitForTimeout(80);
+      await b.waitForSelector('body[data-engine="idle"]', { timeout: 120000 });
+      await b.waitForTimeout(80);
+      await b.waitForSelector('body[data-engine="idle"]', { timeout: 120000 });
+    };
+    const card = () =>
+      b.evaluate(() => ({
+        hidden: document.querySelector('#partsCard').hidden,
+        note: document.querySelector('#partsNote').hidden ? '' : document.querySelector('#partsNote').textContent,
+        parts: [...document.querySelectorAll('#partList li')].map((li) => ({
+          title: li.querySelector('.part-title').textContent.replace(/\u00a0/g, ' '),
+          detail: li.querySelector('.part-detail')?.textContent.replace(/\u00a0/g, ' ') ?? '',
+          badge: li.querySelector('.part-badge')?.textContent ?? '',
+          buttons: [...li.querySelectorAll('button')].map((x) => x.textContent),
+        })),
+      }));
+    const listed = () => b.waitForFunction(() => !document.querySelector('#partsCard').hidden && !document.querySelector('#partsNote').classList.contains('busy') && document.querySelectorAll('#partList li').length > 0, null, { timeout: 120000 });
+    const partRows = () =>
+      b.evaluate(() =>
+        [...document.querySelectorAll('#cutList > li')].map((li) => ({
+          part: li.classList.contains('part'),
+          name: li.querySelector('.part-name')?.textContent ?? null,
+          z: li.querySelector('[data-part-z]')?.value ?? null,
+          zShown: li.querySelector('[data-part-z]') ? !li.querySelector('[data-part-z]').closest('label').hidden : null,
+          d: li.querySelector('[data-part-d]')?.value ?? null,
+          holds: [...li.querySelectorAll('[data-cut-hold]')].map((r) => ({ value: r.value, checked: r.checked, disabled: r.disabled, title: r.parentElement.title })),
+          meta: li.querySelector('.meta').textContent,
+        })),
+      );
+    const size = () => b.evaluate(() => document.querySelector('#modelInfo').textContent.match(/: ([\d.]+ × [\d.]+ × [\d.]+) mm/)?.[1] ?? null);
+    const teal = () =>
+      b.evaluate(() => {
+        const c = document.querySelector('#stage canvas');
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        let n = 0;
+        for (let i = 0; i < d.length; i += 4) if (Math.abs(d[i] - 13) + Math.abs(d[i + 1] - 148) + Math.abs(d[i + 2] - 136) < 40) n++;
+        return n;
+      });
+    // the model's blue-grey with a part's amber mixed in, or the amber itself
+    const amberTint = () =>
+      b.evaluate(() => {
+        const c = document.querySelector('#stage canvas');
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        let n = 0;
+        for (let i = 0; i < d.length; i += 4) if (d[i + 2] > 50 && d[i] - d[i + 2] > 40 && d[i + 1] > 0.75 * d[i] && d[i + 1] < d[i]) n++;
+        return n;
+      });
+    await b.goto(url);
+    await b.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    await b.setInputFiles('#stlFile', batFile);
+    await b.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('batlantern:'), null, { timeout: 60000 });
+    await settle();
+    await b.evaluate(() => (document.querySelector('#toast').hidden = true));
+    await b.click('#itemList li:first-child');
+    await b.keyboard.press('Delete');
+    await settle();
+
+    // + Removable part lists the parts that come off: at 100 % neither locks, each says from what size one does. The
+    // engine is asked for the parts first – the card – and only then for what a plane snaps to; and what the page
+    // says to do while placing is there to read, at the foot of the panel, not scrolled away under the buttons
+    await clearPosts();
+    await b.click('#addApartBtn');
+    await listed();
+    await settle();
+    const asked = (await posts()).filter((x) => x.startsWith('split.plan:'));
+    const hint = await b.evaluate(() => {
+      const el = document.querySelector('#status');
+      const r = el.getBoundingClientRect();
+      const top = document.elementFromPoint(r.left + Math.min(40, r.width / 2), r.top + r.height / 2);
+      return { text: el.textContent, top: Math.round(r.top), bottom: Math.round(r.bottom), height: innerHeight, onTop: !!top && el.contains(top) };
+    });
+    check(
+      asked[0] === 'split.plan:parts' && asked.includes('split.plan:targets') && hint.text.startsWith('Click a part that lights up') && hint.bottom <= hint.height && hint.onTop,
+      "+ Removable part asks for the parts first, and what to do shows at the foot of the panel, over what scrolls under it",
+      JSON.stringify({ asked, hint }),
+    );
+    await b.keyboard.press('Escape');
+    await settle();
+    const small = await card();
+    const [dome, base] = small.parts;
+    check(
+      !small.hidden && small.parts.length === 2 &&
+        dome.title === 'Dome and cap – comes off inside the handle; the handle stays on the lantern.' &&
+        dome.detail === 'Too small for a lock at this size: its roof is 0.7 mm thick. A twist-lock fits from 275 % (a 24 mm opening); a 38 mm tea light fits through it from 365 %.' &&
+        JSON.stringify(dome.buttons) === JSON.stringify(['Make it 300 %', 'Make it 400 %', 'Use – it just lifts off']) &&
+        base.title === 'Base – could twist off underneath from 215 % (a 30 mm opening); a 38 mm tea light fits through it from 275 %.' &&
+        JSON.stringify(base.buttons) === JSON.stringify(['Make it 300 %']),
+      '+ Removable part lists the dome and cap inside the handle and the base, each too small to lock at 100 % and from what size one fits',
+      JSON.stringify(small),
+    );
+    check(
+      /^No good place for a cut across the whole model – use a part above, or pick a place on the model yourself:/.test(await b.locator('#spotsNote').innerText()),
+      "with parts listed, the spots' note points to them where no cut across the whole model does well",
+      await b.locator('#spotsNote').innerText(),
+    );
+    check(
+      await b.evaluate(() => document.querySelector('#partList .part-detail').textContent.includes('from 275\u00a0% (a 24\u00a0mm opening)')),
+      'a number in the card keeps its unit on its line',
+    );
+    // the card's [Make it 300 %]: the model three times as big, framed in the view as it was, and the card lists the
+    // parts at that size; an undo brings back 100 %
+    const modelPixels = () =>
+      b.evaluate(() => {
+        const c = document.querySelector('#stage canvas');
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        let n = 0;
+        for (let i = 0; i < d.length; i += 4) if (d[i + 2] - d[i] > 40) n++;
+        return n;
+      });
+    const shown100 = await modelPixels();
+    // pressed while a part is being picked on the model: picking goes on, among the parts at the new size
+    await b.click('#addApartBtn');
+    await settle();
+    await b.locator('#partList li').nth(1).locator('button', { hasText: 'Make it 300 %' }).click();
+    await settle();
+    await listed();
+    await settle();
+    const shown300 = await modelPixels();
+    const at300 = { size: await size(), first: (await card()).parts[0]?.title, picking: await b.getAttribute('#addApartBtn', 'aria-pressed') };
+    await b.keyboard.press('Escape');
+    await settle();
+    check(
+      at300.size === '75.0 × 75.0 × 150.0' && /^Dome and cap – twist-lock/.test(at300.first ?? '') && shown300 > 0.5 * shown100 && shown300 < 2 * shown100 && at300.picking === 'true',
+      "the card's Make it 300 % scales the model, shows it whole at its new size, and lists the dome and cap's twist-lock; picking a part goes on",
+      JSON.stringify({ at300, shown100, shown300 }),
+    );
+    await b.click('#undoBtn');
+    await settle();
+    await listed();
+    await settle();
+    check((await size()) === '25.0 × 25.0 × 50.0' && (await card()).parts[0].title === dome.title, 'undo brings back 100 % and the card lists the parts at that size', await size());
+
+    // Use – it just lifts off: a part row, its circle on the model; Twist-lock struck through and saying from what size
+    const before = await teal();
+    await b.locator('#partList li').first().locator('button', { hasText: 'Use – it just lifts off' }).click();
+    await settle();
+    const [lifting] = await partRows();
+    const lockRadio = lifting?.holds.find((h) => h.value === 'lock');
+    check(
+      lifting?.part && lifting.name === 'Dome and cap' && lifting.z === '29' && lifting.d === '15.7' && lockRadio.disabled && !lockRadio.checked &&
+        lockRadio.title === 'No twist-lock fits at this size – from 275 %' && lifting.holds.find((h) => h.value === 'lift').checked &&
+        lifting.meta === 'lifts off – too small for a lock here (twist-lock from 275 %)',
+      "Use – it just lifts off adds the part's row: Z, Ø, Twist-lock struck through with the size that fits one, lifting off",
+      JSON.stringify(lifting),
+    );
+    // amber, as it only lifts off at this size: its outline, and its material from its face up to its cap tinted
+    const drawn = await teal();
+    const tinted = await amberTint();
+    check(drawn < before + 50 && tinted > 1000, "the part's circle is drawn on the model in amber, its material tinted: at this size it only lifts off", JSON.stringify({ before, drawn, tinted }));
+    check(
+      (await b.locator('#downloadBtn').innerText()) === 'Download 2 pieces (.zip)' && /2 · Dome and cap · Ø 15\.7 mm · comes off at A/.test(await b.locator('#pieceList').innerText()),
+      'the part is a piece of its own before it is cut: the download and the pieces list count it',
+      `${await b.locator('#downloadBtn').innerText()} | ${await b.locator('#pieceList').innerText()}`,
+    );
+    check(
+      (await card()).parts[0].buttons.join('|') === 'Make it 300 %|Make it 400 %|Cut A takes it out',
+      'the card offers the cut that takes the part out, not a second one, and still the sizes its lock and a tea light fit from',
+      JSON.stringify((await card()).parts[0]),
+    );
+    // nothing holds it at this size: the fit test has no rings to try, and says why
+    await b.click('#splitFitTestBtn');
+    await settle();
+    check(
+      (await b.locator('#status').innerText()) === 'Nothing to try: the dome and cap lift off at this size – a twist-lock fits from 275 %.',
+      'Download fit test with only a part that lifts off says it lifts off at this size and from what size a twist-lock fits',
+      await b.locator('#status').innerText(),
+    );
+
+    // its pieces at 100 %: the note says why no lock fits and from what size one does, and offers that size
+    await b.click('#showPiecesBtn');
+    await settle();
+    const smallNote = await b.locator('#splitNotes').innerText();
+    const noteSizes = await b.locator('#splitNotes button').allInnerTexts();
+    check(
+      smallNote.includes('Cut A: the dome is 0.7 mm thick here and slopes 30° – too thin for a twist-lock at 100 %. A twist-lock fits from 275 % (a 24 mm opening); a 38 mm tea light needs 365 %. The base can twist off from 215 %. At this size the dome and cap just lift off.') &&
+        noteSizes.filter((t) => /^Make it/.test(t)).join('|') === 'Make it 300 %|Make it 400 %',
+      'its note at 100 % says the dome is too thin for a twist-lock, from what size one fits and a tea light does, and offers both sizes',
+      `${smallNote} | ${JSON.stringify(noteSizes)}`,
+    );
+    // the note's Make it 300 %: the part placed again by the finder for that size – its face on the layers at 86, not
+    // 87 – and now it twist-locks, its hold never touched; one undo takes back both
+    await b.locator('#splitNotes button', { hasText: 'Make it 300 %' }).click();
+    await settle();
+    await listed();
+    await settle();
+    const big = await card();
+    const [locking] = await partRows();
+    const stillPieces = { shown: await b.isChecked('#resultToggle'), pieces: (await b.locator('#pieceList').innerText()).split('\n').filter(Boolean) };
+    check(
+      (await size()) === '75.0 × 75.0 × 150.0' && locking.z === '86' && locking.d === '47.3' && locking.holds.find((h) => h.value === 'lock').checked &&
+        !locking.holds.find((h) => h.value === 'lock').disabled && locking.meta === 'twist-lock, 3 lugs, 3 clicks – turn 27° · the handle stays',
+      'Make it 300 % scales the model and places the part again for it: at Z 86 it twist-locks, 3 lugs and 3 clicks, the handle staying',
+      JSON.stringify({ size: await size(), locking }),
+    );
+    check(
+      stillPieces.shown && stillPieces.pieces.length === 2 && /twist-lock socket, 3 clicks$/.test(stillPieces.pieces[1]),
+      "the note's Make it 300 % stays in the pieces view: the pieces at the new size, the lid with its twist-lock",
+      JSON.stringify(stillPieces),
+    );
+    check(
+      big.parts[0].title === 'Dome and cap – twist-lock · Ø 29 mm opening · the handle stays · a 38 mm tea light fits through the base, not the lid' &&
+        big.parts[0].badge === "the lantern's collar needs the dome's support" &&
+        big.parts[1].title === 'Base – twists off underneath · twist-lock · Ø 43 mm opening, takes a 38 mm tea light' && big.parts[1].badge === 'no extra support' &&
+        JSON.stringify(big.parts[1].buttons) === JSON.stringify(['Use']),
+      'at 300 % the card lists the dome and cap with its twist-lock and the base with its own, each with its print badge',
+      JSON.stringify(big),
+    );
+    await b.click('#undoBtn');
+    await settle();
+    const undone = { size: await size(), rows: await partRows() };
+    await b.click('#redoBtn');
+    await settle();
+    check(
+      undone.size === '25.0 × 25.0 × 50.0' && undone.rows.length === 1 && undone.rows[0].z === '29' && (await size()) === '75.0 × 75.0 × 150.0' && (await partRows())[0].z === '86',
+      'one undo takes back the Scale and the part placed again for it, one redo brings both',
+      JSON.stringify(undone),
+    );
+
+    // the base as well: its row has no Z (its face is the model's bottom), and three pieces
+    await b.locator('#partList li').nth(1).locator('button', { hasText: /^Use$/ }).click();
+    await settle();
+    const withBase = await partRows();
+    check(
+      withBase.length === 2 && withBase[1].name === 'Base' && withBase[1].zShown === false && withBase[1].meta === 'twist-lock, 3 lugs – turn 23° · coin slot' &&
+        (await b.locator('#downloadBtn').innerText()) === 'Download 3 pieces (.zip)',
+      "Use on the base adds its row – no Z, its twist-lock with its coin slot – and a third piece",
+      JSON.stringify(withBase),
+    );
+    await b.click('#undoBtn');
+    await settle();
+    check((await partRows()).length === 1, 'undo takes the base out again', JSON.stringify(await partRows()));
+
+    // Show pieces: the lantern with its neck and the dome and cap with its socket, and the notes that say how it
+    // twists on, how it prints and the fit test first (worked out already at this size: the box shows them)
+    await b.check('#resultToggle');
+    await settle();
+    await b.waitForTimeout(500);
+    await settle();
+    const pieces = (await b.locator('#pieceList').innerText()).split('\n').filter(Boolean);
+    const notes = await b.locator('#splitNotes').innerText();
+    check(
+      pieces.length === 2 && /^1 · Lantern, with the handle · 75 × 75 × 150 mm · .* · twist-lock neck, 3 lugs$/.test(pieces[0]) &&
+        /^2 · Dome and cap · .* · comes off at A · twist-lock socket, 3 clicks$/.test(pieces[1]),
+      'Show pieces lists the lantern with the twist-lock neck and the dome and cap with its socket',
+      JSON.stringify(pieces),
+    );
+    check(
+      notes.includes('Cut A: the dome and cap (piece 2) twist-lock onto piece 1 and the handle stays on piece 1. To fit it: set it on turned 27° to the left') &&
+        notes.includes('its slots and click tabs are bridged (10.5 mm or less)') && notes.includes('Print the fit test first (Download fit test): two rings Ø 40 mm, about 5 g.'),
+      "the notes say how the dome and cap twist-lock on, that its 10.5 mm bridges need no support, and to print the fit test first",
+      notes,
+    );
+    const metaShown = (await partRows())[0].meta;
+    check(metaShown === 'twist-lock, 3 lugs, 3 clicks – turn 27° · the handle stays', "the row says what the pieces got", metaShown);
+    // nothing is glued: the glued cuts' settings are not there to puzzle over, the legend keys only what is drawn (no
+    // text, and the pieces in their own colours), and the button and the box say the same
+    const tidy = await b.evaluate(() => {
+      // in the panel, folded away or not: not hidden itself, nor in something hidden
+      const shown = (el) => !!el && !el.closest('[hidden]');
+      return {
+        glued: ['joint', 'diameter', 'pins', 'labels', 'depth', 'count'].filter((k) => [...document.querySelectorAll(`[data-split="${k}"]`)].some(shown)),
+        kept: ['clearance', 'orient'].filter((k) => shown(document.querySelector(`[data-split="${k}"]`))),
+        joints: shown(document.querySelector('#splitJointsLabel')),
+        legend: [...document.querySelectorAll('.legend > span')].filter((x) => !x.hidden).map((x) => x.textContent.trim()),
+        button: document.querySelector('#showPiecesBtn').textContent,
+        box: document.querySelector('#resultLabel').textContent,
+      };
+    });
+    check(
+      tidy.glued.length === 0 && tidy.kept.length === 2 && !tidy.joints && JSON.stringify(tidy.legend) === JSON.stringify(['comes apart', 'pieces', 'lock', 'lugs']) &&
+        tidy.button === tidy.box,
+      "with only a part taken out, the pieces panel shows no glue settings, and the legend keys the pieces, the lock and its lugs, nothing else",
+      JSON.stringify(tidy),
+    );
+
+    // the lock in the view: painted orange on the pieces, the lid moving out along its way on the Spread slider and ▶,
+    // looked at close, and as printed. What the canvas shows, by colour: the lock's orange, the lid's gold (where its
+    // middle is), the red and yellow of an overhang and a bridge as printed, the teal and amber of a part's circle
+    const view = () =>
+      b.evaluate(() => {
+        const c = document.querySelector('#stage canvas');
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        const out = { orange: 0, gold: 0, x: 0, y: 0, red: 0, yellow: 0, tealish: 0, amber: 0, blue: 0, label: 0 };
+        for (let i = 0; i < d.length; i += 4) {
+          const [r, g, bl] = [d[i], d[i + 1], d[i + 2]];
+          // a piece's number: its dark disc over the lantern's blue, or over the lid's gold
+          const overBlue = r >= 26 && r <= 46 && g >= 42 && g <= 62 && bl >= 64 && bl <= 88;
+          const overGold = r >= 42 && r <= 62 && g >= 42 && g <= 62 && bl >= 38 && bl <= 58 && Math.abs(r - g) < 10;
+          if (d[i + 3] > 200 && (overBlue || overGold)) out.label++;
+          // the lantern's own blue, solid (faded round a lock, the view behind shows through: the canvas is clear there)
+          if (bl > 150 && bl - r > 100 && d[i + 3] > 230) out.blue++;
+          if (r > 150 && bl < 70 && g < 0.62 * r && g > 0.25 * r) out.orange++;
+          if (bl > 50 && r - bl > 40 && g > 0.75 * r && g < r) {
+            out.gold++;
+            out.x += (i / 4) % probe.width;
+            out.y += Math.floor(i / 4 / probe.width);
+          }
+          if (r > 150 && g < 80 && bl > 40 && bl < 130) out.red++;
+          if (r > 200 && g > 170 && bl < 90) out.yellow++;
+          if (g - r > 55 && bl > r) out.tealish++;
+          if (r > 200 && g > 120 && g < 190 && bl < 60) out.amber++;
+        }
+        out.x = out.gold ? Math.round(out.x / out.gold) : null;
+        out.y = out.gold ? Math.round(out.y / out.gold) : null;
+        return out;
+      });
+    const lockUi = () =>
+      b.evaluate(() => ({
+        panel: !document.querySelector('#lockPanel').hidden,
+        play: !document.querySelector('#playWayBtn').hidden,
+        look: !document.querySelector('#lookLockBtn').hidden,
+        chip: !document.querySelector('#legendLock').hidden,
+        lugs: !document.querySelector('#legendLugs').hidden,
+        over: !document.querySelector('#legendOver').hidden,
+        printed: document.querySelector('#asPrintedToggle').checked,
+        spreadShown: !document.querySelector('#spreadField').hidden,
+        spread: Number(document.querySelector('#spreadRange').value),
+        caption: document.querySelector('#wayCaption').hidden ? null : document.querySelector('#wayCaption').textContent,
+      }));
+    const spreadTo = async (f) => {
+      await b.locator('#spreadRange').fill(String(f));
+      await b.waitForTimeout(150);
+      return { ...(await view()), caption: (await lockUi()).caption };
+    };
+    await b.mouse.move(700, 840); // nothing pointed at
+    const apart = await view();
+    const ui = await lockUi();
+    check(
+      ui.panel && ui.play && ui.look && ui.chip && !ui.over && apart.orange > 800,
+      "the pieces view paints the twist-lock's own faces orange – the lantern's neck, out from under the lid – with a lock chip in the legend, ▶ and Look at the lock",
+      JSON.stringify({ ui, apart }),
+    );
+    // its lugs in a colour of their own, standing out of the neck they are on, with their own chip
+    check(ui.lugs && apart.yellow > 20, "the lugs are painted yellow on the orange neck, and the legend says which are the lugs", JSON.stringify({ ui, yellow: apart.yellow }));
+    // Spread: seated at 0 (the neck hidden under the lid); the first third turns it (nothing moves off the axis), the
+    // second lifts it, the last slides it out under the handle; the view says which step it is on
+    const seated = await spreadTo(0);
+    const turned = await spreadTo(0.3);
+    const rising = await spreadTo(0.5);
+    const lifted = await spreadTo(0.65);
+    const sliding = await spreadTo(0.85);
+    const out1 = await spreadTo(1);
+    check(
+      seated.orange < 50 && seated.caption === null && Math.abs(turned.x - seated.x) <= 2 && Math.abs(turned.y - seated.y) <= 2 &&
+        turned.caption === 'Dome and cap: 1 of 3 · Turn it 27° to the left – it clicks free' && rising.caption === 'Dome and cap: 2 of 3 · Lift it 4.5 mm' &&
+        lifted.y <= seated.y - 6 && Math.abs(lifted.x - seated.x) <= 3 && sliding.caption === 'Dome and cap: 3 of 3 · Slide it out under the handle, square to it' &&
+        Math.hypot(out1.x - seated.x, out1.y - seated.y) > 80 && out1.caption === null && out1.orange > 800,
+      'on the Spread slider the lid turns free in place, lifts, then slides out under the handle, and the view says each step',
+      JSON.stringify({ seated, turned, rising, lifted, sliding, out1 }),
+    );
+    // ▶ plays it from seated to out, the slider following, seen across the slide – here, looking along it, the view
+    // turns square to it so the lid is seen passing under the handle, not into the view through a leg; Shift+▶ plays
+    // it going on again, its words the steps the other way round
+    await b.click('#playWayBtn');
+    await b.waitForTimeout(120);
+    const early = { ...(await view()), spread: (await lockUi()).spread };
+    await b.waitForTimeout(2900);
+    const played = { ...(await view()), ...(await lockUi()) };
+    const goingOn = [];
+    await b.click('#playWayBtn', { modifiers: ['Shift'] });
+    for (let t = 0; t < 3000; t += 40) {
+      const c = (await lockUi()).caption;
+      if (c && goingOn.at(-1) !== c) goingOn.push(c);
+      await b.waitForTimeout(40);
+    }
+    const back = { ...(await view()), ...(await lockUi()) };
+    const across = { dx: played.x - early.x, dy: played.y - early.y };
+    check(
+      early.spread < 0.3 && played.spread === 1 && Math.abs(across.dx) > 80 && Math.abs(across.dx) > 2 * Math.abs(across.dy) && played.caption === null &&
+        back.spread === 0 && back.orange <= early.orange + 20 && back.orange < 0.2 * played.orange,
+      '▶ shows the lid coming apart, from seated to out, the slider following, the view turned to see it slide across, under the handle',
+      JSON.stringify({ early, played, across, back }),
+    );
+    check(
+      JSON.stringify(goingOn) === JSON.stringify([
+        'Dome and cap: 1 of 3 · Slide it in under the handle, square to it',
+        'Dome and cap: 2 of 3 · Lower it 4.5 mm into place',
+        'Dome and cap: 3 of 3 · Turn it 27° to the right – it clicks shut',
+      ]),
+      'Shift+▶ says how it goes on, step by step: slide it in, lower it, turn it right until it clicks shut',
+      JSON.stringify(goingOn),
+    );
+    await spreadTo(1);
+    // pointing at the part's row lights its lock
+    const unlit = await view();
+    await b.hover('#cutList li.part .part-name');
+    await b.waitForTimeout(150);
+    const lit = await view();
+    await b.mouse.move(700, 840);
+    await b.waitForTimeout(150);
+    const after = await view();
+    // (the lugs' yellow against the neck's orange leaves an edge of amber unlit)
+    const glow = Math.max(unlit.amber, 10);
+    check(lit.amber > 4 * glow && after.amber < 2 * glow, "pointing at the part's row makes its lock glow", JSON.stringify({ unlit: unlit.amber, lit: lit.amber, after: after.amber }));
+    check(lit.blue < 0.5 * unlit.blue, "and the pieces fade round it, so all of the lock shows", JSON.stringify({ unlit, lit }));
+    // Look at the lock: close on the neck, the lid set down beside it, the lock glowing
+    await b.click('#lookLockBtn');
+    await b.waitForTimeout(200);
+    const close = { ...(await view()), spread: (await lockUi()).spread };
+    check(close.orange > 5 * apart.orange && close.spread === 1, 'Look at the lock brings the camera close on it: its orange fills the view', JSON.stringify({ close, apart: apart.orange }));
+    // close on it, what is what: a lug on the neck, a slot and a click tab in the lid, each named over it in the view
+    const words = await b.evaluate(() => {
+      const stage = document.querySelector('#stage').getBoundingClientRect();
+      return [...document.querySelectorAll('#stage .lock-word')].filter((x) => !x.hidden).map((x) => {
+        const r = x.getBoundingClientRect();
+        return { text: x.textContent, inside: r.left >= stage.left && r.right <= stage.right && r.top >= stage.top && r.bottom <= stage.bottom };
+      });
+    });
+    check(
+      words.map((x) => x.text).sort().join('|') === 'click tab|lug|slot' && words.every((x) => x.inside) && close.yellow > 5 * apart.yellow && close.label < 120,
+      'Look at the lock names a lug, a slot and a click tab on the pieces, the lugs yellow close up, with no piece number over them',
+      JSON.stringify({ words, yellow: close.yellow }),
+    );
+    // As printed: each piece on the bed as it prints; the collar's 60° underside red, the lid's bridged ceilings outlined
+    await b.click('#frameBtn');
+    await b.click('#asPrintedToggle');
+    await b.waitForTimeout(200);
+    const printed = { ...(await view()), ...(await lockUi()) };
+    await b.click('#asPrintedToggle');
+    await b.waitForTimeout(200);
+    const unprinted = await view();
+    check(
+      printed.red > 500 && printed.yellow > 200 && printed.over && !printed.spreadShown && unprinted.red < 20 && unprinted.yellow < 20 + 2 * apart.yellow,
+      'As printed shows what the lock adds that overhangs in red – the collar under the face – and outlines its bridges',
+      JSON.stringify({ printed, unprinted: { red: unprinted.red, yellow: unprinted.yellow } }),
+    );
+    // ▶ from As printed: the pieces spread along their ways again, and the box, its chips and the Spread slider say so
+    // from the start, and after
+    await b.click('#asPrintedToggle');
+    await b.waitForTimeout(200);
+    await b.click('#playWayBtn');
+    await b.waitForTimeout(1200);
+    const playing = await lockUi();
+    await b.waitForTimeout(2000);
+    const playedOut = await lockUi();
+    check(
+      !playing.printed && !playing.over && playing.spreadShown && !playedOut.printed && playedOut.spreadShown && playedOut.spread === 1,
+      '▶ pressed as printed plays the pieces spread along their ways, As printed off and the Spread slider there throughout',
+      JSON.stringify({ playing, playedOut }),
+    );
+    // As printed goes with the pieces: shown again, they are spread, never laid out with nothing on screen to undo it
+    await b.click('#asPrintedToggle');
+    await b.waitForTimeout(200);
+    await b.click('#resultToggle');
+    await settle();
+    await b.click('#resultToggle');
+    await settle();
+    await b.waitForTimeout(200);
+    const shownAgain = await lockUi();
+    check(!shownAgain.printed && shownAgain.spreadShown && shownAgain.panel, 'the pieces shown again after As printed are spread apart, the Spread slider back', JSON.stringify(shownAgain));
+    // on the model: the part tinted teal from its face to its cap, its lugs marked; the row's ▶ shows the pieces and plays
+    await b.click('#resultToggle');
+    await settle();
+    await b.waitForTimeout(200);
+    const onModel = await view();
+    check(onModel.tealish > 1000 && onModel.amber < 10, "on the model the part that locks is tinted teal, inside its circle", JSON.stringify(onModel));
+    check(await b.isVisible('#cutList li.part [data-part-play]'), "the part's row has ▶");
+    await b.click('#cutList li.part [data-part-play]');
+    await settle();
+    await b.waitForTimeout(3000);
+    const fromRow = await lockUi();
+    check((await b.isChecked('#resultToggle')) && fromRow.spread === 1 && fromRow.panel, "the row's ▶ shows the pieces and plays the lid coming out", JSON.stringify(fromRow));
+
+    // on a laptop's width the legend's chips – the lock's colours among them – wrap beside the view's tools, never
+    // under them, as printed too
+    const covered = () =>
+      b.evaluate(() => {
+        const tools = [...document.querySelectorAll('.stage-tools > *')].filter((x) => !x.hidden).map((x) => x.getBoundingClientRect());
+        return [...document.querySelectorAll('.legend > span')].filter((x) => !x.hidden).flatMap((x) => {
+          const r = x.getBoundingClientRect();
+          return tools.some((t) => Math.min(r.right, t.right) - Math.max(r.left, t.left) > 0 && Math.min(r.bottom, t.bottom) - Math.max(r.top, t.top) > 0) ? [x.textContent.trim()] : [];
+        });
+      });
+    const under = {};
+    for (const width of [1024, 1180]) {
+      await b.setViewportSize({ width, height: 850 });
+      await b.waitForTimeout(250);
+      under[width] = await covered();
+      await b.click('#asPrintedToggle');
+      await b.waitForTimeout(250);
+      under[`${width} as printed`] = await covered();
+      await b.click('#asPrintedToggle');
+      await b.waitForTimeout(150);
+    }
+    check(Object.values(under).every((x) => x.length === 0), "at 1024 and 1180 px no chip of the legend lies under the view's tools", JSON.stringify(under));
+
+    // the download: two pieces, each one solid, the dome and cap lying on its face; the glue sheet says to twist it on.
+    // At 1024 px, what the engine is doing shows over the lock's tools, never on them
+    await b.setViewportSize({ width: 1024, height: 850 });
+    await b.waitForTimeout(250);
+    await b.evaluate(() => {
+      const watch = (window.__pill = { seen: 0, over: [] });
+      watch.timer = setInterval(() => {
+        const pill = document.querySelector('#progress');
+        if (pill.hidden) return;
+        watch.seen++;
+        const a = pill.getBoundingClientRect();
+        for (const el of [...document.querySelectorAll('#lockPanel button, #lockPanel label')].filter((x) => !x.closest('[hidden]'))) {
+          const r = el.getBoundingClientRect();
+          const w = Math.min(a.right, r.right) - Math.max(a.left, r.left);
+          const h = Math.min(a.bottom, r.bottom) - Math.max(a.top, r.top);
+          if (w > 0 && h > 0) watch.over.push(el.textContent.trim());
+        }
+      }, 15);
+    });
+    const [dl] = await Promise.all([b.waitForEvent('download', { timeout: 120000 }), b.click('#downloadBtn')]);
+    const zipFile = path.join(out, 'batlantern.zip');
+    await dl.saveAs(zipFile);
+    await settle();
+    const pill = await b.evaluate(() => {
+      clearInterval(window.__pill.timer);
+      return { seen: window.__pill.seen, over: [...new Set(window.__pill.over)] };
+    });
+    await b.setViewportSize({ width: 1400, height: 850 });
+    await b.waitForTimeout(250);
+    check(pill.seen > 0 && pill.over.length === 0, "the progress shows over the lock's tools while the pieces are saved, not on them", JSON.stringify(pill));
+    const zip = unzipSync(new Uint8Array(fs.readFileSync(zipFile)));
+    const stls = Object.keys(zip).filter((n) => n.endsWith('.stl')).sort();
+    const shells = stls.map((n) => {
+      const m = geometryToManifold(parseSTL(zip[n].buffer.slice(zip[n].byteOffset, zip[n].byteOffset + zip[n].byteLength)));
+      const parts = m.decompose();
+      const bb = m.boundingBox();
+      const out = { n: parts.length, min: bb.min[2], h: bb.max[2] - bb.min[2] };
+      parts.forEach((x) => x.delete());
+      m.delete();
+      return out;
+    });
+    const glue = strFromU8(zip[Object.keys(zip).find((n) => n.endsWith('.txt'))]);
+    check(
+      stls.length === 2 && shells.every((x) => x.n === 1) && Math.abs(shells[0].h - 150) < 0.01 && shells[1].min === 0 && shells[1].h < 31,
+      'the zip holds the lantern and the dome and cap, each one solid, the lid lying on its cut face',
+      JSON.stringify({ stls, shells }),
+    );
+    check(
+      glue.includes('turn it right until it clicks') && glue.includes('twist-lock neck for cut A') &&
+        glue.includes("The dome and cap (cut A) should twist on with a click and twist off again by hand. Try the fit test first"),
+      'the glue sheet says the lantern carries the neck, how to twist the dome and cap on, and to try the fit test first',
+      glue,
+    );
+    // the fit test: the twist-lock on two rings, as the note says
+    const [fit] = await Promise.all([b.waitForEvent('download', { timeout: 120000 }), b.click('#splitFitTestBtn')]);
+    await fit.saveAs(path.join(out, 'batlantern-fit-test.stl'));
+    await settle();
+    check(/Two rings Ø 40 mm with the twist-lock at this size \(about 5 g\)/.test(await b.locator('#status').innerText()), 'Download fit test gives the twist-lock on two rings, Ø 40 mm as the note says', await b.locator('#status').innerText());
+
+    // Lifts off chosen: nothing holds it, and the row says so
+    await b.evaluate(() => [...document.querySelectorAll('#cutList li.part .cut-hold label')].find((l) => l.textContent === 'Lifts off').click());
+    await settle();
+    check((await partRows())[0].meta === 'lifts off – sits on its cut face', 'Lifts off chosen: the row says it sits on its cut face', (await partRows())[0].meta);
+    // no lock is painted, nor offered to look at, and the part on the model is amber
+    await b.waitForTimeout(400);
+    await settle();
+    const plain = { ...(await view()), ...(await lockUi()) };
+    check(plain.orange < 20 && !plain.chip && !plain.look && plain.play, 'lifting off, the pieces show no lock and offer none to look at; ▶ still shows how it comes off', JSON.stringify(plain));
+    await b.click('#resultToggle');
+    await settle();
+    await b.waitForTimeout(200);
+    const amberModel = { ...(await view()), tint: await amberTint() };
+    check(amberModel.tint > 3000 && amberModel.tealish < 300, 'on the model a part that only lifts off is tinted amber', JSON.stringify(amberModel));
+
+    // click to pick: + Removable part, and the part under the pointer lights up – gold, the handle it leaves on drawn in
+    // blue – and the readout says what it gets; a click takes it out as the finder places it, as one undo step
+    console.log('\nclick to pick a part on the bat lantern');
+    await b.click('#splitClearBtn');
+    await settle();
+    const pickColours = () =>
+      b.evaluate(() => {
+        const c = document.querySelector('#stage canvas');
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        const o = { gold: 0, stays: 0, dark: 0, x: 0, y: 0, teal: 0, tx: 0, ty: 0 };
+        for (let i = 0; i < d.length; i += 4) {
+          const [r, g, bl] = [d[i], d[i + 1], d[i + 2]];
+          // the model's own surface tinted gold, and the handle blue: opaque (the faint walls round the part, over the
+          // page behind the view, read back as gold seen through)
+          const solid = d[i + 3] > 200;
+          if (solid && r > 170 && g > 130 && g < 0.92 * r && bl < 100) o.gold++;
+          if (solid && bl > 120 && bl - r > 90 && bl > g) o.stays++;
+          // a part that locks, tinted teal: where its middle is on screen
+          if (g - r > 55 && bl > r) {
+            o.teal++;
+            o.tx += (i / 4) % probe.width;
+            o.ty += Math.floor(i / 4 / probe.width);
+          }
+          // a selected part's ring handle, the dark dot on its circle
+          if (r < 40 && g < 45 && bl < 60 && d[i + 3] > 200) {
+            o.dark++;
+            o.x += (i / 4) % probe.width;
+            o.y += Math.floor(i / 4 / probe.width);
+          }
+        }
+        const scale = c.getBoundingClientRect().width / probe.width;
+        if (o.dark) [o.x, o.y] = [Math.round((o.x / o.dark) * scale), Math.round((o.y / o.dark) * scale)];
+        if (o.teal) [o.tx, o.ty] = [Math.round((o.tx / o.teal) * scale), Math.round((o.ty / o.teal) * scale)];
+        return o;
+      });
+    const pickReadout = () =>
+      b.evaluate(() => {
+        const el = document.querySelector('#cutReadout');
+        return el.hidden ? null : { lines: [...el.children].map((c) => c.textContent), verdict: el.dataset.verdict };
+      });
+    const restAt = async (x, y) => {
+      await b.mouse.move(x, y + 1);
+      await b.mouse.move(x, y);
+      await b.waitForTimeout(300);
+      await settle();
+    };
+    await b.click('#addApartBtn');
+    await listed();
+    await settle();
+    const pickStatus = await b.locator('#status').innerText();
+    // the places to cut across, listed under the parts: each would take the handle off with the top, and says so
+    const spotTexts = await b.locator('#spotList .spot').allInnerTexts();
+    check(
+      spotTexts.length > 0 && spotTexts.every((t) => t.endsWith(' – takes the handle with the top')),
+      'the spots for a cut across the whole lantern say each would take the handle with the top',
+      JSON.stringify(spotTexts),
+    );
+    const stage = await b.locator('#stage canvas').boundingBox();
+    const px = stage.x + stage.width / 2;
+    // down the middle of the view: what the readout says at each height
+    const said = [];
+    for (let y = stage.y + 30; y < stage.y + stage.height - 20; y += 6) {
+      await b.mouse.move(px, y);
+      await b.waitForTimeout(40);
+      const r = await pickReadout();
+      if (r) said.push([y, r.lines]);
+    }
+    const middleOf = (re) => {
+      const pickAt = said.filter(([, lines]) => lines.some((l) => re.test(l))).map(([y]) => y);
+      return pickAt[Math.floor(pickAt.length / 2)];
+    };
+    const pickAt = { dome: middleOf(/^Dome and cap come off/), handle: middleOf(/^The handle stays/), band: middleOf(/^A cut here would take the handle/), base: middleOf(/^Base twists off/) };
+    check(
+      pickStatus === 'Click a part that lights up to take it out, or the model where it should come apart – it snaps to ledges and good spots; hold Alt to place it freely. Shift+click to place more. Esc stops.' &&
+        Object.values(pickAt).every(Number.isFinite) && pickAt.handle < pickAt.dome && pickAt.dome < pickAt.band && pickAt.band < pickAt.base,
+      '+ Removable part says a click on a part takes it out; down the lantern the readout finds the handle, the dome, the band under them and the base',
+      JSON.stringify({ pickStatus, pickAt }),
+    );
+    await restAt(px, pickAt.dome);
+    const onDome = { ...(await pickReadout()), ...(await pickColours()) };
+    await restAt(px, pickAt.handle);
+    const onHandle = { ...(await pickReadout()), ...(await pickColours()) };
+    await restAt(px, pickAt.band);
+    const onBand = { ...(await pickReadout()), ...(await pickColours()) };
+    await restAt(px, pickAt.base);
+    const onBase = { ...(await pickReadout()), ...(await pickColours()) };
+    await b.screenshot({ path: path.join(out, '20-pick-base.png') });
+    await restAt(px, pickAt.dome);
+    await b.screenshot({ path: path.join(out, '20-pick-dome.png') });
+    check(
+      JSON.stringify(onDome.lines) === JSON.stringify(['Dome and cap come off · twist-lock, 3 lugs, turn 27° · Ø 29 mm opening · the handle stays']) && onDome.verdict === 'full' &&
+        onDome.gold > 4000 && onDome.stays > 800,
+      'over the dome its readout says the dome and cap come off with their twist-lock, the handle staying; the part is gold, the handle outlined in blue',
+      JSON.stringify(onDome),
+    );
+    check(
+      onHandle.lines[0] === 'The handle stays on the lantern – click to take off the dome and cap under it' && onHandle.gold > 4000 && onHandle.stays > 800,
+      'over the handle the readout says it stays on the lantern, and the dome and cap under it light up',
+      JSON.stringify(onHandle),
+    );
+    check(
+      onBand.lines[0] === 'A cut here would take the handle with the top – click the dome to take off just the lid' && onBand.verdict !== 'full' &&
+        onBand.gold < onDome.gold / 2 && onBand.stays < 100,
+      'under the handle a cut across would take it with the top: the readout says so first, and never shows it as a good place; nothing lights up',
+      JSON.stringify(onBand),
+    );
+    // low on the lantern, where the top a cut takes is most of it, the readout does not say it again and again
+    await restAt(px, Math.round((pickAt.band + pickAt.base) / 2));
+    const lowDown = await pickReadout();
+    check(!!lowDown && !lowDown.lines.some((l) => l.startsWith('A cut here would take the handle')), 'lower down the lantern the readout leaves the handle out', JSON.stringify(lowDown));
+    check(
+      JSON.stringify(onBase.lines) === JSON.stringify(['Base twists off underneath · Ø 43 mm opening · twist-lock, 3 lugs, turn 23°']) && onBase.gold > 1000,
+      'over the base its readout says it twists off underneath, and it lights up',
+      JSON.stringify(onBase),
+    );
+    // a click on the dome: its part, placed as the finder places it, selected; placing stops
+    await b.mouse.click(px, pickAt.dome);
+    await settle();
+    const picked = { rows: await partRows(), pressed: await b.getAttribute('#addApartBtn', 'aria-pressed'), view: await pickColours() };
+    await b.click('#undoBtn');
+    await settle();
+    const unpicked = await partRows();
+    await b.click('#redoBtn');
+    await settle();
+    check(
+      picked.rows.length === 1 && picked.rows[0].name === 'Dome and cap' && picked.rows[0].z === '86' && picked.rows[0].d === '47.3' &&
+        picked.rows[0].meta === 'twist-lock, 3 lugs, 3 clicks – turn 27° · the handle stays' && picked.pressed === 'false' && picked.view.gold < 500 &&
+        unpicked.length === 0 && (await partRows()).length === 1,
+      'a click on the dome takes out the dome and cap where the finder puts it, twist-locking; placing stops, and one undo takes it back',
+      JSON.stringify({ picked, unpicked }),
+    );
+    // Shift+click picks on: the base too; over the dome the readout says cut A takes it out already
+    await b.click('#addApartBtn');
+    await settle();
+    await b.keyboard.down('Shift');
+    await b.mouse.click(px, pickAt.base);
+    await b.keyboard.up('Shift');
+    await settle();
+    await restAt(px, pickAt.dome);
+    const kept = { rows: await partRows(), pressed: await b.getAttribute('#addApartBtn', 'aria-pressed'), readout: await pickReadout() };
+    await b.mouse.click(px, pickAt.dome);
+    await settle();
+    check(
+      kept.rows.map((r) => r.name).join('|') === 'Dome and cap|Base' && kept.pressed === 'true' && kept.readout?.lines[1] === 'cut A takes it out already' &&
+        (await b.locator('#status').innerText()) === 'Cut A takes the dome and cap out already.' && (await partRows()).length === 2,
+      'Shift+click takes the base out too and goes on picking; a part already taken out says which cut takes it, and a click on it adds no other',
+      JSON.stringify(kept),
+    );
+    // the base's crosshair: a part picked again moves its cut, and nothing else does
+    await b.locator('#cutList > li').first().locator('.cut-remove').click();
+    await settle();
+    await b.locator('#cutList > li').first().locator('[data-part-pick]').click();
+    await settle();
+    const again = { status: await b.locator('#status').innerText(), pressed: await b.locator('[data-part-pick]').first().getAttribute('aria-pressed') };
+    await restAt(px, pickAt.band);
+    again.band = await pickReadout();
+    await b.mouse.click(px, pickAt.dome);
+    await settle();
+    const movedTo = await partRows();
+    await b.click('#undoBtn');
+    await settle();
+    const movedBack = await partRows();
+    await b.click('#redoBtn');
+    await settle();
+    check(
+      again.status === 'Click a part that comes off to move cut A to it. Esc stops.' && again.pressed === 'true' &&
+        again.band?.lines[0] === 'No part comes off here – point at one to move cut A there' && movedTo.length === 1 && movedTo[0].name === 'Dome and cap' &&
+        movedTo[0].z === '86' && movedBack[0].name === 'Base',
+      "a part's crosshair picks it again on the model: the base's cut moved to the dome, as one undo step",
+      JSON.stringify({ again, movedTo, movedBack }),
+    );
+    // the selected part's ring handle: a white knob with a dark arrow across it – nothing like a hole – that says what
+    // it does; pressed and let go where it was, nothing changes: the part keeps its lock's words and its lug marks
+    await b.locator('#cutList > li').first().locator('.part-name').click();
+    await b.mouse.move(stage.x + 20, stage.y + stage.height - 20);
+    await b.waitForTimeout(300);
+    const knob = await pickColours();
+    const seatedRow = (await partRows())[0];
+    await b.mouse.move(stage.x + knob.x, stage.y + knob.y);
+    await b.waitForTimeout(200);
+    const tip = await b.evaluate(() => document.querySelector('#stage canvas').title);
+    await b.mouse.down();
+    await b.mouse.move(stage.x + knob.x - 20, stage.y + knob.y, { steps: 4 });
+    await b.mouse.move(stage.x + knob.x, stage.y + knob.y, { steps: 4 });
+    await b.mouse.up();
+    await settle();
+    await b.mouse.move(stage.x + 20, stage.y + stage.height - 20);
+    await b.waitForTimeout(300);
+    const letGo = { row: (await partRows())[0], view: await pickColours() };
+    check(
+      knob.dark > 30 && knob.dark < 250 && tip === 'Drag to make the circle wider or narrower' && seatedRow.meta === 'twist-lock, 3 lugs, 3 clicks – turn 27° · the handle stays' &&
+        letGo.row.meta === seatedRow.meta && letGo.row.d === seatedRow.d && letGo.view.teal > 0.9 * knob.teal,
+      "the ring handle is a knob that says what it does; pressed and let go where it was, the part keeps its lock and its lug marks",
+      JSON.stringify({ knob, tip, seatedRow, letGo }),
+    );
+    // a width typed with a pause in it is drawn as it is typed, and the cut changes only once it is entered: a half-
+    // typed Ø 6 builds nothing and says nothing; entered as 60, it is held at the edge of its band, still twist-locking
+    const widthBox = b.locator('[data-part-d]').first();
+    await widthBox.click({ clickCount: 3 });
+    await b.keyboard.type('6');
+    await b.waitForTimeout(800);
+    await settle();
+    const halfTyped = { row: (await partRows())[0], notes: await b.locator('#splitNotes').innerText() };
+    await b.keyboard.type('0');
+    await b.keyboard.press('Enter');
+    await settle();
+    const entered = { row: (await partRows())[0], status: await b.locator('#status').innerText() };
+    await b.locator('#cutList > li').first().locator('.part-name').click();
+    await b.click('#undoBtn');
+    await settle();
+    check(
+      halfTyped.row.meta === seatedRow.meta && halfTyped.row.d === '6' && !/cuts nothing/.test(halfTyped.notes) && entered.row.d === '47.3' &&
+        entered.status === 'Ø 47.3 is as wide as fits here.' && entered.row.meta === seatedRow.meta && (await partRows())[0].d === seatedRow.d,
+      'a Ø half typed builds nothing: the part keeps its lock until the number is entered, then is held where it prints apart',
+      JSON.stringify({ halfTyped, entered }),
+    );
+    // the Clearance raised as the fit test says to: the part the finder placed is placed again for it, a layer up where
+    // its edge needs the room, its lock's words kept – no warning about a face the finder chose
+    await b.evaluate(() => (document.querySelector('[data-split="clearance"]').closest('details').open = true));
+    const clearance = b.locator('[data-split="clearance"]');
+    await clearance.fill('0.2');
+    await clearance.dispatchEvent('change');
+    await settle();
+    await b.waitForTimeout(300);
+    await settle();
+    const refit = { row: (await partRows())[0], status: await b.locator('#status').innerText() };
+    await clearance.fill('0.15');
+    await clearance.dispatchEvent('change');
+    await settle();
+    await b.waitForTimeout(300);
+    await settle();
+    const refitBack = (await partRows())[0];
+    check(
+      refit.row.z === '86.2' && /^twist-lock, 3 lugs/.test(refit.row.meta) && !/moved/.test(refit.status) && refitBack.z === '86',
+      'raising the Clearance places the finder\'s part again for it: Z 86.2, still twist-locking, no warning; lowered again, back at 86',
+      JSON.stringify({ refit, refitBack }),
+    );
+    // and so does a change of the printer's layers: the face goes onto the new layers where its edge prints apart
+    await b.evaluate(() => (document.querySelector('#printing').open = true));
+    await b.fill('#layerHeight', '0.28');
+    await b.dispatchEvent('#layerHeight', 'change');
+    await settle();
+    await b.waitForTimeout(300);
+    await settle();
+    const layered = (await partRows())[0];
+    await b.fill('#layerHeight', '0.2');
+    await b.dispatchEvent('#layerHeight', 'change');
+    await settle();
+    await b.waitForTimeout(300);
+    await settle();
+    const layeredBack = (await partRows())[0];
+    check(
+      layered.z !== '86' && Math.abs(Number(layered.z) - 86) < 1 && /^twist-lock, 3 lugs/.test(layered.meta) && layeredBack.z === '86',
+      "0.28 mm layers place the finder's part again on them, still twist-locking; 0.2 mm again, back at 86",
+      JSON.stringify({ layered, layeredBack }),
+    );
+
+    // its face typed too low: on the printer's layers, then moved up to where it prints apart, with the note's words
+    const faceBox = b.locator('[data-part-z]').first();
+    await faceBox.fill('85.3');
+    await faceBox.press('Enter');
+    await b.waitForTimeout(300);
+    await settle();
+    const low = { row: (await partRows())[0], status: await b.locator('#status').innerText() };
+    check(
+      low.row.z === '86' && low.row.meta === "the circle runs too close to the handle's feet at Z 85.2 – moved to Z 86" &&
+        low.status === "Cut A: at Z 85.2 the dome and cap's edge runs into the handle's feet – it needs 0.9 mm to print apart. Moved to Z 86.",
+      "a face typed under where the part prints apart goes onto the layers, then up to where it does, and the row and the page say why",
+      JSON.stringify(low),
+    );
+    // the ring handle: the dark dot on the selected part's circle; dragged far out, held at the edge of its band – a
+    // little over the lowest face, where the band round the dome widens past the handle's feet
+    await faceBox.fill('87.4');
+    await faceBox.press('Enter');
+    await b.waitForTimeout(300);
+    await settle();
+    const higher = (await partRows())[0];
+    await b.locator('#cutList > li').first().locator('.part-name').click();
+    await b.mouse.move(stage.x + 20, stage.y + stage.height - 20);
+    await b.waitForTimeout(300);
+    const dot = await pickColours();
+    await b.mouse.move(stage.x + dot.x, stage.y + dot.y);
+    await b.waitForTimeout(200);
+    const grab = await b.evaluate(() => document.querySelector('#stage canvas').style.cursor);
+    // outwards: from the middle of the part through the dot, and on
+    const away = Math.hypot(dot.x - dot.tx, dot.y - dot.ty) || 1;
+    const [ux, uy] = [(dot.x - dot.tx) / away, (dot.y - dot.ty) / away];
+    await b.mouse.down();
+    await b.mouse.move(stage.x + dot.x + 60 * ux, stage.y + dot.y + 60 * uy, { steps: 6 });
+    await b.mouse.move(stage.x + dot.x + 160 * ux, stage.y + dot.y + 160 * uy, { steps: 6 });
+    await b.waitForTimeout(100);
+    const dragging = (await partRows())[0].d;
+    await b.mouse.up();
+    await settle();
+    const wide = { row: (await partRows())[0], status: await b.locator('#status').innerText() };
+    await b.screenshot({ path: path.join(out, '21-ring-handle.png') });
+    await b.click('#undoBtn');
+    await settle();
+    check(
+      higher.z === '87.4' && dot.dark > 10 && grab === 'grab' && dragging === wide.row.d && Number(wide.row.d) > 48 && Number(wide.row.d) < 60 &&
+        wide.status === `Ø ${wide.row.d} is as wide as fits here.` && (await partRows())[0].d === '47.3',
+      "the selected part's ring handle drags its circle wider, held where it still prints apart, and the page says so; one undo takes it back",
+      JSON.stringify({ higher, dot, grab, dragging, wide }),
+    );
+
+    // the card put away once the model is turned with no part taken out: turning it changes no part, and the engine is
+    // not asked for the parts again ahead of the text's previews
+    await b.click('#splitClearBtn');
+    await settle();
+    await b.click('#suggestSpotsBtn');
+    await listed();
+    await settle();
+    await clearPosts();
+    await b.evaluate(() => document.querySelector('[data-fix="rotZ"]').click());
+    await settle();
+    await b.waitForTimeout(300);
+    await settle();
+    const turnedAsked = (await posts()).filter((x) => x === 'split.plan:parts').length;
+    check(turnedAsked === 0 && (await b.locator('#partsCard').isHidden()), 'turning the model with no part taken out puts the card away and asks for no parts', JSON.stringify({ turnedAsked, posts: await posts() }));
+
+    // a closed hollow ball: its base is listed, but no lock fits it at any size, so the card offers nothing to press –
+    // the note under it says to pick a place on the model, not to use a part above
+    const ball = Manifold.difference(Manifold.sphere(40, 96), Manifold.sphere(37, 96));
+    const ballFile = writeFixture('hollowball.stl', soupOf(ball));
+    ball.delete();
+    await b.setInputFiles('#stlFile', ballFile);
+    await b.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('hollowball:'), null, { timeout: 60000 });
+    await settle();
+    await b.click('#suggestSpotsBtn');
+    await listed();
+    await settle();
+    await b.waitForFunction(() => !document.querySelector('#spotsNote').hidden && !document.querySelector('#spotsNote').classList.contains('busy'), null, { timeout: 120000 });
+    const ballCard = { card: await card(), note: await b.locator('#spotsNote').innerText() };
+    check(
+      ballCard.card.parts.length > 0 && ballCard.card.parts.every((x) => x.buttons.length === 0) && ballCard.note.startsWith('No good spot found – pick one on the model yourself:'),
+      "a hollow ball's card offers nothing to press, and the spots' note says to pick a place on the model, not to use a part",
+      JSON.stringify(ballCard),
+    );
+    check(batProblems.length === 0, 'no page errors with parts that come off', batProblems.join(' | '));
+    await batContext.close();
+  }
+
   console.log('\na cut row on the narrowest phone');
   {
     const narrow = await browser.newContext({ viewport: { width: 320, height: 640 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
@@ -3459,7 +4447,118 @@ try {
       return out;
     });
     check(fits.every((f) => f.need <= f.room), "on a 320 px phone a cut row's position box shows its number in full beside the crosshair", JSON.stringify(fits));
+    // how each cut holds – Locks … Lifts off, a part's Twist-lock and Lifts off – inside its row, none of it cut off
+    const holdsFit = () =>
+      n.evaluate(() =>
+        [...document.querySelectorAll('#cutList > li')].map((li) => {
+          const row = li.getBoundingClientRect();
+          const seg = li.querySelector('.cut-hold').getBoundingClientRect();
+          const labels = [...li.querySelectorAll('.cut-hold label')];
+          return { part: li.classList.contains('part'), out: Math.round(seg.right - row.right), clipped: labels.filter((l) => l.scrollWidth > l.clientWidth + 1).length, n: labels.length };
+        }),
+      );
+    const planeHolds = await holdsFit();
+    await n.setInputFiles('#stlFile', path.join(out, 'batlantern.stl'));
+    await n.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('batlantern:'), null, { timeout: 60000 });
+    await n.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    await n.evaluate(() => document.querySelector('#suggestSpotsBtn').click());
+    await n.waitForFunction(() => !document.querySelector('#partsCard').hidden && !document.querySelector('#partsNote').classList.contains('busy') && document.querySelectorAll('#partList li').length > 0, null, { timeout: 120000 });
+    await n.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    await n.evaluate(() => [...document.querySelectorAll('#partList button')].find((x) => x.textContent === 'Use – it just lifts off').click());
+    await n.waitForTimeout(500);
+    await n.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    const partHolds = await holdsFit();
+    check(
+      planeHolds.length === 1 && planeHolds[0].n === 4 && partHolds.length === 1 && partHolds[0].part && partHolds[0].n === 2 &&
+        [...planeHolds, ...partHolds].every((h) => h.out <= 0 && h.clipped === 0),
+      "on a 320 px phone how a cut holds fits its row: a plane's four holds and a part's two, none cut off",
+      JSON.stringify({ planeHolds, partHolds }),
+    );
     await narrow.close();
+  }
+
+  console.log("\nthe lock on a phone");
+  {
+    // a phone's view is short, and the legend over it and the lock's tools under it take a good share: the lock looked
+    // at, and the pieces as printed, are framed in what they leave clear
+    const phone = await browser.newContext({ viewport: { width: 390, height: 664 }, isMobile: true, hasTouch: true, deviceScaleFactor: 1 });
+    await phone.addInitScript(() => {
+      const getContext = HTMLCanvasElement.prototype.getContext;
+      HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+        if (type === 'webgl' || type === 'webgl2') attrs = { ...attrs, preserveDrawingBuffer: true };
+        return getContext.call(this, type, attrs);
+      };
+    });
+    const q = await phone.newPage();
+    const settled = async () => {
+      await q.waitForTimeout(80);
+      await q.waitForSelector('body[data-engine="idle"]', { timeout: 120000 });
+      await q.waitForTimeout(80);
+      await q.waitForSelector('body[data-engine="idle"]', { timeout: 120000 });
+    };
+    const press = (selector, text = null) =>
+      q.evaluate(([selector, text]) => [...document.querySelectorAll(selector)].find((x) => text === null || x.textContent === text).click(), [selector, text]);
+    await q.goto(url);
+    await settled();
+    await q.setInputFiles('#stlFile', path.join(out, 'batlantern.stl'));
+    await q.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('batlantern:'), null, { timeout: 60000 });
+    await settled();
+    await press('#suggestSpotsBtn');
+    await q.waitForFunction(() => !document.querySelector('#partsCard').hidden && !document.querySelector('#partsNote').classList.contains('busy') && document.querySelectorAll('#partList li').length > 0, null, { timeout: 120000 });
+    await settled();
+    await press('#partList li:first-child button', 'Make it 300 %');
+    await settled();
+    await q.waitForFunction(() => [...document.querySelectorAll('#partList button')].some((x) => x.textContent === 'Use'), null, { timeout: 120000 });
+    await press('#partList li:first-child button', 'Use');
+    await settled();
+    await q.evaluate(() => document.querySelector('#resultToggle').click());
+    await settled();
+    await q.waitForTimeout(300);
+    // the lock's orange on the canvas, and how much of it, or of the pieces, lies under an element over the view
+    const under = (selector) =>
+      q.evaluate((selector) => {
+        const c = document.querySelector('#stage canvas');
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        const cr = c.getBoundingClientRect();
+        const k = probe.width / cr.width;
+        const boxes = [...document.querySelectorAll(selector)].filter((x) => !x.closest('[hidden]')).map((x) => x.getBoundingClientRect());
+        const out = { lock: 0, lockUnder: 0, piece: 0, pieceUnder: 0 };
+        for (let i = 0; i < d.length; i += 4) {
+          const [r, g, bl] = [d[i], d[i + 1], d[i + 2]];
+          const x = ((i / 4) % probe.width) / k + cr.left;
+          const y = Math.floor(i / 4 / probe.width) / k + cr.top;
+          const hidden = boxes.some((b) => x >= b.left && x <= b.right && y >= b.top && y <= b.bottom);
+          const lock = r > 150 && bl < 70 && g < 0.62 * r && g > 0.25 * r;
+          const piece = lock || (bl > 150 && bl - r > 100) || (r > 200 && g > 120 && bl > 60 && bl < 140 && r - bl > 80);
+          if (lock) {
+            out.lock++;
+            if (hidden) out.lockUnder++;
+          }
+          if (piece) {
+            out.piece++;
+            if (hidden) out.pieceUnder++;
+          }
+        }
+        return out;
+      }, selector);
+    await press('#lookLockBtn');
+    await q.waitForTimeout(400);
+    const looked = await under('#stage .legend, #stage .stage-tools, #lockPanel .lock-tools > *');
+    await press('#frameBtn');
+    await press('#asPrintedToggle');
+    await q.waitForTimeout(400);
+    const printedOn = await under('#stage .legend, #stage .stage-tools, #lockPanel .lock-tools > *');
+    check(
+      looked.lock > 300 && looked.lockUnder < 0.05 * looked.lock && printedOn.piece > 300 && printedOn.pieceUnder < 0.05 * printedOn.piece,
+      "on a phone Look at the lock and As printed frame the pieces clear of the legend and the lock's tools over the view",
+      JSON.stringify({ looked, printedOn }),
+    );
+    await phone.close();
   }
 
   check(problems.length === 0, 'no console errors or exceptions (page or worker)', problems.join(' | '));

@@ -13,6 +13,8 @@
   --cut: #8b5cf6; /* the violet of the cut planes in the view */
   --apart: #0d9488; /* the teal of a cut that comes apart (split.js APART_COLOR) */
   --amber: #f59e0b; /* a place where only a shorter or clipless lip fits (viewer.js AIM_COLORS) */
+  --lock: #ff6a00; /* a twist-lock's own faces in the pieces view (viewer.js LOCK_COLORS) */
+  --lock-text: #c2410c; /* words in that orange, dark enough to read on the panel */
   --stage-top: #eef2fa;
   --stage-bottom: #cfd8e8;
   --radius: 10px;
@@ -28,6 +30,7 @@
     --text: #e8edf7;
     --muted: #94a0b8;
     --accent-soft: #3a2616;
+    --lock-text: #fb923c;
     --stage-top: #243049;
     --stage-bottom: #121827;
     color-scheme: dark;
@@ -348,6 +351,16 @@ input[type='range'] {
   color: var(--muted);
   white-space: pre-line;
 }
+/* in the bar that stays at the foot of the panel, under its buttons: what the page says is never scrolled away (the
+   placing hint, a download's name, the fit test's instructions); a long one scrolls in its own few lines */
+.actions .status {
+  grid-column: 1 / -1;
+  max-height: 7.5em;
+  overflow-y: auto;
+}
+.actions .status:empty {
+  min-height: 0;
+}
 .status.ok {
   color: var(--ok);
 }
@@ -379,12 +392,25 @@ input[type='range'] {
   touch-action: none;
 }
 
-.legend {
+/* the legend and the view's tools along the top of the view, side by side: at any width the legend gives way and wraps
+   its chips rather than run under the tools */
+.stage-top {
   position: absolute;
   top: 12px;
   left: 12px;
+  right: 12px;
   display: flex;
-  gap: 12px;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+  pointer-events: none;
+}
+.legend {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 12px;
   padding: 6px 10px;
   border-radius: 8px;
   background: color-mix(in srgb, var(--panel) 80%, transparent);
@@ -410,12 +436,16 @@ input[type='range'] {
 
 
 .stage-tools {
-  position: absolute;
-  top: 12px;
-  right: 12px;
+  flex: 0 0 auto;
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 8px;
   align-items: center;
+  pointer-events: auto;
+}
+.legend > span {
+  white-space: nowrap;
 }
 .check.pill {
   padding: 4px 10px;
@@ -671,7 +701,8 @@ input[type='range'] {
 .progress {
   position: absolute;
   left: 50%;
-  bottom: 16px;
+  /* over the lock's tools when they are shown (--lock-room, their height): never on them */
+  bottom: calc(16px + var(--lock-room, 0px));
   transform: translateX(-50%);
   display: flex;
   align-items: center;
@@ -701,7 +732,7 @@ input[type='range'] {
 .toast {
   position: absolute;
   left: 50%;
-  bottom: 60px;
+  bottom: calc(60px + var(--lock-room, 0px));
   transform: translateX(-50%);
   display: flex;
   align-items: center;
@@ -969,6 +1000,9 @@ ul.plan li select {
   margin: 0;
   accent-color: var(--apart);
 }
+#cutList .cut-hold {
+  max-width: 100%;
+}
 #cutList .cut-hold span {
   padding: 2px 7px;
   font-size: 0.78rem;
@@ -1030,6 +1064,120 @@ ul.plan li select {
   background: color-mix(in srgb, var(--apart) 10%, var(--panel));
   border-color: var(--apart);
   outline: none;
+}
+
+/* the parts that come off on their own: a lid inside a handle, a base from underneath, each with the twist-lock it
+   gets at this size – or why none fits, and the sizes that fit one */
+.parts-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 9px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--apart) 35%, var(--border));
+  background: color-mix(in srgb, var(--apart) 5%, var(--panel));
+}
+.parts-card[hidden] {
+  display: none;
+}
+.parts-title {
+  margin: 0;
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+.parts-note {
+  margin: 0;
+}
+.parts-note.busy {
+  animation: deriving-pulse 1.2s ease-in-out infinite;
+}
+.part-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.part-list:empty {
+  display: none;
+}
+.part-offer {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  background: var(--panel);
+  border-left: 3px solid var(--apart);
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+/* too small for a lock at this size: amber, as a place where only a lip without clips fits */
+.part-offer.small {
+  border-left-color: var(--amber);
+}
+.part-detail {
+  color: var(--muted);
+}
+.part-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.part-badge {
+  margin-right: auto;
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-style: italic;
+}
+
+/* a part's row: its letter, its name and remove; where its face is, how wide it is and how it holds below; what it
+   gets under that */
+#cutList li.part {
+  grid-template-columns: auto 1fr auto auto;
+}
+#cutList .part-name {
+  font-weight: 600;
+  min-width: 0;
+}
+#cutList .part-place {
+  grid-column: 2 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+#cutList .part-place .at input {
+  width: 72px;
+}
+#cutList .part-place .at[hidden] {
+  display: none;
+}
+/* what it gets, and ▶ beside it: the part coming out along its way in the pieces view */
+#cutList .part-meta {
+  grid-column: 2 / -1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+#cutList .part-meta .meta {
+  flex: 1;
+  min-width: 0;
+}
+#cutList .part-play {
+  flex: none;
+  padding: 0 7px;
+  color: var(--lock-text);
+}
+#cutList .part-play[hidden] {
+  display: none;
+}
+/* no twist-lock fits at this size: Twist-lock is struck through, and says from what size one does */
+#cutList .cut-hold label.struck span {
+  text-decoration: line-through;
+  opacity: 0.6;
 }
 
 /* one row per piece: its colour in the view, then what it is */
@@ -1108,16 +1256,105 @@ ul.plan li select {
 .dot.pieces {
   background: conic-gradient(#4f8fe6 0 33%, #e88d67 0 66%, #5aa469 0);
 }
+/* a twist-lock's own faces in the pieces view, its lugs; as printed, what of it overhangs and its bridged ceilings */
+.dot.lock {
+  background: var(--lock);
+}
+.dot.lug {
+  background: #ffd60a;
+}
+.dot.over {
+  background: #e11d48;
+}
+.dot.bridge {
+  background: transparent;
+  box-shadow: inset 0 0 0 2px #eab308;
+}
+/* the lock's tools, bottom left of the view: what the part is doing as it comes out, over the buttons */
+.lock-panel {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  max-width: calc(100% - 24px);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  pointer-events: none;
+}
+.lock-panel[hidden] {
+  display: none;
+}
+.lock-panel > * {
+  pointer-events: auto;
+}
+.lock-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.lock-tools .btn[hidden] {
+  display: none;
+}
+#playWayBtn {
+  border-color: var(--lock);
+  color: var(--lock-text);
+}
+.way-caption {
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--lock);
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.way-caption[hidden] {
+  display: none;
+}
+/* the words on a lock looked at: which is a lug, a slot, a click tab, each over its point with a stalk down to it */
+.lock-words {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.lock-word {
+  position: absolute;
+  left: 0;
+  top: 0;
+  margin-top: -30px;
+  padding: 2px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--lock);
+  background: color-mix(in srgb, var(--panel) 90%, transparent);
+  color: var(--lock-text);
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  translate: -50% 0;
+}
+.lock-word::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  width: 2px;
+  height: 8px;
+  margin-left: -1px;
+  background: var(--lock);
+}
+.lock-word[hidden] {
+  display: none;
+}
 /* small screens: the legend and the view's tools share the top of the view instead of covering each other */
 @media (max-width: 820px) {
   .legend {
-    flex-wrap: wrap;
     gap: 2px 10px;
     max-width: calc(45% - 12px);
   }
   .stage-tools {
-    flex-wrap: wrap;
-    justify-content: flex-end;
     max-width: calc(55% - 12px);
   }
   .stage-tools .pill {
@@ -1146,5 +1383,10 @@ ul.plan li select {
   }
   #cutList .seg span {
     padding: 2px 6px;
+  }
+  /* and how a cut that comes apart holds still fits the card, Locks to Lifts off on one line */
+  #cutList .cut-hold span {
+    padding: 2px 4px;
+    font-size: 0.74rem;
   }
 }

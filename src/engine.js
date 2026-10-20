@@ -23,11 +23,11 @@ import {
   spotStart, spotWhy, socketsAsWell,
 } from './split.js';
 import {
-  buildSplitDisplay, carveParts, checkPart, clearSplitCaches, couponRow, cutPieces, drillPiece, fitTestCoupon, layoutSplit, lockPieces, partFrame, partInFrame, partedSolids,
-  pinAt, pinSheet, pinSpares, pinsPerSheet, planDovetails, probeLip, shellCounts, tabsAcross, wayOverlaps,
+  buildSplitDisplay, carveParts, checkPart, clearSplitCaches, couponRow, cutPieces, drillPiece, fitTestCoupon, layoutSplit, lockFaces, lockMatrix, lockPieces, lockPoints, partFrame, partInFrame, partedSolids,
+  partRows, pinAt, pinSheet, pinSpares, pinsPerSheet, placePart, planDovetails, probeLip, shellCounts, tabsAcross, wayOverlaps,
 } from './splitGeometry.js';
-import { FINE_SPECK, WAY_START, WAY_STEP, findParts, fineSlices, sliceStack } from './partFinder.js';
-import { sizes, takesTeaLight } from './locks.js';
+import { FINE_SPECK, LEAST_MOST, WAY_START, WAY_STEP, findParts, fineSlices, freeWindows, sliceStack } from './partFinder.js';
+import { scalePercent, sizes, slitBridge, takesTeaLight } from './locks.js';
 import { twistCoupon } from './lockGeometry.js';
 
 /**
@@ -55,7 +55,7 @@ import { twistCoupon } from './lockGeometry.js';
  *                                                          'part'` and `part: { kind, name, centre, r, side, cap, top,
  *                                                          handle, way }`, `way` its way out in the world: `{ turn,
  *                                                          up, lift, dir, out, reach }`)
- *   split.plan  { items, baseVersion, printing, split, bed, mode: 'fit'|'measure'|'probe'|'spots'|'targets'|'parts' }
+ *   split.plan  { items, baseVersion, printing, split, bed, mode: 'fit'|'measure'|'probe'|'spots'|'targets'|'parts'|'part' }
  *                                                       -> fit: { cuts, counts, pieces, notes } (the cuts that come
  *                                                          apart first, as stored, then the new ones without ids)
  *                                                          measure: { bounds, cuts, notes } (a dovetail cut also has
@@ -81,9 +81,13 @@ import { twistCoupon } from './lockGeometry.js';
  *               mode: 'targets' { axis }                -> { axis, lo, hi, seams: [{ at, kind, shift }], notes,
  *                                                          estimate? }: where the shape changes along the axis,
  *                                                          for snapping a cut being placed (`aimProfile`)
- *               mode: 'parts' {}                         -> { centre, h, zmin, zmax, width, scale, solid, open,
+ *               mode: 'part' { centre: [x, y], at, r }  -> { ok, why, asked, z0, kind, lo, hi, gap, nearest, tried, windows,
+ *                                                          gmin, estimate? }: one part's face tried where it is put,
+ *                                                          as the split places it (`partRequest`)
+ *               mode: 'parts' {}                         -> { centre, h, zmin, zmax, width, scale, most, solid, open,
  *                                                          handles, parts: [{ kind: 'lid'|'plug', name, centre, face,
- *                                                          side, r, window, cap, top, lock, least, way, handle, … }],
+ *                                                          side, r, window, cap, top, lock, least: { lock, tea,
+ *                                                          opening? }, wall?, way, handle, … }],
  *                                                          notes, estimate? }: the parts that come off – a lid inside
  *                                                          a handle, a base from underneath – with the twist-lock
  *                                                          each gets at the split's clearance and the printer's
@@ -123,6 +127,11 @@ const AIM_SLICES = 640;
 const AIM_TOLERANCE = 0.01;
 const AIM_PROBES = 64;
 const AIM_EXTRA = 64; // samples the profile takes between faces square to its axis, at most
+// a shell of its own that starts where another ends, or this share of the model's length under where it ends, stands
+// on it (a roof on its body), rather than beside it
+const STACKED = 0.05;
+// the ends of shells side by side lie on the bed together only where they are this level (mm)
+const LEVEL_ENDS = 0.5;
 // A bend is found to within the slices' noise over its slope (a few hundredths of a millimetre): the model's corner is
 // looked for this far (mm) either side of it.
 const BEND_CORNER = 0.1;
@@ -131,6 +140,31 @@ const BEND_GAP = 0.05;
 // What hangs below a take-apart cut's clips is weighed as PLA (g/mm³) under gravity (m/s²).
 const PLA_DENSITY = 1.24e-3;
 const GRAVITY = 9.81;
+
+/**
+ * What the notes say of a part asked to lock where no twist-lock fits (`PART_SMALL`), from the parts table's entry
+ * for it – the same kind, round the same axis, its face in the same family: the model's size now as a share of the
+ * one loaded, how thick its roof is, the least scales a lock and a tea light need (whole 5 % of the model as loaded)
+ * and the lock's opening there; and where the split leaves the base on, the least scale its own lock needs ('now'
+ * when it locks at this size); with no least scale, how far up it was looked for (`most`). Null for a part the table
+ * has no entry for (one across X or Y, say).
+ * @param {object} table the parts table (`findParts`)
+ * @param {object} lid the part as the part stage has it (`axis`, `side`, `centre`, `at`, `plug`)
+ * @param {object[]} lids every part the split takes out
+ */
+export function partSmall(table, lid, lids) {
+  if (lid.axis !== 2 || lid.side !== 1) return null;
+  const pct = (q) => (q == null ? null : scalePercent(q * table.scale));
+  const near = (e) => Math.hypot(e.centre[0] - lid.centre[0], e.centre[1] - lid.centre[1]) <= 0.05 * table.width;
+  const entry = table.parts.find((e) => near(e) && (lid.plug ? e.kind === 'plug' : e.kind === 'lid' && lid.at >= e.from - 2 * table.h && lid.at <= e.cap));
+  if (!entry) return null;
+  const base = lid.plug || lids.some((x) => x.plug) ? null : table.parts.find((e) => e.kind === 'plug');
+  return {
+    now: Math.round(table.scale * 100), lock: pct(entry.least.lock), opening: entry.least.opening ?? null, tea: pct(entry.least.tea),
+    ...(entry.least.lock == null ? { most: Math.round(LEAST_MOST * table.scale * 100) } : {}),
+    wall: entry.wall ?? null, base: base ? (base.lock ? 'now' : pct(base.least.lock)) : null,
+  };
+}
 
 export class EngineError extends Error {
   constructor(code, message, details) {
@@ -2119,7 +2153,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const kept = solid ? solid.translate(0, 0, 0) : null; // our own handle, outside the scope
       const owned = separate.map((p) => ({ id: p.id, name: p.name, world: p.world.translate(0, 0, 0), local: p.local.translate(0, 0, 0) }));
       disposeResult(result);
-      result = { key, solid: kept, notes, skipped, separate: owned, passthrough: b.current.passthrough, itemBounds, split: null };
+      // the model with nothing merged into it or cut from it: what the parts are worked out from is the sketch's too
+      const plain = model && !covers.length && !emboss.length && !engrave.length ? model : null;
+      result = { key, solid: kept, notes, skipped, separate: owned, passthrough: b.current.passthrough, itemBounds, split: null, plain };
       return result;
     } finally {
       temps.dispose();
@@ -2448,12 +2484,30 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   const WAY_TRIES = 4;
   /** A point this far (mm) into the piece a part comes out of, from the part's plane, finds that piece's cell. */
   const PART_INSIDE = 0.01;
+  /**
+   * Why no lock fits a part at its size, where a bigger print may fit one (the parts table says from what size): a
+   * lid's roof, tabs or collar, a base's floor, wall or ring – not a lock that would leave the part in pieces.
+   */
+  const SMALL_WHY = new Set(['room', 'tabs', 'collar', 'floor', 'wall', 'cam']);
+
+  /**
+   * What the parts that come off are worked out from, the model alone's (`model`, a Manifold): kept once for both the
+   * cheap measure's sketch and a final result that is the model with nothing merged into it, so the slices the card
+   * read are not read again when the pieces are first shown.
+   */
+  let modelParts = null;
 
   /** What the parts that come off are worked out from, kept on a result: its slices, and those of it turned (plain). */
   function partsState(final) {
     const state = splitState(final);
-    state.parts ??= { stack: null, tables: new Map() };
+    if (!state.parts) {
+      const model = final === sketch ? final.solid : final.plain ?? null;
+      if (model && modelParts?.model !== model) modelParts = { model, parts: { stack: null, tables: new Map() } };
+      state.parts = model ? modelParts.parts : { stack: null, tables: new Map() };
+    }
     state.parts.frames ??= new Map();
+    // the fine slices read across Z so far, for the next search: plain islands, by height
+    state.parts.fine ??= new Map();
     state.parts.checks ??= new Map();
     state.parts.failed ??= new Map();
     state.parts.ways ??= new Map();
@@ -2542,7 +2596,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
             if (frame) ps.frames.set(key, stack);
             else ps.stack = stack;
           }
-          turned.set(key, { solid, stack, fine: fineSlices(solid, stack.speck * FINE_SPECK) });
+          turned.set(key, { solid, stack, fine: fineSlices(solid, stack.speck * FINE_SPECK, frame ? undefined : ps.fine) });
         }
         return turned.get(key);
       };
@@ -2560,6 +2614,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         let got = ps.checks.get(key);
         if (got) ps.checks.delete(key);
         else {
+          progress?.('Placing the parts that come off…');
           const { solid, stack, fine } = inFrame(frame);
           got = checkPart(solid, stack, fine, { c, z0, R }, { hl, gmin: S.gmin, grid, letter: part.letter, minLift: WAY_START * stack.height, S: locks ? S : null });
         }
@@ -2706,7 +2761,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         down: `${part.side > 0 ? '-' : '+'}${AXES[part.axis]}`, inside: fromFrame(frame, [c[0], c[1], got.z0 + (plug ? PART_INSIDE : -PART_INSIDE)]),
         // a locked part is turned free first (anticlockwise about its way out), then lifted, slid or dropped out
         way: { turn: mech ? got.lock.theta : 0, up: got.way.up, lift: k.lift ?? got.way.lift, dir: inPlane(got.way.dir), out, reach: got.way.reach },
-        lock: got.lock, why: got.lock?.why ?? null,
+        lock: got.lock, why: got.lock?.why ?? null, small: null,
         // what the drill stage builds the lock from: in the part's frame, its face at z0 (a base's plug turned down to
         // its wall's gap even when nothing holds it)
         build: mech || plug ? {
@@ -2716,6 +2771,13 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         } : null,
       };
     });
+    // a part asked to lock where no twist-lock fits at this size: the notes say from what size one does, read off the
+    // parts table (the card's, when it asked for it)
+    const small = lids.filter((lid) => lid.hold === 'lock' && SMALL_WHY.has(lid.why));
+    if (small.length) {
+      const table = partsTable(final, { n: S.n, hl, c: spec.clearance }, progress);
+      for (const lid of small) lid.small = partSmall(table, lid, lids);
+    }
     return { notes, lids, carved: stage.carved };
   }
 
@@ -2915,6 +2977,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const early = new Map();
     let parted = [];
     const solidOf = (index) => solids[cut.pieces.findIndex((c) => c.index === laid.find((p) => p.index === index).from)];
+    // what drilling the pieces is, as the progress says it: a twist-lock built into them where they have no pins
+    const doing = !layout.dowels.length && (layout.locks ?? []).some((l) => l.mech) ? 'Building the twist-lock…' : 'Drilling pin holes…';
     try {
       // each piece is drilled with every lock still listed – the necks of those it carries, the lips of the cuts whose
       // lock is not: a lock dropped changes the pieces settled before it, so they are settled again, until none is
@@ -2949,7 +3013,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         // a box whose shells print apart: each group of them is a piece of its own
         parted = mine.length > 1 ? partedSolids(solids[i], c.parts, mine.map((p) => p.parts)) : [];
         mine.forEach((p, k) => {
-          progress?.('Drilling pin holes…', { done: p.index, total: laid.length });
+          progress?.(doing, { done: p.index, total: laid.length });
           const done = early.get(p.index);
           early.delete(p.index);
           drilled.push(done ?? drillPiece(parted[k] ?? solids[i], layout, p.index, { font }));
@@ -2957,6 +3021,13 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         parted.forEach((m) => m.delete());
         parted = [];
       });
+      // the locks' own faces as these pieces have them, for the view to paint: a lock built again has new ids; and
+      // where its lugs, slots and click tabs are, for the view's words on them
+      for (const lock of layout.locks ?? []) {
+        if (!lock.mech) continue;
+        lock.faces = lockFaces(lock);
+        lock.points = lockPoints(lock);
+      }
       return drilled;
     } catch (err) {
       drilled.forEach((m) => m.delete());
@@ -3135,7 +3206,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         : mech === 'plug' ? { R: L.R, opening: L.opening, theta: L.theta, tabs: L.tabs, teaLight, coin: L.coin } : {};
       return {
         cutId: lid.id, letter: lid.letter, axis: lid.axis, at: lid.at, pieces: [home, piece], joint: 'part', labels: null, dowels: [], pegs: [], male: null,
-        apart: { hold: lid.hold, lip: false, clips: 0, mech, ...lock, ...(lid.hold === 'lock' && !mech ? { why: lid.why ?? 'pieces' } : {}) },
+        apart: {
+          hold: lid.hold, lip: false, clips: 0, mech, ...lock, ...(lid.hold === 'lock' && !mech ? { why: lid.why ?? 'pieces' } : {}),
+          ...(lid.small && !mech ? { small: lid.small } : {}),
+        },
         part: {
           kind: lid.kind, name: lid.name, centre: lid.centre, r: lid.r, side: lid.side, cap: lid.cap, top: lid.top, handle: lid.handle, span: lid.span,
           way: mech ? lid.way : { ...lid.way, turn: 0 },
@@ -3193,7 +3267,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const cutNotes = cut.notes.filter((x) => x.code !== 'SMALL_PIECE');
     const after = cutNotes.findIndex((x) => x.code === 'PART_SPANS_CUT' || x.code === 'SPLIT_UNREPAIRED');
     cutNotes.splice(after < 0 ? cutNotes.length : after, 0, ...textNotes(cut.crossings, laid));
-    // how each part comes off: its twist-lock and how to work it, or that nothing holds it
+    // how each part comes off: its twist-lock and how to work it, too small for one (and from what size one fits), or
+    // that nothing holds it; then how each lock prints, and the fit test that tries it
     const lockNotes = partSeams.map((x) => {
       const ids = { letter: x.letter, cutId: x.cutId, name: x.part.name };
       const { mech, theta, opening, teaLight } = x.apart;
@@ -3202,8 +3277,20 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         return splitNote('PART_LOCK', { ...ids, piece, home, handle: x.part.handle, turn: theta, lift: x.part.way.lift, dir: x.part.way.dir, span: x.part.span });
       }
       if (mech === 'plug') return splitNote('PART_PLUG', { ...ids, piece, home, turn: theta, opening, teaLight, model: bodyName ? 'the lantern' : null });
+      if (x.apart.small) return splitNote('PART_SMALL', { ...ids, why: x.apart.why, ...x.apart.small });
       return splitNote('PART_LIFTS', ids);
     });
+    for (const x of partSeams.filter((s) => s.apart.mech)) {
+      const [home, piece] = x.pieces;
+      const built = layout.locks.find((l) => l.cutId === x.cutId);
+      lockNotes.push(splitNote('PART_PRINT', {
+        letter: x.letter, cutId: x.cutId, name: x.part.name, piece, home, mech: x.apart.mech,
+        ...(x.apart.mech === 'twist' ? { bridge: slitBridge(built.S, x.apart.r0).long, slope: x.apart.slope } : {}),
+      }));
+    }
+    // the fit test tries the split's first twist-lock: said once, when a part has one
+    const tried = (layout.locks ?? []).find((l) => l.mech === 'twist');
+    if (tried && partSeams.some((s) => s.apart.mech === 'twist')) lockNotes.push(splitNote('PART_FIT', couponOf(tried.S, tried.r0, tried.theta)));
     notes.push(...given, ...lockNotes, ...plan.notes, ...smallPieceNotes(laid, cuts), ...cutNotes);
     // what prints on its own must fit the bed as it is saved too: a part lying pegs up, a pin on its flat
     for (const p of final.separate) {
@@ -3247,13 +3334,37 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           return simpler.numTri() < m.numTri() ? simpler : m;
         });
         const by = axisCuts(split.cuts);
-        const entries = split.laid.map((p, i) => ({ solid: shown[i], soup: p.soup, part: { kind: 'piece', index: p.index } }));
+        // each twist-lock's faces on the two pieces it was drilled into: what is the lock, and what carries it; and
+        // its joint's plane (a point on its axis, and the axis), where what carries it shares the pieces' own face
+        const marks = [];
+        const marksOf = (index) => {
+          const ids = new Map();
+          for (const lock of drill.layout.locks ?? []) {
+            if (!lock.faces || !lock.sides.some((x) => x.piece === index)) continue;
+            const M = lockMatrix(lock);
+            const at = applyMat4(M, [0, 0, 0]);
+            const axis = applyMat4(M, [0, 0, 1]).map((v, a) => +(v - at[a]).toFixed(9) + 0);
+            for (const kind of ['lock', 'carry', 'lug']) {
+              let m = marks.findIndex((x) => x.cutId === lock.cutId && x.kind === kind);
+              if (m < 0) m = marks.push({ cutId: lock.cutId, kind, at, axis }) - 1;
+              for (const id of lock.faces[kind]) ids.set(id, m);
+            }
+          }
+          return ids.size ? ids : null;
+        };
+        const entries = split.laid.map((p, i) => ({ solid: shown[i], soup: p.soup, part: { kind: 'piece', index: p.index }, marks: marksOf(p.index) }));
         for (const d of drill.layout.dowels) entries.push({ solid: temps.add(pinAt(d)), part: { kind: 'pin', cell: d.cell } });
         for (const p of final.separate) {
           const b = boxOf(p.world);
           entries.push({ solid: p.world, part: { kind: 'part', id: p.id, cell: cellOfPoint(b.min.map((v, a) => (v + b.max[a]) / 2), by) } });
         }
-        drill.display = buildSplitDisplay(entries);
+        // the words on a lock looked at: each point on the piece it is part of, the body's or the part's
+        const lockLabels = (drill.layout.locks ?? []).flatMap((lock) => {
+          const part = lock.sides.find((x) => x.role === 'part')?.piece;
+          const body = lock.sides.find((x) => x.role !== 'part')?.piece;
+          return (lock.points ?? []).map((x) => ({ cutId: lock.cutId, name: x.name, piece: x.on === 'part' ? part : body, at: x.at.map((v) => +v.toFixed(4)) }));
+        }).filter((x) => x.piece != null);
+        drill.display = { ...buildSplitDisplay(entries), marks, lockLabels };
       } finally {
         temps.dispose();
         if (owned) solids.forEach((m) => m.delete());
@@ -3267,6 +3378,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       passthroughStart: d.passthroughStart,
       passthroughRanges: d.passthroughRanges,
       ranges: d.ranges,
+      markRanges: d.markRanges,
+      marks: d.marks,
+      lockLabels: d.lockLabels,
       parts: d.parts,
       bvhRoots: [],
     };
@@ -3428,6 +3542,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const { items, baseVersion, printing, split = null, bed = null, mode = 'fit' } = request;
     if (mode === 'probe' || mode === 'spots' || mode === 'targets') return aimRequest(request, progress);
     if (mode === 'parts') return partsRequest(request, progress);
+    if (mode === 'part') return partRequest(request, progress);
     if (mode === 'measure' && sketchWill(items, baseVersion)) {
       // the final result for this text is not built: a measure while the text is edited must not build it
       const message = measureCuts(sketchFor(items, baseVersion), items, split, null, progress);
@@ -3640,7 +3755,30 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * axis's profile and seams, the flat area the model ends in on each side,
    * and the last answers.
    */
-  const aimState = (final) => (splitState(final).aim ??= { slices: new Map(), profiles: new Map(), ends: null, probes: new Map() });
+  const aimState = (final) => (splitState(final).aim ??= { slices: new Map(), profiles: new Map(), ends: null, probes: new Map(), spans: [] });
+
+  /** Each shell's span along an axis (`shellSpans`), kept with the result: read once, the first time a cut needs it. */
+  function aimSpans(final, axis) {
+    const aim = aimState(final);
+    aim.spans[axis] ??= shellSpans(final.solid.getMesh(), axis);
+    return aim.spans[axis];
+  }
+
+  /**
+   * Whether a seam over [lo, hi] along an axis is where one shell of a model of several ends or starts beside others
+   * that go on through it – two canisters side by side, the shorter one ending – and not where one stands on another:
+   * a roof modelled as a shell of its own starts where the body under it ends, resting on it, or a little under where
+   * it ends, sunk into it (as far as `STACKED` of the model's length), and that is the model's own seam.
+   */
+  function besideAt(spans, lo, hi, length) {
+    const near = (e) => e >= lo - 0.01 && e <= hi + 0.01;
+    if (!spans.some(([b, e]) => near(b) || near(e))) return false;
+    // the shells themselves, not the hollows sealed in them
+    const solids = spans.filter(([, , v]) => v > 0);
+    const sink = STACKED * length;
+    const onIt = solids.some(([u, e]) => near(e) && u < lo - 0.01 && solids.some(([b, t]) => b >= e - sink && b <= e + 0.01 && t > hi + 0.01));
+    return !onIt;
+  }
 
   /** Lets go of what trying cuts kept on a result. */
   function releaseAim(final) {
@@ -3829,8 +3967,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
 
   /**
    * The span along an axis of each shell of a mesh – each set of triangles
-   * joined by their corners – as [min, max]: one of two boxes printed side by
-   * side ends where it ends, which says nothing of the other.
+   * joined by their corners – as [min, max, volume]: one of two boxes printed
+   * side by side ends where it ends, which says nothing of the other. The
+   * volume is signed: a hollow sealed inside a shell has its own surface, and
+   * its volume is less than nothing.
    */
   function shellSpans(mesh, axis) {
     const { vertProperties: P, numProp, triVerts: T, mergeFromVert, mergeToVert } = mesh;
@@ -3857,7 +3997,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       if (span) {
         span[0] = Math.min(span[0], h);
         span[1] = Math.max(span[1], h);
-      } else spans.set(r, [h, h]);
+      } else spans.set(r, [h, h, 0]);
+    }
+    for (let t = 0; t + 2 < T.length; t += 3) {
+      const [a, b, c] = [T[t] * numProp, T[t + 1] * numProp, T[t + 2] * numProp];
+      const cross = [
+        P[b + 1] * P[c + 2] - P[b + 2] * P[c + 1],
+        P[b + 2] * P[c] - P[b] * P[c + 2],
+        P[b] * P[c + 1] - P[b + 1] * P[c],
+      ];
+      spans.get(root(T[t]))[2] += (P[a] * cross[0] + P[a + 1] * cross[1] + P[a + 2] * cross[2]) / 6;
     }
     return [...spans.values()];
   }
@@ -4018,7 +4167,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         if (!seam) continue;
         // a shell of its own ending or starting here: as the profile's samples do not know which island is which
         spans ??= shellSpans(mesh, axis);
-        const ends = spans.length > 1 && spans.some(([s0, s1]) => [s0, s1].some((e) => e >= seam.lo - 0.01 && e <= seam.hi + 0.01));
+        const ends = spans.length > 1 && besideAt(spans, seam.lo, seam.hi, hi - lo);
         const judged = seamOf(at(seam.lo).cs, at(seam.hi).cs, { ends });
         if (!judged) continue;
         found.push({ lo: seam.lo - SPOT.tolerance, hi: seam.hi + SPOT.tolerance, ...judged, shift: Math.round(seam.shift * 1000) / 1000 });
@@ -4076,7 +4225,15 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       face.delete();
     }
     const ends = aimEnds(final);
-    const asWell = endsAsWell(ends.beds[a], area, { lengths: [at - profile.lo, profile.hi - at], spans: ends.spans[a], faceSpan: span });
+    let asWell = endsAsWell(ends.beds[a], area, { lengths: [at - profile.lo, profile.hi - at], spans: ends.spans[a], faceSpan: span });
+    // a cut through several shells side by side: the piece either side of it is one piece of each of their ends, which
+    // lies on the model's end there only where every one of them reaches it – two canisters of different heights cut
+    // across leave a top that can't lie on its top, so it carries no lip, as the download finds
+    if (islands > 1) {
+      const crossed = aimSpans(final, a).filter(([s0, s1, v]) => v > 0 && s0 < at - CUT_TOLERANCE && s1 > at + CUT_TOLERANCE);
+      const even = (k) => crossed.every((x) => Math.abs(x[k] - crossed[0][k]) <= LEVEL_ENDS);
+      if (crossed.length > 1) asWell = asWell.map((w, k) => w && even(k));
+    }
     const socketsWell = socketsAsWell(ends.beds[a], area);
     const r = probeLip(final.solid, { axis: a, at }, {
       c, nozzle, hl, hold, bounds: boxOf(final.solid), asWell, socketsWell, sliceAt: (t) => aimSlice(final, a, t), flats: profile.flats, moves, within,
@@ -4326,7 +4483,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         return { message: { axis: AXES[a], spots, seams: seamsOf(aimProfile(final, a)), notes, ...extra }, transfer: [] };
       }
       if (!Number.isFinite(at)) fail('INTERNAL', 'A probe needs a place along the axis (at)');
-      const answer = aimAt(final, a, at, settings, progress);
+      const answer = wholeNear(final, a, aimAt(final, a, at, settings, progress), settings);
       const temps = scope();
       let crosses;
       try {
@@ -4338,6 +4495,26 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     } finally {
       trimAim(final);
     }
+  }
+
+  /**
+   * A place tried by hand whose lip comes in short stretches – an opening's edge in its foot cuts its tongue, just over
+   * a row of windows' tips – and no move offered: the half step up, else down, where the lip is as full and in one
+   * piece, as the spots take it, offered as the move (`suggestedAt`, `suggestedLip`).
+   */
+  function wholeNear(final, a, answer, settings) {
+    const { lip } = answer;
+    if (!lip?.broken || Number.isFinite(answer.suggestedAt)) return answer;
+    const { hold, c } = settings;
+    const bare = !(lip.clips > 0 || lip.twist);
+    const profile = aimProfile(final, a);
+    for (const x of [answer.at + SPOT.step, answer.at - SPOT.step]) {
+      if (!(x > profile.lo && x < profile.hi)) continue;
+      const r = aimAt(final, a, x, settings, null, { moves: false });
+      if (!fullLip(r.lip, hold, c, bare) || r.lip.broken || (r.lip.clips ?? 0) < (lip.clips ?? 0)) continue;
+      return { ...answer, suggestedAt: x, suggestedLip: { H: r.lip.H, clips: r.lip.clips, ...(r.lip.twist ? { twist: true } : {}), whole: true } };
+    }
+    return answer;
   }
 
   /** The parts tables kept with a result: this many sets of printer settings. */
@@ -4360,22 +4537,65 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const extra = estimate ? { estimate: true } : {};
     if (unavailable || !final.solid) return { message: { parts: [], handles: [], solid: false, open: null, notes, ...extra }, transfer: [] };
     const { spec } = normaliseSplit({ ...(split ?? {}), cuts: [] });
-    const settings = { n: printing?.nozzle ?? 0.4, hl: printing?.layerHeight ?? 0.2, c: spec.clearance };
-    const state = splitState(final);
-    partsState(final);
+    const table = partsTable(final, { n: printing?.nozzle ?? 0.4, hl: printing?.layerHeight ?? 0.2, c: spec.clearance }, progress);
+    return { message: { ...table, notes, ...extra }, transfer: [] };
+  }
+
+  /**
+   * One part's face tried where it is being put (`split.plan` mode 'part'): a circle of radius `r` round `centre`
+   * across Z, lying up from `at`, as the split will place it (`placePart`) – on the layers of the piece it comes out
+   * of (from the model's bottom, or the highest cut across Z under it, in the split's `cuts`), moved a layer or two up
+   * where it would not print apart from what stands beside it, refused with the nearest face that would. With it, the
+   * free bands round the centre at the face taken (`windows`, radii), which a width typed in or dragged is kept in.
+   * On the slices of the model kept with the parts table and a few dozen fine ones: a tenth of a second or so on a
+   * dense model.
+   */
+  function partRequest({ items, baseVersion, printing, split = null, centre = null, at = null, r = null }, progress) {
+    if (!(Array.isArray(centre) && Number.isFinite(at) && r > 0)) fail('INTERNAL', 'A part needs its centre, its face (at) and its radius (r)');
+    const estimate = sketchWill(items, baseVersion);
+    const final = estimate ? sketchFor(items, baseVersion) : finalFor(items, baseVersion, printing, progress);
+    const extra = estimate ? { estimate: true } : {};
+    if ((base.kind !== 'none' && !base.current?.watertight) || !final.solid) return { message: { ok: false, why: 'empty', asked: at, z0: at, windows: [], ...extra }, transfer: [] };
+    const { spec, cuts } = normaliseSplit({ ...(split ?? {}), cuts: (split?.cuts ?? []).filter((c) => !c.part) });
+    const hl = printing?.layerHeight ?? 0.2;
+    const S = sizes(printing?.nozzle ?? 0.4, hl, spec.clearance);
+    const ps = partsState(final);
+    if (!ps.stack) {
+      progress?.('Finding the parts that come off…');
+      ps.stack = sliceStack(final.solid);
+    }
+    // the model's slices at the heights this face needs: a few dozen, kept for the next face tried
+    const fine = fineSlices(final.solid, ps.stack.speck * FINE_SPECK, ps.fine);
+    const zmin = splitBounds(final).min[2];
+    const under = cuts.filter((c) => c.axis === 2 && c.at < at - CUT_TOLERANCE).map((c) => c.at);
+    const c = [centre[0], centre[1]];
+    const placed = placePart(ps.stack, fine, { c, z0: at, R: r }, { hl, gmin: S.gmin, grid: { from: Math.max(zmin, ...under), step: hl } });
+    const { rows } = partRows(ps.stack, fine, c, placed.z0, hl);
+    const windows = freeWindows(rows).filter((w) => Number.isFinite(w.hi)).map((w) => [+w.lo.toFixed(4), +w.hi.toFixed(4)]);
+    const { ok, why, asked, z0, kind, lo, hi, gap, nearest, tried } = placed;
+    return { message: { ok, why, asked, z0, kind, lo, hi, gap, nearest, tried, windows, gmin: S.gmin, ...extra }, transfer: [] };
+  }
+
+  /** The model's size against the one loaded (the cube root of its transforms' scale), for the texts' scales. */
+  const modelScale = () => +Math.cbrt(Math.abs(composeTransforms(base.transforms ?? []).determinant())).toFixed(6);
+
+  /**
+   * The parts table for a result and the printer's nozzle, layer height and the clearance (`settings`: `n`, `hl`,
+   * `c`), kept with the result – the card's, the pick mode's and the notes of a part too small to lock read the same.
+   */
+  function partsTable(final, settings, progress) {
+    const ps = partsState(final);
     const key = stableKey(settings);
-    let table = state.parts.tables.get(key);
-    if (table) state.parts.tables.delete(key);
+    let table = ps.tables.get(key);
+    if (table) ps.tables.delete(key);
     else {
       progress?.('Finding the parts that come off…');
-      state.parts.stack ??= sliceStack(final.solid);
-      // the model's size against the one loaded, for the texts' scales
-      const scale = Math.cbrt(Math.abs(composeTransforms(base.transforms ?? []).determinant()));
-      table = findParts(final.solid, { ...settings, stack: state.parts.stack, scale: +scale.toFixed(6) });
+      ps.stack ??= sliceStack(final.solid);
+      table = findParts(final.solid, { ...settings, stack: ps.stack, slices: ps.fine, scale: modelScale() });
     }
-    state.parts.tables.set(key, table);
-    while (state.parts.tables.size > PARTS_TABLES) state.parts.tables.delete(state.parts.tables.keys().next().value);
-    return { message: { ...table, notes, ...extra }, transfer: [] };
+    ps.tables.set(key, table);
+    while (ps.tables.size > PARTS_TABLES) ps.tables.delete(ps.tables.keys().next().value);
+    return table;
   }
 
   /**
@@ -4707,6 +4927,30 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     });
   }
 
+  /** The twist-lock fit tests sized so far, by lock: their rings' diameter and weight (a few kept). */
+  const coupons = new Map();
+  const COUPONS = 8;
+
+  /**
+   * A twist-lock's fit test (`twistCoupon`): its rings' outer diameter (`d`, mm) and their weight in PLA (`grams`),
+   * which a part's note and the fit test's own words quote alike. Kept by lock, so the note makes the rings once; with
+   * `keep` the rings are handed back too (the caller's).
+   */
+  function couponOf(S, r0, theta, { keep = false } = {}) {
+    const key = stableKey({ S, r0, theta });
+    const kept = coupons.get(key);
+    if (kept && !keep) return kept;
+    const rings = twistCoupon(S, r0, { theta });
+    const size = { d: +rings.d.toFixed(2), grams: Math.round((rings.body.volume() + rings.lid.volume()) * PLA_DENSITY) };
+    coupons.delete(key);
+    coupons.set(key, size);
+    while (coupons.size > COUPONS) coupons.delete(coupons.keys().next().value);
+    if (keep) return { ...size, rings };
+    rings.body.delete();
+    rings.lid.delete();
+    return size;
+  }
+
   /**
    * The fit test: a small print to try the joints before printing the
    * pieces. Given the model (`items`, `baseVersion`) and a split with cuts,
@@ -4771,9 +5015,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       }
       let twist = null;
       if (uses.twist) {
-        const rings = twistCoupon(uses.twist.S, uses.twist.r0, { theta: uses.twist.theta });
+        const { d, grams, rings } = couponOf(uses.twist.S, uses.twist.r0, uses.twist.theta, { keep: true });
         shells.push(temps.add(rings.body), temps.add(rings.lid));
-        twist = { r0: uses.twist.r0, theta: uses.twist.theta, d: +rings.d.toFixed(2), grams: Math.round((rings.body.volume() + rings.lid.volume()) * PLA_DENSITY) };
+        twist = { r0: uses.twist.r0, theta: uses.twist.theta, d, grams };
       }
       const coupon = shells.length === 1 ? shells[0] : temps.add(couponRow(shells));
       const soup = manifoldToSoup(coupon);

@@ -4255,6 +4255,9 @@ const NOTE_LEVELS = Object.freeze({
   PART_LIFTS: 'info',
   PART_LOCK: 'info',
   PART_PLUG: 'info',
+  PART_SMALL: 'warn',
+  PART_PRINT: 'info',
+  PART_FIT: 'info',
   PART_GAP: 'warn',
   PART_STUCK: 'warn',
   PART_SPLIT: 'warn',
@@ -4467,6 +4470,37 @@ const NOTE_TEXT = {
     const many = partMany(name);
     return `Cut ${letter}: the ${partCalled(name)} ${many ? 'lift' : 'lifts'} off – nothing holds ${many ? 'them' : 'it'}.`;
   },
+  PART_SMALL: ({ letter, name, why = 'room', now = 100, wall = null, lock = null, opening = null, tea = null, most = null, base = null }) => {
+    const called = partCalled(name);
+    // the dome and cap's roof is the dome: that is what is too thin
+    const roof = name === 'Dome and cap' ? 'dome' : called;
+    let s;
+    if (why === 'tabs') s = `Cut ${letter}: the ${roof} has no room for a twist-lock's click tabs at ${now} %.`;
+    else if (why === 'collar') s = `Cut ${letter}: nothing under the ${roof} is deep enough to carry a twist-lock at ${now} %.`;
+    else if (wall) s = `Cut ${letter}: the ${roof} is ${mm1(wall.t)} mm thick here and slopes ${roundAngle(wall.slope)}° – too thin for a twist-lock at ${now} %.`;
+    else s = `Cut ${letter}: the ${roof} has no room for a twist-lock at ${now} %.`;
+    if (lock != null) {
+      const at = Number.isFinite(opening) ? ` (a ${roundOpening(opening)} mm opening)` : '';
+      if (tea != null && tea > lock) s += ` A twist-lock fits from ${lock} %${at}; a ${TEA_LIGHT} mm tea light needs ${tea} %.`;
+      else if (tea === lock) s += ` A twist-lock fits from ${lock} %${at}, and takes a ${TEA_LIGHT} mm tea light.`;
+      else s += ` A twist-lock fits from ${lock} %${at}.`;
+    } else if (most != null) s += ` No twist-lock fits it up to ${most} %.`;
+    if (base === 'now') s += ' The base can twist off with a lock at this size.';
+    else if (base != null) s += ` The base can twist off from ${base} %.`;
+    const many = partMany(name);
+    return `${s} At this size the ${called} just ${name === 'Base' ? 'lifts out' : many ? 'lift off' : 'lifts off'}.`;
+  },
+  PART_PRINT: ({ piece = null, home = null, name, mech = 'twist', bridge = 0, slope = 1 }) => {
+    const which = partPiece(piece, `the ${partCalled(name)}`);
+    if (mech === 'plug') return `Print ${which} on its bottom, as saved. Its lock needs no support: every face it adds slopes at 45° or less, with no bridge.`;
+    const s = `Print ${which} on its cut face, as saved. The lock needs no support: its slots and click tabs are bridged (${need1(bridge)} mm or less) – if your slicer puts support inside them, turn on "don't support bridges".`;
+    // the collar under the joint slopes out as steeply as the model beside it does, up to 60° from upright
+    const inside = partPiece(home, 'the model');
+    if (!(slope > 1 + 1e-6)) return `${s} The collar under the joint inside ${inside} slopes at 45°, so it needs no support either.`;
+    const like = name === 'Dome and cap' ? 'the dome' : 'the model round it';
+    return `${s} The collar under the joint inside ${inside} slopes like ${like} (${roundAngle((Math.atan(slope) * 180) / Math.PI)}°), so it needs whatever support ${like} needs.`;
+  },
+  PART_FIT: ({ d = 0, grams = 0 }) => `Print the fit test first (Download fit test): two rings Ø ${roundOpening(d)} mm, about ${grams} g. If they won't twist together, raise the Clearance by 0.05 mm and print them again; if they rattle or don't click, lower it. Most printers need 0.15–0.25 mm, and PETG 0.25–0.3.`,
   PART_GAP: ({ letter, name, axis = 2, z = 0, gap = 0, need = 0.9, by = 'the model beside it', islands = 0, movedTo = null, nearest = null }) => {
     const where = `Cut ${letter}: at ${partAt(axis, z)} the ${partCalled(name)}'s`;
     // the face in pieces, or its edge too near what stands beside it (or running into it) to print apart
@@ -4545,6 +4579,14 @@ const NOTE_TEXT = {
  * alike); PART_PLUG `{ letter, cutId, name, piece, home, turn, opening, teaLight, model }` (a base that twists off
  * underneath, its opening Ø `opening`, said to take a tea light when `teaLight`; `model` what is turned over to fit
  * it, "the lantern", else piece `home`); PART_LIFTS `{ letter, cutId, name }` (it comes off and nothing holds it);
+ * PART_SMALL `{ letter, cutId, name, why, now, wall, lock, opening, tea, most, base }` (asked to lock, but no twist-lock
+ * fits at this size – `why` a lid's 'room', 'tabs' or 'collar', or a base's 'floor', 'wall' or 'cam' (no room for one),
+ * `now` the size as a share of the model as loaded (%), `wall`
+ * its roof's `{ t, slope }` – so it lifts off: a twist-lock fits from `lock` % with an opening Ø `opening`, a tea light
+ * from `tea` %, none up to `most` %; `base` the least scale (%) the base's own lock needs, or 'now');
+ * PART_PRINT `{ letter, cutId, name, piece, home, mech, bridge, slope }` (how a locked part prints: a collar
+ * twist-lock's longest bridge `bridge` mm, its collar's slope `slope` in r per z; a base prints on its bottom);
+ * PART_FIT `{ d, grams }` (the fit test's two rings, Ø `d`, about `grams` g);
  * PART_GAP `{ letter, cutId, name, axis, z, gap, need, by,
  * islands, movedTo, nearest }` (at `z` its edge is `gap` mm from what stands beside it, `by` – 0 when it runs into it
  * – where it needs `need` to print apart, or its face is in `islands` pieces: moved to `movedTo`, or refused, with
@@ -4770,7 +4812,9 @@ export function howToGlueText(plan) {
   }
   const anyLip = lips.size > 0;
   const anyClips = [...lips.values()].some((l) => l.clicks);
-  const anyTwist = [...lips.values()].some((l) => l.twist);
+  // the parts that twist-lock in their own place: a lid's collar twist-lock, or a base's from underneath
+  const locked = seams.filter((s) => s.joint === 'part' && s.apart?.mech && s.part);
+  const anyTwist = [...lips.values()].some((l) => l.twist) || locked.length > 0;
   const plainLips = [...lips.values()].some((l) => !l.twist);
   const where = printer?.size
     ? `a ${formatSize(printer.size)} printer${printer.margin ? ` (${mm(printer.margin)} mm margin)` : ''}`
@@ -4789,9 +4833,15 @@ export function howToGlueText(plan) {
       if (l.male.has(p.index)) extra.push(`${l.twist ? 'twist-lock neck' : 'lip'} for cut ${l.letter}`);
       if (l.off.has(p.index)) extra.push(`comes off at cut ${l.letter}`);
     }
+    for (const x of locked) if (x.pieces[0] === p.index) extra.push(`${x.apart.mech === 'plug' ? 'twist-lock slots' : 'twist-lock neck'} for cut ${x.letter}`);
     if (p.part) extra.push(`comes off at cut ${listOf(p.lids ?? [])} (the ${partCalled(p.name)})`);
     out.push(`  ${pad(`piece ${p.index} of ${n}`, 12)}${pad(size1(p.size), width)}${pad(`lies ${p.lies}`, 0)}${extra.join(', ')}`);
   });
+  // a lid's collar slopes out under the joint as steeply as the model beside it: support the dome, support the collar
+  for (const x of locked.filter((y) => y.apart.mech === 'twist' && y.apart.slope > 1 + 1e-6)) {
+    const like = x.part.name === 'Dome and cap' ? 'the dome' : 'the model round it';
+    out.push(`  The collar under cut ${x.letter}'s neck slopes like ${like} (${roundAngle((Math.atan(x.apart.slope) * 180) / Math.PI)}°): it takes whatever support ${like} takes.`);
+  }
   const indent = ' '.repeat(17);
   for (const g of pins) {
     const spares = g.spares ?? 0;
@@ -4809,7 +4859,7 @@ export function howToGlueText(plan) {
     const spans = [...new Set(plan.bridges ?? [...lips.values()].filter((l) => l.clicks).map((l) => clipShape(l.hold)?.span ?? CLIP.span))].sort((a, b) => a - b);
     out.push(`  Clips are ${listOf(spans.map(mm))} mm bridges over a slot: print with bridging on (the default) and no supports.`);
   }
-  if (anyPins || anyPegs || anyTabs || anyLip) out.push('  Not sure about the fit? Print the fit test first (Split card → Download fit test).');
+  if (anyPins || anyPegs || anyTabs || anyLip || locked.length) out.push('  Not sure about the fit? Print the fit test first (Split card → Download fit test).');
   out.push('');
 
   if (!steps.length) {
@@ -4837,7 +4887,15 @@ export function howToGlueText(plan) {
       out.push(`  ${who} should click onto ${its} lip and pull off again by hand. Too stiff: raise Clearance by 0.05 mm${lighter}; no click or too loose: lower it by 0.05 mm, and download again.`);
     }
   }
-  if (!anyPins && !anyPegs && !anyTabs && !anyLip) out.push('  Hold the pieces together and check that the faces meet all round.');
+  for (const x of locked) {
+    const who = `The ${partCalled(x.part.name)} (cut ${x.letter})`;
+    if (x.apart.mech === 'plug') {
+      out.push(`  ${who} should twist in with a click and twist out again by hand. Too stiff to turn: raise Clearance by 0.05 mm; loose, or no click: lower it by 0.05 mm, and download again.`);
+    } else {
+      out.push(`  ${who} should twist on with a click and twist off again by hand. Try the fit test first: if it's too stiff to turn, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.`);
+    }
+  }
+  if (!anyPins && !anyPegs && !anyTabs && !anyLip && !locked.length) out.push('  Hold the pieces together and check that the faces meet all round.');
   out.push('');
 
   // the glued steps, then those of the cuts that come apart, numbered on
@@ -4897,6 +4955,82 @@ export const pieceColorIndex = ([i, j, k]) => mod(i + j + k, 2) + 2 * mod(7 * i 
  * @param {number} gap mm between neighbours
  */
 export const explodeOffset = (cell, grid, gap) => [0, 1, 2].map((a) => (cell[a] - grid[a] / 2) * gap + 0);
+
+/**
+ * Where a part's piece is drawn along its way out (a part seam's `part.way`) at `f`, the Spread slider: 0 seated, 1
+ * out. The way's steps share 0 … 1 evenly – turned free about the way out (anticlockwise, the way it opens), lifted,
+ * then slid out under what stands over it – leaving out those it has not: a part that only lifts off is not turned,
+ * and one that comes straight off, or a base that drops out underneath, is not slid but moved `drop` along the way out
+ * (the viewer's: its own length that way and a gap) – at least its lift. Past 1 it goes on the same way, as far again
+ * by 2.
+ * @param {{ turn: number, up: boolean, lift: number|null, dir: number[]|null, out: number[], reach: number }} way
+ * @param {number} f
+ * @param {number} drop mm
+ * @returns {{ turn: number, offset: number[] }} degrees about `way.out`, and the move (mm)
+ */
+export function wayAt(way, f, drop = 0) {
+  const slides = waySlides(way);
+  const steps = waySteps(way);
+  const share = (step) => (steps.includes(step) ? clamp01(f * steps.length - steps.indexOf(step)) : 0);
+  const on = Math.max(0, f - 1);
+  const lift = slides ? (way.lift ?? 0) * share('lift') : Math.max(way.lift ?? 0, drop) * (share('lift') + on);
+  const slide = slides ? way.reach * (share('slide') + on) : 0;
+  return {
+    turn: (way.turn || 0) * share('turn'),
+    offset: [0, 1, 2].map((a) => way.out[a] * lift + (slides ? way.dir[a] * slide : 0) + 0),
+  };
+}
+
+/** Whether a part's way out slides it out sideways once lifted (not straight off, nor dropped out underneath). */
+const waySlides = (way) => !way.up && !!way.dir;
+
+/** The steps of a part's way out, in order (`wayAt`): 'turn' when it locks, 'lift', 'slide' when it slides out. */
+export const waySteps = (way) => [...(way.turn ? ['turn'] : []), 'lift', ...(waySlides(way) ? ['slide'] : [])];
+
+/**
+ * Which step of its way out a part is on at `f` (`wayAt`): `{ step, n, of }`, the step and its number of how many;
+ * null when it is seated (f 0) or out (f 1 or more).
+ */
+export function wayStep(way, f) {
+  const steps = waySteps(way);
+  if (!(f > 0) || f >= 1) return null;
+  const k = Math.min(steps.length - 1, Math.floor(f * steps.length));
+  return { step: steps[k], n: k + 1, of: steps.length };
+}
+
+/** A face of a lock that slopes further than this from vertical overhangs: past 45°, with a little rounding. */
+const OVERHANG_NZ = -Math.sin((46.5 * Math.PI) / 180);
+/** A face of a lock that faces down within this of straight down is a flat ceiling the printer bridges. */
+const BRIDGE_NZ = -Math.cos((10 * Math.PI) / 180);
+
+/**
+ * What a face of a lock is as its piece prints, from the up component of its normal as it lies on the bed: a flat
+ * ceiling the printer bridges ('bridge'), a face sloping further than 45° from vertical ('over', which needs support
+ * as the model beside it does), else nothing to say (null). A face on the bed is none of them.
+ * @param {number} nz the normal's z as printed
+ * @param {boolean} onBed the face lies on the bed
+ */
+export function printedFace(nz, onBed = false) {
+  if (onBed || !(nz < OVERHANG_NZ)) return null;
+  return nz <= BRIDGE_NZ ? 'bridge' : 'over';
+}
+
+/**
+ * The pieces laid in a row as they print, each its width along x apart with `gap` between: the x of each one's
+ * middle, the row centred on 0.
+ * @param {number[]} widths each piece's width along x as it lies (mm)
+ * @param {number} gap mm
+ * @returns {number[]}
+ */
+export function printedRow(widths, gap) {
+  const total = widths.reduce((sum, w) => sum + w, 0) + gap * Math.max(0, widths.length - 1);
+  let x = -total / 2;
+  return widths.map((w) => {
+    const middle = x + w / 2;
+    x += w + gap;
+    return middle + 0;
+  });
+}
 
 /**
  * Where along a cut's normal line (through p) the pointer's ray passes

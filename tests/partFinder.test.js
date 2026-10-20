@@ -2,7 +2,7 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
 import { FINE_SPECK, PART_LEVELS, WAY_START, axisOf, findLoops, findParts, fineSlices, freeWindows, pickPart, reach, sliceStack } from '../src/partFinder.js';
 import { carveParts, checkPart } from '../src/splitGeometry.js';
-import { gminOf, scalePercent, sizes } from '../src/locks.js';
+import { STEEP, gminOf, scalePercent, sizes } from '../src/locks.js';
 import { setup } from './helpers.js';
 import { batLanternSolid, box, gothicSolid, lanternSolid, lidBoxSolid, loggiaSolid, roundLanternSolid, slenderTowerSolid } from './lanternFixture.js';
 import { bailBoxSolid, blockSolid, chimneyBoxSolid, hexLanternSolid, jarSolid, mugSolid, pavilionSolid, plinthLanternSolid } from './partFixtures.js';
@@ -147,10 +147,11 @@ describe('the bat lantern fixture (n 0.4, layers 0.2, clearance 0.15)', () => {
     }
   });
 
-  it('reads how the body slopes under the face, for the collar', () => {
-    // the cone 30° from horizontal: 1.73 mm out per mm down; at 100 % the 2.4 mm under the face reach the upright band
-    for (const s of [2, 3, 4]) expect(lidOf(tables[s]).underSlope).toBeCloseTo(1 / Math.tan(Math.PI / 6), 1);
-    expect(lidOf(tables[1]).underSlope).toBeLessThan(1.5);
+  it('reads the slope of the collar the download builds under the face, for the card', () => {
+    // the cone 30° from horizontal, 1.73 mm out per mm down, as steep as a collar goes (60° from level): the slope the
+    // download's PART_PRINT words, so the card's badge says the same
+    for (const s of [3, 4]) expect(lidOf(tables[s]).lock.slope).toBe(STEEP);
+    expect(lidOf(tables[3])).not.toHaveProperty('underSlope');
   });
 
   it('finds the base that twists off underneath, and its lock from 300 %', () => {
@@ -180,6 +181,27 @@ describe('the bat lantern fixture (n 0.4, layers 0.2, clearance 0.15)', () => {
     expect(lidOf(tables[4]).least).toEqual({ lock: null, tea: null });
     expect(lidOf(tables[3]).least.lock).toBeNull();
     expect(lidOf(tables[3]).least.tea * 3).toBeCloseTo(3.65, 9);
+  });
+
+  it('says how big an opening the least scale gives, how thick the roof is where none fits, and how far it looks', () => {
+    // the lid locks from 275 % with a Ø 24.12 opening – what the finder itself gives at that size – and the base from
+    // 215 % (its least, 210.8 %, up to the 5 % the texts give) with Ø 30.2
+    const lid = lidOf(tables[1]);
+    const lockAt = (s) => lidOf(findParts(scaled(own(batLanternSolid()), s), { scale: s })).lock;
+    expect(lid.least.opening).toBe(24.12);
+    expect(lockAt(2.75).opening).toBe(24.12);
+    expect(lidOf(tables[2]).least.opening).toBe(24.12);
+    expect(baseOf(tables[1]).least.opening).toBe(30.2);
+    expect(baseOf(findParts(scaled(own(batLanternSolid()), 2.15), { scale: 2.15 })).lock.opening).toBe(30.2);
+    // with a lock now, no least scale and no opening for it
+    expect('opening' in lidOf(tables[3]).least).toBe(false);
+    expect('opening' in baseOf(tables[3]).least).toBe(false);
+    // the dome where it meets the body: 1.48 mm across at z 29 (its inside cone runs from 1.85 at the band to 1.25 at
+    // the flange), 0.74 square to its 29.8° slope
+    expect(lid.wall.t).toBeCloseTo(0.74, 1);
+    expect(Math.abs(lid.wall.slope - 29.8)).toBeLessThan(0.5);
+    for (const s of [2, 3]) expect(lidOf(tables[s]).wall.t / s).toBeCloseTo(lid.wall.t, 1);
+    expect(tables[1].most).toBe(6);
   });
 
   it('the least scale it names is one where the finder finds the lock, and 5 % under it it does not', () => {

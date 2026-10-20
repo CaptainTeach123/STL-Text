@@ -6,6 +6,7 @@
  * so they can be tested on their own.
  */
 import { LIP, seamWords } from './split.js';
+import { TEA_LIGHT, offerPercent, roundAngle, roundLift, roundOpening, roundZ, scalePercent, slideWords } from './locks.js';
 
 const AXIS_NAMES = ['X', 'Y', 'Z'];
 
@@ -33,6 +34,8 @@ export function lipVerdict(probe, hold) {
   // the twist-lock holds where no lip would fit at all, too (a cut through a round lantern's eave)
   if (lip?.twist && hold !== 'lift') return 'full';
   if (!lip || !(lip.H > 0)) return 'none';
+  // a tongue in short stretches holds less than a whole one
+  if (lip.broken) return 'short';
   return lip.H >= LIP.heights[0] && (lip.clips > 0 || hold === 'lift') ? 'full' : 'short';
 }
 
@@ -83,7 +86,10 @@ function noLipWords(probe) {
  * has them (`suggestedLip`): on a round wall, where no clip fits, it is for
  * the twist-lock the cut takes there instead, or for a taller lip. Where
  * the cut takes the twist-lock, that is what it gets, whatever the hold
- * that asked for clips: "twist-lock, 3 lugs, 6 clicks – turn 10°".
+ * that asked for clips: "twist-lock, 3 lugs, 6 clicks – turn 10°". A lip
+ * whose tongue comes in short stretches says so, and the half step where it
+ * is whole: "6 mm lip in short stretches, no clips – lifts off – move up to
+ * 125.5, where it is whole".
  * @param {object} probe the engine's answer (mode 'probe')
  * @param {string} hold
  * @param {number} axis
@@ -96,6 +102,13 @@ export function lipWords(probe, hold, axis) {
   if (!lip || !(lip.H > 0)) {
     const why = noLipWords(probe);
     return move ? `${why} – ${move}` : why;
+  }
+  // a tongue in short stretches (an opening's edge in its foot cuts it): said so, and the half step where it is whole
+  if (lip.broken) {
+    const whole = move ? ` – ${move}, where it is whole` : '';
+    if (hold === 'lift') return `${mm(lip.H)} mm lip in short stretches – lifts off${whole}`;
+    if (lip.clips > 0) return `${HELD[hold] ?? HELD.snap} with ${lip.clips} ${lip.clips === 1 ? 'clip' : 'clips'} – its lip in short stretches${whole}`;
+    return `${mm(lip.H)} mm lip in short stretches, no clips – lifts off${whole}`;
   }
   const full = lip.H >= LIP.heights[0];
   if (hold === 'lift') return full ? `${mm(lip.H)} mm lip – lifts off` : `${mm(lip.H)} mm lip – lifts off${move ? ` – ${move} for a full one` : ''}`;
@@ -155,6 +168,7 @@ export function snappedWords(target, axis) {
   if (!target) return '';
   if (target.kind === 'spot') return `snapped to a good spot at ${mm(target.at)} mm${target.why ? ` – ${target.why}` : ''}`;
   if (target.kind === 'lip' && target.twist) return `snapped to where a twist-lock fits, at ${mm(target.at)} mm`;
+  if (target.kind === 'lip' && target.whole) return `snapped to where the lip is whole, at ${mm(target.at)} mm`;
   if (target.kind === 'lip') return `snapped to where a ${target.full === false && target.H > 0 ? `${mm(target.H)} mm` : 'full'} lip fits, at ${mm(target.at)} mm`;
   return `snapped to ${seamWords(target.what, axis)} at ${mm(target.at)} mm`;
 }
@@ -168,26 +182,364 @@ export function snappedWords(target, axis) {
  * @param {string} hold the hold the spots were found for
  * @param {{ through?: string[], taken?: string|null }} [options]
  */
-export function spotLabel(spot, hold, { through = [], taken = null } = {}) {
+export function spotLabel(spot, hold, { through = [], taken = null, handles = [] } = {}) {
   const axis = AXIS_NAMES.indexOf(String(spot.axis).toUpperCase());
   const lip = lipWords({ at: spot.at, lip: spot.lip, suggestedAt: null }, hold, axis);
   const off = offWords(axis, spot.comesOff);
   const here = taken ? `cut ${taken} is here` : '';
-  return `${AXIS_NAMES[axis]} ${mm(spot.at)} mm – ${[off, lip, spot.why, throughWords(through), here].filter(Boolean).join(' · ')}`;
+  const label = `${AXIS_NAMES[axis]} ${mm(spot.at)} mm – ${[off, lip, spot.why, throughWords(through), here].filter(Boolean).join(' · ')}`;
+  return takesHandle(spot, handles) ? `${label} – takes the handle with the top` : label;
+}
+
+/**
+ * Whether the top a cut across Z takes off holds some of a handle the parts table traced (`handles`, each `{ foot,
+ * top }`): its top is over the cut, so a lantern's handle goes with its lid – which a part inside the handle avoids.
+ */
+export function takesHandle(spot, handles = []) {
+  if (String(spot.axis).toLowerCase() !== 'z' || !(spot.comesOff?.side > 0)) return false;
+  return handles.some((h) => h.top > spot.at);
+}
+
+/* ------------------------------------------------- parts that come off */
+
+/** A least scale (a factor on the size now) as the texts give it: a whole 5 % of the model as loaded. */
+export const percentOf = (q, scale = 1) => (q == null ? null : scalePercent(q * scale));
+
+/** "Dome and cap" → "dome and cap", what a sentence calls a part; a generic part is "part". */
+const calledOf = (name) => (!name || /^Part\b/.test(name) ? 'part' : String(name).toLowerCase());
+
+/** Whether a part's name is more than one thing: the dome and cap come off. */
+const manyOf = (name) => / and /.test(name ?? '');
+
+/** The opening a lock leaves, and whether a tea light goes through it: "Ø 44 mm opening, takes a 38 mm tea light". */
+const openingWords = (lock, join = ', ') => `Ø ${roundOpening(lock.opening)} mm opening${lock.teaLight ? `${join}takes a ${TEA_LIGHT} mm tea light` : ''}`;
+
+/** What happens to a lantern's handle when a lid comes off: it stays, it goes with it, or there is none. */
+const handleWords = (entry) => (entry.takesHandle ? 'takes the handle with it' : entry.handle ? 'the handle stays' : '');
+
+/**
+ * Why no lock fits a lid at this size, as the card says it: its roof too thin (and how thin), no room for the click
+ * tabs, or nothing under it to carry one.
+ */
+function smallWords(entry) {
+  if (entry.why === 'tabs') return 'there is no room round it for the click tabs';
+  if (entry.why === 'collar') return 'nothing under it is deep enough to carry one';
+  if (entry.wall) return `its roof is ${mm(entry.wall.t)} mm thick`;
+  return 'there is no room for one';
+}
+
+/**
+ * From what size a lock fits, as the card and the notes say it: "A twist-lock fits from 275 % (a 24 mm opening); a 38
+ * mm tea light fits through it from 365 %." – or, when none does as far as the finder looks, that none fits up to
+ * that size.
+ */
+function leastWords(entry, table) {
+  const scale = table.scale ?? 1;
+  const lock = percentOf(entry.least?.lock, scale);
+  if (lock == null) return Number.isFinite(table.most) ? `No twist-lock fits it up to ${Math.round(table.most * scale * 100)} %.` : '';
+  const at = Number.isFinite(entry.least.opening) ? ` (a ${roundOpening(entry.least.opening)} mm opening)` : '';
+  const tea = percentOf(entry.least.tea, scale);
+  if (tea != null && tea > lock) return `A twist-lock fits from ${lock} %${at}; a ${TEA_LIGHT} mm tea light fits through it from ${tea} %.`;
+  if (tea === lock) return `A twist-lock fits from ${lock} %${at}, and takes a ${TEA_LIGHT} mm tea light.`;
+  return `A twist-lock fits from ${lock} %${at}.`;
+}
+
+/**
+ * One part in the card "Parts that come off", from the engine's parts table (`split.plan` mode 'parts'): what it is
+ * and the lock it gets at this size, or why none fits and from what size one does; the print badge; the sizes its
+ * [Make it N %] buttons offer (the least scale of a lock, and of a tea light through it, each up to a whole 100 % of
+ * the model as loaded); and how [Use] puts it on – 'lock' (it twist-locks), 'lift' ("Use – it just lifts off", a lid
+ * too small for a lock) or null (a base too small for one, which would just drop out).
+ * @param {object} entry one of the table's `parts`
+ * @param {{ scale?: number, most?: number, parts?: object[] }} table the table it is from
+ * @returns {{ kind: string, name: string, lock: boolean, title: string, detail: string, badge: string, offers: number[], use: 'lock'|'lift'|null }}
+ */
+export function partCard(entry, table) {
+  const scale = table.scale ?? 1;
+  const { name, lock } = entry;
+  const offers = [...new Set([entry.least?.lock, entry.kind === 'lid' ? entry.least?.tea : null].filter((q) => q != null).map((q) => offerPercent(q * scale)))];
+  if (entry.kind === 'plug') {
+    if (lock) return { kind: 'plug', name, lock: true, title: `${name} – twists off underneath · twist-lock · ${openingWords(lock)}`, detail: '', badge: 'no extra support', offers: [], use: 'lock' };
+    const from = percentOf(entry.least?.lock, scale);
+    const tea = percentOf(entry.least?.tea, scale);
+    const title = from == null
+      ? `${name} – no twist-lock fits it underneath${Number.isFinite(table.most) ? ` up to ${Math.round(table.most * scale * 100)} %` : ''}.`
+      : `${name} – could twist off underneath from ${from} %${Number.isFinite(entry.least.opening) ? ` (a ${roundOpening(entry.least.opening)} mm opening)` : ''}${tea != null && tea > from ? `; a ${TEA_LIGHT} mm tea light fits through it from ${tea} %` : ''}.`;
+    return { kind: 'plug', name, lock: false, title, detail: '', badge: '', offers: offers.slice(0, 1), use: null };
+  }
+  if (lock) {
+    // a lid whose opening is too small for a tea light, on a lantern whose base takes one
+    const base = (table.parts ?? []).find((e) => e.kind === 'plug' && e.lock?.teaLight);
+    const elsewhere = !lock.teaLight && base ? `a ${TEA_LIGHT} mm tea light fits through the base, not the lid` : '';
+    const title = `${name} – ${['twist-lock', openingWords(lock), handleWords(entry), elsewhere].filter(Boolean).join(' · ')}`;
+    return { kind: 'lid', name, lock: true, title, detail: '', badge: collarBadge(name, lock.slope), offers: [], use: 'lock' };
+  }
+  const where = entry.takesHandle ? 'comes off, and takes the handle with it.' : entry.handle ? 'comes off inside the handle; the handle stays on the lantern.' : 'comes off.';
+  const detail = [`Too small for a lock at this size: ${smallWords(entry)}.`, leastWords(entry, table)].filter(Boolean).join(' ');
+  return { kind: 'lid', name, lock: false, title: `${name} – ${where}`, detail, badge: '', offers, use: 'lift' };
+}
+
+/**
+ * The print badge of a lid that locks: what its collar needs. The collar is the lantern's, under the joint, and slopes
+ * out as the model beside it does (`slope`, run over rise, as the download builds it and PART_PRINT says it): no
+ * steeper than 45°, it needs nothing; steeper, the support the model round it needs.
+ */
+function collarBadge(name, slope) {
+  if (!(slope > 1 + 1e-6)) return 'no extra support';
+  return name === 'Dome and cap' ? "the lantern's collar needs the dome's support" : "the collar under it needs the model's support";
+}
+
+/**
+ * Whether the card offers anything for a part: to use it, or a size that fits its lock. A base no lock fits at any size
+ * the finder looks at is listed with neither.
+ */
+export const partOffered = (entry, table) => {
+  const w = partCard(entry, table);
+  return !!w.use || w.offers.length > 0;
+};
+
+/**
+ * What Download fit test says when there is nothing to try because the split's only cuts take out parts that come off
+ * with nothing holding them (a base's lock has no rings of its own to try): each part, and from what size its
+ * twist-lock fits where none does at this size.
+ * @param {{ name: string, kind?: 'lid'|'plug', hold: string, least?: number|null, locks?: boolean }[]} parts
+ */
+export function noFitTestWords(parts) {
+  const each = parts.map(({ name, kind = 'lid', hold, least = null, locks = false }) => {
+    const many = manyOf(name);
+    if (locks) return `the ${calledOf(name)}'s twist-lock has no fit test of its own`;
+    const off = `the ${calledOf(name)} ${kind === 'plug' ? 'lifts out' : many ? 'lift off' : 'lifts off'}`;
+    if (hold === 'lift') return `${off} with nothing holding ${many ? 'them' : 'it'}`;
+    return `${off} at this size – ${least != null ? `a twist-lock fits from ${least} %` : 'no twist-lock fits'}`;
+  });
+  return `Nothing to try: ${each.join('; ')}.`;
+}
+
+/**
+ * What the card says when it lists no part: the model is solid all through, already open, or has no part that comes
+ * off cleanly – where a cut is being placed, to click the model where it should open; or null when it lists some.
+ * @param {{ solid?: boolean, open?: { d: number }|null, parts?: object[] }} table
+ * @param {{ aiming?: boolean }} [options]
+ */
+export function partsNote(table, { aiming = true } = {}) {
+  if (table.solid) return "This model is solid all through – there's no inside to open.";
+  if (table.open) return `The top is already open (Ø ${roundOpening(table.open.d)} mm).`;
+  // a click on the model only places a cut while one is being placed: else it would move the text
+  if (!table.parts?.length) return `No part comes off cleanly here${aiming ? ' – click the model where it should open' : ''}.`;
+  return null;
+}
+
+/**
+ * What the readout says over a part the pointer picks (`pickPart`): the lid and its lock, or why none fits; the handle
+ * the lid leaves on the lantern; the base and its lock. Null when it picks none.
+ * @param {{ part: object|null, on: 'lid'|'handle'|'under'|'base'|null }} pick
+ * @param {{ scale?: number }} table
+ */
+export function partReadout({ part, on }, table) {
+  if (!part) return null;
+  const scale = table.scale ?? 1;
+  const { name, lock } = part;
+  if (on === 'handle') return `The handle stays on the lantern – click to take off the ${calledOf(name)} under it`;
+  if (part.kind === 'plug') {
+    if (lock) return `${name} twists off underneath · Ø ${roundOpening(lock.opening)} mm opening · twist-lock, 3 lugs, turn ${roundAngle(lock.theta)}°`;
+    const from = percentOf(part.least?.lock, scale);
+    return `${name} · too small for a lock at this size${from != null ? ` – twists off from ${from} %` : ''}`;
+  }
+  const comes = `${name} ${manyOf(name) ? 'come' : 'comes'} off`;
+  if (lock) return [comes, `twist-lock, 3 lugs, turn ${roundAngle(lock.theta)}°`, openingWords(lock, ' – '), handleWords(part)].filter(Boolean).join(' · ');
+  const from = percentOf(part.least?.lock, scale);
+  const roof = part.wall && part.why === 'room' ? ` (roof ${mm(part.wall.t)} mm)` : '';
+  return `${comes} · too small for a lock at this size${roof}${from != null ? ` – a twist-lock fits from ${from} %` : ''}`;
+}
+
+/**
+ * Which part a point on the model picks, from the table alone (each pointer move, so no slicing): a lid when the
+ * point is on it; the lid under a handle when it is on the handle the lid leaves on the body; the lid when it is
+ * just under its face, on the shell it sits in; the base when it is on the model's solid bottom. `on` says which.
+ * @returns {{ part: object|null, index: number, on: 'lid'|'handle'|'under'|'base'|null }}
+ */
+export function pickPart(table, p) {
+  const { h } = table;
+  const dist = (e) => Math.hypot(p[0] - e.centre[0], p[1] - e.centre[1]);
+  const rules = [
+    ['lid', (e) => e.kind === 'lid' && p[2] >= e.face - 1e-6 && p[2] <= e.cap + 1e-6 && dist(e) <= e.r],
+    ['handle', (e) => e.kind === 'lid' && !!e.handle && onTrace(e.handle, p, 1.5 * h)],
+    ['under', (e) => e.kind === 'lid' && p[2] < e.face && p[2] >= e.from - 2 * h && dist(e) <= e.window[1] + 2 * h],
+    ['base', (e) => e.kind === 'plug' && p[2] <= e.solidTop + 1e-6 && dist(e) <= e.reach + 1e-6],
+  ];
+  for (const [on, test] of rules) {
+    const index = table.parts.findIndex(test);
+    if (index >= 0) return { part: table.parts[index], index, on };
+  }
+  return { part: null, index: -1, on: null };
+}
+
+/** Whether p is on a traced handle: inside one of its islands' boxes, grown by tol, at a level within tol of it. */
+function onTrace(handle, p, tol) {
+  return handle.levels.some(({ z, boxes }) => Math.abs(z - p[2]) <= tol
+    && boxes.some((b) => p[0] >= b[0] - tol && p[0] <= b[2] + tol && p[1] >= b[1] - tol && p[1] <= b[3] + tol));
+}
+
+/** The readout's words over a plane whose top would take a traced handle with it, where a part inside the handle would not. */
+export const HANDLE_PLANE = 'A cut here would take the handle with the top – click the dome to take off just the lid';
+
+/**
+ * The readout's line over a place where a cut across Z at `at` would take a lantern's handle off with its top – a
+ * handle the parts table traced reaches over it – while a lid inside the handle comes off on its own and leaves it on
+ * the lantern (HANDLE_PLANE); null anywhere else.
+ * @param {{ handles?: { top: number }[], parts?: object[] }|null} table the parts table
+ * @param {number} at
+ */
+export function handlePlaneWords(table, at) {
+  if (!table?.handles?.some((h) => h.top > at)) return null;
+  // low down the top a cut takes is most of the model, handle and all: that it takes the handle is no news there
+  if (Number.isFinite(table.zmin) && Number.isFinite(table.zmax) && at < (table.zmin + table.zmax) / 2) return null;
+  return table.parts?.some((e) => e.kind === 'lid' && e.handle && !e.takesHandle) ? HANDLE_PLANE : null;
+}
+
+/**
+ * Where a part's face typed in or nudged goes: onto the printer's layers of the piece it comes out of – every `hl`
+ * from `from`, the model's bottom or the cut under it – as the split puts it, which then moves it up a layer or two
+ * where it would not print apart (the engine's mode 'part' says).
+ * @param {number} z the face asked for
+ * @param {{ from: number, hl: number }} layers
+ */
+export function partFace(z, { from, hl }) {
+  if (!(hl > 0) || !Number.isFinite(from)) return z;
+  return +(from + Math.round((z - from) / hl) * hl).toFixed(6);
+}
+
+/**
+ * The free band round a part's centre at its face that its circle is kept in: the one it lies in, else the nearest,
+ * from the bands the engine found there (`windows`, each [lo, hi] in radii); null when none is known.
+ * @param {number[][]} windows
+ * @param {number} r
+ */
+export function bandOf(windows, r) {
+  if (!windows?.length) return null;
+  const off = ([lo, hi]) => (r < lo ? lo - r : r > hi ? r - hi : 0);
+  const [lo, hi] = windows.reduce((best, w) => (off(w) < off(best) ? w : best));
+  return { lo, hi };
+}
+
+/**
+ * How wide a part's circle typed in or dragged goes (its radius): in the free band round it at its face (`lo`–`hi`),
+ * never nearer either edge than half the gap a face needs to print apart (`gmin`), and onto the band's middle – the
+ * finder's own pick – from within `tol` of it. `edge` says which edge held it back ('wide' or 'narrow'), for
+ * `widthWords`; null when none did, or no band is known.
+ * @param {number} r
+ * @param {{ lo?: number|null, hi?: number|null, gmin: number, tol?: number }} band
+ * @returns {{ r: number, edge: 'wide'|'narrow'|null }}
+ */
+export function partWidth(r, { lo = null, hi = null, gmin, tol = 0, mid = null }) {
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return { r, edge: null };
+  // the finder's own width where it is known: the middle of its band before that was rounded
+  const middle = Number.isFinite(mid) ? mid : +((lo + hi) / 2).toFixed(4);
+  const [least, most] = [+(lo + gmin / 2).toFixed(4), +(hi - gmin / 2).toFixed(4)];
+  // a band too narrow to print apart in at all: the middle, where the split says why
+  if (least > most) return { r: middle, edge: null };
+  if (Math.abs(r - middle) <= tol) return { r: middle, edge: null };
+  if (r > most) return { r: most, edge: 'wide' };
+  if (r < least) return { r: least, edge: 'narrow' };
+  return { r, edge: null };
+}
+
+/**
+ * Why a cut that comes apart, asked to lock, gets no lock from the lip it was found to have (`{ H, clips, twist, why }`,
+ * or null for none): 'round' where its wall has no straight stretch for a clip – a round wall the twist-lock does not
+ * fit either – 'other' for any other reason; null where clips or the twist-lock hold it.
+ * @param {{ clips?: number, twist?: object, why?: string[] }|null} lip
+ */
+export function noLockOf(lip) {
+  if (lip?.twist || lip?.clips > 0) return null;
+  return lip?.why?.includes('short') ? 'round' : 'other';
+}
+
+/** What a cut's struck-through Locks says, for why it gets no lock (`noLockOf`): and that a part inside the wall would. */
+export const noLockTitle = (why) =>
+  why === 'round' ? 'A round wall takes no clips – try a removable part (+ Removable part)' : 'No clip or twist-lock fits this cut here – try a removable part (+ Removable part)';
+
+/** What the page says when a part's circle met the edge of its band: "Ø 63 is as wide as fits here". */
+export const widthWords = (d, edge) => (edge ? `Ø ${mm(d)} is as ${edge === 'wide' ? 'wide' : 'narrow'} as fits here` : '');
+
+/** The readout's words where a part's circle would cross the model on both sides of its plane. */
+export const MIXED_PART = 'The circle crosses the model above and around its plane here – use a full cut, or move it to where the circle crosses only air';
+
+/** The readout's words for a part that can't come out, and what holds it in. */
+export const stuckWords = (name, over, beside) => `${name} can't come out: ${over} is over it and ${beside} is beside it`;
+
+/**
+ * What a part's row says under its name: its twist-lock and turn, the handle it leaves on; that it lifts off, chosen
+ * or too small for a lock (and from what size one fits); or what the split said of it – moved up the layers, refused,
+ * stuck. `lock` is what it gets – the built seam's when the pieces are worked out, else the parts table's while the
+ * part's face is the finder's – with `least` the least scale (%) a lock needs; null until either is known.
+ * `known` that no lock fits it at this size (or, with `why` 'pieces', that one would leave it in pieces).
+ * @param {{ hold: string, kind?: 'lid'|'plug', lock?: object|null, least?: number|null, handle?: boolean, note?: object|null,
+ *   known?: boolean, why?: string|null }} part
+ */
+export function partMeta({ hold, kind = 'lid', lock = null, least = null, handle = false, note = null, known = false, why = null }) {
+  if (note?.code === 'PART_STUCK') return "can't come out – see the note";
+  if (note?.code === 'PART_GAP') {
+    // its face in several pieces (through a ring of columns), or its edge too near what stands beside it
+    const pieces = note.islands > 1;
+    const where = pieces ? `its face at Z ${roundZ(note.z)} is in ${note.islands} pieces` : `the circle runs too close to ${note.by ?? 'the model beside it'} at Z ${roundZ(note.z)}`;
+    if (Number.isFinite(note.movedTo)) return `${where} – moved to Z ${roundZ(note.movedTo)}`;
+    return pieces ? `${where} – no face near here is one piece` : `${where} – no face here leaves ${note.need} mm`;
+  }
+  if (note) return 'left out – see the note';
+  if (hold === 'lift') return kind === 'plug' ? 'lifts out – nothing holds it' : 'lifts off – sits on its cut face';
+  if (lock?.mech === 'plug') return `twist-lock, 3 lugs – turn ${roundAngle(lock.theta)}° · coin slot`;
+  if (lock?.mech === 'twist') {
+    return `twist-lock, 3 lugs, ${lock.tabs} ${lock.tabs === 1 ? 'click' : 'clicks'} – turn ${roundAngle(lock.theta)}°${handle ? ' · the handle stays' : ''}`;
+  }
+  if (known && why === 'pieces') return 'lifts off – a twist-lock would leave it in pieces';
+  if (known) return `lifts off – too small for a lock here${least != null ? ` (twist-lock from ${least} %)` : ''}`;
+  return 'comes off – Show pieces works out its lock';
+}
+
+/**
+ * What the view says while a part comes out along its way (`wayStep`): its name, the step's number of how many, and
+ * what to do – turn it free (a base seen from underneath, as it is fitted), lift it, slide it out – the lift and the
+ * turn as the notes give them; going on (`on`, Shift+▶), the steps the other way round, counted as they are done –
+ * slide it in, lower it, turn it right until it clicks shut. Null when it is seated or out.
+ * @param {{ name: string, kind?: 'lid'|'plug', way: object, span?: number[]|null }} part a part seam's: its `part`
+ * @param {{ step: string, n: number, of: number }|null} at `wayStep`'s
+ * @param {{ on?: boolean }} [options]
+ */
+export function wayCaption({ name, kind = 'lid', way, span = null }, at, { on = false } = {}) {
+  if (!at) return null;
+  const plug = kind === 'plug';
+  const under = plug ? ', seen from underneath' : '';
+  // going on (Shift+▶), the same steps the other way round: slid in, lowered, turned back until it clicks shut
+  const words = on
+    ? {
+      turn: `Turn it ${roundAngle(way.turn)}° to the right${under} – it clicks shut`,
+      lift: plug ? 'Push it in' : at.of > at.n ? `Lower it ${roundLift(way.lift)} mm into place` : `Set it on${way.turn ? `, turned ${roundAngle(way.turn)}° to the left` : ''}`,
+      slide: `Slide it in ${slideWords(way.dir ?? [1, 0], span)}`,
+    }[at.step]
+    : {
+      turn: `Turn it ${roundAngle(way.turn)}° to the left${under} – it clicks free`,
+      lift: plug ? 'Lift it out' : at.of > at.n ? `Lift it ${roundLift(way.lift)} mm` : 'Lift it off',
+      slide: `Slide it out ${slideWords(way.dir ?? [1, 0], span)}`,
+    }[at.step];
+  // counted in the order they are done
+  const n = on ? at.of - at.n + 1 : at.n;
+  return `${name}: ${n} of ${at.of} · ${words}`;
 }
 
 /**
  * What a cut being placed snaps to along one axis: the model's seams, the
  * spots suggested and the nearest place a full lip fits (the probe's
  * `suggestedAt`; with `full` false and its height `H` where the lip there is
- * short of a full one, `twist` where the twist-lock takes the clips' place),
+ * short of a full one, `twist` where the twist-lock takes the clips' place,
+ * `whole` where the lip is whole a half step from one in short stretches),
  * as `snapTarget` takes them.
  * @param {{ seams?: { at: number, kind: string }[], spots?: { at: number, why: string }[],
- *   lip?: number|{ at: number, full?: boolean, H?: number, twist?: boolean }|null }} from
+ *   lip?: number|{ at: number, full?: boolean, H?: number, twist?: boolean, whole?: boolean }|null }} from
  */
 export function aimTargets({ seams = [], spots = [], lip = null } = {}) {
   const near = typeof lip === 'number' ? { at: lip } : lip;
-  const what = near?.twist ? { twist: true } : near?.full === false ? { full: false, H: near.H } : {};
+  const what = near?.twist ? { twist: true } : near?.whole ? { whole: true } : near?.full === false ? { full: false, H: near.H } : {};
   return [
     ...seams.map((s) => ({ at: s.at, kind: 'seam', what: s.kind })),
     ...spots.map((s) => ({ at: s.at, kind: 'spot', why: s.why })),

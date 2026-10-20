@@ -311,6 +311,15 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
     },
 
     /**
+     * One part's face tried where it is being put (`{ centre, at, r, printing, split }`, mode 'part'): the face the
+     * split takes there – on the layers, moved up where it would not print apart, or refused with the nearest that
+     * would – and the free bands round it. On a channel of its own, so a newer try replaces one still waiting.
+     */
+    partAt(items, baseVersion, options = {}) {
+      return request('split.part', 'split.plan', { items, baseVersion, ...options, mode: 'part' });
+    },
+
+    /**
      * The best places along an axis for a cut that comes apart (`{ axis,
      * hold, printing, split }`, mode 'spots'), best first. Seconds on a dense
      * model, so on a channel of its own, and asked for a slice of time at a

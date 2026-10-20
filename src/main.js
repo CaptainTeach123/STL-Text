@@ -1,16 +1,20 @@
 import { Matrix4, Vector3 } from 'three';
-import { Document, ITEM_DEFAULTS, SPLIT_DEFAULTS, coversOf, createPart, createSpot, fontIds, frameOf, hasText, isPart, isSpot, itemLabel, maxSize, placeKey, shapeKey, spotsOf, stableKey, modelPlacementKey } from './document.js';
+import { Document, ITEM_DEFAULTS, SPLIT_DEFAULTS, baseMode, coversOf, createPart, createSpot, fontIds, frameOf, hasText, isPart, isSpot, itemLabel, maxSize, placeKey, shapeKey, spotsOf, stableKey, modelPlacementKey } from './document.js';
 import { planRebuild, removalSpotsFor, specForKind } from './rebuild.js';
 import { DECOR_KINDS, decorPartId, normaliseDecorSpec } from './decor.js';
 import { createEngineClient } from './engineClient.js';
 import { ENHANCE_DEFAULTS, isEnhanceActive } from './enhance.js';
 import { Viewer } from './viewer.js';
-import { aimLine, aimTargets, lipLine, lipVerdict, snappedWords, spotLabel, throughWords } from './aim.js';
+import {
+  aimLine, aimTargets, bandOf, handlePlaneWords, lipLine, lipVerdict, noFitTestWords, partCard, partFace, partMeta, partOffered, partReadout, partWidth, partsNote,
+  percentOf, pickPart, noLockOf, noLockTitle, snapTolerance, snappedWords, spotLabel, throughWords, wayCaption, widthWords,
+} from './aim.js';
+import { gminOf, offerPercent, roundZ } from './locks.js';
 import { SIDES, placementMatrix, snapPartTo } from './placement.js';
 import { BUNDLED_FONTS, canQueryLocalFonts, fetchBundledFont, listLocalFonts, localFontBytes } from './fontCatalog.js';
 import {
   BED_DEFAULTS, BED_PRESETS, FILAMENT, PIECE_COLORS, SPLIT_LIMITS, SPLIT_NOTE_CODES, axisCuts, bedSize, cellFits, cellSizes, cutPlane, fitPieces, formatSize,
-  letterFor, nextCut, pegSizeOf, pieceColorIndex, splitActive, splitNote, usableBed,
+  letterFor, nextCut, pegSizeOf, pieceColorIndex, splitActive, splitNote, usableBed, wayStep,
 } from './split.js';
 
 const $ = (id) => document.getElementById(id);
@@ -69,7 +73,11 @@ const client = createEngineClient({
   },
   onState: (state) => {
     document.body.dataset.engine = !booted ? 'starting' : state === 'busy' ? 'busy' : 'idle';
-    if (state !== 'busy') showProgress(null);
+    if (state !== 'busy') {
+      showProgress(null);
+      // a moment later: what a request answered asks for next (a model updated: its previews) goes first
+      if (idleWaiters.length) setTimeout(flushIdle, 0);
+    }
   },
   onFatal: (err) => {
     console.error('Geometry engine failed:', err);
@@ -98,6 +106,23 @@ const client = createEngineClient({
 });
 
 /* ---------------------------------------------------------------- helpers */
+
+const idleWaiters = []; // what waits for the engine to have nothing else to do (`whenIdle`)
+
+/** Run each waiter once the engine is idle and nothing else is asked of it meanwhile. */
+function flushIdle() {
+  if (client.state === 'busy' || basePending || !idleWaiters.length) return;
+  for (const run of idleWaiters.splice(0)) run();
+}
+
+/**
+ * Run `run` once the engine has nothing else to do: work nobody waits for goes after what an edit asks for itself (a
+ * model turned: its update and the previews of its text), never ahead of it on the one worker.
+ */
+function whenIdle(run) {
+  idleWaiters.push(run);
+  setTimeout(flushIdle, 0);
+}
 
 function setStatus(message, kind = '') {
   const el = $('status');
@@ -319,8 +344,8 @@ function renderNotes(el, notes, actions = {}) {
       span.className = 'text';
       span.textContent = n.text;
       li.append(span);
-      const action = actions[n.code]?.(n);
-      if (action) {
+      // one thing to do about it, or several (sizes to make the model)
+      for (const action of [actions[n.code]?.(n)].flat().filter(Boolean)) {
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = 'btn small';
@@ -361,7 +386,10 @@ function onBase(result, { frame = false } = {}) {
   modelReport = result.report;
   viewer.setBase(result.display);
   viewer.setHoverEnabled(!!modelInfo.hasModel);
-  if (frame) viewer.frame();
+  // a model made bigger for its parts' locks is shown whole at its new size
+  const grown = frameAfter != null && result.info.version >= frameAfter;
+  if (grown) frameAfter = null;
+  if (frame || grown) viewer.frame();
   modelShown = '';
   renderModel();
   renderSuggestions();
@@ -523,7 +551,7 @@ function applyFix(kind) {
       matrix = centering(bounds);
       break;
     case 'reset':
-      doc.resetBase();
+      refitParts(doc.resetBase());
       break;
     case 'simplify': {
       const tol = Number.parseFloat($('simplifyTol').value);
@@ -534,7 +562,11 @@ function applyFix(kind) {
     default:
       return;
   }
-  if (matrix) doc.transformBase(matrix);
+  if (matrix) {
+    const step = doc.transformBase(matrix);
+    // a new size: the parts the finder placed are placed again for it, in the same undo step
+    if (kind === 'scale' || kind === 'inches') refitParts(step);
+  }
   setStatus('');
 }
 
@@ -1059,7 +1091,7 @@ async function showResult(on, { keep = false } = {}) {
     const r = await client.result(doc.items, version(), { printing, split, bed: usableBed(bed) });
     if (!r || !$('resultToggle').checked || lastContentKey !== requestedFor || lastSplitKey !== splitFor) return; // stale
     const entering = viewer.viewMode !== 'pieces';
-    if (r.pieces) viewer.setPieces(r.display, r.pieces, r.grid);
+    if (r.pieces) viewer.setPieces(r.display, r.pieces, r.grid, waysOf(r.seams));
     else viewer.setResult(r.display);
     // without pieces a split still has its say: every cut missed, or the model cannot be split
     lastPieces = split
@@ -1067,7 +1099,9 @@ async function showResult(on, { keep = false } = {}) {
       : null;
     if (split) rememberJoints(splitFor, requestedFor, jointsOfSeams(r.seams));
     viewer.showResult(true);
-    // pulled apart, the pieces take more room than the model: fit them in view once, then leave the camera to the user
+    // pulled apart, the pieces take more room than the model: fit them in view once, then leave the camera to the
+    // user – clear of the lock's tools and the legend, which are shown for them first
+    syncLockTools();
     if (r.pieces && entering) viewer.frame();
     renderSplit();
     // the split's own notes are in its card; the status line keeps the summary and anything to act on
@@ -1234,11 +1268,24 @@ const cellTooBig = (cell) => !cellFits(cell, usableBed(bed));
  * `cellSizes`; a cut moved since keeps them until it is measured again.
  */
 function cutsWithTabs() {
-  return (doc.split?.cuts ?? []).map((c) => {
+  return planeCuts().map((c) => {
     const m = measured?.cuts.get(c.id);
     return m?.reach && m.axis === cutPlane(c)?.axis ? { ...c, reach: m.reach, w: m.w } : c;
   });
 }
+
+/**
+ * The full-plane cuts, each with its letter from its place in the whole list: what the grid, the planes across the
+ * model and the boxes between them are made of. A cut that takes out only a part (a circle on its plane) makes none
+ * of them: it is a piece of its own, drawn as its circle.
+ */
+const planeCuts = () => (doc.split?.cuts ?? []).map((c, i) => ({ ...c, letter: letterFor(i) })).filter((c) => !c.part);
+
+/** How many parts the split takes out, each a piece of its own. */
+const takenOut = () => (doc.split?.cuts ?? []).filter((c) => c.part).length;
+
+/** Whether one more cut, of any kind, stays within the split's 12. */
+const roomForAnyCut = () => (doc.split?.cuts.length ?? 0) < SPLIT_LIMITS.cuts;
 const nudgeStep = () => Number.parseFloat($('nudgeStep').value) || 1;
 const round = (v, digits = 2) => Math.round(v * 10 ** digits) / 10 ** digits;
 
@@ -1394,7 +1441,7 @@ async function addCut() {
   const fresh = splitBounds?.key === boundsKey() ? splitBounds.bounds : null;
   const bounds = fresh ?? (modelInfo?.hasModel ? cutBounds() : await measureBounds());
   if (!bounds) return;
-  const next = nextCut(bounds, doc.split?.cuts ?? []);
+  const next = roomForAnyCut() ? nextCut(bounds, planeCuts()) : null;
   if (!next) return setStatus(`A split can have up to ${SPLIT_LIMITS.cuts} cuts and ${SPLIT_LIMITS.cells} pieces.`, 'error');
   selectCut(doc.addCut(next, { defaults: splitDefaults }));
 }
@@ -1432,9 +1479,16 @@ function moveCut(id, at, options) {
 }
 
 function nudgeCut(id, step) {
-  const plane = cutPlane(doc.split?.cuts.find((c) => c.id === id));
-  if (plane) moveCut(id, round(plane.at + step, 4), { coalesce: 'split:nudge' });
+  const cut = doc.split?.cuts.find((c) => c.id === id);
+  const plane = cutPlane(cut);
+  if (!plane) return;
+  if (!cut.part || plane.axis !== 2) return moveCut(id, round(plane.at + step, 4), { coalesce: 'split:nudge' });
+  // a part's face goes by the printer's layers, and is tried there once the keys rest
+  moveCut(id, partFace(plane.at + step, partLayers(cut)), { coalesce: `split:at:${id}` });
+  clearTimeout(nudged);
+  nudged = setTimeout(() => settlePartFace(id), 300);
 }
+let nudged = 0;
 
 /** Turn a cut to run across another axis, through the middle of the model. */
 function setCutAxis(id, axis) {
@@ -1486,6 +1540,9 @@ function setSplitSetting(key, value, { coalesce = null } = {}) {
   saveSettings();
   if (doc.split) doc.setSplit({ [key]: value }, { coalesce });
   else render();
+  // the gap a part's face needs to print apart grows with the clearance: the parts the finder placed are placed by it
+  // again for the new one, in the same undo step while that is still the last edit
+  if (key === 'clearance') refitParts(coalesce);
 }
 
 /** A split control's value as the document keeps it, within its range; null for nonsense typed in a box. */
@@ -1569,7 +1626,7 @@ function filledBoxes() {
   const b = cutBounds();
   if (!b || !splitActive(doc.split)) return [];
   const { cells } = cellSizes(b, cutsWithTabs());
-  const filled = viewer.filledCells(doc.split.cuts, b); // null: the view can't tell, so every box counts
+  const filled = viewer.filledCells(planeCuts(), b); // null: the view can't tell, so every box counts
   return filled ? cells.filter((c) => filled.has(c.cell.join(','))) : cells;
 }
 
@@ -1586,10 +1643,11 @@ const measuredPieces = () => (measured?.pieces && measured.key === measureKey() 
 function piecesToDownload() {
   if (!splitActive(doc.split)) return 0;
   if (piecesCurrent()) return lastPieces.pieces.length;
+  // the measure cuts the full-plane cuts alone: each part taken out is one piece more
   const counted = measuredPieces();
-  if (counted) return counted.length;
+  if (counted) return counted.length + takenOut();
   if (downloaded?.key === lastSplitKey && downloaded.content === lastContentKey) return downloaded.count;
-  return filledBoxes().length;
+  return filledBoxes().length + takenOut();
 }
 
 /** Relabel an element, leaving it alone when the label is the same (this runs on every render). */
@@ -1597,25 +1655,177 @@ function relabel(el, text) {
   if (el.textContent !== text) el.textContent = text;
 }
 
-/** The Spread slider goes with the pieces view. */
+/** The Spread slider goes with the pieces view (not as printed, where nothing is spread), and so do the lock's tools. */
 function syncSpread() {
-  $('spreadField').hidden = viewer.viewMode !== 'pieces';
+  syncLockTools();
+}
+
+/**
+ * Each part's way out, for the pieces view to move it along (`setPieces`): from the seams of the pieces shown, the
+ * part's piece and the one it comes out of, and its circle's centre (the document's, where the cut still is).
+ */
+function waysOf(seams) {
+  return (seams ?? []).flatMap((s) => {
+    if (s.joint !== 'part' || !s.part?.way?.out) return [];
+    const cut = doc.split?.cuts.find((c) => c.id === s.cutId && c.part);
+    const point = cut?.position ?? (s.axis === 2 ? [s.part.centre[0], s.part.centre[1], s.at] : null);
+    return point ? [{ cutId: s.cutId, piece: s.pieces[1], home: s.pieces[0], point, way: s.part.way, kind: s.part.kind, r: s.part.r }] : [];
+  });
+}
+
+let wayFocus = null; // the cut whose part was last played or looked at: the view's words follow it
+
+/** The part the lock's tools work on: the one last played or looked at, else the selected part, else the first. */
+function lockFocus() {
+  const ways = viewer.partWays;
+  return (ways.find((w) => w.cutId === wayFocus) ?? ways.find((w) => w.cutId === selectedCutId) ?? ways[0])?.cutId ?? null;
+}
+
+/**
+ * The lock's tools under the pieces: ▶ Show how it comes apart where a part moves along its way out, Look at the lock
+ * where it has a lock, As printed; the legend's chips for the lock (and, as printed, its overhang and bridges); and
+ * what the part is doing while it moves.
+ */
+function syncLockTools() {
+  const pieces = viewer.viewMode === 'pieces';
+  const ways = pieces ? viewer.partWays : [];
+  const locks = pieces ? viewer.lockCuts : [];
+  // As printed is a look at a part's pieces: it goes when they do – the view left, or pieces with no part shown –
+  // so the next pieces are spread apart again, never laid out with nothing on screen to turn it off
+  if (viewer.asPrinted && !ways.length && !locks.length) viewer.setAsPrinted(false);
+  $('spreadField').hidden = !pieces || viewer.asPrinted;
+  syncLegend();
+  $('lockPanel').hidden = !ways.length && !locks.length;
+  $('playWayBtn').hidden = !ways.length;
+  $('lookLockBtn').hidden = !ways.some((w) => locks.includes(w.cutId));
+  $('asPrintedToggle').checked = viewer.asPrinted;
+  $('legendLock').hidden = !locks.length;
+  $('legendLugs').hidden = !locks.length || !viewer.lugsShown;
+  $('legendOver').hidden = !(locks.length && viewer.asPrinted);
+  $('legendBridge').hidden = !(locks.length && viewer.asPrinted);
+  syncWayCaption();
+}
+
+let wayOn = false; // ▶ is playing how the parts go on (Shift+▶): the words say so
+
+/**
+ * What the part ▶ follows is doing, while it is neither seated nor out: "Dome and cap: 2 of 3 · Lift it 5 mm"; while
+ * Shift+▶ plays it going on, the steps the other way round ("1 of 3 · Slide it in …").
+ */
+function syncWayCaption() {
+  const id = viewer.viewMode === 'pieces' && !viewer.asPrinted ? lockFocus() : null;
+  const seam = id ? lastPieces?.seams.find((s) => s.joint === 'part' && s.cutId === id) : null;
+  const on = wayOn && viewer.wayPlaying;
+  const text = seam ? wayCaption({ name: seam.part.name, kind: seam.part.kind, way: seam.part.way, span: seam.part.span }, wayStep(seam.part.way, viewer.spread), { on }) : null;
+  $('wayCaption').hidden = !text;
+  relabel($('wayCaption'), text ?? '');
+}
+
+/**
+ * ▶ Show how it comes apart: each part turned free, lifted and slid out along its way out over a moment, the Spread
+ * slider following; backwards (Shift) how it goes on. A part's own ▶ (`cutId`) shows the pieces first when they are
+ * not, and lights its lock.
+ */
+async function playWays({ back = false, cutId = null } = {}) {
+  if (cutId) {
+    wayFocus = cutId;
+    if (viewer.viewMode !== 'pieces' || !piecesCurrent()) {
+      endAim();
+      $('resultToggle').checked = true;
+      await showResult(true);
+    }
+    if (!viewer.partWays.some((w) => w.cutId === cutId)) return;
+    viewer.setLockHighlight(cutId);
+  }
+  // the pieces spread along their ways, not as printed: the box, its chips and the Spread slider say so from the start
+  if (viewer.asPrinted) viewer.setAsPrinted(false);
+  syncSpread();
+  wayOn = back;
+  await viewer.playWay({ back });
+  wayOn = false;
+  syncSpread();
+}
+
+/**
+ * Look at the lock: the camera close on it, glowing, its part set down beside it – the part the lock's tools work on;
+ * pressed again while looking, the next part's.
+ */
+function lookAtLock() {
+  const ids = viewer.partWays.map((w) => w.cutId).filter((id) => viewer.lockCuts.includes(id));
+  if (!ids.length) return;
+  const looking = viewer.lookingAt;
+  const id = looking && ids.length > 1 ? ids[(ids.indexOf(looking) + 1) % ids.length] : ids.includes(lockFocus()) ? lockFocus() : ids[0];
+  if (!viewer.lookAtLock(id)) return;
+  wayFocus = id;
+  syncSpread();
+}
+
+/** The locks on a piece: those of the parts that come out of it, and its own part's. */
+const locksOn = (index) => (lastPieces?.seams ?? []).filter((s) => s.joint === 'part' && s.apart?.mech && s.pieces.includes(index)).map((s) => s.cutId);
+
+/**
+ * How a part's circle is drawn on the model: red when it can't come out or cuts something (a note left it out), teal
+ * when its lock fits, amber when it only lifts off – chosen, or too small for a lock; its lugs once its lock is known;
+ * and where it ends, for its material's tint – the pieces', else the parts table's for its family.
+ */
+function partLook(cut, letter) {
+  const info = partInfo(cut, letter);
+  const refused = !!info.note && !(info.note.code === 'PART_GAP' && Number.isFinite(info.note.movedTo));
+  const seam = piecesCurrent() ? lastPieces.seams.find((s) => s.joint === 'part' && s.cutId === cut.id) : null;
+  const top = seam?.part.top ?? entryIn(currentTable(), cut)?.top ?? null;
+  const lifts = cut.hold === 'lift' || (!info.lock && (info.small || info.known));
+  const state = refused ? 'stuck' : lifts ? 'lift' : 'lock';
+  return { state, lugs: state === 'lock' && !!info.lock, top: Number.isFinite(top) ? top : null };
+}
+
+/**
+ * The parts the split takes out, each drawn on the model as its circle – the one whose ring handle is dragged at its
+ * size under the pointer, the one whose Z or Ø is being typed where it would go.
+ */
+function drawParts() {
+  viewer.setParts(
+    (doc.split?.cuts ?? []).flatMap((c, i) => {
+      const plane = c.part ? cutPlane(c) : null;
+      if (!plane) return [];
+      const typed = partTyped?.id === c.id ? partTyped : null;
+      const r = partDrag?.id === c.id ? partDrag.r : typed?.r ?? c.part.r;
+      const position = Number.isFinite(typed?.at) ? c.position.map((v, a) => (a === plane.axis ? typed.at : v)) : c.position;
+      return [{ id: c.id, letter: letterFor(i), axis: plane.axis, position, r, selected: c.id === selectedCutId, ...partLook(c, letterFor(i)) }];
+    }),
+  );
+}
+
+/**
+ * The legend's chips for what the view draws in its own colours: the model and the raised and cut text where they are
+ * drawn so – in the model view, and only text there is. The pieces are drawn in their pieces' colours instead, with the
+ * lock's orange beside them.
+ */
+function syncLegend() {
+  const pieces = viewer.viewMode === 'pieces';
+  const texts = doc.items.filter((i) => hasText(i) && !isSpot(i));
+  $('legendModel').hidden = pieces || !modelInfo?.hasModel;
+  $('legendRaised').hidden = pieces || !texts.some((i) => baseMode(i) !== 'engrave');
+  $('legendEngraved').hidden = pieces || !texts.some((i) => baseMode(i) === 'engrave');
 }
 
 /** The split's share of the page and the view: its card, the cut planes and their live colours, the download button. */
 function renderSplit() {
   fillSplit();
   const cuts = doc.split?.cuts.length ? doc.split.cuts : null;
-  viewer.setCuts(cuts, { selectedId: selectedCutId, bounds: measuredBounds() });
-  viewer.setCellPreview(cuts && cutsWithTabs(), { tooBig: cellTooBig });
+  // the planes across the model are the full cuts'; a part is drawn as the circle it takes out
+  const planes = cuts ? planeCuts() : [];
+  viewer.setCuts(planes.length ? planes : null, { selectedId: selectedCutId, bounds: measuredBounds() });
+  viewer.setCellPreview(planes.length ? cutsWithTabs() : null, { tooBig: cellTooBig });
+  drawParts();
   viewer.setCutSnap(nudgeStep(), 5 * nudgeStep()); // Shift moves five times as far, as with the arrow keys
   // the seams a cut that comes apart snaps to: along the axis one is being placed on, else the selected one's, whose
   // handle may be dragged. A glued cut snaps to none of them, so a glued split never waits for them
   const selected = doc.split?.cuts.find((c) => c.id === selectedCutId);
-  const snapAxis = aiming ? (holdOf(aiming.cutId) ? aiming.axis : null) : selected?.joint === 'apart' ? cutPlane(selected)?.axis ?? null : null;
+  const snapAxis = aiming ? (holdOf(aiming.cutId) && !partAim() ? aiming.axis : null) : selected?.joint === 'apart' && !selected.part ? cutPlane(selected)?.axis ?? null : null;
   if (snapAxis !== null) loadTargets(snapAxis);
   refreshAim();
   // the planes of cuts that come apart are teal, the others violet
+  syncLegend();
   $('legendPieces').hidden = !cuts;
   $('legendCut').hidden = !cuts?.some((c) => c.joint !== 'apart');
   $('legendApart').hidden = !cuts?.some((c) => c.joint === 'apart');
@@ -1665,15 +1875,16 @@ function fillSplit() {
         (allApart && GLUED_SETTINGS.has(key)) ||
         (glueOnly && PIN_SETTINGS.has(key) && !(key === 'clearance' && apart.length)) ||
         ((filament || pegs) && key === 'pins');
+      // where every cut comes apart nothing is glued: the glued cuts' settings go, rather than stand there greyed out
+      if (GLUED_SETTINGS.has(key)) (el.closest('fieldset') ?? el.closest('label')).hidden = allApart;
     });
   } finally {
     filling = false;
   }
-  const jointsHint = !apart.length
+  $('splitJointsLabel').hidden = allApart;
+  const jointsHint = !apart.length || allApart
     ? ''
-    : allApart
-      ? 'Every cut here comes apart – Joints are for glued cuts.'
-      : `Joints are for the glued cuts; ${apart.length > 1 ? `cuts ${listOf(apart)} come apart` : `cut ${apart[0]} comes apart`}.`;
+    : `Joints are for the glued cuts; ${apart.length > 1 ? `cuts ${listOf(apart)} come apart` : `cut ${apart[0]} comes apart`}.`;
   relabel($('splitJointsHint'), jointsHint);
   $('splitJointsHint').hidden = !jointsHint;
   const filamentOption = document.querySelector(`[data-split="diameter"] option[value="${FILAMENT}"]`);
@@ -1696,7 +1907,7 @@ function fillSplit() {
   const bounds = cutBounds();
   $('splitFitBtn').disabled = !usable;
   $('splitFitTestBtn').disabled = !usable || (glueOnly && !apart.length); // nothing to try the fit of, but a lip's
-  $('addCutBtn').disabled = !usable || (!!bounds && !nextCut(bounds, split?.cuts ?? []));
+  $('addCutBtn').disabled = !usable || !roomForAnyCut() || (!!bounds && !nextCut(bounds, planeCuts()));
   // a removable part is picked on the model: the button stays pressed while it is
   const picking = !!aiming && !aiming.cutId;
   $('addApartBtn').disabled = !usable || !modelInfo?.hasModel || (!picking && !roomForCut(2));
@@ -1704,6 +1915,7 @@ function fillSplit() {
   $('splitClearBtn').hidden = !active;
   $('splitSettings').hidden = !active;
   renderCuts();
+  renderPartsCard();
   renderSpots();
   renderPieces();
   renderSplitNotes();
@@ -1714,17 +1926,20 @@ let cutsSignature = '';
 function renderCuts() {
   const list = $('cutList');
   const cuts = doc.split?.cuts ?? [];
-  const signature = cuts.map((c) => c.id).join(',');
+  // a part's row is not a plane's: a cut that turns into the other kind gets its row built again
+  const signature = cuts.map((c) => (c.part ? `${c.id}:part` : c.id)).join(',');
   if (signature !== cutsSignature) {
     cutsSignature = signature;
-    const focused = document.activeElement?.dataset?.cutAt; // a rebuild must not swallow the box being typed in
-    list.replaceChildren(...cuts.map((c) => cutRow(c.id)));
-    if (focused) list.querySelector(`[data-cut-at="${CSS.escape(focused)}"]`)?.focus();
+    // a rebuild must not swallow the box being typed in
+    const focused = ['cutAt', 'partZ', 'partD'].map((k) => [k, document.activeElement?.dataset?.[k]]).find(([, id]) => id);
+    list.replaceChildren(...cuts.map((c) => (c.part ? partRow(c.id) : cutRow(c.id))));
+    if (focused) list.querySelector(`[data-${focused[0].replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`)}="${CSS.escape(focused[1])}"]`)?.focus();
   }
   const bounds = cutBounds();
   const usable = canSplit();
-  list.querySelectorAll('li').forEach((li, i) => {
+  list.querySelectorAll(':scope > li').forEach((li, i) => {
     const cut = cuts[i];
+    if (cut.part) return fillPartRow(li, cut, i);
     const plane = cutPlane(cut);
     const letter = letterFor(i);
     li.classList.toggle('selected', cut.id === selectedCutId);
@@ -1737,9 +1952,15 @@ function renderCuts() {
     box.disabled = !usable;
     box.setAttribute('aria-label', `Cut ${letter} comes apart`);
     li.querySelector('.cut-hold').hidden = !apart;
+    // asked to lock where nothing locks – no clip fits and no twist-lock takes their place – Locks is struck through,
+    // and says why and what would
+    const missing = lockMissing(cut, plane);
     li.querySelectorAll('[data-cut-hold]').forEach((r) => {
       r.checked = apart && r.value === cut.hold;
       r.disabled = !usable;
+      const struck = r.value === 'lock' && !!missing;
+      r.parentElement.classList.toggle('struck', struck);
+      r.parentElement.title = struck ? noLockTitle(missing) : CUT_HOLD_CHOICES.find(([v]) => v === r.value)?.[2] ?? '';
     });
     li.querySelectorAll('[data-cut-axis]').forEach((r) => {
       r.checked = Number(r.value) === plane?.axis;
@@ -1759,8 +1980,191 @@ function renderCuts() {
       }
       if (at !== document.activeElement && Number.parseFloat(at.value) !== round(plane.at)) at.value = round(plane.at);
     }
-    li.querySelector('.meta').textContent = cutMeta(cut, plane);
+    li.querySelector('.meta').textContent = [cutMeta(cut, plane), missing ? 'no lock fits here' : ''].filter(Boolean).join(' · ');
   });
+}
+
+/**
+ * Why a cut that comes apart and is asked to lock (Locks) gets no lock where it is – 'round' a round wall, 'other' –
+ * as the split worked out says it, else as the engine said of the place while it was placed; null where it locks, or
+ * nobody knows yet.
+ */
+function lockMissing(cut, plane) {
+  if (cut.joint !== 'apart' || cut.hold !== 'lock' || !plane) return null;
+  const got = joined?.key === lastSplitKey && joined.content === lastContentKey ? joined.joints.get(cut.id) : undefined;
+  if (got !== undefined) {
+    if (got !== 'lifts off' && got !== 'none') return null;
+    const note = piecesCurrent() ? lastPieces.notes.find((n) => n.cutId === cut.id && n.code === 'APART_NO_CLIPS') : null;
+    return note?.why === 'short' ? 'round' : 'other';
+  }
+  const probe = probes.get(probeKey(plane.axis, plane.at, 'lock'));
+  return probe ? noLockOf(probe.lip) : null;
+}
+
+/** How a part holds, as its row offers it: the value, its name and what it means. */
+const PART_HOLD_CHOICES = [
+  ['lock', 'Twist-lock', 'Turns on and clicks shut: lugs on the lantern, slots and click tabs in the part'],
+  ['lift', 'Lifts off', 'Nothing holds it: it sits on its cut face'],
+];
+
+/** The notes that say a part was moved up the layers, or left out: its row says so. */
+const PART_REFUSALS = new Set(['PART_GAP', 'PART_STUCK', 'PART_MIXED', 'PART_SPLIT', 'PART_CROSSED', 'CUT_MISSES']);
+
+/**
+ * One part's row: its letter, what it is called and ×; on a line below where its face is (Z) and how wide its circle
+ * is (Ø), and how it holds – Twist-lock or Lifts off; what it gets under that.
+ */
+function partRow(id) {
+  const li = document.createElement('li');
+  li.dataset.id = id;
+  li.className = 'part apart';
+  li.title = 'Select this part: the arrow keys move its face up and down, and the dot on its circle makes it wider or narrower';
+  const badge = document.createElement('span');
+  badge.className = 'badge';
+  const name = document.createElement('span');
+  name.className = 'part-name';
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'btn small ghost cut-remove';
+  remove.textContent = '×';
+  remove.title = 'Remove this part: it stays on the model';
+  remove.setAttribute('aria-label', 'Remove this part');
+  remove.addEventListener('click', () => removeCut(id));
+  // the crosshair: click the part on the model itself – the dome, the base – and the circle goes where the finder puts it
+  const pick = document.createElement('button');
+  pick.type = 'button';
+  pick.className = 'btn small ghost cut-place';
+  pick.dataset.partPick = id;
+  pick.title = 'Pick on the model: click the part this cut takes out';
+  pick.innerHTML =
+    '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="8" cy="8" r="4.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8 .5v4.2M8 11.3v4.2M.5 8h4.2M11.3 8h4.2" stroke="currentColor" stroke-width="1.6"/></svg>';
+  pick.addEventListener('click', () => startAim(id));
+  const place = document.createElement('div');
+  place.className = 'part-place';
+  // where its face is, and how wide: typed in, the circle drawn there as it is typed (`preview`), and the cut changed
+  // once the box is left or Enter pressed – a number half typed is no place to cut the model at – then put on the
+  // printer's layers and kept to where the part prints apart (`settle`), each one undo step a box
+  const box = (label, key, step, preview, set, settle) => {
+    const where = document.createElement('label');
+    where.className = 'at';
+    const tag = document.createElement('span');
+    tag.className = 'unit';
+    tag.textContent = label;
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.step = step;
+    input.dataset[key] = id;
+    input.addEventListener('focus', () => selectedCutId !== id && selectCut(id));
+    input.addEventListener('input', () => {
+      const v = Number.parseFloat(input.value);
+      partTyped = Number.isFinite(v) ? { id, ...preview(v) } : null;
+      drawParts();
+    });
+    input.addEventListener('change', () => {
+      const v = Number.parseFloat(input.value);
+      partTyped = null;
+      if (Number.isFinite(v) && set(v) !== false) settle();
+      else drawParts();
+    });
+    input.addEventListener('blur', () => {
+      // a box left empty, or with nonsense in it, shows the part as it is again
+      partTyped = null;
+      drawParts();
+      renderCuts();
+    });
+    const unit = document.createElement('span');
+    unit.className = 'unit';
+    unit.textContent = 'mm';
+    where.append(tag, input, unit);
+    return where;
+  };
+  const z = box('Z', 'partZ', '0.1', (v) => ({ at: v }), (v) => moveCut(id, v, { coalesce: `split:at:${id}` }), () => settlePartFace(id));
+  const d = box(
+    'Ø', 'partD', '0.5', (v) => (v > 0 ? { r: v / 2 } : {}),
+    (v) => (v > 0 ? doc.updateCut(id, { part: { r: v / 2 } }, { coalesce: `split:d:${id}` }) : false),
+    () => settlePartWidth(id, { tol: 0.25 }),
+  );
+  const holds = document.createElement('fieldset');
+  holds.className = 'seg cut-hold';
+  holds.setAttribute('aria-label', 'How the part holds');
+  for (const [value, label, title] of PART_HOLD_CHOICES) {
+    const option = document.createElement('label');
+    option.title = title;
+    const radio = document.createElement('input');
+    radio.type = 'radio';
+    radio.name = `cutHold-${id}`;
+    radio.value = value;
+    radio.dataset.cutHold = id;
+    radio.addEventListener('change', () => radio.checked && setCutHold(id, value));
+    keepKeysForCut(radio);
+    const span = document.createElement('span');
+    span.textContent = label;
+    option.append(radio, span);
+    holds.append(option);
+  }
+  place.append(z, d, holds);
+  const meta = document.createElement('span');
+  meta.className = 'meta';
+  // ▶ the part coming out along its way, in the pieces view; Shift: going on
+  const play = document.createElement('button');
+  play.type = 'button';
+  play.className = 'btn small ghost part-play';
+  play.textContent = '▶';
+  play.title = 'Show how it comes apart (Shift: how it goes on)';
+  play.dataset.partPlay = id;
+  play.addEventListener('click', (e) => playWays({ back: e.shiftKey, cutId: id }));
+  const under = document.createElement('div');
+  under.className = 'part-meta';
+  under.append(meta, play);
+  li.append(badge, name, pick, remove, place, under);
+  li.addEventListener('pointerdown', (e) => selectedCutId !== id && !e.target.closest('.cut-remove, .part-play, .cut-place') && selectCut(id));
+  // pointing at the part lights its lock in the pieces view
+  li.addEventListener('mouseenter', () => viewer.setLockHighlight(id));
+  li.addEventListener('mouseleave', () => viewer.setLockHighlight(null));
+  return li;
+}
+
+/**
+ * A part's row as the part is now: its name and kind, where its face is and how wide it is, and – from the pieces
+ * once they are worked out, else the parts table – the lock it gets, or why none fits and from what size one does.
+ * Where no lock fits at this size, Twist-lock is drawn disabled and saying from what size one does, and the part
+ * shows as lifting off; its hold stays Twist-lock, so a bigger print locks it with no other click.
+ */
+function fillPartRow(li, cut, i) {
+  const letter = letterFor(i);
+  const usable = canSplit();
+  const plane = cutPlane(cut);
+  const info = partInfo(cut, letter);
+  li.classList.toggle('selected', cut.id === selectedCutId);
+  li.querySelector('.badge').textContent = letter;
+  relabel(li.querySelector('.part-name'), info.name);
+  const z = li.querySelector('[data-part-z]');
+  // a base's face is the model's own bottom: there is nowhere else for it to go
+  z.closest('label').hidden = info.kind === 'plug';
+  z.disabled = !usable || !plane;
+  z.setAttribute('aria-label', `Where cut ${letter}'s part comes off, Z in mm`);
+  if (plane && z !== document.activeElement && Number.parseFloat(z.value) !== roundZ(plane.at)) z.value = roundZ(plane.at);
+  const d = li.querySelector('[data-part-d]');
+  d.disabled = !usable;
+  d.setAttribute('aria-label', `How wide cut ${letter}'s part is, Ø in mm`);
+  const across = round(2 * cut.part.r, 1);
+  if (d !== document.activeElement && Number.parseFloat(d.value) !== across) d.value = across;
+  const shown = info.small && cut.hold === 'lock' ? 'lift' : cut.hold;
+  li.querySelectorAll('[data-cut-hold]').forEach((r) => {
+    r.checked = r.value === shown;
+    const none = r.value === 'lock' && info.small;
+    r.disabled = !usable || none;
+    r.parentElement.title = none ? `No twist-lock fits at this size${info.least != null ? ` – from ${info.least} %` : ''}` : PART_HOLD_CHOICES.find(([v]) => v === r.value)[2];
+    r.parentElement.classList.toggle('struck', none);
+  });
+  li.querySelector('.meta').textContent = partMeta({ hold: cut.hold, kind: info.kind, lock: info.lock, least: info.least, handle: info.handle, note: info.note, known: info.known, why: info.why });
+  const pick = li.querySelector('[data-part-pick]');
+  pick.disabled = !usable || !modelInfo?.hasModel || plane?.axis !== 2;
+  pick.setAttribute('aria-pressed', String(aiming?.cutId === cut.id));
+  pick.setAttribute('aria-label', `Pick cut ${letter}'s part on the model`);
+  const play = li.querySelector('[data-part-play]');
+  play.hidden = !usable || !modelInfo?.hasModel || partLook(cut, letter).state === 'stuck';
+  play.setAttribute('aria-label', `Show how cut ${letter}'s ${info.name.toLowerCase()} comes apart`);
 }
 
 /** How a cut that comes apart holds, as its row offers it, firmest first: the value, its name and what it means. */
@@ -1951,8 +2355,25 @@ function renderPieces() {
   const computed = active && lastPieces?.pieces.length && (piecesCurrent() || $('resultToggle').checked) ? lastPieces : null;
   let rows = [];
   if (computed) {
+    // what each piece of a part's twist-lock carries: the lantern its neck (a base's slots), the part its socket and
+    // click tabs (a base its lugs and coin slot)
+    const locks = new Map();
+    const lockOn = (index, words) => locks.set(index, [...(locks.get(index) ?? []), words]);
+    for (const s of computed.seams ?? []) {
+      if (s.joint !== 'part' || !s.apart?.mech) continue;
+      const [home, piece] = s.pieces;
+      if (s.apart.mech === 'plug') {
+        lockOn(home, 'twist-lock slots');
+        lockOn(piece, 'twist-lock, 3 lugs, coin slot');
+      } else {
+        lockOn(home, 'twist-lock neck, 3 lugs');
+        lockOn(piece, `twist-lock socket, ${s.apart.tabs} ${s.apart.tabs === 1 ? 'click' : 'clicks'}`);
+      }
+    }
     rows = computed.pieces.map((p) => ({
       index: p.index,
+      // a piece with a name of its own: a part taken out, or the lantern it came out of
+      name: p.name && !/^piece \d+ of \d+$/.test(p.name) ? p.name : null,
       cell: p.cell,
       size: p.size,
       fits: p.fits,
@@ -1966,6 +2387,7 @@ function renderPieces() {
         // which piece a take-apart cut's lip (or the neck of its twist-lock) stands out of, and which comes off it
         ...(p.lips ?? []).map((l) => (l.twist ? `twist-lock neck at ${l.letter}` : `lip at ${l.letter}${l.clips ? `, ${l.clips} ${l.clips === 1 ? 'clip' : 'clips'}` : ''}`)),
         p.lids?.length ? `comes off at ${listOf(p.lids)}` : '',
+        ...(locks.get(p.index) ?? []),
       ].filter(Boolean),
     }));
   } else if (active) {
@@ -1975,6 +2397,12 @@ function renderPieces() {
     rows = filledBoxes().map((c, i) => ({
       index: i + 1, cell: c.cell, size: c.size, fits: !cellTooBig(c), predicted: true, extra: makes(c.cell) > 1 ? [`prints as ${makes(c.cell)} pieces`] : [],
     }));
+    // each part taken out is a piece of its own, past the boxes: its size is known once it is cut, its circle now
+    (doc.split?.cuts ?? []).forEach((c, i) => {
+      if (!c.part) return;
+      const letter = letterFor(i);
+      rows.push({ index: rows.length + 1, cell: [0, 0, rows.length], name: partInfo(c, letter).name, across: round(2 * c.part.r, 1), predicted: true, extra: [`comes off at ${letter}`] });
+    });
   }
   list.classList.toggle('stale', !!computed && !piecesCurrent());
   $('piecesHint').hidden = !rows.length || !rows[0].predicted || $('resultToggle').checked;
@@ -1993,11 +2421,24 @@ function renderPieces() {
       const fit = document.createElement('span');
       fit.className = row.fits ? '' : 'err';
       fit.textContent = row.fits ? 'fits' : 'too big';
-      text.append(`${row.index} · ${formatSize(row.size)} · ${row.lies ? `${row.lies} · ` : ''}`, fit, row.extra?.length ? ` · ${row.extra.join(' · ')}` : '');
+      if (!row.size) {
+        // a part not cut yet: its name and its circle
+        text.append(`${row.index} · ${row.name} · Ø ${row.across} mm · ${row.extra.join(' · ')}`);
+        li.append(swatch, text);
+        return li;
+      }
+      text.append(`${row.index}${row.name ? ` · ${row.name}` : ''} · ${formatSize(row.size)} · ${row.lies ? `${row.lies} · ` : ''}`, fit, row.extra?.length ? ` · ${row.extra.join(' · ')}` : '');
       li.append(swatch, text);
       if (!row.predicted) {
-        li.addEventListener('mouseenter', () => viewer.setPieceHighlight(row.index));
-        li.addEventListener('mouseleave', () => viewer.setPieceHighlight(null));
+        // a piece pointed at stands out, and the locks it has glow on it and on the piece each one holds
+        li.addEventListener('mouseenter', () => {
+          viewer.setPieceHighlight(row.index);
+          viewer.setLockHighlight(locksOn(row.index));
+        });
+        li.addEventListener('mouseleave', () => {
+          viewer.setPieceHighlight(null);
+          viewer.setLockHighlight(null);
+        });
       }
       return li;
     }),
@@ -2019,7 +2460,20 @@ const splitNoteActions = (() => {
     const name = CUT_HOLD_CHOICES.find(([hold]) => hold === n.firmer)?.[1];
     return name && cutLetter(n.cutId) && { label: `Use ${name}`, run: () => setCutHold(n.cutId, n.firmer) };
   };
+  // a part too small for a lock at this size: the sizes that fit one, and a tea light through it, as the card offers
+  // them
+  const bigger = (n) => {
+    if (n.lock == null) return null;
+    const sizes = [...new Set([n.lock, n.tea].filter((q) => q != null).map((q) => offerPercent(q / 100)))];
+    return sizes.map((percent) => ({ label: `Make it ${percent} %`, run: () => makeIt(percent, currentTable()?.scale ?? n.now / 100) }));
+  };
   return {
+    PART_SMALL: bigger,
+    PART_FIT: () => ({ label: 'Download fit test', run: downloadFitTest }),
+    PART_GAP: select,
+    PART_STUCK: select,
+    PART_SPLIT: select,
+    PART_MIXED: select,
     APART_NO_CLIPS: moveTo,
     APART_FLAT: moveTo,
     APART_HEAVY: firmer,
@@ -2144,6 +2598,7 @@ const probes = new Map(); // probe key -> the engine's answer for a place (64 ke
 let targetsFor = null; // { key, axis, seams, estimate } the model's seams along an axis, which a cut placed or dragged snaps to
 let lipTarget = null; // { axis, at }: where the place tried last gets a full lip, when it had none – a target while it is placed or dragged
 let spots = null; // { base, key, axis, hold, busy, list, failed, estimate, quiet } the spots suggested, while they are shown
+let aimHintShown = ''; // what the status line said to do while placing: it goes when placing stops
 
 /** The split's settings as the engine reads them for a cut tried on its own (the clearance sizes the lip). */
 const aimSplit = () => ({ ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split });
@@ -2164,22 +2619,21 @@ const namesOf = (ids = []) => ids.map((id) => doc.items.find((i) => i.id === id)
 
 /** The cut across `axis` already at `at` (to within 0.05 mm), other than `except`: another one there would do nothing. */
 function cutHere(axis, at, except = null) {
-  return (doc.split?.cuts ?? []).find((c) => c.id !== except && cutPlane(c)?.axis === axis && Math.abs(cutPlane(c).at - at) < 0.05) ?? null;
+  return planeCuts().find((c) => c.id !== except && cutPlane(c)?.axis === axis && Math.abs(cutPlane(c).at - at) < 0.05) ?? null;
 }
 
 /** The selected cut when it comes apart (and is straight): the one a suggestion moves. */
 function selectedApartCut() {
   const cut = doc.split?.cuts.find((c) => c.id === selectedCutId);
-  return cut?.joint === 'apart' && cutPlane(cut) ? cut : null;
+  return cut?.joint === 'apart' && !cut.part && cutPlane(cut) ? cut : null;
 }
 
 /** Whether one more cut across `axis` stays within the limits (12 cuts, 64 pieces). */
 function roomForCut(axis) {
-  const cuts = doc.split?.cuts ?? [];
-  if (cuts.length >= SPLIT_LIMITS.cuts) return false;
+  if (!roomForAnyCut()) return false;
   const b = cutBounds();
   if (!b) return true;
-  const { grid } = cellSizes(b, cuts);
+  const { grid } = cellSizes(b, planeCuts());
   return grid.reduce((n, g, a) => n * (g + 1 + (a === axis ? 1 : 0)), 1) <= SPLIT_LIMITS.cells;
 }
 
@@ -2282,20 +2736,32 @@ function probeAim() {
   }, 150);
 }
 
+/**
+ * Over a plane a new cut across Z would take a lantern's handle off with the top through, where the lid inside the
+ * handle comes off on its own: the readout's warning (`handlePlaneWords`), else null.
+ */
+const handleWarning = (a) => (a.axis === 2 && !a.cutId && !a.pick ? handlePlaneWords(currentTable(), a.at) : null);
+
+/** How the section and the readout are coloured for a place: by its lip, never as a good place where it takes the handle. */
+function aimVerdict(a, probe) {
+  const verdict = lipVerdict(probe, a.hold);
+  return verdict === 'full' && handleWarning(a) ? 'short' : verdict;
+}
+
 /** An answer about a place, if it is still the place being placed or dragged: the section's colour, the readout, where a full lip fits. */
 function showProbe(key) {
   const a = aimAt;
   if (!a?.hold || probeKey(a.axis, a.at, a.hold) !== key) return;
   const r = probes.get(key);
-  viewer.setAimVerdict(lipVerdict(r, a.hold));
+  viewer.setAimVerdict(a.drag ? lipVerdict(r, a.hold) : aimVerdict(a, r));
   // where the move gives a full lip, a target too – the view snaps to it at once – and kept while the place shown is
   // that target itself, which has no move of its own to suggest. It says when the lip there is short of a full one
   if (a.target?.kind !== 'lip') {
     const there = r.suggestedLip;
     const lip = Number.isFinite(r.suggestedAt)
-      ? { axis: a.axis, at: r.suggestedAt, full: !there || lipVerdict({ lip: there }, a.hold) === 'full', H: there?.H, ...(there?.twist ? { twist: true } : {}) }
+      ? { axis: a.axis, at: r.suggestedAt, full: !there || lipVerdict({ lip: there }, a.hold) === 'full', H: there?.H, ...(there?.twist ? { twist: true } : {}), ...(there?.whole ? { whole: true } : {}) }
       : null;
-    if (lip?.at !== lipTarget?.at || lip?.axis !== lipTarget?.axis || lip?.full !== lipTarget?.full) {
+    if (lip?.at !== lipTarget?.at || lip?.axis !== lipTarget?.axis || lip?.full !== lipTarget?.full || lip?.whole !== lipTarget?.whole) {
       lipTarget = lip;
       pushTargets();
     }
@@ -2321,12 +2787,17 @@ function showAimReadout() {
     el.hidden = true;
     return;
   }
+  if (a.pick || partAim()) return showPartReadout(a);
   const probe = a.hold ? probes.get(probeKey(a.axis, a.at, a.hold)) : null;
   const first = document.createElement('div');
   first.textContent = aimLine(a.axis, a.at, probe ?? null, a.hold, { through: namesOf(probe?.crosses) });
   if (!a.hold) first.append(' · ', ...(piecesBeside(a.cutId, a.axis, a.at) ?? ['misses the model']));
   const here = cutHere(a.axis, a.at, a.cutId);
-  const lines = [first, here ? `cut ${cutLetter(here.id)} is already here` : '', snappedWords(a.target, a.axis)];
+  // a new cut across Z under a lantern's handle would take the handle with the top, where its lid alone comes off: said
+  // first, ahead of the lock the plane would get, which is no good place then; over a base too small for a lock at this
+  // size, what it would take from what size
+  const handle = handleWarning(a);
+  const lines = [handle ?? '', first, here ? `cut ${cutLetter(here.id)} is already here` : '', snappedWords(a.target, a.axis), a.base ?? ''];
   if (a.pinned) {
     const row = document.createElement('div');
     row.className = 'readout-actions';
@@ -2343,11 +2814,50 @@ function showAimReadout() {
     row.append(place, stop);
     lines.push(row);
   }
-  fillReadout(lines, a.hold ? lipVerdict(probe, a.hold) : null, !!probe);
+  fillReadout(lines, a.hold ? aimVerdict(a, probe) : null, !!probe);
+  placeReadout(el, a);
+}
+
+/**
+ * The readout over a part a click would take out (`aimAt.pick`): the part and the lock it gets, or the handle the lid
+ * under it leaves on; that a cut takes it out already. Picking a part's own cut again, anywhere else: that a part
+ * is what moves it. Where a finger put it, the buttons to take the part out (or move the cut there) or stop.
+ */
+function showPartReadout(a) {
+  const el = $('cutReadout');
+  const pick = a.pick;
+  const taken = pick ? partCutFor(pick.part, pick.table) : null;
+  const letter = aiming.cutId ? cutLetter(aiming.cutId) : null;
+  const lines = pick
+    ? [partReadout(pick, pick.table), taken && taken.id !== aiming.cutId ? `cut ${cutLetter(taken.id)} takes it out already` : '']
+    : [`No part comes off here – point at one to move cut ${letter} there`];
+  if (a.pinned && pick) {
+    const row = document.createElement('div');
+    row.className = 'readout-actions';
+    const place = document.createElement('button');
+    place.type = 'button';
+    place.className = 'btn small accent';
+    place.textContent = letter ? `Move cut ${letter} here` : 'Take it out';
+    place.addEventListener('click', () => takePart(pick));
+    const stop = document.createElement('button');
+    stop.type = 'button';
+    stop.className = 'btn small';
+    stop.textContent = 'Cancel';
+    stop.addEventListener('click', () => endAim());
+    row.append(place, stop);
+    lines.push(row);
+  }
+  fillReadout(lines, pick ? (pick.part.lock ? 'full' : 'short') : 'none', true);
+  placeReadout(el, a);
+}
+
+/**
+ * The readout beside the pointer where it fits, and always within the view; moved, not laid out again, so following
+ * the pointer over a dense model costs the page nothing but the move. Put there by a finger, along the top of the view
+ * under its own controls (the bottom when the finger is near the top), clear of the middle where two fingers zoom it.
+ */
+function placeReadout(el, a) {
   el.classList.toggle('pinned', !!a.pinned);
-  // beside the pointer where it fits, and always within the view; moved, not laid out again, so following the pointer
-  // over a dense model costs the page nothing but the move. Put there by a finger, along the top of the view under its own
-  // controls (the bottom when the finger is near the top), clear of the middle where two fingers zoom it
   const [w, h] = [el.offsetWidth, el.offsetHeight];
   const [x, y] = a.screen;
   const [sw, sh] = viewer.viewSize;
@@ -2365,21 +2875,76 @@ function controlsBottom() {
   return Math.max(0, ...[...document.querySelectorAll('#stage .legend, #stage .stage-tools')].map((el) => el.getBoundingClientRect().bottom - stage.top));
 }
 
-/** What the page says while a cut is placed on the model: a glued one snaps to nothing. */
+/**
+ * What the page says while a cut is placed on the model: a glued one snaps to nothing; a part's own cut goes to a
+ * part that comes off; a new one, where the model has such parts, takes one out with a click on it.
+ */
 function aimHint() {
+  const part = partAim();
+  if (part) {
+    const letter = cutLetter(part.id);
+    return touchOnly() ? `Touch a part that comes off, then tap Move cut ${letter} here.` : `Click a part that comes off to move cut ${letter} to it. Esc stops.`;
+  }
   const what = aiming.cutId ? `cut ${cutLetter(aiming.cutId)} should go` : 'it should come apart';
   const snaps = !!holdOf(aiming.cutId);
+  if (!aiming.cutId && currentTable()?.parts.some(takesOut)) {
+    return touchOnly()
+      ? 'Touch a part that lights up to take it out, or the model where it should come apart and slide to move the plane, then tap the button. It snaps to ledges and good spots.'
+      : 'Click a part that lights up to take it out, or the model where it should come apart – it snaps to ledges and good spots; hold Alt to place it freely. Shift+click to place more. Esc stops.';
+  }
   return touchOnly()
     ? `Touch the model where ${what} and slide to move the plane, then tap ${aiming.cutId ? `Move cut ${cutLetter(aiming.cutId)} here` : 'Place cut here'}.${snaps ? ' It snaps to ledges and good spots.' : ''}`
     : `Click the model where ${what}${snaps ? ' – it snaps to ledges and good spots; hold Alt to place it freely.' : '.'}${aiming.cutId ? '' : ' Shift+click to place more.'} Esc stops.`;
 }
 
+/** Say what to do while placing (`aimHint`), and remember it was said: placing stops, and it goes. */
+function showAimHint() {
+  aimHintShown = aimHint();
+  setStatus(aimHintShown);
+}
+
+/** The cut a part is being picked again for, with its row's crosshair: a click on a part moves it there. */
+const partAim = () => (aiming?.cutId ? doc.split?.cuts.find((c) => c.id === aiming.cutId && c.part) ?? null : null);
+
+/**
+ * Whether a click on this part of the table takes it out: a lid always (too small for a lock, it lifts off until the
+ * model is made bigger), a base only where its lock fits – one too small would just drop out, so a click there places
+ * a cut across instead, and the readout says from what size the base twists off.
+ */
+const takesOut = (entry) => entry.kind !== 'plug' || !!entry.lock;
+
+/**
+ * The part a point on the model picks while placing (`pickPart` on the parts table: no engine round trip, so at once
+ * on a dense model), with the table; null where it picks none, the table is not in yet, or Alt places a cut freely.
+ * Only a new cut that comes apart, or a part's own cut picked again, takes a part.
+ */
+function partPicked(point, free = false) {
+  if (!aiming || (aiming.cutId && !partAim()) || free || !point) return null;
+  const table = currentTable();
+  if (!table?.parts.length) return null;
+  const pick = pickPart(table, point);
+  return pick.part ? { ...pick, table } : null;
+}
+
+/** The part a click would take out, drawn on the model: tinted gold, its circle and walls, the handle it leaves on outlined. */
+function showPartHover(pick) {
+  const e = pick?.part;
+  viewer.setPartHover(
+    e
+      ? { centre: e.centre, r: e.r, face: e.face, top: e.top ?? e.cap, handle: e.handle && !e.takesHandle ? { step: pick.table.h, levels: e.handle.levels } : null }
+      : null,
+  );
+}
+
 /**
  * Pick a place on the model for a cut: for "+ Removable part" (`cutId`
- * null) a new cut across Z that comes apart, otherwise the cut `cutId`
- * along its own axis. A plane follows the pointer, snapping to the model's
- * seams, the spots suggested and where a full lip fits; a click puts the cut
- * there. The same button again, Escape, or anything else taken up stops it.
+ * null) a new cut across Z that comes apart – or, a click on a part that
+ * comes off on its own (a lid inside a handle, a base), that part – otherwise
+ * the cut `cutId` along its own axis, or a part's cut moved to another part.
+ * A plane follows the pointer, snapping to the model's seams, the spots
+ * suggested and where a full lip fits; over a part, the part lights up
+ * instead. A click puts the cut there. The same button again, Escape, or
+ * anything else taken up stops it.
  */
 function startAim(cutId = null) {
   if (aiming && aiming.cutId === cutId) return endAim(); // the button pressed again
@@ -2396,25 +2961,31 @@ function startAim(cutId = null) {
   if (doc.selected) doc.select(null);
   if (!cutId && selectedCutId) selectCut(null); // a new part: a spot clicked meanwhile adds one too, rather than move this
   aiming = { cutId, axis };
-  // a cut that comes apart snaps to the seams, the spots and where a full lip fits; a glued one to none of them
-  const snaps = !!holdOf(cutId);
-  viewer.setAim({ axis, snap: snaps });
+  // a cut that comes apart snaps to the seams, the spots and where a full lip fits; a glued one to none of them; a
+  // part's own cut goes only to a part, with no plane to follow the pointer
+  const part = !!cut?.part;
+  const snaps = !part && !!holdOf(cutId);
+  viewer.setAim({ axis, snap: snaps, plane: !part });
+  // the parts that come off on their own (a lid inside a handle, a base) first – the card, and what a click picks –
+  // then the seams a plane snaps to, and for a new cut the places to cut across: the engine answers them in turn
+  if (!cutId || part) findPartsCard();
   if (snaps) loadTargets(axis);
   if (!cutId) suggestSpots({ axis, hold: 'lock' });
-  setStatus(aimHint());
+  showAimHint();
   renderSplit();
 }
 
 /** Stop placing a cut on the model. */
 function endAim() {
   if (!aiming) return;
-  const hint = aimHint();
   aiming = null;
   aimAt = null;
   clearTimeout(probeTimer);
+  viewer.setPartHover(null);
   viewer.setAim(null);
   $('cutReadout').hidden = true;
-  if ($('status').textContent === hint) setStatus('');
+  if ($('status').textContent === aimHintShown) setStatus('');
+  aimHintShown = '';
   dropLipTarget();
   renderSplit();
 }
@@ -2433,9 +3004,14 @@ function dropLipTarget() {
  * across the axis already is – a click near one snaps onto it – nothing is
  * placed, and the page says so.
  */
-function placeAimed(at, { keep = false } = {}) {
+function placeAimed(at, { keep = false, point = null, free = false } = {}) {
   const a = aiming;
   if (!a || !Number.isFinite(at)) return;
+  // on a part that comes off: that part (a finger's pinned plane has no point of its own: the one it showed)
+  const pick = point ? partPicked(point, free) : aimAt?.pick ?? null;
+  if (pick && takesOut(pick.part)) return takePart(pick, { keep });
+  const part = partAim();
+  if (part) return setStatus(`No part comes off there – click one to move cut ${cutLetter(part.id)} to it.`, 'error');
   const here = cutHere(a.axis, at, a.cutId);
   if (here) return setStatus(`Cut ${cutLetter(here.id)} is already at ${round(at, 1)} mm – a cut there would do nothing.`, 'error');
   if (!keep) endAim();
@@ -2456,13 +3032,23 @@ viewer.onAim = (h) => {
   if (h.at == null) {
     aimAt = null;
     clearTimeout(probeTimer);
+    showPartHover(null);
     $('cutReadout').hidden = true;
     return;
   }
-  const moved = aimAt?.at !== h.at;
-  const hold = holdOf(aiming.cutId);
-  aimAt = { axis: aiming.axis, at: h.at, target: h.target, screen: h.screen, pinned: !!h.pinned, hold, cutId: aiming.cutId, key: hold ? probeKey(aiming.axis, h.at, hold) : null };
-  if (moved || h.pinned) probeAim();
+  // over a part that comes off, the part lights up and the readout says what it gets; elsewhere the plane is tried
+  const found = partPicked(h.point, h.free);
+  const pick = found && takesOut(found.part) ? found : null;
+  showPartHover(pick);
+  const plane = !pick && !partAim();
+  const moved = aimAt?.at !== h.at || !!aimAt?.pick !== !!pick;
+  const hold = plane ? holdOf(aiming.cutId) : null;
+  aimAt = {
+    axis: aiming.axis, at: h.at, target: h.target, screen: h.screen, pinned: !!h.pinned, hold, cutId: aiming.cutId, key: hold ? probeKey(aiming.axis, h.at, hold) : null,
+    pick, point: h.point, free: !!h.free, base: found && !pick ? partReadout(found, found.table) : null,
+  };
+  if (!plane) clearTimeout(probeTimer);
+  else if (moved || h.pinned) probeAim();
   showAimReadout();
 };
 
@@ -2475,7 +3061,7 @@ viewer.onAim = (h) => {
  */
 function refreshAim() {
   const a = aimAt;
-  if (!aiming || !a || a.drag) return;
+  if (!aiming || !a || a.drag || a.pick || partAim()) return;
   const hold = holdOf(aiming.cutId);
   const key = hold ? probeKey(a.axis, a.at, hold) : null;
   if (hold === a.hold && key === a.key) return;
@@ -2484,7 +3070,39 @@ function refreshAim() {
   showAimReadout();
 }
 
-viewer.onAimPick = ({ at, shift }) => placeAimed(at, { keep: shift });
+viewer.onAimPick = ({ at, shift, point, free }) => placeAimed(at, { keep: shift, point, free });
+
+/** A part as the finder places it: its circle round the centre, on its face, the finder's own pick. */
+const partPlaced = (entry) => ({ position: [entry.centre[0], entry.centre[1], entry.face], part: { r: entry.r, side: entry.side, auto: true } });
+
+/**
+ * A part clicked while placing: taken out as the finder places it, as one undo step, and selected – a new cut, or the
+ * part's own cut moved to it. A part another cut takes out already selects that cut. Placing stops unless `keep`
+ * (Shift+click picks more).
+ */
+function takePart(pick, { keep = false } = {}) {
+  const a = aiming;
+  if (!a) return;
+  const entry = pick.part;
+  const taken = partCutFor(entry, pick.table);
+  if (taken && taken.id !== a.cutId) {
+    if (!keep) endAim();
+    selectCut(taken.id);
+    setStatus(`Cut ${cutLetter(taken.id)} takes the ${entry.name.toLowerCase()} out already.`);
+    return;
+  }
+  if (!keep) endAim();
+  if (a.cutId) {
+    doc.updateCut(a.cutId, partPlaced(entry));
+    selectCut(a.cutId);
+    return;
+  }
+  if (!roomForAnyCut()) {
+    endAim();
+    return setStatus(`A split can have up to ${SPLIT_LIMITS.cuts} cuts and ${SPLIT_LIMITS.cells} pieces.`, 'error');
+  }
+  selectCut(doc.addCut({ ...partPlaced(entry), normal: [0, 0, 1], joint: 'apart', hold: 'lock' }, { defaults: splitDefaults }));
+}
 
 /**
  * "Suggest spots": the engine's best places along an axis for a cut that
@@ -2583,6 +3201,10 @@ function renderSpots() {
   const note = $('spotsNote');
   const list = $('spotList');
   const found = spots?.list?.length ? spots.list : null;
+  // the parts listed above it are what comes off where no cut across the whole model does well – those the card
+  // offers something for: a base no lock fits at any size is listed with nothing to press
+  const table = currentTable();
+  const parts = !!table?.parts.some((e) => partOffered(e, table));
   const text = !spots
     ? ''
     : spots.busy && !spots.quiet
@@ -2590,16 +3212,20 @@ function renderSpots() {
       : spots.failed
         ? spots.failed
         : !found
-          ? aiming
-            ? 'No good spot found – click the model where it should come apart.'
-            : 'No good spot found – pick one on the model yourself:'
+          ? parts
+            ? `No good place for a cut across the whole model – use a part above, or ${aiming ? 'click the model where it should come apart.' : 'pick a place on the model yourself:'}`
+            : aiming
+              ? 'No good spot found – click the model where it should come apart.'
+              : 'No good spot found – pick one on the model yourself:'
           : sel
             ? `Best first – click one to move cut ${cutLetter(sel.id)} there.`
             : 'Best first – click one to add a cut that comes apart there.';
   const hold = spots?.hold;
+  // where a lid inside a lantern's handle comes off on its own, a spot whose top would take the handle with it says so
+  const handles = table?.parts.some((e) => e.kind === 'lid' && e.handle && !e.takesHandle) ? table.handles : [];
   const labels = (found ?? []).map((spot) => {
     const taken = cutHere(AXES.indexOf(spot.axis), spot.at);
-    return spotLabel(spot, hold, { through: namesOf(spot.crosses), taken: taken ? cutLetter(taken.id) : null });
+    return spotLabel(spot, hold, { through: namesOf(spot.crosses), taken: taken ? cutLetter(taken.id) : null, handles });
   });
   const signature = JSON.stringify([text, !aiming && spots && !spots.busy && !found, found, hold, labels]);
   if (signature === spotsSignature) return;
@@ -2648,6 +3274,450 @@ function renderSpots() {
   }
 }
 
+/* ------------------------------------------------- parts that come off */
+
+let partsCard = null; // { key, loads, version, busy, table, failed } the parts that come off, listed once asked for
+let partsAsk = null; // { key, promise } the parts table being asked for: the card and the refit after a Scale share it
+let partsSignature = '';
+let frameAfter = null; // the model's version [Make it N %] made: the view is framed on it once it is in
+
+/** The model's size against the one loaded (the cube root of its transforms' scale), as the parts table's `scale`. */
+const modelScale = () => +Math.cbrt(Math.abs((doc.base?.transforms ?? []).reduce((acc, t) => new Matrix4().fromArray(t).multiply(acc), new Matrix4()).determinant())).toFixed(6);
+
+/** What the parts table depends on: the model as it is (the text on it hardly moves a part), the clearance and the printer. */
+const partsKey = () => stableKey({ version: version(), clearance: aimSplit().clearance, nozzle: printing.nozzle, layers: printing.layerHeight });
+
+/** The parts table for the model as it is now, asked for once by whoever wants it first; null when it can't be had now. */
+function askPartsTable() {
+  const key = partsKey();
+  if (partsAsk?.key === key) return partsAsk.promise;
+  const ask = { key, promise: null };
+  ask.promise = (async () => {
+    if (!(await syncBase()) || partsKey() !== key) return null;
+    return (await client.parts(doc.items, version(), { printing, split: aimSplit() })) ?? null;
+  })();
+  partsAsk = ask;
+  // an answer that never came is asked for again next time
+  const forget = () => partsAsk === ask && (partsAsk = null);
+  ask.promise.then((table) => !table && forget(), forget);
+  return ask.promise;
+}
+
+/**
+ * The table's entry for a part taken out (a cut with a circle across Z, lying up): the same kind round the same
+ * centre, its face within the family's – the finder's lid wherever its face was moved to, or the base.
+ */
+function entryIn(table, cut) {
+  const plane = cutPlane(cut);
+  if (!table || !cut?.part || plane?.axis !== 2 || !(cut.normal[2] > 0) || cut.part.side !== 1) return null;
+  const [x, y] = cut.position;
+  const near = (e) => Math.hypot(e.centre[0] - x, e.centre[1] - y) <= 0.05 * table.width;
+  return table.parts.find((e) => near(e) && (e.kind === 'plug' ? Math.abs(plane.at - e.face) <= table.h : plane.at >= e.from - 2 * table.h && plane.at <= e.cap)) ?? null;
+}
+
+/** The card's table while it is for the model and the settings as they are now, else null. */
+const currentTable = () => (partsCard?.table && partsCard.key === partsKey() && partsCard.loads === loads ? partsCard.table : null);
+
+/**
+ * What a part's row says of it: from the pieces once they are worked out for the split as it is, else from the card's
+ * table – its name and kind, the lock it gets (the table's while the part's face is the finder's), whether
+ * none fits at this size and from what size one does, whether a handle stays on, and the note that moved or refused it.
+ */
+function partInfo(cut, letter) {
+  const current = piecesCurrent();
+  const seam = current ? lastPieces.seams.find((s) => s.joint === 'part' && s.cutId === cut.id) : null;
+  // what the split said of it, once the pieces are worked out; until then, what trying its face where it was put said
+  const tried = partChecks.get(cut.id);
+  const note = current
+    ? lastPieces.notes.find((n) => PART_REFUSALS.has(n.code) && (n.code === 'PART_CROSSED' ? n.partId : n.cutId) === cut.id) ?? null
+    : tried && tried.step === doc.history.at(-1) && tried.at === cutPlane(cut)?.at ? tried.note : null;
+  const table = currentTable();
+  const entry = entryIn(table, cut);
+  // a lid's lock is sized on its outside over its face and carried by the wall under it, whatever the circle's width
+  // in its band: at the finder's face it is the table's; a base's lock is its circle's own
+  const exact = !!entry && Math.abs(cutPlane(cut).at - entry.face) < 1e-6 && (entry.kind !== 'plug' || Math.abs(cut.part.r - entry.r) < 1e-6);
+  const lock = seam ? (seam.apart.mech ? seam.apart : null) : exact ? entry.lock : null;
+  // asked to lock and none is built: the pieces say so, or the table does for the part's family wherever its face is.
+  // At this size none fits – unless the lock was left off because it would have left the part in pieces
+  const lockless = seam ? !seam.apart.mech && seam.apart.hold === 'lock' : !!entry && !entry.lock;
+  const pieces = lockless && seam?.apart.why === 'pieces';
+  return {
+    name: seam?.part.name ?? entry?.name ?? `Part ${letter}`,
+    kind: seam?.part.kind ?? entry?.kind ?? 'lid',
+    lock,
+    small: lockless && !pieces,
+    least: seam ? seam.apart.small?.lock ?? null : entry && !entry.lock ? percentOf(entry.least?.lock, table.scale) : null,
+    handle: seam ? !!seam.part.handle : !!entry?.handle && !entry.takesHandle,
+    note,
+    known: lockless,
+    why: seam?.apart.why ?? null,
+  };
+}
+
+/**
+ * "Parts that come off": the engine's parts table – a lid inside a handle, a base from underneath, each with the
+ * twist-lock it gets at this size or the least size one needs – listed in the card, asked for by "+ Removable part"
+ * and "Suggest spots", and again while it is listed once the model is scaled or the printer changed. Seconds on a
+ * dense model the first time; at once after that.
+ */
+async function findPartsCard() {
+  if (!booted || halted || !modelInfo?.hasModel || !canSplit()) return;
+  const key = partsKey();
+  if (partsCard?.key === key && partsCard.loads === loads && (partsCard.busy || partsCard.table)) return renderPartsCard();
+  const card = { key, loads, version: version(), busy: true, table: null, failed: null };
+  partsCard = card;
+  renderPartsCard();
+  try {
+    card.table = await askPartsTable();
+  } catch (err) {
+    card.failed = friendly(err);
+  } finally {
+    card.busy = false;
+    // not had for the model as it was asked for: asked again for the model as it is now, or on the next press
+    if (partsCard === card && !card.table && !card.failed) partsCard = partsKey() === key ? null : card;
+    if (partsCard === card || !partsCard) {
+      renderPartsCard();
+      renderCuts();
+      renderSpots();
+      // placing meanwhile: the parts now light up under the pointer, and the page says a click takes one out
+      if (aiming && $('status').textContent === aimHintShown) showAimHint();
+    }
+  }
+}
+
+let relisting = false;
+/** The card listed again for the model and the printer as they are now, once the engine is idle. */
+function relistParts() {
+  if (relisting) return;
+  relisting = true;
+  whenIdle(() => {
+    relisting = false;
+    if (partsCard && !partsCard.busy && partsCard.key !== partsKey()) findPartsCard();
+  });
+}
+
+/** The part cut already taking out this entry's part, if any. */
+const partCutFor = (entry, table) => (doc.split?.cuts ?? []).find((c) => c.part && entryIn(table, c) === entry) ?? null;
+
+/**
+ * [Use]: the part taken out as the finder found it, as one undo step, and selected: a cut across Z with its circle,
+ * the finder's pick (`auto`), so a Scale places it again for the new size. It holds by its twist-lock – also where none
+ * fits at this size ("Use – it just lifts off"): it lifts off until the model is big enough, then locks with no other
+ * click.
+ */
+function usePart(entry) {
+  endAim();
+  if (!roomForAnyCut()) return setStatus(`A split can have up to ${SPLIT_LIMITS.cuts} cuts and ${SPLIT_LIMITS.cells} pieces.`, 'error');
+  selectCut(doc.addCut({ ...partPlaced(entry), normal: [0, 0, 1], joint: 'apart', hold: 'lock' }, { defaults: splitDefaults }));
+}
+
+/**
+ * [Make it N %]: the model scaled to N % of its size as loaded, and the parts still where the finder put them placed
+ * again for the new size, as one undo step; the card lists the parts at that size. What was on screen stays: the
+ * pieces are shown again at the new size once their parts are placed for it, and a part being picked on the model goes
+ * on being picked, among the parts at that size.
+ */
+async function makeIt(percent, scale = currentTable()?.scale) {
+  if (!doc.base || !(scale > 0)) return;
+  const f = percent / 100 / scale;
+  if (Math.abs(f - 1) < 1e-9) return;
+  const pieces = $('resultToggle').checked && splitActive(doc.split);
+  if (aiming) {
+    // what the pointer was over is a part of the model at its old size
+    aimAt = null;
+    viewer.setPartHover(null);
+    $('cutReadout').hidden = true;
+  }
+  const step = doc.transformBase(new Matrix4().makeScale(f, f, f));
+  const made = version();
+  frameAfter = made;
+  undoToast(`Scaled the model to ${percent} %.`);
+  await refitParts(step);
+  if (pieces && version() === made && !$('resultToggle').checked && splitActive(doc.split)) {
+    $('resultToggle').checked = true;
+    showResult(true);
+  }
+}
+
+/**
+ * After a Scale (or [Make it N %]), the parts still where the finder put them are placed by it again for the new
+ * size: scaled with the model, a face lands off the printer's layers and away from the best face there. It joins the
+ * Scale's undo step while that is still the last edit (`Document.refitParts`), and does nothing once the model has
+ * moved on.
+ */
+async function refitParts(step) {
+  if (!(doc.split?.cuts ?? []).some((c) => c.part?.auto)) return;
+  const base = modelPlacementKey(doc.base);
+  let table;
+  try {
+    table = await askPartsTable();
+  } catch {
+    return; // the parts stay as they were scaled; the split says what they get
+  }
+  if (!table || modelPlacementKey(doc.base) !== base) return;
+  const fits = [];
+  for (const c of doc.split?.cuts ?? []) {
+    const e = c.part?.auto ? entryIn(table, c) : null;
+    if (e) fits.push({ id: c.id, position: [e.centre[0], e.centre[1], e.face], part: { r: e.r, side: e.side } });
+  }
+  if (fits.length) doc.refitParts(fits, { base, step });
+}
+
+/* ------------------------------------------------- a part's face and width */
+
+const partChecks = new Map(); // cutId -> { at, note, step } what trying a part's face where it was put said: its row says so until the next edit
+const partTries = new Map(); // a part's face tried (`partTryKey`) -> the engine's answer: where it goes, the free bands round it
+let partDrag = null; // { id, r, band } while a part's ring handle is dragged: the circle is drawn at `r`, the cut changed when dropped
+let partTyped = null; // { id, at?, r? } while a part's Z or Ø is typed: the circle is drawn there, the cut changed once the box is left
+
+/** A cut that takes out a part, by its id. */
+const partCut = (id) => doc.split?.cuts.find((c) => c.id === id && c.part) ?? null;
+
+/** The layers a part across Z prints on: those of the piece it comes out of, from the model's bottom or the cut under it. */
+function partLayers(cut) {
+  const at = cutPlane(cut)?.at ?? 0;
+  const zmin = currentTable()?.zmin ?? cutBounds()?.min[2] ?? 0;
+  const under = planeCuts().map((c) => cutPlane(c)).filter((p) => p?.axis === 2 && p.at < at - 1e-6).map((p) => p.at);
+  return { from: Math.max(zmin, ...under), hl: printing.layerHeight ?? 0.2 };
+}
+
+const partTryKey = (cut, at) => `${partsKey()}|${aimSplit().clearance}|${cut.position[0]},${cut.position[1]}|${at}|${cut.part.r}`;
+
+/** The engine's answer for a part's face tried at `at` (mode 'part'): kept, so a face tried again answers at once. */
+async function tryPartAt(cut, at) {
+  const key = partTryKey(cut, at);
+  if (partTries.has(key)) return partTries.get(key);
+  if (!(await syncBase())) return null;
+  const r = await client.partAt(doc.items, version(), { centre: cut.position.slice(0, 2), at, r: cut.part.r, printing, split: aimSplit() });
+  if (!r) return null;
+  partTries.set(key, r);
+  while (partTries.size > 32) partTries.delete(partTries.keys().next().value);
+  return r;
+}
+
+/**
+ * A part's face typed in or nudged, settled: on the printer's layers (`partFace`), then tried where the split will put
+ * it – moved a layer or two up where it would not print apart from what stands beside it, or to the nearest face that
+ * does – in the same undo step as the edit. The page and the part's row say why it moved (PART_GAP's words), or that
+ * it can't go there.
+ */
+async function settlePartFace(id) {
+  const key = `split:at:${id}`;
+  const cut = partCut(id);
+  const plane = cutPlane(cut);
+  if (!plane || plane.axis !== 2 || cut.part.side !== 1) return doc.endCoalescing();
+  const at = partFace(plane.at, partLayers(cut));
+  if (at !== plane.at) moveCut(id, at, { coalesce: key });
+  let check = null;
+  try {
+    check = await tryPartAt(partCut(id), at);
+  } catch {
+    // the split says what the face gets
+  }
+  const now = partCut(id);
+  // moved again meanwhile: that move is settled in its turn
+  if (!check || !now || cutPlane(now)?.at !== at) return doc.endCoalescing();
+  const letter = cutLetter(id);
+  const entry = entryIn(currentTable(), now);
+  const name = entry?.name ?? partInfo(now, letter).name;
+  let note = null;
+  let to = null;
+  if (check.why === 'mixed') note = splitNote('PART_MIXED', { letter, cutId: id });
+  else if (check.why === 'empty') note = splitNote('CUT_MISSES', { letter, cutId: id });
+  else if (!check.ok || check.z0 !== check.asked) {
+    to = check.ok ? check.z0 : Number.isFinite(check.nearest) ? check.nearest : null;
+    note = splitNote('PART_GAP', {
+      letter, cutId: id, name, axis: 2, z: check.asked, gap: check.tried?.gap ?? 0, need: check.gmin, islands: check.tried?.islands ?? 0,
+      by: entry?.handle ? "the handle's feet" : 'the model beside it', ...(to != null ? { movedTo: to } : {}),
+    });
+  }
+  if (to != null) moveCut(id, to, { coalesce: key });
+  doc.endCoalescing();
+  if (note) {
+    // said until anything else is done: undone, the face it moved from is the one that is there
+    partChecks.set(id, { at: to ?? at, note, step: doc.history.at(-1) });
+    setStatus(note.text, to != null ? '' : 'error');
+  } else partChecks.delete(id);
+  renderSplit();
+  // the box typed in still has the focus, which keeps what was typed: it shows where the face went
+  const box = document.querySelector(`[data-part-z="${CSS.escape(id)}"]`);
+  if (box) box.value = roundZ(cutPlane(partCut(id))?.at ?? at);
+}
+
+/**
+ * The free band a part's circle is kept in at its face (`{ lo, hi, gmin }`, radii): the parts table's where the part's
+ * face is the finder's, else the engine's for the face as it is. None for a base, whose width its lock decides.
+ */
+async function partBand(cut) {
+  const plane = cutPlane(cut);
+  if (plane?.axis !== 2) return null;
+  const entry = entryIn(currentTable(), cut);
+  if (entry?.kind === 'plug') return null;
+  const gmin = gminOf(aimSplit().clearance);
+  if (entry && Math.abs(plane.at - entry.face) < 1e-6) return { lo: entry.window[0], hi: entry.window[1], gmin, mid: entry.r };
+  let check = null;
+  try {
+    check = await tryPartAt(cut, plane.at);
+  } catch {
+    return null;
+  }
+  const band = bandOf(check?.windows, cut.part.r);
+  return band ? { ...band, gmin: check.gmin } : null;
+}
+
+/**
+ * A part's width typed in, settled: kept in the free band round it at its face, onto the band's middle from within
+ * `tol` (mm of radius) – the finder's own width – and the page says so where an edge of the band held it back.
+ */
+async function settlePartWidth(id, { tol = 0 } = {}) {
+  const cut = partCut(id);
+  if (!cut) return doc.endCoalescing();
+  const band = await partBand(cut);
+  const now = partCut(id);
+  // changed again meanwhile: that change is settled in its turn
+  if (!band || !now || now.part.r !== cut.part.r || cutPlane(now)?.at !== cutPlane(cut)?.at) return doc.endCoalescing();
+  const { r, edge } = partWidth(now.part.r, { ...band, tol });
+  if (r !== now.part.r) doc.updateCut(id, { part: { r: +r.toFixed(4), ...finderPick(now, r) } }, { coalesce: `split:d:${id}` });
+  doc.endCoalescing();
+  if (edge) setStatus(`${widthWords(2 * r, edge)}.`);
+  const box = document.querySelector(`[data-part-d="${CSS.escape(id)}"]`);
+  if (box) box.value = round(2 * r, 1);
+}
+
+// a part's ring handle dragged: the circle follows the pointer on the model – kept in its free band and pulled onto
+// the band's middle from a few pixels away – and the cut changes, as one undo step, when it is dropped
+viewer.onPartDrag = ({ id, r, pxPerMm, done, cancelled }) => {
+  const cut = partCut(id);
+  if (!cut) return;
+  if (!done) {
+    if (partDrag?.id !== id) {
+      const drag = { id, r: cut.part.r, band: null };
+      partDrag = drag;
+      partBand(cut).then((band) => (drag.band = band), () => {});
+    }
+    const fit = partDrag.band ? partWidth(r, { ...partDrag.band, tol: snapTolerance(pxPerMm) }) : { r, edge: null };
+    partDrag.r = fit.r;
+    partDrag.edge = fit.edge;
+    const box = document.querySelector(`[data-part-d="${CSS.escape(id)}"]`);
+    if (box && box !== document.activeElement) box.value = round(2 * fit.r, 1);
+    drawParts();
+    return;
+  }
+  const drag = partDrag;
+  partDrag = null;
+  if (!cancelled && drag) {
+    // let go where its Ø reads as it did (a press, or held back at the edge it was at) it is no edit, and a part the
+    // finder placed stays its pick
+    if (round(2 * drag.r, 1) !== round(2 * cut.part.r, 1) || finderPick(cut, drag.r).auto) doc.updateCut(id, { part: { r: +drag.r.toFixed(4), ...finderPick(cut, drag.r) } });
+    if (drag.edge) setStatus(`${widthWords(2 * drag.r, drag.edge)}.`);
+  }
+  renderSplit();
+};
+
+/**
+ * A part's width put back on the finder's own (the middle of its band, at its face): the finder's pick again (`auto`),
+ * so a Scale places it again for the new size.
+ */
+function finderPick(cut, r) {
+  const entry = entryIn(currentTable(), cut);
+  const at = cutPlane(cut)?.at;
+  return entry && Math.abs(r - entry.r) < 1e-6 && Math.abs(at - entry.face) < 1e-6 ? { auto: true } : {};
+}
+
+/**
+ * The card's list: for each part, what it is and the lock it gets, or why none fits and from what size one does,
+ * with [Use], [Make it N %] and [Use – it just lifts off]; a part already taken out offers its cut in place of [Use].
+ * Or what is happening (looking), or why there is none (solid all through, open already).
+ */
+function renderPartsCard() {
+  const usable = !!modelInfo?.hasModel && canSplit();
+  if (partsCard && (!usable || partsCard.loads !== loads)) partsCard = null;
+  // listed, and the model or the printer changed since: listed again where the card is still wanted – the model
+  // scaled (the card offers sizes), the clearance or the printer changed, a part taken out or being picked reads it –
+  // once the engine has done what the edit itself asked for (its previews first); else put away until asked for
+  // again: turning or moving the model changes no part, and the table takes seconds on a dense model
+  if (partsCard && !partsCard.busy && partsCard.key !== partsKey()) {
+    const resized = !!partsCard.table && Math.abs(partsCard.table.scale - modelScale()) > 1e-6;
+    const wanted = partsCard.version === version() || resized || !!aiming || takenOut() > 0;
+    if (!wanted) partsCard = null;
+    else {
+      // while a part is picked on the model it is the parts that light up under the pointer: asked for at once, ahead
+      // of the seams the plane snaps to
+      if (aiming) findPartsCard();
+      else relistParts();
+      return;
+    }
+  }
+  const box = $('partsCard');
+  box.hidden = !partsCard;
+  const card = partsCard;
+  const table = card?.table ?? null;
+  const note = !card ? '' : card.busy ? 'Finding the parts that come off…' : card.failed ?? (table ? partsNote(table, { aiming: !!aiming }) ?? '' : '');
+  const entries = table?.parts ?? [];
+  // a number keeps its unit on its line: "275 %", "Ø 44 mm"
+  const keep = (text) => text.replace(/(\d|Ø) (?=%|mm\b|\d)/g, '$1\u00a0');
+  const words = entries.map((e) => {
+    const w = partCard(e, table);
+    return { ...w, title: keep(w.title), detail: keep(w.detail) };
+  });
+  const taken = entries.map((e) => cutLetter(partCutFor(e, table)?.id));
+  const signature = JSON.stringify([!!card, note, words, taken, table?.zmax, table?.zmin]);
+  if (signature === partsSignature) return;
+  partsSignature = signature;
+  const p = $('partsNote');
+  p.textContent = note;
+  p.hidden = !note;
+  p.classList.toggle('busy', !!card?.busy);
+  $('partList').replaceChildren(
+    ...entries.map((entry, k) => {
+      const w = words[k];
+      const li = document.createElement('li');
+      li.className = `part-offer ${w.lock ? 'locks' : 'small'}`;
+      const title = document.createElement('div');
+      title.className = 'part-title';
+      const name = document.createElement('b');
+      name.textContent = w.name;
+      title.append(name, w.title.slice(w.name.length));
+      li.append(title);
+      if (w.detail) {
+        const detail = document.createElement('div');
+        detail.className = 'part-detail';
+        detail.textContent = w.detail;
+        li.append(detail);
+      }
+      const actions = document.createElement('div');
+      actions.className = 'part-actions';
+      if (w.badge) {
+        const badge = document.createElement('span');
+        badge.className = 'part-badge';
+        badge.textContent = w.badge;
+        actions.append(badge);
+      }
+      const button = (label, run, { accent = false, title: hint = '' } = {}) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = `btn small${accent ? ' accent' : ''}`;
+        b.textContent = label;
+        if (hint) b.title = hint;
+        b.addEventListener('click', run);
+        actions.append(b);
+      };
+      const letter = taken[k];
+      // the sizes its lock (and a tea light through it) fits from, whether or not a cut takes it out already: made
+      // bigger, the part taken out is placed again for that size and locks
+      const tall = (n) => Math.round(((table.zmax - table.zmin) * n) / 100 / table.scale);
+      for (const n of w.offers) button(`Make it ${n} %`, () => makeIt(n), { title: `Scale the model to ${n} % of its size as loaded: ${tall(n)} mm tall` });
+      if (letter) button(`Cut ${letter} takes it out`, () => selectCut(partCutFor(entry, currentTable())?.id ?? null));
+      else {
+        if (w.use === 'lock') button('Use', () => usePart(entry), { accent: true, title: `Take the ${w.name.toLowerCase()} out with its twist-lock` });
+        if (w.use === 'lift') button('Use – it just lifts off', () => usePart(entry), { title: 'Take it out with nothing holding it: it locks once the model is big enough' });
+      }
+      if (actions.childNodes.length) li.append(actions);
+      return li;
+    }),
+  );
+}
+
 let offered = null; // the text of the toast that offers to split the model just loaded
 /** Once for each model loaded: one bigger than the printer gets a toast that splits it. */
 function offerSplit() {
@@ -2689,14 +3759,24 @@ async function downloadFitTest() {
       renderCuts();
     }
     if (!r.stl) {
-      // cuts between the letters of a sign cross no material: nothing is joined, not even with glue
-      const apart = split.cuts.length > 0 && split.cuts.every((c) => measured?.cuts.get(c.id)?.islands === 0);
+      // only parts taken out, none of them locking: each lifts off, and says from what size a twist-lock fits
+      const planes = split.cuts.filter((c) => !c.part);
+      if (!planes.length && split.cuts.length) {
+        const parts = split.cuts.map((c) => {
+          const info = partInfo(c, cutLetter(c.id));
+          return { name: info.name, kind: info.kind, hold: c.hold, least: info.least, locks: c.hold === 'lock' && !!info.lock };
+        });
+        return setStatus(noFitTestWords(parts), '');
+      }
+      // cuts between the letters of a sign cross no material: nothing is joined, not even with glue (a part taken out
+      // is never measured across: it is no cut between letters)
+      const apart = planes.every((c) => measured?.cuts.get(c.id)?.islands === 0);
       const joints = split.joint === 'pegs' ? 'pegs' : 'pins';
       // a cut that comes apart is never glued: with no lip its pieces just rest on each other
-      const lips = split.cuts.filter((c) => c.joint === 'apart').length;
+      const lips = planes.filter((c) => c.joint === 'apart').length;
       const why = apart
         ? 'these cuts cross no material, so nothing is joined'
-        : lips === split.cuts.length
+        : lips === planes.length
           ? 'these cuts get no lip or tabs, so the pieces just rest on each other'
           : lips
             ? `these cuts get no ${joints}, tabs or lip`
@@ -2757,7 +3837,10 @@ function bindSplit() {
   $('splitFitBtn').addEventListener('click', autoSplit);
   $('addCutBtn').addEventListener('click', addCut);
   $('addApartBtn').addEventListener('click', () => startAim(null));
-  $('suggestSpotsBtn').addEventListener('click', () => suggestSpots());
+  $('suggestSpotsBtn').addEventListener('click', () => {
+    findPartsCard();
+    suggestSpots();
+  });
   $('splitClearBtn').addEventListener('click', () => {
     endAim();
     doc.setSplit(null);
@@ -2773,7 +3856,36 @@ function bindSplit() {
     e.preventDefault();
     openPrinting();
   });
-  $('spreadRange').addEventListener('input', () => viewer.setSpread(Number.parseFloat($('spreadRange').value)));
+  $('spreadRange').addEventListener('input', () => {
+    wayOn = false;
+    viewer.stopWay();
+    viewer.setSpread(Number.parseFloat($('spreadRange').value));
+    syncWayCaption();
+  });
+  // the view moves the pieces itself while ▶ plays or the lock is looked at: the slider and the words follow
+  viewer.onSpread = (f) => {
+    $('spreadRange').value = String(f);
+    syncWayCaption();
+  };
+  $('playWayBtn').addEventListener('click', (e) => playWays({ back: e.shiftKey }));
+  // the pieces framed, looked at or played clear of what the page puts over the view: the legend and its tools along
+  // the top, the lock's tools along the foot
+  viewer.insets = () => {
+    const panel = $('lockPanel');
+    const bottom = panel.hidden ? 0 : $('stage').getBoundingClientRect().bottom - panel.getBoundingClientRect().top;
+    return { top: controlsBottom(), bottom: Math.max(0, bottom) };
+  };
+  // the progress and the toast go up over the lock's tools, as tall as they are now (a caption comes and goes)
+  new ResizeObserver(() => {
+    const panel = $('lockPanel');
+    $('stage').style.setProperty('--lock-room', panel.hidden ? '0px' : `${panel.offsetHeight + 8}px`);
+  }).observe($('lockPanel'));
+  $('lookLockBtn').addEventListener('click', lookAtLock);
+  $('asPrintedToggle').addEventListener('change', () => {
+    viewer.setAsPrinted($('asPrintedToggle').checked);
+    syncSpread();
+    viewer.frame();
+  });
 
   const preset = $('bedPreset');
   preset.replaceChildren(...Object.entries(BED_PRESETS).map(([id, p]) => new Option(p.label, id)));
@@ -3355,6 +4467,8 @@ function bindControls() {
       printing[key] = v;
       saveSettings();
       render();
+      // the parts the finder placed go on the new layers, and where they print apart with the new nozzle
+      refitParts(null);
     });
   }
 

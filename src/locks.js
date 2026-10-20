@@ -289,6 +289,22 @@ export function collarFor(outer, S, { phi0 = 0 } = {}) {
 /** Whether click tabs at radius r keep PLA under its strain as a typical printer prints them (`click`). */
 const clickHolds = (S, r) => click(S, r, 1, { printer: 'typical' }).ok;
 
+/**
+ * The longest bridge a collar twist-lock asks the printer for: the roof of the slit over a click tab, which runs the
+ * tab's length and its end slit round the socket, a tab and a slit wide (`across`). Its length (`long`) is taken along
+ * the middle of that strip, as a slicer reads it. The rest of the lock's ceilings are narrower rings and ledges, so
+ * this is what the print notes quote: about 10.5 mm on a 0.4 nozzle round a 30 mm neck, a little more round a
+ * smaller one, and longer for a wide nozzle's longer tab.
+ * @param {object} S `sizes()`
+ * @param {number} r0 the neck's radius
+ * @returns {{ long: number, across: number }} mm
+ */
+export function slitBridge(S, r0) {
+  const rs = r0 + S.c;
+  const across = S.td + S.g;
+  return { long: r6((S.Ld + S.g) * (rs + across / 2) / rs), across: r6(across) };
+}
+
 /** The collar's underside never slopes out further than this (r per z): 59.8° from vertical. */
 export const STEEP = 1.72;
 

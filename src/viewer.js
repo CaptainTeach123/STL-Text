@@ -6,27 +6,32 @@ import {
   CanvasTexture,
   Color,
   CylinderGeometry,
+  DataTexture,
   DirectionalLight,
   DoubleSide,
   EdgesGeometry,
+  FloatType,
   FrontSide,
   GridHelper,
   Group,
   HemisphereLight,
   LatheGeometry,
   LineBasicMaterial,
+  LinearFilter,
   LineSegments,
   Matrix4,
   Triangle,
   Mesh,
   MeshBasicMaterial,
   MeshStandardMaterial,
+  NearestFilter,
   PerspectiveCamera,
   Plane,
   PlaneGeometry,
   Quaternion,
   Ray,
   Raycaster,
+  RGBAFormat,
   RingGeometry,
   Scene,
   SphereGeometry,
@@ -46,8 +51,8 @@ import { placedAt, snapTolerance } from './aim.js';
 import { geometryFromBuffers } from './mesh.js';
 import { clickRadius, surfaceNormalAt } from './surfaceNormal.js';
 import {
-  APART_COLOR, CUT_COLOR, PIECE_COLORS, PIN_COLOR, TOO_BIG_COLOR, axisCuts, cellSizes, cutPlane, explodeOffset, letterFor, offsetAlongRay, pieceColorIndex, snapTarget,
-  triangleInBox,
+  APART_COLOR, CUT_COLOR, PIECE_COLORS, PIN_COLOR, TOO_BIG_COLOR, axisCuts, cellSizes, cutPlane, explodeOffset, letterFor, offsetAlongRay, pieceColorIndex,
+  printTransform, printedFace, printedRow, snapTarget, triangleInBox, wayAt,
 } from './split.js';
 
 Mesh.prototype.raycast = acceleratedRaycast;
@@ -74,6 +79,97 @@ const COLORS = {
 const AIM_COLORS = { full: APART_COLOR, short: 0xf59e0b, none: COLORS.tooBig, neutral: 0xf8fafc };
 /** The ticks beside it where it snaps: a seam of the model's, a spot suggested, where a full lip fits, and the one it snapped to. */
 const TICK_COLORS = { seam: 0x64748b, spot: APART_COLOR, lip: 0xf59e0b, snapped: 0xff7a1a };
+
+/**
+ * A twist-lock in the pieces view: its own faces orange (the neck and grooves; the socket, slots and click tabs), its
+ * lugs yellow so they stand out of the neck they are on, what carries it lighter (the collar, the socket ring), glowing
+ * while its part is pointed at. As printed, a face of it that overhangs more than 45° is red, and its bridged ceilings
+ * are outlined.
+ */
+export const LOCK_COLORS = Object.freeze({ lock: 0xff6a00, carry: 0xffb27a, lug: 0xffd60a, glow: 0xb84c00, over: 0xe11d48, bridge: 0xfacc15 });
+
+/** A part's circle in the model view: teal when its lock fits, amber when it only lifts off, red when it can't come out. */
+const PART_STATE_COLORS = { lock: APART_COLOR, lift: 0xf59e0b, stuck: COLORS.tooBig };
+
+/**
+ * While a part is picked on the model: the part under the pointer gold, and the handle it leaves on the lantern drawn
+ * in the colour of what stays. A selected part's ring handle is a white knob on its circle, ringed in the circle's
+ * colour, with a dark two-headed arrow across it: something to drag, not a hole.
+ */
+export const HOVER_COLORS = Object.freeze({ part: 0xf2b705, stays: 0x2563eb, grip: 0x111827 });
+
+/** What the pointer over a part's ring handle is told. */
+export const GRIP_TITLE = 'Drag to make the circle wider or narrower';
+/** The most islands of a handle on one level the outline follows (a lantern's two legs, or its crown). */
+const HANDLE_BOXES = 4;
+
+/** Boxes as a texture of `levels` columns and `HANDLE_BOXES` rows, each texel one box: x0, y0, x1, y1. */
+function boxTexture(data, levels) {
+  const t = new DataTexture(data, levels, HANDLE_BOXES, RGBAFormat, FloatType);
+  t.magFilter = t.minFilter = NearestFilter;
+  t.needsUpdate = true;
+  return t;
+}
+
+/** How long ▶ takes to show a part coming apart (ms). */
+const WAY_PLAY_MS = 2500;
+/** The most parts the model view tints at once (the split's cut limit). */
+const TINTS = 12;
+/** The class of a piece's triangle: the solid, unrepaired, and from here on its lock's materials (`#buildPieces`). */
+const SOLID = 0;
+const LOOSE = 1;
+
+/** Triangle ranges `[start, count, mark]` clipped to the triangles t0 … t0 + tc, relative to t0. */
+function marksWithin(ranges, t0, tc) {
+  const out = [];
+  for (const [start, count, mark] of ranges) {
+    const a = Math.max(start, t0);
+    const b = Math.min(start + count, t0 + tc);
+    if (b > a) out.push([a - t0, b - a, mark]);
+  }
+  return out;
+}
+
+/** Smooth in and out over 0 … 1. */
+const ease = (t) => t * t * (3 - 2 * t);
+
+/**
+ * What carries a lock (the collar, the socket ring) is added flush with the pieces' own face at the joint, and the
+ * union leaves that face's triangles some its and some the face's: drawn as they come they are a fringe of slivers.
+ * The triangles of class `k` lying in the joint's plane – facing along its axis, a hair from it – are the face's, and
+ * go back to the solid's class.
+ * @param {Uint8Array} cls each triangle's class, changed in place
+ * @param {number} k the class of what carries the lock
+ * @param {ArrayLike<number>} index the triangles' corners
+ * @param {ArrayLike<number>} positions x, y, z of each corner
+ * @param {number[]} at a point on the joint's plane
+ * @param {number[]} axis the joint's axis
+ * @returns {number} how many went back
+ */
+export function unmarkJoint(cls, k, index, positions, at, axis) {
+  const len = Math.hypot(...axis);
+  const [ax, ay, az] = axis.map((v) => v / len);
+  const plane = at[0] * ax + at[1] * ay + at[2] * az;
+  const p = (t, j) => index[t * 3 + j] * 3;
+  let n = 0;
+  for (let t = 0; t < cls.length; t++) {
+    if (cls[t] !== k) continue;
+    const [a, b, c] = [p(t, 0), p(t, 1), p(t, 2)];
+    const u = [0, 1, 2].map((i) => positions[b + i] - positions[a + i]);
+    const v = [0, 1, 2].map((i) => positions[c + i] - positions[a + i]);
+    const nx = u[1] * v[2] - u[2] * v[1];
+    const ny = u[2] * v[0] - u[0] * v[2];
+    const nz = u[0] * v[1] - u[1] * v[0];
+    const area = Math.hypot(nx, ny, nz);
+    if (!(area > 0)) continue;
+    const middle = [0, 1, 2].map((i) => (positions[a + i] + positions[b + i] + positions[c + i]) / 3);
+    if (Math.abs(nx * ax + ny * ay + nz * az) / area > 0.995 && Math.abs(middle[0] * ax + middle[1] * ay + middle[2] * az - plane) < 0.02) {
+      cls[t] = SOLID;
+      n++;
+    }
+  }
+  return n;
+}
 
 const CLICK_PX = 5;
 const CLICK_MS = 500;
@@ -366,6 +462,51 @@ function disposeSprite(sprite) {
   sprite.material.dispose();
 }
 
+/**
+ * A part's ring handle, as big as the place a press grabs it (scaled in mm, as its circle is): a white knob ringed in
+ * `ring`, a dark two-headed arrow across it – it resizes the circle.
+ */
+function gripSprite(ring) {
+  const size = 128;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.beginPath();
+  ctx.arc(size / 2, size / 2, size / 2 - 8, 0, Math.PI * 2);
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+  ctx.lineWidth = 12;
+  ctx.strokeStyle = ring;
+  ctx.stroke();
+  // the arrow, across the knob: a shaft and a head at each end
+  ctx.translate(size / 2, size / 2);
+  ctx.rotate(Math.PI / 4);
+  ctx.strokeStyle = cssColor(HOVER_COLORS.grip);
+  ctx.fillStyle = cssColor(HOVER_COLORS.grip);
+  ctx.lineWidth = 18;
+  ctx.beginPath();
+  ctx.moveTo(-24, 0);
+  ctx.lineTo(24, 0);
+  ctx.stroke();
+  for (const s of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(s * 46, 0);
+    ctx.lineTo(s * 18, -24);
+    ctx.lineTo(s * 18, 24);
+    ctx.closePath();
+    ctx.fill();
+  }
+  const map = new CanvasTexture(canvas);
+  map.colorSpace = SRGBColorSpace;
+  // drawn small, the arrow stays dark rather than averaged into the white round it
+  map.generateMipmaps = false;
+  map.minFilter = LinearFilter;
+  const sprite = new Sprite(new SpriteMaterial({ map, depthTest: false, transparent: true }));
+  sprite.renderOrder = 13;
+  sprite.raycast = () => {}; // never picked: the handle under it is
+  return sprite;
+}
+
 /** A small white dot ringed in dark, `px` CSS pixels across whatever the zoom: the point under the pointer while a cut is placed. */
 function dotSprite(px = 11) {
   const size = 64;
@@ -464,6 +605,81 @@ export class Viewer {
       model: new MeshStandardMaterial({ color: COLORS.model, roughness: 0.55, metalness: 0.05, side: FrontSide }), // a closed solid: back faces never show, and culling them halves the fill work on every frame
       passthrough: new MeshStandardMaterial({ color: COLORS.passthrough, roughness: 0.6, metalness: 0.05, side: DoubleSide }),
     };
+    // a part's material tinted in the model view (setParts): its circle (x, y, r), the heights it takes and its colour
+    this.tint = {
+      count: { value: 0 },
+      disc: { value: Array.from({ length: TINTS }, () => new Vector3()) },
+      span: { value: Array.from({ length: TINTS }, () => new Vector2()) },
+      color: { value: Array.from({ length: TINTS }, () => new Color()) },
+    };
+    this.tintCount = 0;
+    // the part under the pointer while one is picked on the model (setPartHover): its material gold, and the handle it
+    // leaves on the lantern outlined in the colour of what stays – its islands' boxes, level by level, in a texture
+    this.hoverTint = {
+      on: { value: 0 },
+      disc: { value: new Vector3() },
+      span: { value: new Vector2() },
+      color: { value: new Color(HOVER_COLORS.part) },
+      handleOn: { value: 0 },
+      handleBoxes: { value: boxTexture(new Float32Array(4 * HANDLE_BOXES), 1) },
+      handleLevels: { value: 0 },
+      handleFrom: { value: 0 },
+      handleStep: { value: 1 },
+      handleGrow: { value: 0 },
+      handleColor: { value: new Color(HOVER_COLORS.stays) },
+    };
+    this.materials.model.onBeforeCompile = (shader) => {
+      shader.uniforms.tintCount = this.tint.count;
+      shader.uniforms.tintDisc = this.tint.disc;
+      shader.uniforms.tintSpan = this.tint.span;
+      shader.uniforms.tintColor = this.tint.color;
+      const h = this.hoverTint;
+      Object.assign(shader.uniforms, {
+        hoverOn: h.on, hoverDisc: h.disc, hoverSpan: h.span, hoverColor: h.color, handleOn: h.handleOn, handleBoxes: h.handleBoxes,
+        handleLevels: h.handleLevels, handleFrom: h.handleFrom, handleStep: h.handleStep, handleGrow: h.handleGrow, handleColor: h.handleColor,
+      });
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nvarying vec3 vTintAt;')
+        .replace('#include <project_vertex>', '#include <project_vertex>\nvTintAt = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          '#include <common>',
+          `#include <common>\nuniform int tintCount;\nuniform vec3 tintDisc[${TINTS}];\nuniform vec2 tintSpan[${TINTS}];\nuniform vec3 tintColor[${TINTS}];\nvarying vec3 vTintAt;
+          uniform int hoverOn;\nuniform vec3 hoverDisc;\nuniform vec2 hoverSpan;\nuniform vec3 hoverColor;
+          uniform int handleOn;\nuniform sampler2D handleBoxes;\nuniform int handleLevels;\nuniform float handleFrom;\nuniform float handleStep;\nuniform float handleGrow;\nuniform vec3 handleColor;`,
+        )
+        .replace(
+          '#include <color_fragment>',
+          `#include <color_fragment>
+          for (int i = 0; i < ${TINTS}; i++) {
+            if (i >= tintCount) break;
+            if (vTintAt.z >= tintSpan[i].x && vTintAt.z <= tintSpan[i].y && distance(vTintAt.xy, tintDisc[i].xy) <= tintDisc[i].z) diffuseColor.rgb = mix(diffuseColor.rgb, tintColor[i], 0.5);
+          }
+          if (hoverOn == 1 && vTintAt.z >= hoverSpan.x && vTintAt.z <= hoverSpan.y && distance(vTintAt.xy, hoverDisc.xy) <= hoverDisc.z) diffuseColor.rgb = mix(diffuseColor.rgb, hoverColor, 0.7);`,
+        )
+        .replace(
+          '#include <emissivemap_fragment>',
+          `#include <emissivemap_fragment>
+          if (handleOn == 1) {
+            // on a level of the handle's (or the one either side, as a leg leans between them): inside one of its boxes
+            int j = int(floor((vTintAt.z - handleFrom) / handleStep + 0.5));
+            bool held = false;
+            for (int dj = -1; dj <= 1; dj++) {
+              int k = j + dj;
+              if (k < 0 || k >= handleLevels) continue;
+              for (int b = 0; b < ${HANDLE_BOXES}; b++) {
+                vec4 box = texelFetch(handleBoxes, ivec2(k, b), 0);
+                if (vTintAt.x >= box.x - handleGrow && vTintAt.x <= box.z + handleGrow && vTintAt.y >= box.y - handleGrow && vTintAt.y <= box.w + handleGrow) held = true;
+              }
+            }
+            // a light tint, and its edges as seen drawn in the colour: an outline that follows the handle as it turns
+            if (held) {
+              float edge = smoothstep(0.5, 0.8, 1.0 - abs(dot(normalize(normal), normalize(vViewPosition))));
+              diffuseColor.rgb = mix(diffuseColor.rgb, handleColor, 0.3 + 0.7 * edge);
+            }
+          }`,
+        );
+    };
     this.baseMesh = null;
     this.baseDimmed = false;
     this.resultMesh = null;
@@ -512,7 +728,25 @@ export class Viewer {
     this.spread = 1;
     this.piecesStale = false;
     this.pieceHighlight = null;
-    this.scene.add(this.cutGroup, this.cellGroup, this.pieceGroup, this.pieceLabelGroup);
+    // the parts a split takes out, as their pieces move: each one's way out from the piece it comes out of
+    this.pieceWays = new Map(); // piece index -> { cutId, way, point: Vector3, out: Vector3, home, drop }
+    this.lockHighlight = new Set(); // the cuts whose lock glows
+    this.asPrinted = false; // the pieces as they lie on the bed, not exploded
+    this.wayPlay = null; // { frame, resolve } while ▶ plays a part coming apart
+    this.lookAside = null; // the piece of a part set down beside its lock while the lock is looked at
+    this.lockLabels = []; // { cutId, name, piece, at } where a lock's lugs, slots and click tabs are (the engine's)
+    this.lockWords = null; // { el, items: [{ el, name, points }] } the words on the lock looked at, in the page over the view
+    this.insets = null; // () => ({ top, bottom }) CSS pixels of the view under the page's own controls: framing keeps clear of them
+    this.onSpread = null; // (f) the view moved the pieces itself: a way played, the lock looked at
+    // the parts a split takes out: each the circle it takes out, on its face
+    this.partGroup = new Group();
+    this.partCircles = []; // { group, badge, dispose }
+    this.partsKey = '';
+    this.partHover = null; // the part a click would take out while one is picked on the model (setPartHover)
+    this.partHoverKey = '';
+    this.partHoverShape = null; // { group, dispose } its circle and walls
+    this.partHoverHandle = false; // whether the handle it leaves on is outlined
+    this.scene.add(this.cutGroup, this.cellGroup, this.pieceGroup, this.pieceLabelGroup, this.partGroup);
 
     // placing a cut from the view (see setAim): a plane that follows the pointer, the model's section on it, the point
     // under the pointer and ticks where it snaps
@@ -540,8 +774,9 @@ export class Viewer {
     this.onDrag = null; // ({ itemId, point, normal, done })
     this.onSelectCut = null; // (cutId) pressed a cut's handle
     this.onCutDrag = null; // ({ id, at, target, done, screen }) dragged a cut's handle; `target` what it snapped to
-    this.onAim = null; // ({ at, raw, target, point, screen, pinned }) the place under the pointer while picking, or ({ at: null }) none
-    this.onAimPick = null; // ({ at, target, shift }) clicked the model while picking
+    this.onPartDrag = null; // ({ id, r, pxPerMm, done, cancelled }) dragged a part's ring handle: the radius under the pointer
+    this.onAim = null; // ({ at, raw, target, point, free, screen, pinned }) the place under the pointer while picking (`free`: Alt held), or ({ at: null }) none
+    this.onAimPick = null; // ({ at, target, shift, point, free }) clicked the model while picking
     this.hoverEnabled = true;
     this.#bindPointer();
     this.#applyVisibility();
@@ -559,6 +794,7 @@ export class Viewer {
       this.queued = false;
       this.controls.update();
       this.renderer.render(this.scene, this.camera);
+      if (this.lockWords) this.#placeLockWords();
     });
   }
 
@@ -658,6 +894,14 @@ export class Viewer {
     this.cellGroup.visible = cells;
     if (this.resultMesh) this.resultMesh.visible = mode === 'result';
     this.pieceGroup.visible = this.pieceLabelGroup.visible = mode === 'pieces';
+    this.partGroup.visible = mode === 'model';
+    this.tint.count.value = mode === 'model' ? this.tintCount : 0; // the model's material draws the final result too
+    // the part a click would take out, on the model only
+    const hover = mode === 'model' && !!this.partHover;
+    this.hoverTint.on.value = hover ? 1 : 0;
+    this.hoverTint.handleOn.value = hover && this.partHoverHandle ? 1 : 0;
+    if (this.partHoverShape) this.partHoverShape.group.visible = hover;
+    this.cutGroup.visible = !(mode === 'pieces' && this.asPrinted); // as printed, the pieces are not where the cuts are
     for (const o of this.overlays.values()) o.mesh.visible = mode === 'model';
     if (mode === 'pieces') this.marker.visible = false;
     this.#layoutCuts(); // the planes sit in the gaps between exploded pieces
@@ -810,6 +1054,232 @@ export class Viewer {
     this.#styleCuts();
     this.#updateCells(); // the bounds may have changed which cells the cuts make
     this.#applyVisibility(); // places the planes
+  }
+
+  /**
+   * Show the parts a split takes out on the model (not on the pieces, which are the parts themselves), each as the
+   * circle it takes out on its face, seen through the model, with its letter: teal when its lock fits, amber when it
+   * only lifts off, red when it can't come out or cuts something. Once its lock is known, three marks on the circle
+   * where the lock's lugs are, the wide key's bigger; once where it ends is known (`top`), its material from its face
+   * up to there tinted the same colour. None for an empty list. Drawn again only when they change.
+   * @param {{ id: string, letter: string, axis: number, position: number[], r: number, selected?: boolean,
+   *   state?: 'lock'|'lift'|'stuck', lugs?: boolean, top?: number|null }[]} parts
+   */
+  setParts(parts = []) {
+    const key = JSON.stringify(parts);
+    if (key === this.partsKey) return;
+    this.partsKey = key;
+    for (const c of this.partCircles) {
+      this.partGroup.remove(c.group);
+      c.dispose();
+    }
+    this.partCircles = parts.map((p) => this.#partCircle(p));
+    for (const c of this.partCircles) this.partGroup.add(c.group);
+    // the tint is drawn by the model's own material: each part's circle and the heights it takes, across Z
+    const tinted = parts.filter((p) => p.axis === 2 && Number.isFinite(p.top)).slice(0, TINTS);
+    tinted.forEach((p, i) => {
+      const [lo, hi] = [Math.min(p.position[2], p.top), Math.max(p.position[2], p.top)];
+      this.tint.disc.value[i].set(p.position[0], p.position[1], p.r);
+      this.tint.span.value[i].set(lo, hi);
+      this.tint.color.value[i].setHex(PART_STATE_COLORS[p.state] ?? APART_COLOR);
+    });
+    this.tintCount = tinted.length;
+    this.#applyVisibility();
+  }
+
+  /**
+   * The part a click would take out while one is picked on the model, or null for none: its material from its face up
+   * to where it ends (`top`) tinted gold, its circle drawn on its face and its prism's walls faintly up to its end;
+   * and the handle it leaves on the lantern (`handle`: its islands' boxes level by level, `[{ z, boxes }]`, the levels
+   * `step` apart) outlined in the colour of what stays. The plane that follows the pointer gives way to it. Drawn
+   * again only when it changes.
+   * @param {{ centre: number[], r: number, face: number, top: number, handle?: { step: number, levels: { z: number,
+   *   boxes: number[][] }[] }|null }|null} spec
+   */
+  setPartHover(spec) {
+    const key = spec ? JSON.stringify(spec) : '';
+    if (key === this.partHoverKey) return;
+    this.partHoverKey = key;
+    this.partHover = spec ?? null;
+    const h = this.hoverTint;
+    if (this.partHoverShape) {
+      this.scene.remove(this.partHoverShape.group);
+      this.partHoverShape.dispose();
+      this.partHoverShape = null;
+    }
+    this.partHoverHandle = false;
+    if (spec) {
+      const [x, y] = spec.centre;
+      const [lo, hi] = [Math.min(spec.face, spec.top), Math.max(spec.face, spec.top)];
+      h.disc.value.set(x, y, spec.r);
+      h.span.value.set(lo, hi);
+      const levels = spec.handle?.levels ?? [];
+      if (levels.length && spec.handle.step > 0) {
+        const { step } = spec.handle;
+        const from = levels[0].z;
+        const n = Math.round((levels.at(-1).z - from) / step) + 1;
+        // a texel with no box holds an empty one, which nothing is inside
+        const data = new Float32Array(4 * n * HANDLE_BOXES);
+        for (let i = 0; i < n * HANDLE_BOXES; i++) data.set([1e9, 1e9, -1e9, -1e9], 4 * i);
+        for (const lv of levels) {
+          const j = Math.round((lv.z - from) / step);
+          lv.boxes.slice(0, HANDLE_BOXES).forEach((b, k) => data.set(b, 4 * (k * n + j)));
+        }
+        h.handleBoxes.value.dispose();
+        h.handleBoxes.value = boxTexture(data, n);
+        h.handleLevels.value = n;
+        h.handleFrom.value = from;
+        h.handleStep.value = step;
+        h.handleGrow.value = step;
+        this.partHoverHandle = true;
+      }
+      this.partHoverShape = this.#hoverShape(spec);
+      this.scene.add(this.partHoverShape.group);
+    }
+    this.#applyVisibility();
+    this.#syncAim();
+  }
+
+  /** The circle on a hovered part's face, over everything, and its prism's walls up to where it ends, faint. */
+  #hoverShape({ centre, r, face, top }) {
+    const group = new Group();
+    const n = 128;
+    const points = new Float32Array(n * 6);
+    for (let k = 0; k < n; k++) {
+      const [a, b] = [(2 * Math.PI * k) / n, (2 * Math.PI * (k + 1)) / n];
+      points.set([r * Math.cos(a), r * Math.sin(a), 0, r * Math.cos(b), r * Math.sin(b), 0], k * 6);
+    }
+    const line = new BufferGeometry();
+    line.setAttribute('position', new BufferAttribute(points, 3));
+    const edge = new LineSegments(line, new LineBasicMaterial({ color: HOVER_COLORS.part, depthTest: false, transparent: true }));
+    edge.renderOrder = 12;
+    edge.position.set(centre[0], centre[1], face);
+    const height = Math.abs(top - face);
+    const wall = new Mesh(
+      new CylinderGeometry(r, r, height, n, 1, true).rotateX(Math.PI / 2),
+      new MeshBasicMaterial({ color: HOVER_COLORS.part, transparent: true, opacity: 0.1, side: DoubleSide, depthWrite: false }),
+    );
+    wall.position.set(centre[0], centre[1], (face + top) / 2);
+    wall.renderOrder = 7;
+    for (const o of [edge, wall]) o.raycast = () => {};
+    group.add(wall, edge);
+    const dispose = () => {
+      line.dispose();
+      edge.material.dispose();
+      wall.geometry.dispose();
+      wall.material.dispose();
+    };
+    return { group, dispose };
+  }
+
+  #partCircle({ id = null, letter, axis, position, r, selected = false, state = 'lock', lugs = false }) {
+    const group = new Group();
+    const [u, v] = CUT_UV[axis];
+    group.quaternion.setFromRotationMatrix(new Matrix4().makeBasis(AXIS_VECTORS[u], AXIS_VECTORS[v], AXIS_VECTORS[axis]));
+    group.position.fromArray(position);
+    const hex = PART_STATE_COLORS[state] ?? APART_COLOR;
+    const n = 128;
+    const points = new Float32Array(n * 6);
+    for (let k = 0; k < n; k++) {
+      const [a, b] = [(2 * Math.PI * k) / n, (2 * Math.PI * (k + 1)) / n];
+      points.set([r * Math.cos(a), r * Math.sin(a), 0, r * Math.cos(b), r * Math.sin(b), 0], k * 6);
+    }
+    const line = new BufferGeometry();
+    line.setAttribute('position', new BufferAttribute(points, 3));
+    // the outline seen through the shell round it, the disc faint behind the model
+    const edge = new LineSegments(line, new LineBasicMaterial({ color: hex, transparent: true, opacity: selected ? 1 : 0.8, depthTest: false }));
+    edge.raycast = () => {};
+    edge.renderOrder = 11;
+    const fill = new Mesh(new RingGeometry(0, r, n), new MeshBasicMaterial({ color: hex, transparent: true, opacity: selected ? 0.3 : 0.16, side: DoubleSide, depthWrite: false }));
+    fill.raycast = () => {};
+    fill.renderOrder = 6;
+    group.add(fill, edge);
+    // the lugs: three tabs standing out of the circle at 0°, 120° and 240° about its axis, as the lugs stand out of
+    // the neck, the key's wider
+    let marks = null;
+    if (lugs) {
+      const tri = [];
+      for (let k = 0; k < 3; k++) {
+        const a = (2 * Math.PI * k) / 3;
+        const h = 0.14 * r;
+        const w = (k === 0 ? 0.65 : 0.5) * h;
+        const [c, sn] = [Math.cos(a), Math.sin(a)];
+        const at = (x, y) => [x * c - y * sn, x * sn + y * c, 0];
+        tri.push(...at(r - 0.02 * r, -w), ...at(r + h, -w), ...at(r + h, w), ...at(r - 0.02 * r, -w), ...at(r + h, w), ...at(r - 0.02 * r, w));
+      }
+      const g = new BufferGeometry();
+      g.setAttribute('position', new BufferAttribute(new Float32Array(tri), 3));
+      marks = new Mesh(g, new MeshBasicMaterial({ color: hex, transparent: true, opacity: 0.95, side: DoubleSide, depthTest: false }));
+      marks.raycast = () => {};
+      marks.renderOrder = 11;
+      group.add(marks);
+    }
+    const badge = labelSprite(letter, { fill: cssColor(hex), ring: '#ffffff', px: selected ? 27 : 22 });
+    // on the circle, between two lugs when they are drawn
+    if (lugs) badge.position.set(r * Math.cos(Math.PI / 3), r * Math.sin(Math.PI / 3), 0);
+    else badge.position.set(r, 0, 0);
+    badge.scale.setScalar(this.#spriteScale(badge.userData.px));
+    group.add(badge);
+    // the selected part's ring handle on its outline, clear of its letter and its lugs, and turned off the X axis a
+    // lantern's handle usually stands on: dragged, the circle grows or shrinks (`onPartDrag`)
+    let grip = null;
+    let pick = null;
+    if (selected && id) {
+      const size = clamp(0.015 * this.bounds.getSize(new Vector3()).length(), 0.5, 8);
+      grip = gripSprite(cssColor(hex));
+      grip.scale.setScalar(2.6 * size); // as wide as the place a press grabs it
+      grip.position.set(r * Math.cos(-Math.PI / 3), r * Math.sin(-Math.PI / 3), 0);
+      pick = new Mesh(this.shapes.pick, this.pickMaterial);
+      pick.visible = false;
+      pick.scale.setScalar(2.6 * size);
+      pick.position.copy(grip.position);
+      pick.userData.partId = id;
+      group.add(grip, pick);
+    }
+    const dispose = () => {
+      line.dispose();
+      edge.material.dispose();
+      fill.geometry.dispose();
+      fill.material.dispose();
+      marks?.geometry.dispose();
+      marks?.material.dispose();
+      if (grip) disposeSprite(grip);
+      disposeSprite(badge);
+    };
+    return { group, badge, grip, dispose, pick, id, axis, position, r };
+  }
+
+  /** Where a part's ring handle is on screen, in CSS pixels from the canvas's top left, or null (none drawn: not selected). */
+  partGripPosition(id) {
+    const c = this.partCircles.find((x) => x.id === id && x.pick);
+    if (!c || !this.partGroup.visible) return null;
+    this.partGroup.updateMatrixWorld(true);
+    const p = c.pick.getWorldPosition(new Vector3()).project(this.camera);
+    const [w, h] = this.viewSize;
+    return [((p.x + 1) / 2) * w, ((1 - p.y) / 2) * h];
+  }
+
+  /** The part whose ring handle is under the pointer (its circle as drawn), or null. */
+  #pickGrip(event) {
+    const picks = this.partCircles.filter((c) => c.pick);
+    if (!picks.length || !this.partGroup.visible) return null;
+    this.partGroup.updateMatrixWorld(true);
+    this.raycaster.setFromCamera(this.#ndc(event), this.camera);
+    const hit = this.raycaster.intersectObjects(picks.map((c) => c.pick), false)[0];
+    return hit ? picks.find((c) => c.pick === hit.object) ?? null : null;
+  }
+
+  /** One pointer move of a ring handle's drag: the circle's radius is how far from its centre the pointer is on its face. */
+  #dragGrip(drag, event) {
+    this.raycaster.setFromCamera(this.#ndc(event), this.camera);
+    const plane = new Plane(AXIS_VECTORS[drag.axis].clone(), -drag.position[drag.axis]);
+    const p = this.raycaster.ray.intersectPlane(plane, new Vector3());
+    if (!p) return; // looking along the face: this move says nothing about the circle
+    const [u, v] = CUT_UV[drag.axis];
+    const r = Math.hypot(p.getComponent(u) - drag.position[u], p.getComponent(v) - drag.position[v]);
+    if (!(r > 0)) return;
+    drag.r = r;
+    this.onPartDrag?.({ id: drag.partId, r, pxPerMm: this.#pxPerMm(p.toArray(), u), done: false });
   }
 
   /** Move one cut's plane (and the piece preview) to `at` mm along its axis, without rebuilding anything. */
@@ -1038,10 +1508,11 @@ export class Viewer {
    * it stays (`pinned`), for the caller to place the cut there. Only in the
    * model view: the pieces are drawn pulled apart, away from the model the
    * pointer would be read on.
-   * @param {{ axis: number, snap?: boolean }|null} aim null ends it; `snap` false places it freely (a glued cut)
+   * @param {{ axis: number, snap?: boolean, plane?: boolean }|null} aim null ends it; `snap` false places it freely (a
+   *   glued cut); `plane` false draws no plane (a part's own cut, picked again, goes only to a part)
    */
   setAim(aim) {
-    this.aim = aim ? { axis: aim.axis, snap: aim.snap !== false } : null;
+    this.aim = aim ? { axis: aim.axis, snap: aim.snap !== false, plane: aim.plane !== false } : null;
     this.#aimTouchEnd();
     this.aimHover = null;
     this.aimVerdict = null;
@@ -1110,7 +1581,7 @@ export class Viewer {
     const list = alt || !this.aim.snap || this.aimTargets.axis !== axis ? [] : this.aimTargets.list;
     const target = list.length ? snapTarget(list, raw, snapTolerance(this.#pxPerMm(hit.point, axis))) : null;
     const rect = this.renderer.domElement.getBoundingClientRect();
-    return { at: placedAt(raw, target), raw, target, point: hit.point, screen: [event.clientX - rect.left, event.clientY - rect.top] };
+    return { at: placedAt(raw, target), raw, target, point: hit.point, free: !!alt, screen: [event.clientX - rect.left, event.clientY - rect.top] };
   }
 
   /**
@@ -1168,8 +1639,10 @@ export class Viewer {
       (this.aim && this.aimHover ? { axis: this.aim.axis, at: this.aimHover.at, verdict: this.aimVerdict } : null) ??
       (drag ? { axis: drag.axis, at: this.cutDrag.at, verdict: this.aimVerdict, handle: true } : null);
     const model = this.#shownMode() === 'model';
-    p.plane.visible = !!shown && !shown.handle && model; // a dragged cut has its own plane
-    p.section.visible = !!shown && model && !!this.baseMesh;
+    // over a part a click would take out, the part is drawn instead of the plane
+    const onPart = !!this.aim && (!!this.partHover || !this.aim.plane) && !this.aimPreview;
+    p.plane.visible = !!shown && !shown.handle && model && !onPart; // a dragged cut has its own plane
+    p.section.visible = !!shown && model && !!this.baseMesh && !onPart;
     p.dot.visible = !this.aimPreview && !!this.aim && !!this.aimHover && model;
     if (shown) {
       const color = AIM_COLORS[shown.verdict] ?? AIM_COLORS.neutral;
@@ -1181,7 +1654,7 @@ export class Viewer {
     }
     if (p.dot.visible) p.dot.position.fromArray(this.aimHover.point);
     const axis = this.aim?.axis ?? drag?.axis ?? null;
-    const ticks = model && axis !== null && this.aimTargets.axis === axis && this.aimTargets.list.length > 0;
+    const ticks = model && !onPart && axis !== null && this.aimTargets.axis === axis && this.aimTargets.list.length > 0;
     p.ticks.visible = ticks;
     if (ticks) this.#layoutTicks(axis, (this.aim ? this.aimHover?.target : this.dragTarget) ?? null);
     this.requestRender();
@@ -1444,24 +1917,33 @@ export class Viewer {
    * shell, a pin or a pegged part), coloured by cell like the preview and
    * pulled apart by Spread. Replaces any final result; showResult(true)
    * then shows them. A display without ranges, or null, clears them.
+   * A twist-lock's faces (`markRanges`) are painted on its pieces, and a
+   * part taken out moves along its own way out (`ways`) as Spread pulls the
+   * pieces apart, from the piece it comes out of.
    * @param {{ positions: Float32Array, normals?: Float32Array, index: Uint32Array, passthroughRanges?: number[][],
-   *           ranges: number[][], parts?: object[] }|null} display
+   *           ranges: number[][], markRanges?: number[][], marks?: object[], parts?: object[] }|null} display
    *   `ranges[r] = [triStart, triCount, vertStart, vertCount]`, each self-contained; `parts[r]` is
-   *   `{ kind: 'piece', index }`, `{ kind: 'pin', cell }` (a half-cell, between its two pieces) or `{ kind: 'part', id, cell }`
-   * @param {{ index: number, cell: number[], fits?: boolean }[]} [pieces] the result's pieces; `fits: false` tints a piece red
+   *   `{ kind: 'piece', index }`, `{ kind: 'pin', cell }` (a half-cell, between its two pieces) or `{ kind: 'part', id, cell }`;
+   *   `markRanges[k] = [triStart, triCount, m]`, the triangles of lock `marks[m]` (`{ cutId, kind: 'lock'|'carry' }`)
+   * @param {{ index: number, cell: number[], fits?: boolean, down?: string, yaw?: number }[]} [pieces] the result's
+   *   pieces; `fits: false` tints a piece red; `down` and `yaw` how it lies as printed
    * @param {number[]|null} [grid] the number of cuts on each axis (from the pieces' cells without it)
+   * @param {{ cutId: string, piece: number, home: number, point: number[], way: object, kind?: string, r?: number }[]} [ways]
+   *   each part's piece, the piece it comes out of, a point on its axis (its circle's centre), its way out (a part
+   *   seam's `part.way`), what it is ('lid', 'plug') and its circle's radius
    */
-  setPieces(display, pieces = [], grid = null) {
+  setPieces(display, pieces = [], grid = null, ways = []) {
     this.#disposeMesh(this.resultMesh);
     this.resultMesh = null;
     this.#clearPieces();
-    if (display?.index?.length && display.ranges?.length) this.#buildPieces(display, pieces ?? [], grid);
+    if (display?.index?.length && display.ranges?.length) this.#buildPieces(display, pieces ?? [], grid, ways ?? []);
     this.showResult(this.resultShown);
   }
 
-  #buildPieces(display, pieces, grid) {
+  #buildPieces(display, pieces, grid, ways) {
     const info = new Map(pieces.map((p) => [p.index, p]));
     const passthrough = display.passthroughRanges ?? [];
+    const marks = display.marks ?? [];
     const shells = new Map(); // piece index -> shells drawn so far
     const boxes = new Map(); // piece index -> { box, cell, fits } for its number
     const all = new Box3();
@@ -1488,18 +1970,37 @@ export class Viewer {
       const color = new Color(part.kind === 'pin' ? PIN_COLOR : part.kind === 'part' ? COLORS.model : PIECE_COLORS[pieceColorIndex(cell)]);
       if (shell) color.offsetHSL(0, 0, shell % 2 ? 0.1 : -0.1); // the parts of one piece share its colour but stay told apart
       const material = new MeshStandardMaterial({ color, roughness: 0.55, metalness: 0.05, side: FrontSide });
+      // each triangle's class: the solid, unrepaired (drawn as in the model view, from both sides), or a lock's
       const loose = rangesWithin(passthrough, t0, tc);
-      let mesh;
-      if (loose.length) {
-        // unrepaired triangles cut with the piece: drawn as in the model view, from both sides
-        addGroups(geometry, loose, tc);
-        mesh = new Mesh(geometry, [material, new MeshStandardMaterial({ color: COLORS.passthrough, roughness: 0.6, metalness: 0.05, side: DoubleSide })]);
-      } else {
-        mesh = new Mesh(geometry, material);
+      const marked = marksWithin(display.markRanges ?? [], t0, tc);
+      const materials = [material, loose.length ? new MeshStandardMaterial({ color: COLORS.passthrough, roughness: 0.6, metalness: 0.05, side: DoubleSide }) : material];
+      const slots = []; // the locks' materials on this piece: { mark, cutId, kind, material }
+      let cls = null;
+      if (loose.length || marked.length) {
+        cls = new Uint8Array(tc);
+        for (const [start, count] of loose) cls.fill(LOOSE, start, start + count);
+        for (const [start, count, m] of marked) {
+          let slot = slots.find((x) => x.mark === m);
+          if (!slot) {
+            const kind = marks[m]?.kind ?? 'lock';
+            slot = { mark: m, cutId: marks[m]?.cutId ?? null, kind, material: new MeshStandardMaterial({ color: LOCK_COLORS[kind] ?? LOCK_COLORS.lock, roughness: 0.45, metalness: 0.05, side: FrontSide }) };
+            slots.push(slot);
+            materials.push(slot.material);
+          }
+          cls.fill(materials.indexOf(slot.material), start, start + count);
+        }
+        this.#unmarkJoint(cls, index, geometry.attributes.position, slots, marks, materials);
       }
+      // the faces a lock adds that overhang, as printed: red, in a material of their own after the lock's
+      // (both sides: an overhang faces down, away from a view from above, and shows through the piece faded round it)
+      const over = slots.length ? new MeshStandardMaterial({ color: LOCK_COLORS.over, roughness: 0.5, metalness: 0.05, side: DoubleSide }) : null;
+      if (over) materials.push(over);
+      const mesh = new Mesh(geometry, cls ? materials : material);
       mesh.userData = { kind: part.kind, index: part.kind === 'piece' ? part.index : null };
       this.pieceGroup.add(mesh);
-      this.pieceEntries.push({ mesh, kind: part.kind, index: part.kind === 'piece' ? part.index : null, cell, fits });
+      const entry = { mesh, kind: part.kind, index: part.kind === 'piece' ? part.index : null, cell, fits, cls, base: cls ? index.slice() : null, slots, over, printed: null, lines: null };
+      this.#groupPiece(entry);
+      this.pieceEntries.push(entry);
       all.union(geometry.boundingBox);
       if (part.kind === 'piece') {
         if (!boxes.has(part.index)) boxes.set(part.index, { box: new Box3(), cell, fits });
@@ -1508,6 +2009,7 @@ export class Viewer {
     });
     this.pieceGrid = grid ?? [0, 1, 2].map((a) => Math.max(0, ...this.pieceEntries.filter((e) => e.kind === 'piece').map((e) => e.cell[a])));
     this.pieceBounds = all.isEmpty() ? null : all;
+    this.pieceInfo = info;
     for (const [index, { box, cell, fits }] of boxes) {
       const sprite = labelSprite(String(index), {
         fill: fits ? 'rgba(27, 34, 48, 0.82)' : cssColor(COLORS.tooBig),
@@ -1516,17 +2018,78 @@ export class Viewer {
       });
       sprite.scale.setScalar(this.#spriteScale(sprite.userData.px));
       this.pieceLabelGroup.add(sprite);
-      this.pieceLabels.push({ sprite, index, centre: box.getCenter(new Vector3()), cell });
+      // the piece a part comes out of has its number away from the lock, which sits where the part comes out: on a
+      // lantern its neck, round the middle of the top
+      const centre = box.getCenter(new Vector3());
+      const way = ways.find((w) => w.home === index && w.way?.out);
+      if (way) {
+        const out = new Vector3(...way.way.out).normalize();
+        const along = Math.abs(out.x) * (box.max.x - box.min.x) + Math.abs(out.y) * (box.max.y - box.min.y) + Math.abs(out.z) * (box.max.z - box.min.z);
+        centre.addScaledVector(out, -0.25 * along);
+      }
+      this.pieceLabels.push({ sprite, index, centre, cell });
     }
+    // each part's piece moves along its way out from where the piece it comes out of is drawn: turned about its axis
+    // through its circle's centre, then lifted and slid, or dropped its own length out of the model's end
+    for (const w of ways) {
+      const box = boxes.get(w.piece)?.box;
+      const home = boxes.get(w.home);
+      if (!box || !home || !w.way?.out) continue;
+      const out = new Vector3(...w.way.out).normalize();
+      const size = box.getSize(new Vector3());
+      const drop = Math.abs(size.x * out.x) + Math.abs(size.y * out.y) + Math.abs(size.z * out.z);
+      // its half-width across its axis, for setting it down beside the lock
+      const half = Math.max(Math.abs(out.x) < 0.5 ? size.x : size.y, Math.abs(out.z) < 0.5 ? size.z : size.y) / 2;
+      this.pieceWays.set(w.piece, { cutId: w.cutId, way: w.way, point: new Vector3(...w.point), out, homeCell: home.cell, homeBox: home.box, drop, half, kind: w.kind ?? 'lid', r: w.r ?? null });
+    }
+    this.lockLabels = display.lockLabels ?? [];
+    if (this.asPrinted) this.#classifyPrinted();
     this.#layoutPieces();
     this.#stylePieces();
   }
 
+  /** What carries a lock, in a piece's classes, that lies in its joint's plane is the piece's own face (`unmarkJoint`). */
+  #unmarkJoint(cls, index, pos, slots, marks, materials) {
+    for (const slot of slots) {
+      const m = marks[slot.mark];
+      if (slot.kind === 'carry' && m?.at && m?.axis) unmarkJoint(cls, materials.indexOf(slot.material), index, pos.array, m.at, m.axis);
+    }
+  }
+
+  /**
+   * A piece's triangles grouped by class, each group drawn in its material: the index reordered so each class is one
+   * run. As printed, the lock's faces that overhang are a class of their own (`printed`).
+   */
+  #groupPiece(e) {
+    if (!e.cls) return;
+    const geometry = e.mesh.geometry;
+    const cls = e.printed ?? e.cls;
+    const n = cls.length;
+    const kinds = [e.mesh.material].flat().length;
+    const counts = new Uint32Array(kinds);
+    for (let t = 0; t < n; t++) counts[cls[t]]++;
+    const starts = new Uint32Array(kinds);
+    for (let k = 1; k < kinds; k++) starts[k] = starts[k - 1] + counts[k - 1];
+    const at = starts.slice();
+    const index = geometry.index.array;
+    for (let t = 0; t < n; t++) {
+      const to = at[cls[t]]++ * 3;
+      index[to] = e.base[t * 3];
+      index[to + 1] = e.base[t * 3 + 1];
+      index[to + 2] = e.base[t * 3 + 2];
+    }
+    geometry.index.needsUpdate = true;
+    geometry.clearGroups();
+    for (let k = 0; k < kinds; k++) if (counts[k]) geometry.addGroup(starts[k] * 3, counts[k] * 3, k);
+  }
+
   #clearPieces() {
+    this.stopWay();
     for (const e of this.pieceEntries) {
       this.pieceGroup.remove(e.mesh);
       e.mesh.geometry.dispose();
-      for (const m of [e.mesh.material].flat()) m.dispose();
+      for (const m of new Set([e.mesh.material].flat())) m.dispose();
+      this.#dropLines(e);
     }
     for (const l of this.pieceLabels) {
       this.pieceLabelGroup.remove(l.sprite);
@@ -1535,42 +2098,221 @@ export class Viewer {
     this.pieceEntries = [];
     this.pieceLabels = [];
     this.pieceBounds = null;
+    this.pieceWays.clear();
+    this.pieceInfo = null;
+    this.lookAside = null;
+    this.lockLabels = [];
+    this.#hideLockWords();
     this.piecesStale = false; // the stale ones are gone
   }
 
   /** How far apart neighbouring pieces are drawn, in mm: Spread × 8 % of the diagonal, kept within 6–50 mm. */
-  #explodeGap() {
+  #explodeGap(spread = this.spread) {
     const box = this.pieceBounds ?? this.#cutBounds();
-    return this.spread * clamp(0.08 * box.getSize(new Vector3()).length(), 6, 50);
+    return spread * clamp(0.08 * box.getSize(new Vector3()).length(), 6, 50);
+  }
+
+  /**
+   * Where a piece is drawn: its turn and its move. A part's piece follows its way out (`wayAt`) from where the piece it
+   * comes out of is; every other piece moves out from the middle by its cell (`explodeOffset`).
+   */
+  #placement(index, cell) {
+    const gap = this.#explodeGap();
+    const w = index != null ? this.pieceWays.get(index) : null;
+    if (!w) return { turn: null, move: new Vector3(...explodeOffset(cell, this.pieceGrid, gap)) };
+    const home = new Vector3(...explodeOffset(w.homeCell, this.pieceGrid, gap));
+    if (this.lookAside === index) {
+      // its lock looked at: set down beside it along its way out, its side of the lock towards the camera – a lid turned
+      // over, its joint at the joint's height; a base as it is, beside the model's end
+      const dir = this.#wayDir(w);
+      const q = w.kind === 'plug' ? new Quaternion() : new Quaternion().setFromAxisAngle(new Vector3().crossVectors(w.out, dir).normalize(), Math.PI);
+      const move = w.point.clone().sub(w.point.clone().applyQuaternion(q)).add(home).addScaledVector(dir, this.#parkAt(w));
+      return { turn: q, move };
+    }
+    const { turn, offset } = wayAt(w.way, this.spread, w.drop + this.#explodeGap(1));
+    const q = new Quaternion().setFromAxisAngle(w.out, (turn * Math.PI) / 180);
+    // turned about its axis through its circle's centre: the centre stays where it is
+    const move = w.point.clone().sub(w.point.clone().applyQuaternion(q)).add(new Vector3(...offset)).add(home);
+    return { turn: q, move };
+  }
+
+  /** The way a part slides out, in the world: its own, or for one that comes straight off, away from the camera. */
+  #wayDir(w) {
+    const dir = w.way.dir ? new Vector3(...w.way.dir) : this.controls.target.clone().sub(this.camera.position);
+    dir.addScaledVector(w.out, -dir.dot(w.out));
+    if (dir.lengthSq() < 1e-9) dir.set(1, 0, 0).addScaledVector(w.out, -w.out.x);
+    return dir.normalize();
+  }
+
+  /** How far from its axis a part is set down beside its lock while it is looked at: clear of its body, with a gap. */
+  #parkAt(w) {
+    const dir = this.#wayDir(w);
+    let reach = w.r ?? 0;
+    const { min, max } = w.homeBox;
+    for (let k = 0; k < 8; k++) {
+      const p = new Vector3(k & 1 ? max.x : min.x, k & 2 ? max.y : min.y, k & 4 ? max.z : min.z);
+      reach = Math.max(reach, p.sub(w.point).dot(dir));
+    }
+    return reach + w.half + this.#explodeGap(1);
   }
 
   #layoutPieces() {
-    const gap = this.#explodeGap();
-    for (const e of this.pieceEntries) e.mesh.position.fromArray(explodeOffset(e.cell, this.pieceGrid, gap));
-    for (const l of this.pieceLabels) l.sprite.position.copy(l.centre).add(new Vector3(...explodeOffset(l.cell, this.pieceGrid, gap)));
+    if (this.asPrinted) return this.#layoutPrinted();
+    for (const e of this.pieceEntries) {
+      const { turn, move } = this.#placement(e.index, e.cell);
+      e.mesh.quaternion.copy(turn ?? new Quaternion());
+      e.mesh.position.copy(move);
+    }
+    for (const l of this.pieceLabels) {
+      const { turn, move } = this.#placement(l.index, l.cell);
+      l.sprite.position.copy(l.centre);
+      if (turn) l.sprite.position.applyQuaternion(turn);
+      l.sprite.position.add(move);
+    }
+  }
+
+  /**
+   * The pieces as they print, in a row on the grid: each turned the way it lies on the bed (its `down` and `yaw`, as
+   * the download saves it), its bottom on the grid, a gap between them.
+   */
+  #layoutPrinted() {
+    const shown = this.pieceEntries.filter((e) => e.kind === 'piece');
+    const gap = this.#explodeGap(1);
+    const turned = new Map(); // piece index -> { R: Matrix4, size }
+    for (const e of shown) {
+      if (turned.has(e.index)) continue;
+      const box = new Box3();
+      for (const x of shown) if (x.index === e.index) box.union(x.mesh.geometry.boundingBox);
+      const p = this.pieceInfo?.get(e.index);
+      const { printMatrix } = printTransform({ min: box.min.toArray(), max: box.max.toArray() }, p?.down ?? '-z', p?.yaw ?? 0);
+      const M = new Matrix4().fromArray(printMatrix);
+      const lying = box.clone().applyMatrix4(M);
+      turned.set(e.index, { M, size: lying.getSize(new Vector3()) });
+    }
+    const order = [...turned.keys()];
+    const xs = printedRow(order.map((i) => turned.get(i).size.x), gap);
+    const c = this.bounds.getCenter(new Vector3());
+    const at = new Map(order.map((i, k) => [i, new Matrix4().makeTranslation(c.x + xs[k], c.y, this.bounds.min.z).multiply(turned.get(i).M)]));
+    for (const e of this.pieceEntries) {
+      const M = at.get(e.index);
+      e.mesh.visible = !!M; // pins and printed parts have files of their own
+      if (!M) continue;
+      M.decompose(e.mesh.position, e.mesh.quaternion, new Vector3());
+    }
+    for (const l of this.pieceLabels) {
+      const M = at.get(l.index);
+      if (M) l.sprite.position.copy(l.centre).applyMatrix4(M);
+    }
+  }
+
+  /**
+   * As printed, which of each piece's lock faces overhang more than 45° (red) and which are bridged ceilings
+   * (outlined), from their normals as the piece lies on the bed.
+   */
+  #classifyPrinted() {
+    const R = new Matrix4();
+    const n = new Vector3();
+    const [a, b, c] = [new Vector3(), new Vector3(), new Vector3()];
+    for (const e of this.pieceEntries) {
+      this.#dropLines(e);
+      e.printed = null;
+      if (!e.slots.length || e.kind !== 'piece') continue;
+      const p = this.pieceInfo?.get(e.index);
+      const box = e.mesh.geometry.boundingBox;
+      const { printMatrix } = printTransform({ min: box.min.toArray(), max: box.max.toArray() }, p?.down ?? '-z', p?.yaw ?? 0);
+      R.fromArray(printMatrix);
+      const pos = e.mesh.geometry.attributes.position;
+      const overAt = [e.mesh.material].flat().indexOf(e.over);
+      const lockAt = new Set(e.slots.map((s) => [e.mesh.material].flat().indexOf(s.material)));
+      const printed = e.cls.slice();
+      const edges = new Map(); // a bridged ceiling's edges, by their ends: those used once are its outline
+      const key = (v) => `${v.x.toFixed(3)},${v.y.toFixed(3)},${v.z.toFixed(3)}`;
+      for (let t = 0; t < printed.length; t++) {
+        if (!lockAt.has(printed[t])) continue;
+        a.fromBufferAttribute(pos, e.base[t * 3]).applyMatrix4(R);
+        b.fromBufferAttribute(pos, e.base[t * 3 + 1]).applyMatrix4(R);
+        c.fromBufferAttribute(pos, e.base[t * 3 + 2]).applyMatrix4(R);
+        n.subVectors(b, a).cross(c.clone().sub(a));
+        if (!(n.lengthSq() > 0)) continue;
+        n.normalize();
+        const kind = printedFace(n.z, Math.max(a.z, b.z, c.z) < 0.05);
+        if (kind === 'over') printed[t] = overAt;
+        if (kind === 'bridge') {
+          for (const [p, q] of [[a, b], [b, c], [c, a]]) {
+            const [k1, k2] = [key(p), key(q)];
+            const k = k1 < k2 ? `${k1}|${k2}` : `${k2}|${k1}`;
+            const seen = edges.get(k);
+            if (seen) seen.n++;
+            else edges.set(k, { n: 1, ends: [p.clone(), q.clone()] });
+          }
+        }
+      }
+      e.printed = printed;
+      const outline = [...edges.values()].filter((x) => x.n === 1);
+      if (outline.length) {
+        // drawn in the piece's own frame, so it goes where the piece goes
+        const back = R.clone().invert();
+        const points = new Float32Array(outline.length * 6);
+        outline.forEach((x, i) => {
+          points.set(x.ends[0].clone().applyMatrix4(back).toArray(), i * 6);
+          points.set(x.ends[1].clone().applyMatrix4(back).toArray(), i * 6 + 3);
+        });
+        const line = new BufferGeometry();
+        line.setAttribute('position', new BufferAttribute(points, 3));
+        // seen through the piece faded round them, as the lock is
+        e.lines = new LineSegments(line, new LineBasicMaterial({ color: LOCK_COLORS.bridge, depthTest: false, transparent: true }));
+        e.lines.renderOrder = 12;
+        e.lines.raycast = () => {};
+        e.mesh.add(e.lines);
+      }
+      this.#groupPiece(e);
+    }
+  }
+
+  #dropLines(e) {
+    if (!e.lines) return;
+    e.mesh.remove(e.lines);
+    e.lines.geometry.dispose();
+    e.lines.material.dispose();
+    e.lines = null;
   }
 
   #stylePieces() {
     const stale = this.piecesStale ? 0.6 : 1;
     const focus = this.pieceHighlight;
+    // a part's row pointed at, no piece picked out: the pieces its lock is on fade round it, as a piece pointed at fades
+    // the others, so the whole lock shows – the socket inside the part too – not only a brighter orange
+    const rowLit = focus == null && !this.asPrinted && this.lockHighlight.size > 0;
     for (const e of this.pieceEntries) {
       const shown = focus == null || e.index === focus;
-      const opacity = stale * (shown ? 1 : 0.3);
+      const round = rowLit && e.slots.some((s) => this.lockHighlight.has(s.cutId));
+      const opacity = stale * (shown ? (round ? 0.35 : 1) : 0.3);
       const materials = [e.mesh.material].flat();
-      for (const m of materials) {
-        if (m.transparent !== opacity < 1) m.needsUpdate = true;
-        m.transparent = opacity < 1;
-        m.opacity = opacity;
+      for (const m of new Set(materials)) {
+        // a lock that glows shows through its piece faded round it; as printed every lock does, inside its piece faded
+        // round it, so what it adds that overhangs shows, wherever it is
+        const lock = e.slots.some((s) => s.material === m) || m === e.over;
+        const lit = lock && (this.asPrinted || e.slots.some((s) => s.material === m && this.#lit(s.cutId)));
+        const o = lit ? stale : this.asPrinted && e.slots.length ? 0.4 * opacity : opacity;
+        if (m.transparent !== o < 1) m.needsUpdate = true;
+        m.transparent = o < 1;
+        m.opacity = o;
       }
       materials[0].emissive.setHex(!e.fits ? TOO_BIG_COLOR : focus != null && shown ? 0x262626 : 0);
+      for (const s of e.slots) s.material.emissive.setHex(this.#lit(s.cutId) ? LOCK_COLORS.glow : 0);
     }
-    for (const l of this.pieceLabels) l.sprite.material.opacity = focus == null || l.index === focus ? stale : 0.35;
+    for (const l of this.pieceLabels) {
+      l.sprite.material.opacity = focus == null || l.index === focus ? stale : 0.35;
+      // close on a lock, a piece's number would sit on the lock itself: the words on the lock say what is what instead
+      l.sprite.visible = this.lookAside == null;
+    }
     this.requestRender();
   }
 
-  /** Spread the pieces apart: 0 (assembled) to 2; 1 is the default gap. */
+  /** Spread the pieces apart: 0 (assembled) to 2; 1 is the default gap. A part's piece goes along its way out. */
   setSpread(f) {
     this.spread = clamp(Number(f) || 0, 0, 2);
+    this.#leaveLook();
     this.#layoutPieces();
     this.#layoutCuts();
     this.requestRender();
@@ -1586,6 +2328,211 @@ export class Viewer {
   setPieceHighlight(index) {
     this.pieceHighlight = index ?? null;
     this.#stylePieces();
+  }
+
+  /**
+   * Make a cut's twist-lock glow on both its pieces (seen through a piece faded round it), or several cuts' (a list),
+   * or none for null.
+   */
+  setLockHighlight(cutIds) {
+    const lit = new Set([cutIds ?? []].flat());
+    if (lit.size === this.lockHighlight.size && [...lit].every((id) => this.lockHighlight.has(id))) return;
+    this.lockHighlight = lit;
+    this.#stylePieces();
+  }
+
+  /** A part set down beside its lock to be looked at goes back on its way out, and its lock stops glowing. */
+  #leaveLook() {
+    if (this.lookAside == null) return;
+    this.lookAside = null;
+    this.#hideLockWords();
+    this.#stylePieces();
+  }
+
+  /**
+   * The words on a lock looked at, in the page over the view: "lug" on the lantern's neck, "slot" and "click tab" in
+   * its part (or on a base, the other way round) – each on the one of its kind nearest the camera, following the
+   * piece it is on.
+   */
+  #showLockWords(cutId) {
+    this.#hideLockWords();
+    const points = this.lockLabels.filter((x) => x.cutId === cutId);
+    if (!points.length) return;
+    const el = document.createElement('div');
+    el.className = 'lock-words';
+    el.setAttribute('aria-hidden', 'true');
+    const names = [...new Set(points.map((x) => x.name))];
+    const items = names.map((name) => {
+      const word = document.createElement('span');
+      word.className = 'lock-word';
+      word.textContent = name;
+      el.append(word);
+      return { el: word, name, points: points.filter((x) => x.name === name).map((x) => ({ piece: x.piece, at: new Vector3(...x.at) })) };
+    });
+    this.container.append(el);
+    this.lockWords = { el, items };
+    this.requestRender();
+  }
+
+  #hideLockWords() {
+    this.lockWords?.el.remove();
+    this.lockWords = null;
+  }
+
+  /** Each word where its point is on screen this frame (the nearest of its kind to the camera), or hidden off it. */
+  #placeLockWords() {
+    const [w, h] = this.viewSize;
+    const meshOf = new Map();
+    for (const e of this.pieceEntries) if (e.kind === 'piece' && !meshOf.has(e.index)) meshOf.set(e.index, e.mesh);
+    for (const item of this.lockWords.items) {
+      let best = null;
+      for (const p of item.points) {
+        const mesh = meshOf.get(p.piece);
+        if (!mesh?.visible) continue;
+        const world = p.at.clone().applyMatrix4(mesh.matrixWorld);
+        const d = world.distanceTo(this.camera.position);
+        if (!best || d < best.d) best = { world, d };
+      }
+      const v = best?.world.project(this.camera);
+      const shown = !!v && v.z > -1 && v.z < 1 && Math.abs(v.x) <= 1 && Math.abs(v.y) <= 1;
+      item.el.hidden = !shown;
+      if (shown) item.el.style.transform = `translate(${Math.round(((v.x + 1) / 2) * w)}px, ${Math.round(((1 - v.y) / 2) * h)}px)`;
+    }
+  }
+
+  /** Whether a cut's twist-lock glows: pointed at, or looked at. */
+  #lit(cutId) {
+    return this.lockHighlight.has(cutId) || (cutId != null && cutId === this.lookingAt);
+  }
+
+  /** Whether a lock's lugs are painted on the pieces shown, in their own colour. */
+  get lugsShown() {
+    return this.pieceEntries.some((e) => e.slots.some((x) => x.kind === 'lug'));
+  }
+
+  /** The cuts whose twist-lock is painted on the pieces shown, in the order they first appear. */
+  get lockCuts() {
+    return [...new Set(this.pieceEntries.flatMap((e) => e.slots.map((s) => s.cutId)))].filter(Boolean);
+  }
+
+  /** The cuts whose part moves along a way out of its own, and each one's way. */
+  get partWays() {
+    return [...this.pieceWays.values()].map((w) => ({ cutId: w.cutId, way: w.way }));
+  }
+
+  /**
+   * ▶: the pieces come apart over 2.5 s, each part along its way out – turned free, lifted, slid out – and stay
+   * apart; backwards (`back`), they go together again. Seen across the slide (`#frameWay`). Spread follows
+   * (`onSpread`). Resolves once it has played, or been stopped.
+   */
+  playWay({ back = false } = {}) {
+    this.stopWay();
+    if (this.asPrinted) this.setAsPrinted(false);
+    this.#leaveLook();
+    this.#frameWay();
+    const [from, to] = back ? [1, 0] : [0, 1];
+    return new Promise((resolve) => {
+      const start = performance.now();
+      const play = { frame: 0, resolve };
+      const step = (now) => {
+        const t = Math.min(1, (now - start) / WAY_PLAY_MS);
+        this.setSpread(from + (to - from) * ease(t));
+        this.onSpread?.(this.spread, t < 1);
+        if (t < 1 && this.wayPlay === play) play.frame = requestAnimationFrame(step);
+        else if (this.wayPlay === play) this.stopWay();
+      };
+      this.wayPlay = play;
+      step(start);
+    });
+  }
+
+  /** Stop ▶ where it is. */
+  stopWay() {
+    const play = this.wayPlay;
+    if (!play) return;
+    this.wayPlay = null;
+    cancelAnimationFrame(play.frame);
+    play.resolve();
+  }
+
+  get wayPlaying() {
+    return !!this.wayPlay;
+  }
+
+  /** The cut whose lock is being looked at (its part set down beside it), or null. */
+  get lookingAt() {
+    return this.lookAside != null ? this.pieceWays.get(this.lookAside)?.cutId ?? null : null;
+  }
+
+  /**
+   * Look at a part's lock: the camera close on it from 35° over its joint (under it, for a base), from the side away
+   * from where the part goes out, and the lock glowing. The part is set down just beyond it, a lid turned over, so
+   * both halves show: the neck and its lugs on the body and the socket, slots and click tabs in the lid; the slots in
+   * the body's bore and the base's lugs, click tabs and coin slot. False when the cut has no part shown.
+   */
+  lookAtLock(cutId) {
+    const entry = [...this.pieceWays.entries()].find(([, x]) => x.cutId === cutId);
+    if (!entry) return false;
+    const [piece, w] = entry;
+    this.stopWay();
+    if (this.asPrinted) this.setAsPrinted(false);
+    const lid = w.kind !== 'plug';
+    this.spread = 1;
+    this.lookAside = piece;
+    this.#layoutPieces();
+    this.#layoutCuts();
+    this.onSpread?.(1, false);
+    const r = w.r ?? w.half;
+    const dir = this.#wayDir(w);
+    const home = new Vector3(...explodeOffset(w.homeCell, this.pieceGrid, this.#explodeGap()));
+    // the lock's middle: a lid's neck stands out of the body's face into it, a base's slots run up into the body
+    const lock = w.point.clone().add(home).addScaledVector(w.out, (lid ? 1 : -1) * Math.min(2, 0.08 * r));
+    // with the part set down beyond it, the view takes in both
+    const park = this.#parkAt(w);
+    const [cos, sin] = [Math.cos((35 * Math.PI) / 180), Math.sin((35 * Math.PI) / 180)];
+    const target = lock.clone().addScaledVector(dir, 0.5 * (park - r)).addScaledVector(w.out, -0.25 * w.drop);
+    // seen from 35° over (or under) them, the row from the lock to the part's far side is foreshortened, and the part
+    // stands back from the joint by its own length
+    const radius = 0.5 * ((park + r + w.half) * sin + w.drop * cos) + 0.15 * r;
+    const look = dir.clone().multiplyScalar(-cos).addScaledVector(w.out, sin).normalize();
+    const vFov = (this.camera.fov * Math.PI) / 180;
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * this.camera.aspect);
+    const dist = radius / Math.sin(Math.min(vFov, hFov) / 2);
+    this.camera.position.copy(target).addScaledVector(look, dist);
+    this.camera.near = Math.max(dist / 500, 0.01);
+    this.camera.far = dist * 400;
+    this.camera.updateProjectionMatrix();
+    this.controls.target.copy(target);
+    this.controls.update();
+    this.#keepClear();
+    this.#showLockWords(cutId);
+    this.#stylePieces();
+    return true;
+  }
+
+  /**
+   * As printed: each piece turned the way it lies on the bed and set on the grid in a row, the faces its lock adds
+   * that overhang more than 45° red and its bridged ceilings outlined; or the pieces apart again.
+   */
+  setAsPrinted(on) {
+    on = !!on;
+    if (on === this.asPrinted) return;
+    if (on) this.stopWay();
+    this.asPrinted = on;
+    this.lookAside = null;
+    this.#hideLockWords();
+    if (on) this.#classifyPrinted();
+    else {
+      for (const e of this.pieceEntries) {
+        e.printed = null;
+        e.mesh.visible = true;
+        this.#dropLines(e);
+        this.#groupPiece(e);
+      }
+    }
+    this.#layoutPieces();
+    this.#stylePieces();
+    this.#applyVisibility();
   }
 
   get hasPieces() {
@@ -1628,19 +2575,88 @@ export class Viewer {
 
   /** Fit the camera to what is shown: the model (or the empty build plate), the final result, or the spread-out pieces. */
   frame() {
-    const box = this.#shownBounds();
+    if (this.lookAside != null) {
+      this.#leaveLook();
+      this.#layoutPieces();
+    }
+    // the pieces, with the lock's tools under them and the legend over them, kept clear of both
+    this.#fitBox(this.#shownBounds(), new Vector3(0.55, -0.95, 0.75).normalize(), { clear: this.viewMode === 'pieces' });
+  }
+
+  /** The camera on `box`, from the side `from` points to (a unit vector from its middle), taking it all in. */
+  #fitBox(box, from, { clear = false } = {}) {
     const center = box.getCenter(new Vector3());
     const radius = Math.max(box.getSize(new Vector3()).length() / 2, 5);
     const vFov = (this.camera.fov * Math.PI) / 180;
     const hFov = 2 * Math.atan(Math.tan(vFov / 2) * this.camera.aspect);
     const dist = radius / Math.sin(Math.min(vFov, hFov) / 2);
-    this.camera.position.copy(center).add(new Vector3(0.55, -0.95, 0.75).normalize().multiplyScalar(dist * 1.05));
+    this.camera.position.copy(center).add(from.clone().multiplyScalar(dist * 1.05));
     this.camera.near = radius / 200;
     this.camera.far = radius * 200;
     this.camera.updateProjectionMatrix();
     this.controls.target.copy(center);
     this.controls.update();
+    if (clear) this.#keepClear();
     this.requestRender();
+  }
+
+  /**
+   * The camera, framed on the whole view, drawn back and moved so what it frames sits in the part of the view the
+   * page's own controls leave clear (`insets`): the legend and the view's tools over its top, the lock's tools under
+   * its foot – on a phone they take a good share of it.
+   */
+  #keepClear() {
+    const { top = 0, bottom = 0 } = this.insets?.() ?? {};
+    const h = this.viewSize[1];
+    const free = h - top - bottom;
+    if (!(top + bottom > 0) || free < 0.3 * h) return; // little enough left that the whole view does better
+    const offset = this.camera.position.clone().sub(this.controls.target);
+    // as much farther as the clear band is shorter than the view
+    offset.multiplyScalar(h / free);
+    const forward = offset.clone().negate().normalize();
+    const right = new Vector3().crossVectors(forward, this.camera.up).normalize();
+    const up = new Vector3().crossVectors(right, forward).normalize();
+    // the clear band's middle is (top − bottom) / 2 pixels under the view's: moved up that far, what is framed is there
+    const perPx = (2 * offset.length() * Math.tan((this.camera.fov * Math.PI) / 360)) / h;
+    if (up.lengthSq() > 0.5) this.controls.target.addScaledVector(up, ((top - bottom) / 2) * perPx);
+    this.camera.position.copy(this.controls.target).add(offset);
+    this.camera.far = Math.max(this.camera.far, offset.length() * 10);
+    this.camera.updateProjectionMatrix();
+    this.controls.update();
+  }
+
+  /**
+   * ▶ seen across the way out: where a part slides out along the line of sight – into the view, past the handle it
+   * goes under, where it seems to run through a leg – the camera turns about the upright through what it looks at
+   * until it looks square to the slide, from a little above, drawn back to take in the whole way, so the part is seen
+   * passing under the handle. Where the slide already runs across the view, the view is left as the user has it.
+   */
+  #frameWay() {
+    const w = [...this.pieceWays.values()].find((x) => x.way?.dir && x.kind !== 'plug');
+    if (!w) return;
+    const dir = this.#wayDir(w);
+    const up = w.out.clone();
+    const offset = this.camera.position.clone().sub(this.controls.target);
+    const flat = offset.clone().addScaledVector(up, -offset.dot(up));
+    if (flat.lengthSq() > 1e-9 && Math.abs(flat.clone().normalize().dot(dir)) < Math.SQRT1_2) return;
+    const side = new Vector3().crossVectors(up, dir).normalize();
+    if (flat.dot(side) < 0) side.negate();
+    // a little round from square towards where the camera was, so the handle shows as an arch, not edge on
+    const toward = dir.clone().multiplyScalar(flat.dot(dir) < 0 ? -1 : 1);
+    const round = (25 * Math.PI) / 180;
+    side.multiplyScalar(Math.cos(round)).addScaledVector(toward, Math.sin(round)).normalize();
+    // the whole way: the pieces where it starts and where it ends
+    const box = new Box3();
+    const was = this.spread;
+    for (const f of [0, 1]) {
+      this.spread = f;
+      this.#layoutPieces();
+      for (const e of this.pieceEntries) if (e.mesh.visible) box.expandByObject(e.mesh);
+    }
+    this.spread = was;
+    this.#layoutPieces();
+    const above = (20 * Math.PI) / 180;
+    this.#fitBox(box, side.multiplyScalar(Math.cos(above)).addScaledVector(up, Math.sin(above)).normalize(), { clear: true });
   }
 
   #shownBounds() {
@@ -1742,6 +2758,17 @@ export class Viewer {
       down = { x: e.clientX, y: e.clientY, t: performance.now(), cut: null };
       // picking a place for a cut: a press never takes a handle or an item (a touch is heard above)
       if (this.aim) return;
+      // a part's ring handle is drawn over everything too: pressing it starts to resize its circle
+      const grip = this.#pickGrip(e);
+      if (grip) {
+        down.cut = grip.id;
+        this.controls.enabled = false;
+        if (this.onPartDrag) {
+          drag = { partId: grip.id, axis: grip.axis, position: grip.position, start: grip.r, r: grip.r, active: false };
+          el.setPointerCapture(e.pointerId);
+        }
+        return;
+      }
       // a cut's handle comes first: it is drawn over everything, and pressing it always means that cut
       const cutId = this.#pickCut(e);
       if (cutId) {
@@ -1793,6 +2820,8 @@ export class Viewer {
         }
         if (drag.active && drag.cutId) {
           this.#dragCut(drag, e);
+        } else if (drag.active && drag.partId) {
+          this.#dragGrip(drag, e);
         } else if (drag.active) {
           const hit = this.#pickModel(e);
           if (hit) this.onDrag({ itemId: drag.itemId, point: hit.point, normal: hit.normal, done: false });
@@ -1818,7 +2847,7 @@ export class Viewer {
         // view moves (#aimAgain); a drag turned the view, and a touch places it from the pinned plane
         const click = d && e.pointerType !== 'touch' && Math.hypot(e.clientX - d.x, e.clientY - d.y) <= CLICK_PX && performance.now() - d.t <= CLICK_MS;
         const h = click ? this.#aimPoint(e) : null;
-        if (h) this.onAimPick?.({ at: h.at, target: h.target, shift: e.shiftKey });
+        if (h) this.onAimPick?.({ at: h.at, target: h.target, shift: e.shiftKey, point: h.point, free: h.free });
         else if (this.aimHover && !this.aimHover.pinned) el.style.cursor = 'crosshair';
         return;
       }
@@ -1828,6 +2857,10 @@ export class Viewer {
         this.#styleCuts();
         this.#syncAim(); // the section under the handle goes
         if (dr.active) this.onCutDrag?.({ id: dr.cutId, at: dr.at, target: dr.target ?? null, done: true, screen: this.cutScreenPosition(dr.cutId) });
+        return;
+      }
+      if (dr?.partId) {
+        if (dr.active) this.onPartDrag?.({ id: dr.partId, r: dr.r, done: true });
         return;
       }
       if (d?.cut) return; // a click on a handle selected its cut when it was pressed
@@ -1850,11 +2883,16 @@ export class Viewer {
     // a press given up: by the browser (the pointer cancelled), or a handle's drag by Escape (`cancelCutDrag`)
     const cancel = ({ dragOnly = false } = {}) => {
       const dr = drag;
-      if (dragOnly && !(dr?.cutId && dr.active)) return false;
+      if (dragOnly && !((dr?.cutId || dr?.partId) && dr.active)) return false;
       down = null;
       drag = null;
       this.controls.enabled = true;
       el.style.cursor = '';
+      // a ring handle let go of: the circle goes back to the size it had
+      if (dr?.partId) {
+        if (dr.active) this.onPartDrag?.({ id: dr.partId, r: dr.start, done: true, cancelled: true });
+        return dr.active;
+      }
       if (!dr?.cutId) return false;
       // the plane goes back where it was, and the caller hears the drag is over
       this.cutDrag = null;
@@ -1926,10 +2964,19 @@ export class Viewer {
     this.hoverQueued = true;
     requestAnimationFrame(() => {
       this.hoverQueued = false;
-      const cutId = this.#pickCut(e);
+      const grip = this.#pickGrip(e);
+      const cutId = grip ? null : this.#pickCut(e);
       if (cutId !== this.hoverCutId) {
         this.hoverCutId = cutId;
         this.#styleCuts();
+      }
+      // over a ring handle, what it does
+      this.renderer.domElement.title = grip ? GRIP_TITLE : '';
+      if (grip) {
+        this.marker.visible = false;
+        this.renderer.domElement.style.cursor = 'grab';
+        this.requestRender();
+        return;
       }
       const overItem = cutId || !model ? null : this.#pickOverlay(e);
       // the marker shows where a click would land on the model, which the pieces view does not draw where it is
@@ -1977,6 +3024,7 @@ export class Viewer {
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     for (const c of this.cuts.values()) c.badge.scale.setScalar(this.#spriteScale(c.badge.userData.px));
+    for (const c of this.partCircles) c.badge.scale.setScalar(this.#spriteScale(c.badge.userData.px));
     for (const l of this.pieceLabels) l.sprite.scale.setScalar(this.#spriteScale(l.sprite.userData.px));
     this.aimParts.dot.scale.setScalar(this.#spriteScale(this.aimParts.dot.userData.px));
     this.requestRender();

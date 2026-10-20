@@ -13,6 +13,7 @@ import {
   pegSizesForRoom, statsWithPegs, uprightPegNotes, APART_COLOR, APART_HOLDS, CLIP, LIP, LIP_ALLOWANCE, apartMales, catchSizes,
   clipHold, clipPush, clipShape, layGrown, lipReach, lipSides, lipSizesFor, statsWithLip, SPOT, comesOffOf, endBeds, endShape, endsAsWell, keepsTo, lipMale,
   locateBend, locateSeam, pickSpots, profileSeams, seamKind, seamWords, snapTarget, spotScore, spotSide, spotStart, spotWhy, socketsAsWell,
+  printedFace, printedRow, wayAt, waySteps, wayStep,
 } from '../src/split.js';
 
 const U = [210, 210, 249]; // the default printer's usable bed
@@ -1464,7 +1465,9 @@ describe('notes', () => {
     expect(splitNote('PART_CROSSED', { letter: 'A', cutId: 'c1', part: 'B', partId: 'c2' })).toMatchObject({
       level: 'warn', partId: 'c2', text: 'Cut A runs through the part of cut B – move one of them.',
     });
-    expect(['PART_LIFTS', 'PART_GAP', 'PART_STUCK', 'PART_SPLIT', 'PART_MIXED', 'PART_CROSSED'].map((code) => splitNote(code, {}).level)).toEqual(['info', 'warn', 'warn', 'warn', 'warn', 'warn']);
+    expect(['PART_LIFTS', 'PART_GAP', 'PART_STUCK', 'PART_SPLIT', 'PART_MIXED', 'PART_CROSSED', 'PART_SMALL', 'PART_PRINT', 'PART_FIT'].map((code) => splitNote(code, {}).level)).toEqual([
+      'info', 'warn', 'warn', 'warn', 'warn', 'warn', 'warn', 'info', 'info',
+    ]);
   });
 
   it('says how a part twist-locks and how to open it, as the design words it for the lantern at 400 %', () => {
@@ -1489,6 +1492,46 @@ describe('notes', () => {
     );
   });
 
+  it("says a part is too small for a twist-lock at this size, why, and from what size one fits, as the design words it at 100 %", () => {
+    const small = { letter: 'B', cutId: 'c2', name: 'Dome and cap', why: 'room', now: 100, wall: { t: 0.6, slope: 30 }, lock: 280, opening: 23.06, tea: 380, base: 205 };
+    expect(splitNote('PART_SMALL', small)).toMatchObject({
+      level: 'warn',
+      text: 'Cut B: the dome is 0.6 mm thick here and slopes 30° – too thin for a twist-lock at 100 %. A twist-lock fits from 280 % (a 23 mm opening); a 38 mm tea light needs 380 %. The base can twist off from 205 %. At this size the dome and cap just lift off.',
+    });
+    const text = (fields) => splitNote('PART_SMALL', { ...small, ...fields }).text;
+    // the base taken out too, or locking at this size; one size for the lock and the tea light; none as far as looked
+    expect(text({ base: null })).toBe('Cut B: the dome is 0.6 mm thick here and slopes 30° – too thin for a twist-lock at 100 %. A twist-lock fits from 280 % (a 23 mm opening); a 38 mm tea light needs 380 %. At this size the dome and cap just lift off.');
+    expect(text({ base: 'now' })).toContain('needs 380 %. The base can twist off with a lock at this size. At this size');
+    expect(text({ tea: 280 })).toContain('A twist-lock fits from 280 % (a 23 mm opening), and takes a 38 mm tea light.');
+    expect(text({ lock: null, tea: null, opening: null, most: 600, base: null })).toBe('Cut B: the dome is 0.6 mm thick here and slopes 30° – too thin for a twist-lock at 100 %. No twist-lock fits it up to 600 %. At this size the dome and cap just lift off.');
+    // the other reasons none fits, and a base that lifts out
+    expect(text({ why: 'tabs', now: 200 })).toMatch(/^Cut B: the dome has no room for a twist-lock's click tabs at 200 %\. /);
+    expect(text({ why: 'collar' })).toMatch(/^Cut B: nothing under the dome is deep enough to carry a twist-lock at 100 %\. /);
+    expect(text({ name: 'Base', why: 'floor', wall: null, lock: 205, opening: 29.4, tea: 275, base: null })).toBe(
+      'Cut B: the base has no room for a twist-lock at 100 %. A twist-lock fits from 205 % (a 29 mm opening); a 38 mm tea light needs 275 %. At this size the base just lifts out.',
+    );
+    expect(text({ name: 'Top', wall: null })).toMatch(/^Cut B: the top has no room for a twist-lock at 100 %\..* At this size the top just lifts off\.$/);
+  });
+
+  it('says how a locked part prints, with the longest bridge its lock really has, and the fit test that tries it first', () => {
+    const print = { letter: 'B', cutId: 'c2', name: 'Dome and cap', piece: 2, home: 1, mech: 'twist', bridge: 10.4569, slope: 1.72 };
+    expect(splitNote('PART_PRINT', print)).toMatchObject({
+      level: 'info',
+      text: 'Print piece 2 on its cut face, as saved. The lock needs no support: its slots and click tabs are bridged (10.5 mm or less) – if your slicer puts support inside them, turn on "don\'t support bridges". The collar under the joint inside piece 1 slopes like the dome (60°), so it needs whatever support the dome needs.',
+    });
+    // a wide nozzle's longer tab bridges further; a collar no steeper than 45° needs nothing
+    expect(splitNote('PART_PRINT', { ...print, bridge: 13.21 }).text).toContain('bridged (13.3 mm or less)');
+    expect(splitNote('PART_PRINT', { ...print, slope: 1 }).text).toMatch(/The collar under the joint inside piece 1 slopes at 45°, so it needs no support either\.$/);
+    expect(splitNote('PART_PRINT', { ...print, name: 'Top' }).text).toContain('slopes like the model round it (60°), so it needs whatever support the model round it needs.');
+    expect(splitNote('PART_PRINT', { letter: 'C', cutId: 'c3', name: 'Base', piece: 3, home: 1, mech: 'plug' }).text).toBe(
+      'Print piece 3 on its bottom, as saved. Its lock needs no support: every face it adds slopes at 45° or less, with no bridge.',
+    );
+    expect(splitNote('PART_FIT', { d: 53.08, grams: 7 })).toMatchObject({
+      level: 'info',
+      text: "Print the fit test first (Download fit test): two rings Ø 53 mm, about 7 g. If they won't twist together, raise the Clearance by 0.05 mm and print them again; if they rattle or don't click, lower it. Most printers need 0.15–0.25 mm, and PETG 0.25–0.3.",
+    });
+  });
+
   it('the glue sheet says how to put a twist-locked part on and take it off, never to glue it', () => {
     const pieces = [
       { index: 1, cell: [0, 0, 0], size: [97, 98, 200], lies: 'flat as modelled', fits: true, name: 'Lantern, with the handle', lids: [] },
@@ -1507,6 +1550,22 @@ describe('notes', () => {
     const sheet = howToGlueText({ name: 'bat', pieces, seams });
     expect(sheet).toContain('turn it right until it clicks');
     expect(sheet).toContain('PUT TOGETHER – nothing is glued');
+    // what each piece carries, that the locks need no supports, and how each should twist on – the fit test first
+    expect(sheet).toContain('PRINT (each file is already turned the way to print it; twist-locks need no supports)');
+    expect(sheet).toMatch(/piece 1 of 3 .*fits, twist-lock neck for cut A, twist-lock slots for cut B\n/);
+    expect(sheet).toContain('  Not sure about the fit? Print the fit test first (Split card → Download fit test).');
+    expect(sheet).toContain("DRY-FIT FIRST\n  The dome and cap (cut A) should twist on with a click and twist off again by hand. Try the fit test first: if it's too stiff to turn, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.\n");
+    expect(sheet).toContain('  The base (cut B) should twist in with a click and twist out again by hand. Too stiff to turn: raise Clearance by 0.05 mm; loose, or no click: lower it by 0.05 mm, and download again.\n');
+    expect(sheet).not.toContain('Hold the pieces together');
+    // a collar steeper than 45° under the joint takes the dome's support
+    expect(sheet).not.toContain('The collar');
+    const steep = seams.map((x) => (x.letter === 'A' ? { ...x, apart: { ...x.apart, slope: 1.72 } } : x));
+    expect(howToGlueText({ name: 'bat', pieces, seams: steep })).toContain("  The collar under cut A's neck slopes like the dome (60°): it takes whatever support the dome takes.\n");
+    // parts that lift off: nothing about locks
+    const loose = seams.map((x) => ({ ...x, apart: { ...x.apart, mech: null } }));
+    const plain = howToGlueText({ name: 'bat', pieces, seams: loose });
+    expect(plain).not.toContain('twist');
+    expect(plain).toContain('Hold the pieces together');
   });
 
   it("the glue sheet puts a part back in its place, and says it isn't glued", () => {
@@ -1624,6 +1683,67 @@ describe('viewer maths', () => {
     expect([0, 1, 2].map((i) => explodeOffset([i, 0, 0], [2, 0, 0], 10)[0])).toEqual([-10, 0, 10]);
     expect(explodeOffset([0.5, 0, 0], [2, 0, 0], 10)).toEqual([-5, 0, 0]);
     expect(explodeOffset([1, 1, 0], [1, 1, 0], 8)).toEqual([4, 4, 0]);
+  });
+
+  it("moves a part's piece along its way out on the Spread slider: turned, lifted, slid, a third of the way each", () => {
+    // the dome and cap at 300 %: turned 27° free, lifted 4.1 mm, slid 78 mm out along +y under the handle
+    const way = { turn: 27, up: false, lift: 4.1, dir: [0, 1, 0], out: [0, 0, 1], reach: 78 };
+    expect(waySteps(way)).toEqual(['turn', 'lift', 'slide']);
+    const at = (f) => {
+      const { turn, offset } = wayAt(way, f);
+      return [+turn.toFixed(6), ...offset.map((v) => +v.toFixed(6))];
+    };
+    expect(at(0)).toEqual([0, 0, 0, 0]);
+    expect(at(1 / 6)).toEqual([13.5, 0, 0, 0]); // turning, not yet lifted
+    expect(at(1 / 3)).toEqual([27, 0, 0, 0]);
+    expect(at(0.5)).toEqual([27, 0, 0, 2.05]); // lifting, turned free
+    expect(at(2 / 3)).toEqual([27, 0, 0, 4.1]);
+    expect(at(5 / 6)).toEqual([27, 0, 39, 4.1]); // sliding out, lifted
+    expect(at(1)).toEqual([27, 0, 78, 4.1]);
+    expect(at(2)).toEqual([27, 0, 156, 4.1]); // on the same way, as far again
+    expect(at(-1)).toEqual([0, 0, 0, 0]);
+    // which step it is on, for the view's words: none seated or out
+    expect([0, 0.1, 0.4, 0.7, 0.99, 1, 1.5].map((f) => wayStep(way, f)?.step ?? null)).toEqual([null, 'turn', 'lift', 'slide', 'slide', null, null]);
+    expect(wayStep(way, 0.5)).toEqual({ step: 'lift', n: 2, of: 3 });
+  });
+
+  it('leaves out the steps a way has not: a part that lifts off is not turned, a base drops out its own length', () => {
+    // lifting off: lifted then slid, a half each
+    const lifts = { turn: 0, up: false, lift: 0.7, dir: [0.6, 0.8, 0], out: [0, 0, 1], reach: 30 };
+    expect(waySteps(lifts)).toEqual(['lift', 'slide']);
+    expect(wayAt(lifts, 0.5)).toEqual({ turn: 0, offset: [0, 0, 0.7] });
+    expect(wayAt(lifts, 0.75).offset.map((v) => +v.toFixed(6))).toEqual([9, 12, 0.7]);
+    expect(wayStep(lifts, 0.75)).toEqual({ step: 'slide', n: 2, of: 2 });
+    // the base: turned free about its way out (down), then dropped the length the view gives it, never less than its lift
+    const base = { turn: 23, up: true, lift: 0, dir: null, out: [0, 0, -1], reach: 0 };
+    expect(waySteps(base)).toEqual(['turn', 'lift']);
+    expect(wayAt(base, 0.25, 40)).toEqual({ turn: 11.5, offset: [0, 0, 0] });
+    expect(wayAt(base, 0.75, 40)).toEqual({ turn: 23, offset: [0, 0, -20] });
+    expect(wayAt(base, 1, 40)).toEqual({ turn: 23, offset: [0, 0, -40] });
+    expect(wayAt(base, 1.5, 40)).toEqual({ turn: 23, offset: [0, 0, -60] });
+    expect(wayAt({ ...base, lift: 50 }, 1, 40).offset).toEqual([0, 0, -50]);
+    // a lid straight off: lifted, not slid
+    expect(wayAt({ turn: 0, up: true, lift: 0, dir: null, out: [0, 0, 1], reach: 80 }, 1, 25)).toEqual({ turn: 0, offset: [0, 0, 25] });
+  });
+
+  it("says, of a lock's face as its piece prints, whether it is bridged or overhangs past 45°", () => {
+    const tilt = (deg) => -Math.sin((deg * Math.PI) / 180); // a face's normal's z, the face tilted deg from vertical, facing down
+    expect(printedFace(-1)).toBe('bridge'); // a flat ceiling: the socket's, a slit's
+    expect(printedFace(tilt(85))).toBe('bridge');
+    expect(printedFace(tilt(59.8))).toBe('over'); // the collar's underside at the dome's slope
+    expect(printedFace(tilt(45))).toBeNull(); // the base's 45° faces
+    expect(printedFace(tilt(46))).toBeNull(); // within rounding of 45°
+    expect(printedFace(tilt(20))).toBeNull();
+    expect(printedFace(0)).toBeNull();
+    expect(printedFace(1)).toBeNull();
+    expect(printedFace(-1, true)).toBeNull(); // on the bed
+  });
+
+  it('lays the pieces as printed in a row, centred, a gap between', () => {
+    expect(printedRow([10, 20], 5)).toEqual([-12.5, 7.5]);
+    expect(printedRow([30], 5)).toEqual([0]);
+    expect(printedRow([10, 10, 10], 2)).toEqual([-12, 0, 12]);
+    expect(printedRow([], 5)).toEqual([]);
   });
 
   it('neighbouring pieces always differ in colour family', () => {

@@ -2,7 +2,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Matrix4 } from 'three';
-import { createEngine, passthroughRangesOf } from '../src/engine.js';
+import { createEngine, partSmall, passthroughRangesOf } from '../src/engine.js';
 import { createEngineClient, createLocalWorker } from '../src/engineClient.js';
 import { createItem } from '../src/document.js';
 import { manifold } from '../src/manifold.js';
@@ -608,12 +608,73 @@ describe('parts that come off', () => {
     }
   });
 
+  it("mode 'part' tries a part's face where it is put, as the split places it: on the layers, moved up to print apart, with its bands", async () => {
+    const fx = batLanternSolid();
+    const big = fx.scale([3, 3, 3]);
+    await client.loadBase({ kind: 'stl', bytes: stlOf(big), name: 'bat', version: ++version });
+    fx.delete();
+    big.delete();
+    const printing = { nozzle: 0.4, layerHeight: 0.2 };
+    const lid = (await client.parts([], version, { printing, split: {} })).parts.find((e) => e.kind === 'lid');
+    const at = (z, r = lid.r, split = {}) => client.partAt([], version, { centre: lid.centre, at: z, r, printing, split });
+    // the finder's face: taken as it is, the circle in the middle of its free band
+    const face = await at(lid.face);
+    expect(face).toMatchObject({ ok: true, why: null, asked: 86, z0: 86, kind: 'lid', gmin: 0.9 });
+    expect(face.windows.some(([lo, hi]) => lo < lid.r && lid.r < hi && Math.abs((lo + hi) / 2 - lid.r) < 1e-3)).toBe(true);
+    // off the layers: put on them first
+    expect(await at(85.93)).toMatchObject({ ok: true, asked: 86, z0: 86 });
+    // a face too low runs into the handle's feet: refused there, with the nearest face that prints apart
+    const low = await at(85);
+    expect(low).toMatchObject({ ok: false, why: 'gap', asked: 85, nearest: 86 });
+    expect(low.tried.gap).toBeLessThan(0.9);
+    // a little low: moved up a layer or two by the split itself
+    const near = await at(85.8);
+    expect(near.ok).toBe(true);
+    expect(near.z0).toBeGreaterThan(85.8);
+    // a circle as wide as the lantern crosses its band: mixed; over the top of the model, nothing to take
+    expect((await at(86, 34)).why).toBe('mixed');
+    expect((await at(160)).why).toBe('empty');
+    // a full cut under it moves the layers it prints on
+    expect(await at(86, lid.r, { cuts: [{ id: 'c1', position: [0, 0, 40.05], normal: [0, 0, 1] }] })).toMatchObject({ asked: 86.05 });
+  });
+
   it('a model with gaps has no parts to offer, and says why', async () => {
     const open = new Float32Array([0, 0, 0, 10, 0, 0, 0, 10, 0]);
     await client.loadBase({ kind: 'stl', bytes: writeBinarySTL(open), name: 'open', version: ++version });
     const r = await client.parts([], version, { printing: { nozzle: 0.4, layerHeight: 0.2 }, split: {} });
     expect(r).toMatchObject({ parts: [], handles: [], open: null, solid: false });
     expect(r.notes.map((n) => n.code)).toEqual(['SPLIT_UNAVAILABLE']);
+  });
+});
+
+describe('what the notes say of a part too small to lock', () => {
+  // the parts table at 200 % of a model: the lid's family from z 56 up, the base with its least scale
+  const table = {
+    scale: 2, width: 50, h: 0.4167, parts: [
+      { kind: 'lid', centre: [0, 0], from: 56, cap: 77.4, lock: null, least: { lock: 1.375, tea: 1.825, opening: 24.12 }, wall: { t: 1.47, slope: 29.8 } },
+      { kind: 'plug', centre: [0, 0], lock: null, least: { lock: 1.054688, tea: 1.351563, opening: 30.2 } },
+    ],
+  };
+  const lid = { axis: 2, side: 1, centre: [0, 0], at: 57.6, plug: false };
+  const base = { axis: 2, side: 1, centre: [0, 0], at: 0, plug: true };
+
+  it("reads the family's entry: the least scales as whole 5 % of the model as loaded, and the base's when it stays on", () => {
+    expect(partSmall(table, lid, [lid])).toEqual({ now: 200, lock: 275, opening: 24.12, tea: 365, wall: { t: 1.47, slope: 29.8 }, base: 215 });
+    // the base taken out too: nothing said of it; the base itself
+    expect(partSmall(table, lid, [lid, base]).base).toBeNull();
+    expect(partSmall(table, base, [lid, base])).toEqual({ now: 200, lock: 215, opening: 30.2, tea: 275, wall: null, base: null });
+    // a base that locks at this size; a lid no lock fits as far as the finder looks
+    expect(partSmall({ ...table, parts: [table.parts[0], { ...table.parts[1], lock: { mech: 'plug' } }] }, lid, [lid]).base).toBe('now');
+    const never = { ...table, parts: [{ ...table.parts[0], least: { lock: null, tea: null } }] };
+    expect(partSmall(never, lid, [lid])).toMatchObject({ lock: null, tea: null, most: 1200 });
+  });
+
+  it('has nothing to say of a part the table has no entry for: across X, under its plane, off the axis, or outside the family', () => {
+    expect(partSmall(table, { ...lid, axis: 0 }, [lid])).toBeNull();
+    expect(partSmall(table, { ...lid, side: -1 }, [lid])).toBeNull();
+    expect(partSmall(table, { ...lid, centre: [5, 0] }, [lid])).toBeNull();
+    expect(partSmall(table, { ...lid, at: 40 }, [lid])).toBeNull();
+    expect(partSmall(table, { ...lid, at: 80 }, [lid])).toBeNull();
   });
 });
 
@@ -644,6 +705,27 @@ describe('a split that takes parts out', () => {
     }
   };
   const solidOf = (file) => geometryToManifold(parseSTL(file.stl));
+
+  it("reads the model's slices once for the card and the pieces, and says it builds the twist-lock, not pin holes", async () => {
+    // the card's table is asked for before any final result is built (just after a Scale): on the model alone
+    await load(batLanternSolid().scale([3, 3, 3]));
+    const table = await client.parts([], version, { printing, split: {} });
+    expect(table.estimate).toBe(true);
+    const lid = table.parts.find((e) => e.kind === 'lid');
+    const split = { clearance: 0.15, cuts: [partCut('c1', lid.centre, lid.face, lid.r)] };
+    progress.length = 0;
+    const kept = await slicesDuring(() => client.result([], version, { printing, split }));
+    expect(kept.value.pieces).toHaveLength(2);
+    expect(progress).not.toContain('Finding the parts that come off…');
+    expect(progress).not.toContain('Drilling pin holes…');
+    expect(progress).toContain('Building the twist-lock…');
+    // the same model with no card asked for first slices it all for the pieces
+    await load(batLanternSolid().scale([3, 3, 3]));
+    progress.length = 0;
+    const fresh = await slicesDuring(() => client.result([], version, { printing, split }));
+    expect(progress).toContain('Finding the parts that come off…');
+    expect(kept.slices).toBeLessThan(fresh.slices / 2);
+  }, 120000);
 
   it('takes the dome and cap and the base out of the lantern at 300 %, each twist-locking: the handle stays, each lies on its face', async () => {
     const model = batLanternSolid().scale([3, 3, 3]);
@@ -697,8 +779,17 @@ describe('a split that takes parts out', () => {
       "SPLIT: Cut into 3 pieces. Cuts A and B come apart – don't glue them.",
       'PART_LOCK: Cut A: the dome and cap (piece 2) twist-lock onto piece 1 and the handle stays on piece 1. To fit it: set it on turned 27° to the left so the wide lug finds its wide slot, push down and turn it right until it clicks. To open it: turn it left until it clicks again, lift it 4.5 mm and slide it out under the handle, square to it.',
       'PART_PLUG: Cut B: the base (piece 3) twists off underneath. Turn the lantern over, set the base in turned 23° to the left, push it in and turn it right until it clicks – a coin in its slot helps. To open it: turn it left until it clicks and lift it out. Its Ø 43 mm opening takes a 38 mm tea light.',
+      // how each prints: the lid's slit bridges as built (9 mm tabs round a Ø 32 mm socket: 10.41 mm along their middle), the
+      // collar as steep as the dome; the base adds no overhang
+      'PART_PRINT: Print piece 2 on its cut face, as saved. The lock needs no support: its slots and click tabs are bridged (10.5 mm or less) – if your slicer puts support inside them, turn on "don\'t support bridges". The collar under the joint inside piece 1 slopes like the dome (60°), so it needs whatever support the dome needs.',
+      'PART_PRINT: Print piece 3 on its bottom, as saved. Its lock needs no support: every face it adds slopes at 45° or less, with no bridge.',
+      // the fit test the download makes: its rings as the fit test's own words give them
+      'PART_FIT: Print the fit test first (Download fit test): two rings Ø 40 mm, about 5 g. If they won\'t twist together, raise the Clearance by 0.05 mm and print them again; if they rattle or don\'t click, lower it. Most printers need 0.15–0.25 mm, and PETG 0.25–0.3.',
     ]);
-    expect(ex.notes.slice(1).map((n) => n.level)).toEqual(['info', 'info']);
+    expect(ex.notes.slice(1).map((n) => n.level)).toEqual(['info', 'info', 'info', 'info', 'info']);
+    expect(ex.notes.find((n) => n.code === 'PART_PRINT')).toMatchObject({ cutId: 'c1', piece: 2, home: 1, mech: 'twist', bridge: expect.closeTo(10.41, 2), slope: 1.72 });
+    const coupon = await client.fitTest([], version, { printing, split: { clearance: 0.15, cuts: cuts('lock') }, name: 'bat' });
+    expect(ex.notes.find((n) => n.code === 'PART_FIT')).toMatchObject({ d: coupon.twist.d, grams: coupon.twist.grams });
     expect(ex.assembly).toEqual([
       'Do not glue cut B: it comes apart. Base: turn piece 1 over, set the base in turned 23° to the left, push in and turn it right until it clicks (a coin in the slot helps). To open: turn it left and lift it out.',
       'Do not glue cut A: it comes apart. Dome and cap: set it on turned 27° to the left so the wide lug finds its wide slot, push down and turn it right until it clicks. To open: turn it left until it clicks again, lift it 4.5 mm and slide it out under the handle, square to it.',
@@ -706,6 +797,13 @@ describe('a split that takes parts out', () => {
     const glue = ex.files.find((f) => f.kind === 'text').text;
     expect(glue).toContain('comes off at cut A (the dome and cap)');
     expect(glue).toContain('comes off at cut B (the base)');
+    // the lantern carries the lid's neck and the base's slots; the collar is supported as the dome is; how each should
+    // twist on, and the fit test first
+    expect(glue).toContain('twist-locks need no supports');
+    expect(glue).toMatch(/piece 1 of 3 .* fits, twist-lock neck for cut A, twist-lock slots for cut B\n/);
+    expect(glue).toContain("  The collar under cut A's neck slopes like the dome (60°): it takes whatever support the dome takes.");
+    expect(glue).toContain("  The dome and cap (cut A) should twist on with a click and twist off again by hand. Try the fit test first: if it's too stiff to turn, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.");
+    expect(glue).toContain('  The base (cut B) should twist in with a click and twist out again by hand.');
     // the same parts lifting off, for what the locks add and take
     const plain = await exportFiles({ cuts: cuts('lift') });
     expect(plain.seams.map((x) => x.apart.mech)).toEqual([null, null]);
@@ -742,6 +840,45 @@ describe('a split that takes parts out', () => {
     // the pieces view: one range per piece
     const shown = await client.result([], version, { printing, split: { cuts: [partCut('c1', lid.centre, lid.face, lid.r)] } });
     expect(shown.display.parts).toEqual([{ kind: 'piece', index: 1 }, { kind: 'piece', index: 2 }]);
+    // and paints the lock on both pieces: its own faces (the neck; the socket, slots and click tabs), its lugs apart and,
+    // lighter, what carries it (the collar, the socket ring), each mark with its joint's plane
+    const d = shown.display;
+    expect(d.marks).toEqual([
+      { cutId: 'c1', kind: 'lock', at: [lid.centre[0], lid.centre[1], 86], axis: [0, 0, 1] },
+      { cutId: 'c1', kind: 'carry', at: [lid.centre[0], lid.centre[1], 86], axis: [0, 0, 1] },
+      { cutId: 'c1', kind: 'lug', at: [lid.centre[0], lid.centre[1], 86], axis: [0, 0, 1] },
+    ]);
+    // the words the view puts on it, close up: the lugs on the lantern, the slots and click tabs in the lid
+    const on = (name) => [...new Set(d.lockLabels.filter((x) => x.name === name).map((x) => x.piece))];
+    expect([on('lug'), on('slot'), on('click tab')]).toEqual([[1], [2], [2]]);
+    expect(d.lockLabels.filter((x) => x.name === 'lug')).toHaveLength(3);
+    const r0 = lid.lock.r0;
+    const seen = d.ranges.map(() => [0, 0, 0]);
+    for (const [t0, n, m] of d.markRanges) {
+      const piece = d.ranges.findIndex(([s0, sn]) => t0 >= s0 && t0 + n <= s0 + sn);
+      expect(piece).toBeGreaterThanOrEqual(0);
+      seen[piece][m] += n;
+      for (let t = t0; t < t0 + n; t++) {
+        for (let k = 0; k < 3; k++) {
+          const v = d.index[t * 3 + k] * 3;
+          const r = Math.hypot(d.positions[v] - lid.centre[0], d.positions[v + 1] - lid.centre[1]);
+          const z = d.positions[v + 2] - 86;
+          // the lock's own faces lie round the neck (r0 15.88), from the socket's floor a millimetre under the face to its
+          // ceiling 2.8 mm over it; what carries it from the bore out to the lantern's wall, from where the collar meets
+          // the wall 8.8 mm down to over the socket ring
+          if (m === 0) expect([r > r0 - 2 && r < r0 + 2.6, z > -1.01 && z < 2.81]).toEqual([true, true]);
+          else if (m === 2) expect([r > r0 - 0.5 && r < r0 + 1.5, z > -0.5 && z < 2.81]).toEqual([true, true]);
+          else expect([r > r0 - 2 && r < 28, z > -9 && z < 4.01]).toEqual([true, true]);
+        }
+      }
+    }
+    // hundreds of triangles of each on each piece: the lantern's neck and collar, the lid's socket and its ring; the
+    // lugs on the lantern only
+    for (const [lock, carry] of seen) expect([lock > 1000, carry > 1000]).toEqual([true, true]);
+    expect([seen[0][2] > 50, seen[1][2]]).toEqual([true, 0]);
+    // nothing painted where no lock was built: the same part lifting off
+    const lifting = await client.result([], version, { printing, split: { cuts: [partCut('c1', lid.centre, lid.face, lid.r, { hold: 'lift' })] } });
+    expect([lifting.display.marks, lifting.display.markRanges]).toEqual([[], []]);
     expect((await client.call('ping', {})).caches.carved).toBe(1);
     // the parts gone, so is what they kept: with no cut at all, or only full ones
     await client.result([], version, { printing });
@@ -923,9 +1060,17 @@ describe('a split that takes parts out', () => {
     let r = await one(partCut('c1', [0, 0], 28.8, 7.8732));
     expect(r.notes).toEqual([
       "warn PART_GAP: Cut A: at Z 28.8 the dome and cap's edge is 0.79 mm from the handle's feet – it needs 0.9 mm to print apart. Moved to Z 29.",
-      'info PART_LIFTS: Cut A: the dome and cap lift off – nothing holds them.',
+      // asked to lock at 100 %, where none fits: from what size one does, read off the parts table, and the base's
+      'warn PART_SMALL: Cut A: the dome is 0.7 mm thick here and slopes 30° – too thin for a twist-lock at 100 %. A twist-lock fits from 275 % (a 24 mm opening); a 38 mm tea light needs 365 %. The base can twist off from 215 %. At this size the dome and cap just lift off.',
     ]);
     expect(r.ex.seams[0].at).toBe(29);
+    expect(r.ex.seams[0].apart).toMatchObject({ hold: 'lock', mech: null, why: 'room', small: { now: 100, lock: 275, opening: 24.12, tea: 365, base: 215, wall: { t: 0.73 } } });
+    // the base asked to lock at 100 %: too thin a ring round its bore, which carries one from 215 %
+    r = await one(partCut('c1', [0, 0], 0, 8.9387));
+    expect(r.notes).toEqual([
+      'warn PART_SMALL: Cut A: the base has no room for a twist-lock at 100 %. A twist-lock fits from 215 % (a 30 mm opening); a 38 mm tea light needs 275 %. At this size the base just lifts out.',
+    ]);
+    expect(r.ex.seams[0].apart).toMatchObject({ mech: null, why: 'wall', small: { lock: 215, base: null } });
     // where the legs fuse into the dome: refused, with the nearest face that would do; the model comes out whole
     r = await one(partCut('c1', [0, 0], 28.4, 7.8732));
     expect(r.notes).toEqual([
@@ -984,7 +1129,7 @@ describe('a split that takes parts out', () => {
     expect(lid).toMatchObject({ name: 'Dome and cap', lock: { mech: 'twist' }, way: { up: false, lift: 2.6 } });
     expect(Math.abs(lid.way.dir[1])).toBeCloseTo(1, 6);
     const ex = await exportFiles({ cuts: [partCut('c1', lid.centre, lid.face, lid.r)] });
-    expect(ex.notes.map((n) => n.code)).toEqual(['SPLIT', 'PART_LOCK']);
+    expect(ex.notes.map((n) => n.code)).toEqual(['SPLIT', 'PART_LOCK', 'PART_PRINT', 'PART_FIT']);
     expect(ex.seams[0].apart.mech).toBe('twist');
     expect(ex.seams[0].part.way).toMatchObject({ up: false, lift: 2.6 });
   });

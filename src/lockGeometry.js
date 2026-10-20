@@ -156,8 +156,10 @@ function unionOf(list) {
  * @param {number} r0 the neck's outside radius
  * @param {{ theta?: number, phi0?: number }} options
  * @returns {{ neck: Manifold, lugs: Manifold, grooves: Manifold, cutters: Manifold, disc: Manifold, ridges: Manifold,
- *   layout: object, rn: number, rs: number, rf: number, theta: number, ids: number[] }} the caller's; `disc` the
- *   full-disc socket (r < rs under its ceiling), for a lid the ring would leave bits of inside the bore
+ *   layout: object, rn: number, rs: number, rf: number, theta: number, ids: number[], lugIds: number[],
+ *   points: object[] }} the caller's; `disc` the full-disc socket (r < rs under its ceiling), for a lid the ring would
+ *   leave bits of inside the bore; `lugIds` the lugs' own among `ids`; `points` where a lug, a slot and a click tab are,
+ *   for the view's words
  */
 export function twistLockSolids(S, r0, { theta = twistFor(S, r0), phi0 = 0 } = {}) {
   const k = kit();
@@ -175,8 +177,11 @@ export function twistLockSolids(S, r0, { theta = twistFor(S, r0), phi0 = 0 } = {
     const grooves = [];
     const cutters = [];
     const ridges = [];
+    const lugIds = []; // the lugs' own faces, which the view paints apart from the neck they stand on
+    const points = []; // where the view says which is a lug, a slot, a click tab: in the lock's frame, on the body or the part
     const cw = deg(c / r0);
     for (const { phi, w, half } of L.lugs) {
+      const first = k.ids.length;
       let lug = revolve(k, lugPoly, phi - half, phi + half);
       // the tip's corners led in 45° in plan, so a drooped edge rides into the slot instead of snagging
       const tip = r0 + h + 0.01;
@@ -189,7 +194,11 @@ export function twistLockSolids(S, r0, { theta = twistFor(S, r0), phi0 = 0 } = {
         const tri = [[zl + lead + 0.5, -0.5], [zl - 1, -0.5], [zl - 1, lead + 1]].map(([z, y]) => [z, -s * y]);
         lug = k.add(lug.subtract(radialPrism(k, tri, r0 + c - 0.01, tip + 1, phi + s * half)));
       }
+      lugIds.push(...k.ids.slice(first));
       lugs.push(lug);
+      points.push({ name: 'lug', on: 'body', at: at(r0 + 0.7 * h, phi, zl + a / 2) });
+      // its slot in the lid: half-way along the arm it turns in
+      points.push({ name: 'slot', on: 'part', at: at((r0 + rf) / 2, phi - theta / 2, (armFloor + armTop) / 2) });
       // the lid's L-slot: the arm from the entry (θ back) to just past the lug, its ceiling flat and bridged
       const from = phi - theta - half - cw;
       cutters.push(revolve(k, [[r0 - 0.05, armFloor], [rf, armFloor], [rf, armTop], [r0 - 0.05, armTop]], from, phi + half + cw));
@@ -212,6 +221,7 @@ export function twistLockSolids(S, r0, { theta = twistFor(S, r0), phi0 = 0 } = {
     for (const { psi } of L.tabs) {
       const freeEnd = psi - deg((base / 2 + 0.1) / rs);
       const root = freeEnd + deg(Ld / rs);
+      points.push({ name: 'click tab', on: 'part', at: at(rs + td / 2, (freeEnd + root) / 2, b / 2) });
       cutters.push(wedge(rs + td, ro, -1, b + gTop, freeEnd - gA, root));
       cutters.push(wedge(rs - 0.05, ro, b, b + gTop, freeEnd - gA, root));
       cutters.push(wedge(rs - 0.05, ro, -1, b + gTop, freeEnd - gA, freeEnd));
@@ -242,7 +252,7 @@ export function twistLockSolids(S, r0, { theta = twistFor(S, r0), phi0 = 0 } = {
     }
     return {
       neck: neck.translate([0, 0, 0]), lugs: unionOf(lugs), grooves: unionOf(grooves), cutters: unionOf(cutters), disc: disc.translate([0, 0, 0]),
-      ridges: unionOf(ridges), layout: L, rn, rs, rf, theta, ids: [...k.ids],
+      ridges: unionOf(ridges), layout: L, rn, rs, rf, theta, ids: [...k.ids], lugIds, points,
     };
   } finally {
     k.dispose();
@@ -310,7 +320,8 @@ export function socketRing(rs, S, above) {
  * @param {object} S `sizes()`
  * @param {number} R the body's bore
  * @returns {{ lugs: Manifold, bodyCut: Manifold, plugCut: Manifold, ridges: Manifold, layout: object, theta: number,
- *   rp: number, ids: number[] }} the caller's
+ *   rp: number, ids: number[], lugIds: number[], points: object[] }} the caller's; `lugIds` the lugs' own among `ids`,
+ *   `points` where a lug, a slot and a click tab are, for the view's words
  */
 export function plugLockSolids(S, R) {
   const k = kit();
@@ -337,10 +348,17 @@ export function plugLockSolids(S, R) {
     const bodyCut = [];
     const plugCut = [];
     const ridges = [];
+    const lugIds = []; // the lugs' own faces, which the view paints apart from the plug they stand on
+    const points = []; // where the view says which is a lug, a slot, a click tab, in the lock's frame once mirrored
+    const mirrored = (r, a, z) => at(r, -a, z);
     const cw = deg(c / rb);
-    L.lugs.forEach(({ phi: mirrored, half }) => {
-      const phi = flip(mirrored);
+    L.lugs.forEach(({ phi: mirroredPhi, half }) => {
+      const phi = flip(mirroredPhi);
+      const first = k.ids.length;
       lugs.push(revolve(k, lugPoly, phi - half, phi + half));
+      lugIds.push(...k.ids.slice(first));
+      points.push({ name: 'lug', on: 'part', at: mirrored((rp + tipR) / 2, phi, zl + a / 2) });
+      points.push({ name: 'slot', on: 'body', at: mirrored((rb + tipR + c) / 2, phi + theta / 2, zl + a / 2) });
       // the lug locks at phi and goes in at phi + θ
       bodyCut.push(revolve(k, armPoly, phi - half - cw, phi + theta + half + cw));
       bodyCut.push(revolve(k, entryPoly, phi + theta - half - cw, phi + theta + half + cw));
@@ -355,10 +373,11 @@ export function plugLockSolids(S, R) {
     const ri = rp - td - g;
     // the slit over the tab rises 45° out to the plug's face: no bridge
     const roofTop = b + gTop + (rp + 0.05 - ri);
-    for (const { psi: mirrored } of L.tabs) {
-      const psi = flip(mirrored);
+    for (const { psi: mirroredPsi } of L.tabs) {
+      const psi = flip(mirroredPsi);
       const freeEnd = psi - deg((base / 2 + 0.1) / rp);
       const root = freeEnd + deg(Ld / rp);
+      points.push({ name: 'click tab', on: 'part', at: mirrored(rp - td / 2, (freeEnd + root) / 2, b / 2) });
       plugCut.push(revolve(k, [[ri, -1], [rp - td, -1], [rp - td, b], [rp + 0.05, b], [rp + 0.05, roofTop], [ri, b + gTop]], freeEnd - gA, root));
       plugCut.push(revolve(k, [[ri, -1], [rp + 0.05, -1], [rp + 0.05, roofTop], [ri, b + gTop]], freeEnd - gA, freeEnd));
       plugCut.push(revolve(k, [[ri - sm, -1], [rp - td + sm, -1], [rp - td + sm, 0], [rp - td, sm], [ri, sm], [ri - sm, 0]], freeEnd - gA, root));
@@ -395,7 +414,7 @@ export function plugLockSolids(S, R) {
     };
     return {
       lugs: mirror(unionOf(lugs)), bodyCut: mirror(unionOf(bodyCut)), plugCut: mirror(unionOf(plugCut)), ridges: mirror(unionOf(ridges)),
-      layout: L, theta, rp, ids: [...k.ids],
+      layout: L, theta, rp, ids: [...k.ids], lugIds, points,
     };
   } finally {
     k.dispose();
@@ -456,11 +475,15 @@ export function twistCoupon(S, r0, { theta = twistFor(S, r0) } = {}) {
  * the neck and the lugs less the grooves; the lid the socket ring, the socket (the ring, or the full disc where the
  * lock says so) and slots and slits, then the ridges. A plug lock: the body loses the slots, grooves and mouths; the
  * plug gets its lugs, loses its wall's gap, slits, mouth and coin slot, then gets its ridges. A plug with no lock gets
- * its wall's gap only.
+ * its wall's gap only. `carry` names, among `ids`, what carries the lock rather than being it – the collar and the
+ * socket ring – which the view paints lighter, and `bare` what is the piece's own outside, only turned down to its
+ * clearance – the plug's wall – which the view leaves the piece's colour; `lugs` the lugs', which it paints apart, and
+ * `points` where a lug, a slot and a click tab are, in the lock's frame, for the words it puts on them.
  * @param {{ mech: 'twist'|'plug'|null, kind: string, S: object, r0?: number, theta?: number, slope?: number,
  *   below?: number[][], above?: number[][], socket?: 'ring'|'disc', R?: number, top?: number }} lock
  * @returns {{ body: { add: Manifold|null, cut: Manifold|null, after: null }, part: { add: Manifold|null, cut: Manifold|null,
- *   after: Manifold|null }, fill: boolean, ids: number[] }} the caller's
+ *   after: Manifold|null }, fill: boolean, ids: number[], carry: number[], bare: number[], lugs: number[],
+ *   points: object[] }} the caller's
  */
 export function lockSolids(lock) {
   const { Manifold } = manifold();
@@ -480,6 +503,10 @@ export function lockSolids(lock) {
         part: { add: ring.solid, cut: lock.socket === 'disc' ? Manifold.union([L.cutters, L.disc]) : L.cutters.translate([0, 0, 0]), after: L.ridges.translate([0, 0, 0]) },
         fill: true,
         ids: [...L.ids, ...collar.ids, ...ring.ids],
+        carry: [...collar.ids, ...ring.ids],
+        bare: [],
+        lugs: [...L.lugIds],
+        points: L.points,
       };
     }
     if (lock.mech === 'plug') {
@@ -492,10 +519,14 @@ export function lockSolids(lock) {
         part: { add: P.lugs.translate([0, 0, 0]), cut: Manifold.union([wall.solid, P.plugCut]), after: P.ridges.translate([0, 0, 0]) },
         fill: false,
         ids: [...P.ids, ...wall.ids],
+        carry: [],
+        bare: [...wall.ids],
+        lugs: [...P.lugIds],
+        points: P.points,
       };
     }
     const wall = plugWall(S, lock.R, lock.top);
-    return { body: { add: null, cut: null, after: null }, part: { add: null, cut: wall.solid, after: null }, fill: false, ids: wall.ids };
+    return { body: { add: null, cut: null, after: null }, part: { add: null, cut: wall.solid, after: null }, fill: false, ids: wall.ids, carry: [], bare: wall.ids, lugs: [], points: [] };
   } finally {
     k.dispose();
   }

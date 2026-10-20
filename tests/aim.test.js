@@ -2,9 +2,11 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { BoxGeometry, BufferGeometry, Float32BufferAttribute, Uint32BufferAttribute } from 'three';
 import { MeshBVH } from 'three-mesh-bvh';
 import {
-  SNAP_MAX, aimLine, aimTargets, lipLine, lipVerdict, lipWords, offWords, placedAt, snapTolerance, snappedWords, spotLabel, throughWords,
+  HANDLE_PLANE, MIXED_PART, SNAP_MAX, aimLine, aimTargets, bandOf, handlePlaneWords, lipLine, lipVerdict, lipWords, noFitTestWords, noLockOf, noLockTitle, offWords,
+  partCard, partFace, partMeta, partOffered, partReadout, partWidth, partsNote, percentOf, pickPart, placedAt, snapTolerance, snappedWords, spotLabel, stuckWords, takesHandle,
+  throughWords, wayCaption, widthWords,
 } from '../src/aim.js';
-import { snapTarget } from '../src/split.js';
+import { snapTarget, wayStep } from '../src/split.js';
 import { sectionSegments } from '../src/viewer.js';
 import { setup } from './helpers.js';
 import { lanternSolid } from './lanternFixture.js';
@@ -190,5 +192,282 @@ describe('placing a cut on the model', () => {
     // inside round the 92 mm square opening
     expect(lengthOf(sectionSegments(view, 2, 190))).toBeCloseTo(4 * 92 + 4 * 24 + 4 * 92, 3);
     expect(sectionSegments(view, 2, 300).count).toBe(0);
+  });
+});
+
+// the user's bat lantern as the engine's parts table reads it (split.plan mode 'parts', n 0.4, c 0.15): at 400 % the
+// dome and cap twist-lock inside the handle (r0 22.39, Ø 41.58, 19°, 6 clicks) and the base from underneath (R 28.7, 17°);
+// at 100 % neither fits a lock – the roof is 0.6 mm thick – from 280 % and 205 %
+const lid400 = {
+  kind: 'lid', name: 'Dome and cap', centre: [0, 0], face: 115.6, r: 31.583, side: 1, takesHandle: false, handle: { legs: 2, span: [-1, 0] },
+  lock: { mech: 'twist', r0: 22.39, opening: 41.58, theta: 19, tabs: 6, teaLight: true, slope: 1.72 }, why: null, least: { lock: null, tea: null },
+  wall: { t: 2.4, slope: 30 },
+};
+const base400 = { kind: 'plug', name: 'Base', centre: [0, 0], face: 0, r: 28.7, side: 1, lock: { mech: 'plug', R: 28.7, opening: 57.4, theta: 17, tabs: 3, coin: 51.1, teaLight: true }, why: null, least: { lock: null, tea: null } };
+const lid100 = { ...lid400, face: 29.2, r: 8.026, lock: null, why: 'room', least: { lock: 2.8, tea: 3.8, opening: 23.06 }, wall: { t: 0.6, slope: 30 } };
+const base100 = { ...base400, r: 8.6, lock: null, why: 'room', least: { lock: 2.04, tea: 2.75, opening: 29.4 } };
+const bat400 = { scale: 4, most: 6, zmin: 0, zmax: 200, parts: [lid400, base400], handles: [{ foot: 114.6, top: 197.1, span: [-1, 0] }] };
+const bat100 = { scale: 1, most: 6, zmin: 0, zmax: 50, parts: [lid100, base100], handles: [{ foot: 28.65, top: 49.27, span: [-1, 0] }] };
+
+describe('parts that come off', () => {
+  it("lists the lantern's parts in the card as the design words them: the lock each gets, its opening and print badge, and [Use]", () => {
+    expect(partCard(lid400, bat400)).toEqual({
+      kind: 'lid', name: 'Dome and cap', lock: true, title: 'Dome and cap – twist-lock · Ø 42 mm opening, takes a 38 mm tea light · the handle stays',
+      detail: '', badge: "the lantern's collar needs the dome's support", offers: [], use: 'lock',
+    });
+    expect(partCard(base400, bat400)).toEqual({
+      kind: 'plug', name: 'Base', lock: true, title: 'Base – twists off underneath · twist-lock · Ø 57 mm opening, takes a 38 mm tea light', detail: '',
+      badge: 'no extra support', offers: [], use: 'lock',
+    });
+    // at 300 % the lid's 26 mm opening takes no tea light, where the base's does: the card says where it goes
+    const lid300 = { ...lid400, lock: { ...lid400.lock, opening: 26.04, theta: 29, tabs: 3, teaLight: false } };
+    expect(partCard(lid300, { ...bat400, scale: 3, parts: [lid300, base400] }).title).toBe(
+      'Dome and cap – twist-lock · Ø 26 mm opening · the handle stays · a 38 mm tea light fits through the base, not the lid',
+    );
+    // the badge is the collar's the download builds (PART_PRINT's slope), the lantern's: no steeper than 45° it asks for
+    // no support, however steep the band just under the face; under a top that is no dome, the model's support
+    expect(partCard({ ...lid400, lock: { ...lid400.lock, slope: 1 } }, bat400).badge).toBe('no extra support');
+    expect(partCard({ ...lid400, lock: { ...lid400.lock, slope: 1 }, underSlope: 7.5 }, bat400).badge).toBe('no extra support');
+    expect(partCard({ ...lid400, name: 'Top', handle: null }, bat400).badge).toBe("the collar under it needs the model's support");
+    // a top with no handle over it, or one that takes the handle
+    expect(partCard({ ...lid400, name: 'Top', handle: null }, bat400).title).toBe('Top – twist-lock · Ø 42 mm opening, takes a 38 mm tea light');
+    expect(partCard({ ...lid400, takesHandle: true }, bat400).title).toBe('Dome and cap – twist-lock · Ø 42 mm opening, takes a 38 mm tea light · takes the handle with it');
+  });
+
+  it('says why no lock fits at this size, from what size one does, and offers those sizes and to use it lifting off', () => {
+    expect(partCard(lid100, bat100)).toEqual({
+      kind: 'lid', name: 'Dome and cap', lock: false, title: 'Dome and cap – comes off inside the handle; the handle stays on the lantern.',
+      detail: 'Too small for a lock at this size: its roof is 0.6 mm thick. A twist-lock fits from 280 % (a 23 mm opening); a 38 mm tea light fits through it from 380 %.',
+      badge: '', offers: [300, 400], use: 'lift',
+    });
+    // a base too small for a lock is offered the size only: lifting out, it would drop out of the lantern
+    expect(partCard(base100, bat100)).toEqual({
+      kind: 'plug', name: 'Base', lock: false, title: 'Base – could twist off underneath from 205 % (a 29 mm opening); a 38 mm tea light fits through it from 275 %.',
+      detail: '', badge: '', offers: [300], use: null,
+    });
+    // least scales are factors on the size now: at 200 % the same lid needs 1.4 times it, still 280 % of the model as loaded
+    const lid200 = { ...lid100, why: 'tabs', least: { lock: 1.4, tea: 1.9, opening: 23.06 } };
+    expect(partCard(lid200, { ...bat100, scale: 2 }).detail).toBe(
+      'Too small for a lock at this size: there is no room round it for the click tabs. A twist-lock fits from 280 % (a 23 mm opening); a 38 mm tea light fits through it from 380 %.',
+    );
+    expect(partCard(lid200, { ...bat100, scale: 2 }).offers).toEqual([300, 400]);
+    // one size for both, and none at all as far as the finder looks
+    expect(partCard({ ...lid100, least: { lock: 3.8, tea: 3.8, opening: 41 } }, bat100)).toMatchObject({
+      detail: 'Too small for a lock at this size: its roof is 0.6 mm thick. A twist-lock fits from 380 % (a 41 mm opening), and takes a 38 mm tea light.', offers: [400],
+    });
+    expect(partCard({ ...lid100, why: 'collar', least: { lock: null, tea: null } }, bat100)).toMatchObject({
+      detail: 'Too small for a lock at this size: nothing under it is deep enough to carry one. No twist-lock fits it up to 600 %.', offers: [], use: 'lift',
+    });
+    expect(partCard({ ...base100, least: { lock: null, tea: null } }, bat100).title).toBe('Base – no twist-lock fits it underneath up to 600 %.');
+    expect(percentOf(2.04, 1)).toBe(205);
+    expect(percentOf(null, 1)).toBeNull();
+  });
+
+  it('says why the card lists nothing: solid all through, already open, or no part – to click the model only while placing', () => {
+    expect(partsNote({ solid: true, parts: [] })).toBe("This model is solid all through – there's no inside to open.");
+    expect(partsNote({ solid: false, open: { d: 72.4 }, parts: [] })).toBe('The top is already open (Ø 72 mm).');
+    expect(partsNote({ solid: false, open: null, parts: [] })).toBe('No part comes off cleanly here – click the model where it should open.');
+    expect(partsNote({ solid: false, open: null, parts: [] }, { aiming: false })).toBe('No part comes off cleanly here.');
+    expect(partsNote(bat400)).toBeNull();
+  });
+
+  it('says which parts the card offers something for: a lid always, a base only where a lock fits at some size', () => {
+    expect(partOffered(lid100, bat100)).toBe(true);
+    expect(partOffered(base100, bat100)).toBe(true);
+    expect(partOffered(base400, bat400)).toBe(true);
+    // a closed ball's base, which no lock fits up to 600 %: listed, with nothing to press
+    expect(partOffered({ ...base100, least: { lock: null, tea: null } }, bat100)).toBe(false);
+  });
+
+  it('says why the fit test has nothing to try when the parts come off with nothing holding them', () => {
+    expect(noFitTestWords([{ name: 'Dome and cap', hold: 'lock', least: 275 }])).toBe('Nothing to try: the dome and cap lift off at this size – a twist-lock fits from 275 %.');
+    expect(noFitTestWords([{ name: 'Dome and cap', hold: 'lift' }])).toBe('Nothing to try: the dome and cap lift off with nothing holding them.');
+    expect(noFitTestWords([{ name: 'Top', hold: 'lock', least: null }, { name: 'Base', kind: 'plug', hold: 'lock', least: 215 }])).toBe(
+      'Nothing to try: the top lifts off at this size – no twist-lock fits; the base lifts out at this size – a twist-lock fits from 215 %.',
+    );
+    expect(noFitTestWords([{ name: 'Base', kind: 'plug', hold: 'lock', locks: true }])).toBe("Nothing to try: the base's twist-lock has no fit test of its own.");
+  });
+
+  it('reads out the part under the pointer: the lid and its lock, the handle it leaves on, the base', () => {
+    expect(partReadout({ part: lid400, on: 'lid' }, bat400)).toBe('Dome and cap come off · twist-lock, 3 lugs, turn 19° · Ø 42 mm opening – takes a 38 mm tea light · the handle stays');
+    expect(partReadout({ part: lid100, on: 'lid' }, bat100)).toBe('Dome and cap come off · too small for a lock at this size (roof 0.6 mm) – a twist-lock fits from 280 %');
+    expect(partReadout({ part: lid400, on: 'handle' }, bat400)).toBe('The handle stays on the lantern – click to take off the dome and cap under it');
+    expect(partReadout({ part: base400, on: 'base' }, bat400)).toBe('Base twists off underneath · Ø 57 mm opening · twist-lock, 3 lugs, turn 17°');
+    expect(partReadout({ part: base100, on: 'base' }, bat100)).toBe('Base · too small for a lock at this size – twists off from 205 %');
+    expect(partReadout({ part: { ...lid400, name: 'Top', handle: null }, on: 'lid' }, bat400)).toBe('Top comes off · twist-lock, 3 lugs, turn 19° · Ø 42 mm opening – takes a 38 mm tea light');
+    expect(partReadout({ part: null, on: null }, bat400)).toBeNull();
+    expect(HANDLE_PLANE).toBe('A cut here would take the handle with the top – click the dome to take off just the lid');
+    expect(MIXED_PART).toBe('The circle crosses the model above and around its plane here – use a full cut, or move it to where the circle crosses only air');
+    expect(stuckWords('Dome and cap', "the handle's crown", 'a leg')).toBe("Dome and cap can't come out: the handle's crown is over it and a leg is beside it");
+  });
+
+  it("says under a part's row what it gets: its twist-lock, why none fits, that it lifts off, or what moved or refused it", () => {
+    expect(partMeta({ hold: 'lock', lock: lid400.lock, handle: true })).toBe('twist-lock, 3 lugs, 6 clicks – turn 19° · the handle stays');
+    expect(partMeta({ hold: 'lock', kind: 'plug', lock: { mech: 'plug', theta: 23 } })).toBe('twist-lock, 3 lugs – turn 23° · coin slot');
+    expect(partMeta({ hold: 'lock', known: true, least: 280 })).toBe('lifts off – too small for a lock here (twist-lock from 280 %)');
+    expect(partMeta({ hold: 'lock', known: true })).toBe('lifts off – too small for a lock here');
+    expect(partMeta({ hold: 'lock', known: true, why: 'pieces' })).toBe('lifts off – a twist-lock would leave it in pieces');
+    expect(partMeta({ hold: 'lift', lock: null })).toBe('lifts off – sits on its cut face');
+    expect(partMeta({ hold: 'lift', kind: 'plug' })).toBe('lifts out – nothing holds it');
+    expect(partMeta({ hold: 'lock' })).toBe('comes off – Show pieces works out its lock');
+    expect(partMeta({ hold: 'lock', lock: lid400.lock, note: { code: 'PART_STUCK' } })).toBe("can't come out – see the note");
+    const gap = { code: 'PART_GAP', by: "the handle's feet", z: 115.4, need: 0.9 };
+    expect(partMeta({ hold: 'lock', note: { ...gap, movedTo: 115.6 } })).toBe("the circle runs too close to the handle's feet at Z 115.4 – moved to Z 115.6");
+    expect(partMeta({ hold: 'lock', note: gap })).toBe("the circle runs too close to the handle's feet at Z 115.4 – no face here leaves 0.9 mm");
+    expect(partMeta({ hold: 'lock', note: { code: 'PART_MIXED' } })).toBe('left out – see the note');
+  });
+
+  it('says what a part is doing as it comes out along its way: each step, its number, and how far', () => {
+    const dome = { name: 'Dome and cap', kind: 'lid', way: { turn: 19, up: false, lift: 4.6, dir: [0, 1, 0], out: [0, 0, 1], reach: 81 }, span: [-1, 0, 0] };
+    const at = (part, f) => wayCaption(part, wayStep(part.way, f));
+    expect(at(dome, 0)).toBeNull();
+    expect(at(dome, 0.1)).toBe('Dome and cap: 1 of 3 · Turn it 19° to the left – it clicks free');
+    expect(at(dome, 0.5)).toBe('Dome and cap: 2 of 3 · Lift it 5 mm');
+    expect(at(dome, 0.9)).toBe('Dome and cap: 3 of 3 · Slide it out under the handle, square to it');
+    expect(at(dome, 1)).toBeNull();
+    // along the handle, or with none, sideways; a lid that lifts off is not turned
+    expect(at({ ...dome, span: null, way: { ...dome.way, turn: 0 } }, 0.25)).toBe('Dome and cap: 1 of 2 · Lift it 5 mm');
+    expect(at({ ...dome, span: null, way: { ...dome.way, turn: 0 } }, 0.75)).toBe('Dome and cap: 2 of 2 · Slide it out sideways');
+    // straight off
+    expect(at({ name: 'Top', way: { turn: 27, up: true, lift: 0, dir: null, out: [0, 0, 1], reach: 50 } }, 0.75)).toBe('Top: 2 of 2 · Lift it off');
+    // the base, as it is fitted: seen from underneath
+    const base = { name: 'Base', kind: 'plug', way: { turn: 17, up: true, lift: 0, dir: null, out: [0, 0, -1], reach: 0 } };
+    expect(at(base, 0.25)).toBe('Base: 1 of 2 · Turn it 17° to the left, seen from underneath – it clicks free');
+    expect(at(base, 0.75)).toBe('Base: 2 of 2 · Lift it out');
+  });
+
+  it('says what a part is doing as it goes on again (Shift+▶): the steps the other way round, counted as they are done', () => {
+    const dome = { name: 'Dome and cap', kind: 'lid', way: { turn: 27, up: false, lift: 4.5, dir: [0, 1, 0], out: [0, 0, 1], reach: 60 }, span: [-1, 0, 0] };
+    const on = (part, f) => wayCaption(part, wayStep(part.way, f), { on: true });
+    expect(on(dome, 0.9)).toBe('Dome and cap: 1 of 3 · Slide it in under the handle, square to it');
+    expect(on(dome, 0.5)).toBe('Dome and cap: 2 of 3 · Lower it 4.5 mm into place');
+    expect(on(dome, 0.1)).toBe('Dome and cap: 3 of 3 · Turn it 27° to the right – it clicks shut');
+    expect(on(dome, 0)).toBeNull();
+    // straight on, turned to the left first; the base seen from underneath
+    expect(on({ name: 'Top', way: { turn: 27, up: true, lift: 0, dir: null, out: [0, 0, 1], reach: 50 } }, 0.75)).toBe('Top: 1 of 2 · Set it on, turned 27° to the left');
+    const base = { name: 'Base', kind: 'plug', way: { turn: 17, up: true, lift: 0, dir: null, out: [0, 0, -1], reach: 0 } };
+    expect(on(base, 0.75)).toBe('Base: 1 of 2 · Push it in');
+    expect(on(base, 0.25)).toBe('Base: 2 of 2 · Turn it 17° to the right, seen from underneath – it clicks shut');
+  });
+
+  it('says a cut across Z whose top holds some of a traced handle takes it with the top', () => {
+    const under = { axis: 'z', at: 112, why: 'under a ledge where the shape widens', lip: { H: 6, clips: 0 }, comesOff: { side: 1, length: 88, fraction: 0.44 } };
+    expect(takesHandle(under, bat400.handles)).toBe(true);
+    expect(spotLabel(under, 'lock', { handles: bat400.handles })).toBe('Z 112 mm – top 88 mm comes off · 6 mm lip without clips – lifts off · under a ledge where the shape widens – takes the handle with the top');
+    // over the handle's top, below the cut, or across X: not
+    expect(takesHandle({ ...under, at: 198 }, bat400.handles)).toBe(false);
+    expect(takesHandle({ ...under, comesOff: { side: -1, length: 112 } }, bat400.handles)).toBe(false);
+    expect(takesHandle({ ...under, axis: 'x' }, bat400.handles)).toBe(false);
+    expect(spotLabel(under, 'lock')).not.toContain('handle');
+  });
+});
+
+describe('a lip in short stretches', () => {
+  // just over the tips of a row of windows (the round lantern at 125): an opening's edge in its foot cuts the tongue
+  const at125 = { axis: 'z', at: 125, area: 820, islands: 1, lip: { H: 6, clips: 0, why: 'edge', broken: true }, noLip: null, suggestedAt: 125.5, suggestedLip: { H: 6, clips: 0, whole: true }, comesOff: { side: 1, length: 113, fraction: 0.47 } };
+
+  it('says so, and offers the half step where it is whole', () => {
+    expect(lipWords(at125, 'lock', 2)).toBe('6 mm lip in short stretches, no clips – lifts off – move up to 125.5, where it is whole');
+    expect(lipWords(at125, 'lift', 2)).toBe('6 mm lip in short stretches – lifts off – move up to 125.5, where it is whole');
+    expect(lipWords({ ...at125, lip: { ...at125.lip, clips: 2 } }, 'snap', 2)).toBe('clicks on with 2 clips – its lip in short stretches – move up to 125.5, where it is whole');
+    expect(lipWords({ ...at125, suggestedAt: null }, 'lock', 2)).toBe('6 mm lip in short stretches, no clips – lifts off');
+    expect(lipVerdict(at125, 'lift')).toBe('short');
+    // the move a target, which says what it snaps to
+    const [target] = aimTargets({ lip: { axis: 2, at: 125.5, full: false, H: 6, whole: true } });
+    expect(target).toEqual({ at: 125.5, kind: 'lip', whole: true });
+    expect(snappedWords(target, 2)).toBe('snapped to where the lip is whole, at 125.5 mm');
+  });
+});
+
+describe('picking a part on the model', () => {
+  // the lid's entry as pick mode reads it at 400 %: its face up to its cap inside its circle, the family's faces from
+  // 114.6, its free band at the face, and the handle's islands level by level (a leg each side, then the crown)
+  const lid = {
+    ...lid400, cap: 154.96, top: 166.4, from: 114.6, window: [30.86, 32.31],
+    handle: { legs: 2, span: [-1, 0], levels: [{ z: 115.4, boxes: [[-41, -3, -37, 3], [37, -3, 41, 3]] }, { z: 190, boxes: [[-41, -3, 41, 3]] }] },
+  };
+  const base = { ...base400, solidTop: 7.6, reach: 36.9 };
+  const table = { ...bat400, h: 0.8333, parts: [lid, base] };
+
+  it('picks the lid on it, the lid under the handle it leaves on, the lid just under its face, and the base on the bottom', () => {
+    expect(pickPart(table, [0, 0, 150])).toMatchObject({ part: lid, on: 'lid' });
+    expect(pickPart(table, [20, 10, 120])).toMatchObject({ part: lid, on: 'lid' });
+    // a leg beside the lid, and the crown over it: the handle, which stays
+    expect(pickPart(table, [39, 0, 115.5])).toMatchObject({ part: lid, on: 'handle' });
+    expect(pickPart(table, [0, 0, 190.5])).toMatchObject({ part: lid, on: 'handle' });
+    // just under the face, inside the band: the lid
+    expect(pickPart(table, [31, 0, 114])).toMatchObject({ part: lid, on: 'under' });
+    expect(pickPart(table, [10, 0, 3])).toMatchObject({ part: base, on: 'base' });
+    // the band round the lantern's middle, a post and the air between the legs: none
+    expect(pickPart(table, [45, 0, 60])).toEqual({ part: null, index: -1, on: null });
+    expect(pickPart(table, [39, 0, 150])).toEqual({ part: null, index: -1, on: null });
+    expect(partReadout(pickPart(table, [39, 0, 115.5]), table)).toBe('The handle stays on the lantern – click to take off the dome and cap under it');
+  });
+
+  it('says over a plane under the handle that it would take the handle with the top, where the lid alone comes off', () => {
+    expect(handlePlaneWords(bat400, 112)).toBe(HANDLE_PLANE);
+    expect(handlePlaneWords(bat400, 101)).toBe(HANDLE_PLANE);
+    // in the lower half the top a cut takes is most of the lantern: that the handle goes with it is no news there
+    expect(handlePlaneWords(bat400, 99)).toBeNull();
+    expect(handlePlaneWords(bat400, 20)).toBeNull();
+    expect(handlePlaneWords(bat400, 0.3)).toBeNull();
+    // over the handle's top, no parts table yet, no handle, or a lid that takes the handle with it: nothing
+    expect(handlePlaneWords(bat400, 198)).toBeNull();
+    expect(handlePlaneWords(null, 112)).toBeNull();
+    expect(handlePlaneWords({ ...bat400, handles: [] }, 112)).toBeNull();
+    expect(handlePlaneWords({ ...bat400, parts: [{ ...lid400, takesHandle: true }] }, 112)).toBeNull();
+  });
+
+  it("puts a part's face on the printer's layers, from the model's bottom or the cut under it", () => {
+    expect(partFace(85.93, { from: 0, hl: 0.2 })).toBe(86);
+    expect(partFace(115.66, { from: 0, hl: 0.2 })).toBe(115.6);
+    expect(partFace(115.66, { from: 0, hl: 0.12 })).toBe(115.68);
+    // over a cut at 40.05: its layers
+    expect(partFace(86, { from: 40.05, hl: 0.2 })).toBe(86.05);
+    expect(partFace(86.3, { from: 0, hl: 0 })).toBe(86.3);
+  });
+
+  it("keeps a part's circle in the free band round it, onto the band's middle from near it, and says which edge held it back", () => {
+    const band = { lo: 30.86, hi: 32.31, gmin: 0.9 };
+    // the finder's own width, from within the tolerance; elsewhere in the band as asked
+    expect(partWidth(31.5, { ...band, tol: 0.2 })).toEqual({ r: 31.585, edge: null });
+    expect(partWidth(31.5, { ...band, tol: 0 })).toEqual({ r: 31.5, edge: null });
+    // past either edge less half the gap a face needs to print apart: held there
+    expect(partWidth(40, band)).toEqual({ r: 31.86, edge: 'wide' });
+    expect(partWidth(20, band)).toEqual({ r: 31.31, edge: 'narrow' });
+    // a band too narrow to print apart in at all: its middle; none known: as asked
+    expect(partWidth(40, { lo: 30, hi: 30.5, gmin: 0.9 })).toEqual({ r: 30.25, edge: null });
+    expect(partWidth(40, { lo: null, hi: null, gmin: 0.9 })).toEqual({ r: 40, edge: null });
+    // the finder's own width as it gave it, not the middle of the band it gave rounded: snapped onto, it is its pick
+    expect(partWidth(23.6, { lo: 23.1435, hi: 24.1138, gmin: 0.9, tol: 0.1, mid: 23.6286 })).toEqual({ r: 23.6286, edge: null });
+    expect(partWidth(23.6, { lo: 23.1435, hi: 24.1138, gmin: 0.9, tol: 0.1 })).toEqual({ r: 23.6287, edge: null });
+    expect(widthWords(63.72, 'wide')).toBe('Ø 63.7 is as wide as fits here');
+    expect(widthWords(62.62, 'narrow')).toBe('Ø 62.6 is as narrow as fits here');
+    expect(widthWords(62, null)).toBe('');
+    // the band the circle lies in, else the nearest
+    const windows = [[2, 5.5], [30.86, 32.31], [40, 44]];
+    expect(bandOf(windows, 31)).toEqual({ lo: 30.86, hi: 32.31 });
+    expect(bandOf(windows, 35)).toEqual({ lo: 30.86, hi: 32.31 });
+    expect(bandOf(windows, 38)).toEqual({ lo: 40, hi: 44 });
+    expect(bandOf([], 38)).toBeNull();
+  });
+
+  it("says in a part's row where its face was moved to print apart, or to be one piece", () => {
+    const gap = { code: 'PART_GAP', z: 85.2, need: 0.9, by: "the handle's feet", islands: 1 };
+    expect(partMeta({ hold: 'lock', note: { ...gap, movedTo: 86 } })).toBe("the circle runs too close to the handle's feet at Z 85.2 – moved to Z 86");
+    expect(partMeta({ hold: 'lock', note: gap })).toBe("the circle runs too close to the handle's feet at Z 85.2 – no face here leaves 0.9 mm");
+    // through the cupola's ring of columns its face is in pieces
+    expect(partMeta({ hold: 'lock', note: { ...gap, z: 95, islands: 12, movedTo: 97.4 } })).toBe('its face at Z 95 is in 12 pieces – moved to Z 97.4');
+    expect(partMeta({ hold: 'lock', note: { ...gap, z: 95, islands: 12 } })).toBe('its face at Z 95 is in 12 pieces – no face near here is one piece');
+  });
+
+  it('says why a cut asked to lock gets no lock: a round wall with no straight stretch for a clip, or otherwise', () => {
+    expect(noLockOf({ H: 6, clips: 4, why: [] })).toBeNull();
+    expect(noLockOf({ H: 6, clips: 0, why: ['short'], twist: { theta: 10, tabs: 6 } })).toBeNull();
+    expect(noLockOf({ H: 6, clips: 0, why: ['short'] })).toBe('round');
+    expect(noLockOf({ H: 4.5, clips: 0, why: ['height'] })).toBe('other');
+    expect(noLockOf(null)).toBe('other');
+    expect(noLockTitle('round')).toBe('A round wall takes no clips – try a removable part (+ Removable part)');
+    expect(noLockTitle('other')).toBe('No clip or twist-lock fits this cut here – try a removable part (+ Removable part)');
   });
 });

@@ -4670,6 +4670,10 @@ function cachedLock(lock) {
       part: { add: place(s.part.add), cut: place(s.part.cut), after: place(s.part.after) },
       fill: s.fill,
       ids: s.ids,
+      carry: s.carry,
+      bare: s.bare,
+      lugs: s.lugs,
+      points: s.points.map((x) => ({ ...x, at: applyMat4(M, x.at) })),
     };
   });
 }
@@ -4679,6 +4683,28 @@ function cachedLock(lock) {
  * are the lock's own faces.
  */
 export const lockIds = (lock) => [...cachedLock(lock).ids];
+
+/**
+ * A lock's faces for the view, as the pieces drilled with it now have them: `lock` the ids of what is the lock (neck,
+ * grooves, slots, click tabs, coin slot), `lug` its lugs', painted apart so they stand out of the neck, `carry` of what
+ * carries it (the collar, the socket ring), which is painted lighter; a plug's wall, its own outside turned down to the
+ * bore's clearance, is none of them. Taken when the pieces are drilled, as a lock built again has new ids.
+ */
+export function lockFaces(lock) {
+  const L = cachedLock(lock);
+  const carry = new Set(L.carry);
+  const bare = new Set(L.bare);
+  const lugs = new Set(L.lugs);
+  return { lock: L.ids.filter((id) => !carry.has(id) && !bare.has(id) && !lugs.has(id)), carry: [...carry], lug: [...lugs] };
+}
+
+/**
+ * Where a lock's lugs, slots and click tabs are, in the world as its pieces were drilled: `{ name, on, at }`, `on`
+ * 'body' or 'part' – the piece the view puts each word on.
+ */
+export function lockPoints(lock) {
+  return cachedLock(lock).points;
+}
 
 /**
  * A piece the collar was added to with the sealed pockets it closed filled: the hollow shells of `m` that `before`
@@ -4884,14 +4910,17 @@ export function drillPiece(solid, layout, pieceIndex, { font = null, marks = nul
  * end to end, vertex ids shifted, so every piece (and pin, and part) is one
  * contiguous range the viewer can move on its own. No BVH, so the ranges
  * stay in order.
- * @param {{ solid?: Manifold|null, soup?: Float32Array|null, part?: object }[]} entries solids borrowed; `soup` unrepaired
- *   triangles of that piece; `part` what the range is (`{ kind: 'piece', index }`, `{ kind: 'pin', cell }`, …)
+ * @param {{ solid?: Manifold|null, soup?: Float32Array|null, part?: object, marks?: Map<number, number>|null }[]} entries
+ *   solids borrowed; `soup` unrepaired triangles of that piece; `part` what the range is (`{ kind: 'piece', index }`,
+ *   `{ kind: 'pin', cell }`, …); `marks` the original ids of the locks' primitives the piece was drilled with, each to
+ *   its mark (`displayBuffers`)
  * @returns {{ positions: Float32Array, normals: Float32Array, index: Uint32Array, passthroughStart: number,
- *   passthroughRanges: number[][], ranges: number[][], parts: object[], bvhRoots: [] }}
- *   ranges `[triStart, triCount, vertStart, vertCount]`, one per entry
+ *   passthroughRanges: number[][], ranges: number[][], markRanges: number[][], parts: object[], bvhRoots: [] }}
+ *   ranges `[triStart, triCount, vertStart, vertCount]`, one per entry; markRanges `[triStart, triCount, mark]` over
+ *   them all
  */
 export function buildSplitDisplay(entries) {
-  const built = entries.map(({ solid = null, soup = null }) => displayBuffers(solid, soup));
+  const built = entries.map(({ solid = null, soup = null, marks = null }) => displayBuffers(solid, soup, marks));
   const verts = built.reduce((n, b) => n + b.positions.length / 3, 0);
   const tris = built.reduce((n, b) => n + b.index.length / 3, 0);
   const positions = new Float32Array(verts * 3);
@@ -4899,6 +4928,7 @@ export function buildSplitDisplay(entries) {
   const index = new Uint32Array(tris * 3);
   const ranges = [];
   const passthroughRanges = [];
+  const markRanges = [];
   let v0 = 0;
   let t0 = 0;
   built.forEach((b) => {
@@ -4909,6 +4939,7 @@ export function buildSplitDisplay(entries) {
     for (let i = 0; i < b.index.length; i++) index[t0 * 3 + i] = b.index[i] + v0;
     ranges.push([t0, nt, v0, nv]);
     if (b.passthroughStart < nt) passthroughRanges.push([t0 + b.passthroughStart, nt - b.passthroughStart]);
+    for (const [start, count, mark] of b.markRanges ?? []) markRanges.push([t0 + start, count, mark]);
     v0 += nv;
     t0 += nt;
   });
@@ -4919,6 +4950,7 @@ export function buildSplitDisplay(entries) {
     passthroughStart: passthroughRanges.length ? passthroughRanges[0][0] : tris,
     passthroughRanges,
     ranges,
+    markRanges,
     parts: entries.map((e) => e.part ?? null),
     bvhRoots: [],
   };

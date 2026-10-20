@@ -12,6 +12,7 @@ import {
   APART_HOLDS, FILAMENT, SPLIT_DEFAULTS, TO_PLANE, cellSizes, cellSupport, fitPieces, isSymmetric, orientationStats, pegSizesFor, sizesFor,
 } from '../src/split.js';
 import { clearSplitCaches, dowelHole, halfHole, pegAt, pinAt, pinSolid, socketAt } from '../src/splitGeometry.js';
+import { lipLine, lipVerdict } from '../src/aim.js';
 import { setup, soupOf as soupGeometry } from './helpers.js';
 import { box, gothicSolid, lanternSolid, lidBoxSolid, lift, loggiaSolid, roundLanternSolid, slenderTowerSolid, stlCheck, stlFileCheck } from './lanternFixture.js';
 
@@ -2450,6 +2451,45 @@ describe('placing a cut that comes apart', () => {
     const r = await spots();
     expect(r.spots[0]).toMatchObject({ at: 59.5, seam: 60, why: 'under a ledge where the shape widens' });
     expect(r.spots.filter((s) => /openings/.test(s.why))).toEqual([]);
+  });
+
+  it('across two parts side by side the readout counts the clips the download makes: a top of two heights carries no lip', async () => {
+    const { Manifold } = wasm;
+    const can = (x, h, lid) => own(Manifold.union([
+      own(own(box([x - 25, -25, 0], [x + 25, 25, lid + 0.5])).subtract(own(box([x - 22, -22, 3], [x + 22, 22, h - 3])))),
+      own(own(box([x - 26, -26, lid], [x + 26, 26, h])).subtract(own(box([x - 22, -22, 3], [x + 22, 22, h - 3])))),
+    ]));
+    await load(own(Manifold.union([can(-35, 80, 60), can(35, 50, 35)])), 'two');
+    const made = async (at) => (await exportSplit({ ...SPLIT_DEFAULTS, cuts: [apartAt(at)] })).seams.filter((x) => x.apart?.lip).reduce((n, x) => n + x.apart.clips, 0);
+    // at 46.5 the top is one piece of the two canisters' tops, 80 and 50 high: it can't lie on them, so the lip stands up
+    // out of the bottoms – a full one into the tall can's top, none into the short one's 3.5 mm lid
+    expect((await probe(46.5)).lip).toMatchObject({ H: 6, clips: 4 });
+    expect(await made(46.5)).toBe(4);
+    // at 34.5 the tops are two pieces, each a lip of its own
+    expect((await probe(34.5)).lip).toMatchObject({ H: 6, clips: 7 });
+    expect(await made(34.5)).toBe(7);
+    expect((await spots()).spots.find((x) => x.at === 46.5)?.lip).toEqual({ H: 6, clips: 4 });
+  });
+
+  it('a roof modelled as a shell of its own on the body keeps its seam: only a shell beside another loses it', async () => {
+    // no eave, and a dome wider than the body's walls: it stands on the body's top edge without touching it
+    const model = own(roundLanternSolid({ eaveR: 0, domeR: 49 }));
+    const shells = model.decompose();
+    expect(shells.length).toBe(2);
+    shells.forEach((m) => m.delete());
+    await load(model, 'stacked');
+    expect((await targets()).seams.find((x) => Math.abs(x.at - 148) < 0.01)).toMatchObject({ kind: 'widens' });
+    expect((await spots()).spots[0]).toMatchObject({ seam: 148, why: 'under a ledge where the shape widens' });
+  });
+
+  it('a place tried by hand whose lip comes in short stretches says so, and offers the half step where it is whole', async () => {
+    await load(own(roundLanternSolid({ eaveR: 47 })), 'round');
+    const p = await probe(125);
+    expect(p).toMatchObject({ lip: { H: 6, clips: 0, why: 'edge', broken: true }, suggestedAt: 125.5, suggestedLip: { H: 6, clips: 0, whole: true } });
+    expect(lipLine(2, p, 'lock')).toMatch(/^6 mm lip in short stretches, no clips – lifts off – move up to 125\.5, where it is whole · top [\d.]+ mm comes off$/);
+    expect(lipVerdict(p, 'lock')).toBe('short');
+    // half a step up it is whole, with nothing more to offer
+    expect((await probe(125.5)).suggestedAt).toBeNull();
   });
 
   it('a lid groove on a box taller than 200 mm is found though it falls between two samples, and so is its spot', async () => {

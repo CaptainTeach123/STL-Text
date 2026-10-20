@@ -432,11 +432,16 @@
               <span class="hint">Where should it come apart?</span>
               <button type="button" id="suggestSpotsBtn" class="btn small" title="The best places for a cut that comes apart: where a full lip with clips fits, by a ledge or a change of shape, with a sensible part coming off">Suggest spots</button>
             </div>
+            <div class="parts-card" id="partsCard" hidden>
+              <h3 class="parts-title">Parts that come off</h3>
+              <p class="hint parts-note" id="partsNote" aria-live="polite" hidden></p>
+              <ul class="part-list" id="partList" aria-label="Parts that come off"></ul>
+            </div>
             <p class="hint spots-note" id="spotsNote" aria-live="polite" hidden></p>
             <ul class="spot-list" id="spotList" aria-label="Good spots for a cut that comes apart"></ul>
           </div>
           <div class="split-settings" id="splitSettings" hidden>
-            <span class="label">Joints</span>
+            <span class="label" id="splitJointsLabel">Joints</span>
             <fieldset class="seg wide joints" aria-label="Joints">
               <label title="Auto: printed pins; dovetail tabs through thin plates"><input type="radio" name="splitJoint" data-split="joint" value="auto" checked /><span>Auto</span></label>
               <label title="Pins in matching holes on both faces of every cut"><input type="radio" name="splitJoint" data-split="joint" value="dowels" /><span>Pins</span></label>
@@ -497,7 +502,7 @@
           <ul class="plan" id="pieceList" aria-label="Pieces"></ul>
           <div class="row spread" id="piecesHint" hidden>
             <span class="hint">Sizes of the boxes between the cuts.</span>
-            <button type="button" id="showPiecesBtn" class="btn small" title="Work out the real pieces, their joints and how each one lies">Show the pieces</button>
+            <button type="button" id="showPiecesBtn" class="btn small" title="Work out the real pieces, their joints and how each one lies">Show pieces</button>
           </div>
           <ul class="notes" id="splitNotes" aria-live="polite"></ul>
         </section>
@@ -524,8 +529,8 @@
           <button type="button" id="undoBtn" class="btn" disabled title="Ctrl+Z">Undo</button>
           <button type="button" id="redoBtn" class="btn" disabled title="Ctrl+Y">Redo</button>
           <button type="button" id="downloadBtn" class="btn accent">Download STL</button>
+          <p id="status" class="status" role="status" aria-live="polite"></p>
         </div>
-        <p id="status" class="status" role="status" aria-live="polite"></p>
         <footer class="foot">
           <a href="https://github.com/captainteach123/stl-text" target="_blank" rel="noreferrer">Source on GitHub</a>
           · Bundled fonts: SIL Open Font License
@@ -533,19 +538,33 @@
       </aside>
 
       <main class="stage" id="stage" aria-label="3D preview">
-        <div class="legend" aria-hidden="true">
-          <span><i class="dot model"></i> model</span>
-          <span><i class="dot emboss"></i> raised text</span>
-          <span><i class="dot engrave"></i> cut text</span>
-          <span id="legendPass" hidden><i class="dot pass"></i> unrepaired</span>
-          <span id="legendCut" hidden><i class="dot cut"></i> cut</span>
-          <span id="legendApart" hidden><i class="dot apart"></i> comes apart</span>
-          <span id="legendPieces" hidden><i class="dot pieces"></i> pieces</span>
+        <div class="stage-top">
+          <div class="legend" aria-hidden="true">
+            <span id="legendModel"><i class="dot model"></i> model</span>
+            <span id="legendRaised"><i class="dot emboss"></i> raised text</span>
+            <span id="legendEngraved" hidden><i class="dot engrave"></i> cut text</span>
+            <span id="legendPass" hidden><i class="dot pass"></i> unrepaired</span>
+            <span id="legendCut" hidden><i class="dot cut"></i> cut</span>
+            <span id="legendApart" hidden><i class="dot apart"></i> comes apart</span>
+            <span id="legendPieces" hidden><i class="dot pieces"></i> pieces</span>
+            <span id="legendLock" hidden><i class="dot lock"></i> lock</span>
+            <span id="legendLugs" hidden><i class="dot lug"></i> lugs</span>
+            <span id="legendOver" hidden><i class="dot over"></i> lock overhang</span>
+            <span id="legendBridge" hidden><i class="dot bridge"></i> bridged</span>
+          </div>
+          <div class="stage-tools">
+            <label class="check pill" id="spreadField" title="How far apart the pieces are drawn" hidden>Spread <input type="range" id="spreadRange" min="0" max="2" step="0.05" value="1" aria-label="Spread the pieces apart" /></label>
+            <label class="check pill" title="Compute the real merged result (takes a moment on big models)"><input type="checkbox" id="resultToggle" /> <span id="resultLabel">Show final result</span></label>
+            <button type="button" id="frameBtn" class="btn small">Reset view</button>
+          </div>
         </div>
-        <div class="stage-tools">
-          <label class="check pill" id="spreadField" title="How far apart the pieces are drawn" hidden>Spread <input type="range" id="spreadRange" min="0" max="2" step="0.05" value="1" aria-label="Spread the pieces apart" /></label>
-          <label class="check pill" title="Compute the real merged result (takes a moment on big models)"><input type="checkbox" id="resultToggle" /> <span id="resultLabel">Show final result</span></label>
-          <button type="button" id="frameBtn" class="btn small">Reset view</button>
+        <div class="lock-panel" id="lockPanel" hidden>
+          <div id="wayCaption" class="way-caption" role="status" aria-live="polite" hidden></div>
+          <div class="lock-tools">
+            <button type="button" id="playWayBtn" class="btn small" title="Each part turned free, lifted and slid out along its way out (Shift: how it goes on)">▶ Show how it comes apart</button>
+            <button type="button" id="lookLockBtn" class="btn small" title="Put the part aside and look at its twist-lock close up">Look at the lock</button>
+            <label class="check pill" title="Each piece as it lies on the bed: what its lock adds that overhangs is red, its bridged ceilings are outlined"><input type="checkbox" id="asPrintedToggle" /> As printed</label>
+          </div>
         </div>
         <div id="cutReadout" class="cut-readout" hidden></div>
         <div id="progress" class="progress" hidden><div class="spinner"></div><span id="progressText">Working…</span></div>

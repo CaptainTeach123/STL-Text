@@ -9,7 +9,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "e2e": "node e2e/smoke.mjs"
+    "e2e": "node e2e/smoke.mjs",
+    "bench:lantern": "node scripts/bench-lantern.mjs"
   },
   "dependencies": {
     "manifold-3d": "^3.5.4",

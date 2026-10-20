@@ -6,9 +6,11 @@
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
 import { FINE_SPECK, SPECK, WAY_START, findParts, fineSlices, plugLockOf, sliceStack } from '../src/partFinder.js';
-import { bandFor, carveParts, checkPart, cutTwist, drillPiece, lockIds, lockMatrix, lockPieces, wayOverlaps } from '../src/splitGeometry.js';
+import { bandFor, buildSplitDisplay, carveParts, checkPart, cutTwist, drillPiece, lockFaces, lockIds, lockMatrix, lockPieces, lockPoints, wayOverlaps } from '../src/splitGeometry.js';
+import { displayBuffers } from '../src/mesh.js';
+import { unmarkJoint } from '../src/viewer.js';
 import { LOCK_SEGMENTS, lockSolids, plugLockSolids, twistCoupon, twistLockSolids } from '../src/lockGeometry.js';
-import { layout, plugLayoutOk, sizes } from '../src/locks.js';
+import { layout, plugLayoutOk, sizes, slitBridge } from '../src/locks.js';
 import { setup } from './helpers.js';
 import { batLanternSolid, overhangs, roundLanternSolid, stlCheck } from './lanternFixture.js';
 
@@ -286,6 +288,28 @@ describe("the dome and cap's collar twist-lock, on the fixture modelled on the u
     expect(bodyNew.length).toBeGreaterThan(0);
     for (const o of bodyNew) expect(o.width).toBeLessThanOrEqual(0.5);
     expect(added(plainUnder, bodyUnder).some((o) => o.width > 3)).toBe(true);
+  });
+
+  it("bridges its click tabs' slits no further than the print note says: the roof over each, along its middle", () => {
+    // the slit over each tab, cut through to the outside of the slots' arms: an island a tab, its length round the axis
+    // at the middle of the strip the roof spans – 10.4 mm at 300 %, a wide nozzle's longer tab more
+    for (const [n, hl, r0, long] of [[0.4, 0.2, 15.88, 10.41], [0.4, 0.2, 23.71, 10.21], [0.6, 0.3, 23.71, 12.97]]) {
+      const S = sizes(n, hl, 0.15);
+      const L = twistLockSolids(S, r0);
+      [L.neck, L.lugs, L.grooves, L.cutters, L.disc, L.ridges].forEach(own);
+      const rs = r0 + S.c;
+      const ro = rs + S.td + S.g;
+      const band = own(own(wasm.CrossSection.circle(ro - 0.05, 720)).subtract(own(wasm.CrossSection.circle(r0 + 2 * S.c + S.e + 0.05, 720))));
+      const roofs = own(own(L.cutters.slice(S.b + S.gTop - 0.05)).intersect(band)).decompose().map(own);
+      expect(roofs).toHaveLength(L.layout.tabs.length);
+      for (const roof of roofs) {
+        const points = roof.toPolygons().flat();
+        const mid = Math.atan2(points.reduce((a, p) => a + p[1], 0), points.reduce((a, p) => a + p[0], 0));
+        const off = points.map(([x, y]) => Math.atan2(x * Math.sin(-mid) + y * Math.cos(-mid), x * Math.cos(-mid) - y * Math.sin(-mid)));
+        expect((Math.max(...off) - Math.min(...off)) * (rs + ro) / 2).toBeCloseTo(slitBridge(S, r0).long, 2);
+      }
+      expect(slitBridge(S, r0)).toEqual({ long: expect.closeTo(long, 2), across: r4(S.td + S.g) });
+    }
   });
 
   it('a looser clearance gives a smaller neck that still fits, its face a layer up; at 200 % no tab fits, and nothing is drilled', () => {
@@ -575,6 +599,23 @@ describe('when the lock meets something else', () => {
     expect(wayOverlaps(plate, bar, { ...way, turn: 0 }).overlaps[0]).toBe(0);
   });
 
+  it('says where its lugs, slots and click tabs are, each on the piece it is part of, for the words the view puts on them', () => {
+    const b = built(bat(3), LID[3]);
+    const points = lockPoints(b.lock);
+    const of = (name) => points.filter((x) => x.name === name);
+    expect(of('lug').length).toBe(3);
+    expect(of('slot').length).toBe(3);
+    expect(of('click tab').length).toBe(b.lock.S ? layout(b.lock.S, b.lock.r0, { theta: b.lock.theta }).tabs.length : 0);
+    expect(of('lug').every((x) => x.on === 'body') && [...of('slot'), ...of('click tab')].every((x) => x.on === 'part')).toBe(true);
+    // a lug and a click tab are material of their piece, a slot is the air the lug turns in
+    const { Manifold } = wasm;
+    const inside = (m, at) => !own(m.intersect(own(Manifold.cube([0.2, 0.2, 0.2], true).translate(at)))).isEmpty();
+    expect(of('lug').every((x) => inside(b.body, x.at))).toBe(true);
+    expect(of('click tab').every((x) => inside(b.part, x.at))).toBe(true);
+    expect(of('slot').some((x) => inside(b.part, x.at))).toBe(false);
+    expect(of('slot').every((x) => inside(own(b.part.hull()), x.at))).toBe(true);
+  });
+
   it("marks the lock's own faces: each piece's mesh keeps its primitives' ids through the drilling", () => {
     const b = built(bat(3), LID[3]);
     const ids = new Set(lockIds(b.lock));
@@ -599,6 +640,82 @@ describe('when the lock meets something else', () => {
     expect([...part.values()].reduce((x, y) => x + y, 0)).toBeGreaterThan(500);
     // the model's own faces carry none of them
     expect(runsOf(b.carved.body).size).toBe(0);
+    // what carries the lock – the collar, the socket ring – told from the lock itself, for the view to paint lighter;
+    // and its lugs, painted apart so they stand out of the neck: on the body only
+    const faces = lockFaces(b.lock);
+    expect(faces.carry.length).toBeGreaterThan(0);
+    expect(faces.lug.length).toBeGreaterThan(0);
+    expect(new Set([...faces.lock, ...faces.carry, ...faces.lug])).toEqual(ids);
+    expect(faces.lock.some((id) => faces.carry.includes(id) || faces.lug.includes(id))).toBe(false);
+    expect(faces.lug.some((id) => faces.carry.includes(id))).toBe(false);
+    expect(faces.lug.reduce((n, id) => n + (body.get(id) ?? 0), 0)).toBeGreaterThan(50);
+    expect(faces.lug.some((id) => part.has(id))).toBe(false);
+    // the view's buffers mark those runs' triangles, neighbouring runs of one mark joined, and the pieces view lays each
+    // piece's marks after the pieces before it
+    const marks = new Map([...faces.lock.map((id) => [id, 0]), ...faces.carry.map((id) => [id, 1]), ...faces.lug.map((id) => [id, 2])]);
+    const total = (ranges, m = null) => ranges.filter((x) => m == null || x[2] === m).reduce((n, x) => n + x[1], 0);
+    const own = displayBuffers(b.body, null, marks);
+    expect(total(own.markRanges)).toBe([...body.values()].reduce((x, y) => x + y, 0));
+    expect(total(own.markRanges, 0)).toBeGreaterThan(500);
+    expect(total(own.markRanges, 1)).toBeGreaterThan(100);
+    for (let i = 1; i < own.markRanges.length; i++) {
+      const [p, q] = [own.markRanges[i - 1], own.markRanges[i]];
+      expect(q[0]).toBeGreaterThanOrEqual(p[0] + p[1]);
+      expect(q[0] === p[0] + p[1] && q[2] === p[2]).toBe(false);
+    }
+    expect(displayBuffers(b.body).markRanges).toBeUndefined();
+    expect(displayBuffers(b.carved.body, null, marks).markRanges).toEqual([]);
+    const both = buildSplitDisplay([{ solid: b.body, marks }, { solid: b.part, marks }, { solid: b.carved.body }]);
+    const [[, n1], [s2, n2]] = both.ranges;
+    const lidOwn = displayBuffers(b.part, null, marks);
+    expect(both.markRanges).toEqual([...own.markRanges, ...lidOwn.markRanges.map(([t, n, m]) => [t + s2, n, m])]);
+    expect(both.markRanges.every(([t, n]) => t + n <= n1 || (t >= s2 && t + n <= s2 + n2))).toBe(true);
+    // the collar is added flush with the body's face, so some of the face's triangles come out with its id: the view
+    // gives those back to the face, and keeps the collar's own (under the face, out of its plane)
+    const cls = new Uint8Array(own.index.length / 3);
+    for (const [t, n, m] of own.markRanges) cls.fill(m + 2, t, t + n);
+    const carried = () => cls.reduce((n, k) => n + (k === 3), 0);
+    const onFace = () => {
+      let n = 0;
+      for (let t = 0; t < cls.length; t++) if (cls[t] === 3 && [0, 1, 2].every((k) => Math.abs(own.positions[own.index[t * 3 + k] * 3 + 2]) < 1e-3)) n++;
+      return n;
+    };
+    const [was, wasOnFace] = [carried(), onFace()];
+    expect(wasOnFace).toBeGreaterThan(10);
+    expect(unmarkJoint(cls, 3, own.index, own.positions, [0, 0, 0], [0, 0, 1])).toBe(wasOnFace);
+    expect([onFace(), carried()]).toEqual([0, was - wasOnFace]);
+    expect(carried()).toBeGreaterThan(100);
+    // the lock's own faces (class 2) are left alone, and a plane elsewhere takes nothing
+    expect(unmarkJoint(cls, 2, own.index, own.positions, [0, 0, 0], [0, 0, 1])).toBe(0);
+    expect(unmarkJoint(cls, 3, own.index, own.positions, [0, 0, -0.5], [0, 0, 2])).toBe(0);
+  });
+
+  it("paints none of a base's own outside: its wall, turned down to the bore's clearance, is no part of its lock", () => {
+    const b = built(bat(3), BASE[3]);
+    const faces = lockFaces(b.lock);
+    const wall = lockIds(b.lock).filter((id) => !faces.lock.includes(id));
+    expect([faces.carry, wall.length > 0]).toEqual([[], true]);
+    // the plug's marked triangles: its lugs, slits, tabs, mouths and coin slot – hardly any of its wall at r = R − c
+    const d = displayBuffers(b.part, null, new Map(faces.lock.map((id) => [id, 0])));
+    const R = BASE[3].R;
+    const marked = new Set(d.markRanges.flatMap(([t0, n]) => Array.from({ length: n }, (_, i) => t0 + i)));
+    const area = { wall: 0, painted: 0 };
+    let lugs = 0;
+    for (let t = 0; t < d.index.length / 3; t++) {
+      const p = [0, 1, 2].map((k) => [...d.positions.subarray(d.index[t * 3 + k] * 3, d.index[t * 3 + k] * 3 + 3)]);
+      const r = p.map(([x, y]) => Math.hypot(x, y));
+      if (marked.has(t) && r.some((x) => x > R)) lugs++;
+      // a face of the wall: every corner on it
+      if (!r.every((x) => Math.abs(x - (R - b.lock.S.c)) < 0.02)) continue;
+      const [u, v] = [1, 2].map((k) => p[k].map((c, a) => c - p[0][a]));
+      const a = Math.hypot(u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]) / 2;
+      area.wall += a;
+      if (marked.has(t)) area.painted += a;
+    }
+    expect(area.wall).toBeGreaterThan(500);
+    expect(area.painted / area.wall).toBeLessThan(0.05);
+    expect(lugs).toBeGreaterThan(20); // the lugs stand out past the bore
+    expect(marked.size).toBeGreaterThan(300);
   });
 });
 

@@ -171,7 +171,7 @@ function shadedMesh(solid, creaseDeg) {
         normals[i * 3 + a] = m.vertProperties[i * m.numProp + 3 + a];
       }
     }
-    return { positions, normals, index: m.triVerts.slice() };
+    return { positions, normals, index: m.triVerts.slice(), runs: runsOf(m) };
   }
   const xyz = mesh.vertProperties;
   const topology = normalsTopology(index, xyz.length / 3);
@@ -200,7 +200,18 @@ function shadedMesh(solid, creaseDeg) {
       normals[k * 3 + a] = corner[3 * c + a];
     }
   });
-  return { positions, normals, index: out };
+  return { positions, normals, index: out, runs: runsOf(mesh) };
+}
+
+/** A mesh's runs, each `[first triangle, triangles, original id]`, in its triangles' order. */
+function runsOf(mesh) {
+  const { runIndex, runOriginalID } = mesh;
+  const runs = [];
+  for (let r = 0; r + 1 < (runIndex?.length ?? 0); r++) {
+    const n = (runIndex[r + 1] - runIndex[r]) / 3;
+    if (n > 0) runs.push([runIndex[r] / 3, n, runOriginalID[r]]);
+  }
+  return runs;
 }
 
 /**
@@ -212,12 +223,27 @@ function shadedMesh(solid, creaseDeg) {
  * Returns { positions, normals, index, passthroughStart } where
  * passthroughStart is the first *triangle* index belonging to the soup
  * (== total triangles when there is none). All arrays are transferable.
+ * With `marks` (original id → a mark), also `markRanges`: the solid's
+ * triangles made from one of those primitives – a lock's own faces, which
+ * keep their primitive's id through every boolean – as `[first triangle,
+ * triangles, mark]`, neighbouring runs of one mark joined.
  */
-export function displayBuffers(solid, passthrough = null) {
+export function displayBuffers(solid, passthrough = null, marks = null) {
   let sPos = new Float32Array(0);
   let sNor = new Float32Array(0);
   let sIdx = new Uint32Array(0);
-  if (solid && !solid.isEmpty()) ({ positions: sPos, normals: sNor, index: sIdx } = shadedMesh(solid, 36));
+  let runs = [];
+  if (solid && !solid.isEmpty()) ({ positions: sPos, normals: sNor, index: sIdx, runs } = shadedMesh(solid, 36));
+  const markRanges = [];
+  if (marks?.size) {
+    for (const [t0, n, id] of runs) {
+      const mark = marks.get(id);
+      if (mark === undefined) continue;
+      const last = markRanges[markRanges.length - 1];
+      if (last && last[2] === mark && last[0] + last[1] === t0) last[1] += n;
+      else markRanges.push([t0, n, mark]);
+    }
+  }
   const pTris = passthrough ? Math.floor(passthrough.length / 9) : 0;
   const total = sPos.length / 3 + pTris * 3;
   const positions = new Float32Array(total * 3);
@@ -246,7 +272,7 @@ export function displayBuffers(solid, passthrough = null) {
     vo += 3;
     io += 3;
   }
-  return { positions, normals, index, passthroughStart: sIdx.length / 3, solidVertexCount: sPos.length / 3 };
+  return { positions, normals, index, passthroughStart: sIdx.length / 3, solidVertexCount: sPos.length / 3, ...(marks ? { markRanges } : {}) };
 }
 
 /** BufferGeometry from display buffers (shares the arrays). */

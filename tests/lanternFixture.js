@@ -255,10 +255,11 @@ export function loggiaSolid() {
  * A round Gothic lantern like the user's: a plinth (r 50 to z 5, r 47.5 to 8.5), a fretwork body – a tube r 45, 3 mm
  * walls, from z 8 to 148, two tiers of 12 pointed windows 10 wide (z 20–58 and 80–116, their tips 8.66 higher) and a
  * row of 12 round holes between – an eave ring r `eaveR` from 148 to 152 (none when `eaveR` is 0, the dome then on
- * the body), a hollow dome r 47 (3 mm) on it, spikes round its rim, a columned cap with a finial on top and an arched
- * handle on two bosses. `seg` sides to every circle.
+ * the body), a hollow dome r `domeR` (3 mm) on it, spikes round its rim, a columned cap with a finial on top and an
+ * arched handle on two bosses. `seg` sides to every circle. With no eave, a dome wider than the body's walls (`domeR`
+ * 49) stands on the body's top edge without touching it: a roof modelled as a shell of its own.
  */
-export function roundLanternSolid({ seg = 96, eaveR = 50 } = {}) {
+export function roundLanternSolid({ seg = 96, eaveR = 50, domeR = 47 } = {}) {
   const { Manifold, CrossSection } = manifold();
   const temps = [];
   const t = (m) => {
@@ -285,22 +286,22 @@ export function roundLanternSolid({ seg = 96, eaveR = 50 } = {}) {
     parts.push(body);
     const foot = eaveR ? 152 : 148; // where the dome stands
     if (eaveR) parts.push(t(cyl(eaveR, eaveR, 148, 152).subtract(cyl(42, 42, 147.9, 152.1))));
-    const dome = t(t(t(Manifold.sphere(47, seg)).translate([0, 0, foot])).subtract(t(t(Manifold.sphere(44, seg)).translate([0, 0, foot]))));
+    const dome = t(t(t(Manifold.sphere(domeR, seg)).translate([0, 0, foot])).subtract(t(t(Manifold.sphere(domeR - 3, seg)).translate([0, 0, foot]))));
     parts.push(t(dome.intersect(b([-60, -60, foot], [60, 60, 260]))));
-    const ring = eaveR ? eaveR - 2.2 : 45.5;
+    const ring = eaveR ? eaveR - 2.2 : domeR - 1.5;
     for (let k = 0; k < 16; k++) {
       const a = (2 * Math.PI * k) / 16;
       parts.push(t(t(Manifold.cylinder(14, 2, 0.3, 24)).translate([ring * Math.cos(a), ring * Math.sin(a), foot])));
     }
     // the cap on the dome's top: a plinth, six columns, a cap disc, a dome and a finial
-    const top = foot + 47;
+    const top = foot + domeR;
     parts.push(cyl(11, 11, top - 3, top + 1.5, 48));
     for (let k = 0; k < 6; k++) parts.push(t(t(Manifold.cylinder(10, 1.6, 1.6, 16)).translate([8 * Math.cos((k * Math.PI) / 3), 8 * Math.sin((k * Math.PI) / 3), top + 1.4])));
     parts.push(cyl(12, 12, top + 11.3, top + 14.5, 48));
     parts.push(t(t(t(Manifold.sphere(8, 48)).translate([0, 0, top + 14.4])).intersect(b([-9, -9, top + 14.4], [9, 9, top + 23]))));
     parts.push(t(t(Manifold.cylinder(18, 2.6, 0.4, 24)).translate([0, 0, top + 21])));
     // the handle: two bosses on the dome and an arch over the cap
-    const boss = foot + Math.sqrt(47 * 47 - 34 * 34);
+    const boss = foot + Math.sqrt(domeR * domeR - 34 * 34);
     for (const x of [-34, 34]) parts.push(t(cyl(5, 5, boss - 3.4, boss + 5.1, 32).translate([x, 0, 0])));
     const tube = t(t(CrossSection.circle(3.2, 24)).translate([34, 0]));
     parts.push(t(t(t(Manifold.revolve(tube, 64, 180)).rotate([90, 0, 0])).translate([0, 0, boss + 5])));

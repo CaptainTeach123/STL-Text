@@ -77,7 +77,9 @@ export const OVER = 1e-4;
 /** Fine slices keep islands of this share of a speck and more: a sliver at the face would close a window. */
 export const FINE_SPECK = 0.01;
 /** The least scale is looked for up to this many times the model's size now, and checked this many 5 % steps up. */
-const LEAST_MOST = 6;
+export const LEAST_MOST = 6;
+/** A lid's roof is read this far (mm) over its face for its slope. */
+const ROOF_RISE = 0.5;
 const LEAST_TRIES = 4;
 
 /** Collects temporaries so they are all deleted, even when something throws (the engine's pattern). */
@@ -617,9 +619,11 @@ export function coverOf(stack, lid) {
   }
 }
 
-/** Slices of the model at the heights asked for, as islands, kept for one search. */
-export function fineSlices(solid, minArea) {
-  const kept = new Map();
+/**
+ * Slices of the model at the heights asked for, as islands, kept for one search – or in `kept` (plain data), for every
+ * search of the same model: the card's table, then the part it took out.
+ */
+export function fineSlices(solid, minArea, kept = new Map()) {
   return (z) => {
     const key = z.toFixed(6);
     let row = kept.get(key);
@@ -1132,15 +1136,18 @@ const round = (v, k = 4) => (v == null ? null : +v.toFixed(k));
 function lidEntry(solid, stack, fam, fine, S, { zBed, handles, cover, scale }) {
   const placed = placeLid(stack, fam, fine, S, zBed, 1, true);
   if (!placed) return null;
-  const { face, at, half } = placed;
+  const { face, at } = placed;
   const c = fam.c;
   const R = (face.lo + face.hi) / 2;
   // the lock at this size as the engine builds it: sized on the lid's outside, and carried by a wall under the face
   // round the axis (`collarAt`) – a dome on a band too thin for the collar gets none
   let now = lidLockOn(placed, S);
+  // the slope of the collar the download builds under it, which the card's print badge words
+  let collar = null;
   if (now.lock) {
     const built = collarAt(fine, c, face.z, S, stack.zmin);
     if (built.why) now = { lock: null, why: built.why };
+    else collar = built.slope;
   }
   // the wall under the face round the axis, read off the levels for the collar at other sizes
   const walls = [];
@@ -1162,28 +1169,47 @@ function lidEntry(solid, stack, fam, fine, S, { zBed, handles, cover, scale }) {
     lock: now.lock ? null : leastOf((q) => fits(lidLockNear(placed, S, q)?.lock, false, q), exact(false), scale),
     tea: now.lock && takesTeaLight(now.lock.opening, S.c) ? null : leastOf((q) => fits(lidLockNear(placed, S, q)?.lock, true, q), exact(true), scale),
   };
+  // the opening the lock has at its least scale, which the texts quote beside it
+  if (least.lock != null) {
+    const there = placeLid(stack, fam, fine, S, zBed, least.lock);
+    least.opening = round(there ? lidLockOn(there, S).lock?.opening ?? null : null, 2);
+  }
   const ends = capOf(stack, fam, fine, c, R);
   // the coarse level of the face, for the handle's trace and the pick mode
   const kFace = stack.levels.findIndex((lv) => lv.z >= face.z);
   const lid = { c, k: kFace < 0 ? stack.levels.length - 1 : kFace, cap: fam.cap, R };
   const trace = traceOver(stack, lid);
   const takesHandle = handles.some((H) => H.top.level >= lid.k && H.top.level < fam.cap && reach(H.top, c).dmax < R);
-  // how fast the body's least outside radius falls going up to the face (mm per mm), over the collar's depth twice:
-  // the collar under the face slopes out as far as the model beside it does, up to `STEEP` (`collarSlope`)
-  const below = face.m - Math.ceil((2 * S.Hc) / half - 1e-9);
-  const rings = [ringRadius(at(below), c), ringRadius(at(face.m), c)];
-  const underSlope = rings.every((r) => r != null) ? (rings[0] - rings[1]) / ((face.m - below) * half) : null;
   const entry = {
     kind: 'lid', name: trace ? 'Dome and cap' : 'Top', centre: c.map((v) => round(v, 6)), face: round(face.z), side: 1, r: round(R),
     window: [round(face.lo), round(face.hi)], gap: round(face.hi - face.lo), cap: round(ends.cap), next: round(ends.next), top: round(ends.top),
     from: round(stack.levels[fam.items[0].k].z), to: round(stack.levels[fam.last.k].z), covered: round(cover, 3), volume: round(fam.items[0].volume, 1),
     takesHandle, handle: trace && { legs: trace.legs, span: trace.span?.map((v) => round(v, 6)) ?? null, levels: trace.levels },
-    lock: now.lock && lockWords(now.lock, S), why: now.lock ? null : now.why, least, underSlope: round(underSlope, 3),
+    lock: now.lock && { ...lockWords(now.lock, S), slope: round(collar, 3) }, why: now.lock ? null : now.why, least,
+    wall: roofAt(at(face.m), placed.outside, face.z, c),
   };
   const minLift = now.lock ? S.H + S.cz : WAY_START * stack.height;
   const way = wayOut(solid, stack, { c, r: R, face: face.z, cap: ends.cap }, minLift);
   entry.way = { up: way.up, lift: round(way.lift), dir: way.dir, dirs: way.dirs, reach: round(way.reach, 2) };
   return entry;
+}
+
+/**
+ * The lid's roof where it meets the body, for the texts that say why no lock fits it: how thick it is square to its
+ * slope (`t`, mm) and how steeply it rises (`slope`, degrees from level) – the ring round the axis at the face, from
+ * its outside in to the farthest point of its inside, and the lid's outside half a millimetre over the face (any
+ * higher, and a small model's flange or cap over the roof is read as its slope). Null where there is no ring to read
+ * (a solid top, or nothing over the face).
+ */
+function roofAt(islands, outside, z0, c) {
+  const ring = ringWall(islands, c);
+  if (!ring || !(ring.rin > 0) || !(ring.r > ring.rin)) return null;
+  const from = outside.find((o) => o.z >= z0 - 1e-9 && o.r != null);
+  const up = outside.filter((o) => o.r != null && o.z > z0 + 1e-9 && o.z <= z0 + ROOF_RISE + 1e-9).at(-1);
+  if (!from || !up) return null;
+  const rise = up.z - from.z;
+  const run = Math.abs(from.r - up.r);
+  return { t: round(((ring.r - ring.rin) * rise) / Math.hypot(rise, run), 2), slope: round((Math.atan2(rise, run) * 180) / Math.PI, 1) };
 }
 
 /** What the table keeps of a collar lock: plain numbers, and whether a tea light goes through it. */
@@ -1193,7 +1219,7 @@ function lockWords(lock, S) {
 }
 
 /** The base's entry: its window, ring and lock, and the least scales. */
-function plugEntry(stack, cand, fine, S, zBed) {
+function plugEntry(stack, cand, fine, S, zBed, scale) {
   const rings = ringRows(fine, cand.c, zBed, S);
   const now = plugLockAt(cand, rings, S, zBed, 1);
   // the base's window, floor and ring grow with the model, so its lock at another scale is read straight off them
@@ -1205,6 +1231,8 @@ function plugEntry(stack, cand, fine, S, zBed) {
     lock: now ? null : leastScale(fits(false), { from: 1, to: LEAST_MOST }),
     tea: fits(true)(1) ? null : leastScale(fits(true), { from: 1, to: LEAST_MOST }),
   };
+  // the opening the lock has at the scale the texts give for it: its least, up to a whole 5 % of the model as loaded
+  if (least.lock != null) least.opening = round(plugLockAt(cand, rings, S, zBed, scalePercent(least.lock * scale) / 100 / scale)?.opening ?? null, 2);
   const lock = now && {
     mech: 'plug', R: now.R, opening: now.opening, theta: now.theta, wall: now.wall, camOutN: now.camOutN, ringOut: now.ringOut, tabs: now.tabs,
     tabR: now.tabR, coin: now.coin, teaLight: takesTeaLight(now.opening, S.c),
@@ -1212,7 +1240,7 @@ function plugEntry(stack, cand, fine, S, zBed) {
   return {
     kind: 'plug', name: 'Base', centre: cand.c.map((v) => round(v, 6)), face: round(zBed), side: 1, r: round(now ? now.R : cand.R),
     window: [0, round(cand.R)], ringOut: round(cand.rOut), solidTop: round(cand.floorTop), top: round(cand.top), reach: round(cand.reach),
-    takesHandle: false, handle: null, lock, why: now ? null : 'room', least, underSlope: null, way: { up: true, lift: 0, dir: null, dirs: [], reach: 0 },
+    takesHandle: false, handle: null, lock, why: now ? null : 'room', least, way: { up: true, lift: 0, dir: null, dirs: [], reach: 0 },
   };
 }
 
@@ -1238,10 +1266,11 @@ function rankParts(parts) {
  * @param {object} solid the model (a Manifold, borrowed)
  * @param {{ n?: number, hl?: number, c?: number, stack?: object, scale?: number }} options nozzle, layer height and
  *   clearance
- * @returns {{ centre: number[], h: number, zmin: number, zmax: number, width: number, scale: number, solid: boolean,
- *   open: { d: number }|null, handles: object[], parts: object[], ms: object }}
+ * @returns {{ centre: number[], h: number, zmin: number, zmax: number, width: number, scale: number, most: number,
+ *   solid: boolean, open: { d: number }|null, handles: object[], parts: object[], ms: object }} `most` how far up (a
+ *   factor on the size now) the least scales are looked for
  */
-export function findParts(solid, { n = 0.4, hl = 0.2, c = 0.15, stack = null, scale = 1 } = {}) {
+export function findParts(solid, { n = 0.4, hl = 0.2, c = 0.15, stack = null, slices = undefined, scale = 1 } = {}) {
   const t0 = performance.now();
   const ms = {};
   const lap = (name, t) => {
@@ -1257,7 +1286,7 @@ export function findParts(solid, { n = 0.4, hl = 0.2, c = 0.15, stack = null, sc
   const loops = findLoops(stack);
   const handles = loops.filter((L) => L.handle);
   t = lap('loops', t);
-  const fine = fineSlices(solid, stack.speck * FINE_SPECK);
+  const fine = fineSlices(solid, stack.speck * FINE_SPECK, slices);
   const open = openTop(stack, axis);
   const base = plugCandidate(stack, axis);
   const parts = [];
@@ -1275,42 +1304,17 @@ export function findParts(solid, { n = 0.4, hl = 0.2, c = 0.15, stack = null, sc
       if (lid && (lid.way.up || lid.way.lift != null)) parts.push(lid);
     }
     t = lap('lids', t);
-    if (base && !base.solid) parts.push(plugEntry(stack, base, fine, S, zBed));
+    if (base && !base.solid) parts.push(plugEntry(stack, base, fine, S, zBed, scale));
     t = lap('base', t);
   }
   ms.all = Math.round(performance.now() - t0);
   return {
     centre: axis.map((v) => round(v, 6)), h: round(stack.h, 6), zmin: round(stack.zmin), zmax: round(stack.zmax), width: round(stack.width),
-    scale, solid: !!base?.solid && !parts.length, open: open && { d: round(open.d, 3) },
+    scale, most: LEAST_MOST, solid: !!base?.solid && !parts.length, open: open && { d: round(open.d, 3) },
     handles: handles.map((H) => ({ foot: round(H.footZ), top: round(H.topZ), span: H.span })),
     parts: rankParts(parts), ms,
   };
 }
 
-/**
- * Which part a point on the model picks, from the table alone (each pointer move, so no slicing): a lid when the
- * point is on it; the lid under a handle when it is on the handle the lid leaves on the body; the lid when it is
- * just under its face, on the shell it sits in; the base when it is on the model's solid bottom. `on` says which.
- * @returns {{ part: object|null, index: number, on: 'lid'|'handle'|'under'|'base'|null }}
- */
-export function pickPart(table, p) {
-  const { h } = table;
-  const dist = (e) => Math.hypot(p[0] - e.centre[0], p[1] - e.centre[1]);
-  const rules = [
-    ['lid', (e) => e.kind === 'lid' && p[2] >= e.face - 1e-6 && p[2] <= e.cap + 1e-6 && dist(e) <= e.r],
-    ['handle', (e) => e.kind === 'lid' && !!e.handle && onTrace(e.handle, p, 1.5 * h)],
-    ['under', (e) => e.kind === 'lid' && p[2] < e.face && p[2] >= e.from - 2 * h && dist(e) <= e.window[1] + 2 * h],
-    ['base', (e) => e.kind === 'plug' && p[2] <= e.solidTop + 1e-6 && dist(e) <= e.reach + 1e-6],
-  ];
-  for (const [on, test] of rules) {
-    const index = table.parts.findIndex(test);
-    if (index >= 0) return { part: table.parts[index], index, on };
-  }
-  return { part: null, index: -1, on: null };
-}
-
-/** Whether p is on a traced handle: inside one of its islands' boxes, grown by tol, at a level within tol of it. */
-function onTrace(handle, p, tol) {
-  return handle.levels.some(({ z, boxes }) => Math.abs(z - p[2]) <= tol
-    && boxes.some((b) => p[0] >= b[0] - tol && p[0] <= b[2] + tol && p[1] >= b[1] - tol && p[1] <= b[3] + tol));
-}
+// which part a point on the model picks is the page's to ask each pointer move, with no Manifold to load: it is aim.js's
+export { pickPart } from './aim.js';

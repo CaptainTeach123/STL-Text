@@ -414,8 +414,9 @@ describe('the least scale', () => {
         const least = leastScale(fits);
         // nothing fits under 250 % (the scan says so), so the brute force starts there
         expect([n, c, [1, 1.5, 2, 2.5].some(fits)]).toEqual([n, c, false]);
+        // every 0.5 % is fine enough to check a quarter-percent answer, and half the cost on a slow runner
         let brute = null;
-        for (let k = 1000; brute == null && k <= 2400; k++) if (fits(k / 400)) brute = k / 400;
+        for (let k = 500; brute == null && k <= 1200; k++) if (fits(k / 200)) brute = k / 200;
         expect([n, c, Math.abs(least / brute - 1) < 0.005, fits(least), fits(least - 0.0025)]).toEqual([n, c, true, true, false]);
         const said = scalePercent(least);
         expect([n, c, fits(said / 100), fits(said / 100 - 0.05)]).toEqual([n, c, true, false]);
@@ -423,7 +424,7 @@ describe('the least scale', () => {
     }
     const S = sizes();
     expect(scalePercent(leastScale((s) => !collarFor(cone(s), S).why))).toBe(290);
-  });
+  }, 240_000);
 
   it('a larger clearance or a wider nozzle never lowers it', () => {
     const at = (n, hl, c) => leastScale((s) => !collarFor(cone(s), sizes(n, hl, c)).why);

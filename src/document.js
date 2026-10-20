@@ -63,10 +63,13 @@ export const ITEM_DEFAULTS = Object.freeze({
  * the model; the engine snaps it to the nearest axis. The settings apply to
  * every seam but those of a cut that comes apart (`joint: 'apart'`): a joint
  * that is never glued, a lantern's top taken off to change its light, held as
- * `hold` says.
+ * `hold` says. Such a cut may take out only a part (`part`): what lies inside
+ * a circle round `position` on one side of the plane, such as a dome inside a
+ * handle that stays on the lantern.
  */
 export const SPLIT_DEFAULTS = Object.freeze({
-  cuts: Object.freeze([]), // [{ id: 'c1', position: [x, y, z], normal: [1, 0, 0], joint?: 'apart', hold?: 'lock' }], model mm
+  // [{ id: 'c1', position: [x, y, z], normal: [1, 0, 0], joint?: 'apart', hold?: 'lock', part?: { r, side, auto } }], model mm
+  cuts: Object.freeze([]),
   joint: 'auto', // 'auto' | 'dowels' | 'dovetail' | 'none'
   diameter: 0, // mm: 0 = automatic | 1.75 (filament) | 3 | 4 | 5 | 6 | 8 | 10
   depth: 0, // mm into each piece: 0 = automatic | 3–30
@@ -200,14 +203,22 @@ export const fontIds = (item) => [...new Set((item.lines ?? []).map((l) => l.fon
 /** Largest letter height in the item (mm); 10 for parts (used for spacing duplicates). */
 export const maxSize = (item) => (isSpot(item) ? item.radius * 2 : isPart(item) ? 10 : Math.max(0, ...(item.lines ?? []).map((l) => l.size || 0)));
 
-/** Move items with the model: positions by the matrix, normals by its rotation. */
+/**
+ * Move items with the model: positions by the matrix, normals by its
+ * rotation. A cut's part grows with the model: every transform the app makes
+ * is a similarity (Scale, the inches fix, quarter turns, centring), so its
+ * circle stays a circle, of radius times the matrix's own scale.
+ */
 export function transformItems(items, matrix) {
   const m = matrix instanceof Matrix4 ? matrix : new Matrix4().fromArray(matrix);
   const rot = new Matrix3().getNormalMatrix(m); // inverse transpose: right for mirrors and uneven scales too
+  const grow = Math.cbrt(Math.abs(m.determinant()));
   return items.map((item) => ({
     ...item,
     position: new Vector3(...item.position).applyMatrix4(m).toArray(),
     normal: new Vector3(...item.normal).applyMatrix3(rot).normalize().toArray(),
+    // the side stays as it is: it is read along the normal, which turns and mirrors with the model
+    ...(item.part ? { part: { ...item.part, r: item.part.r * grow } } : {}),
   }));
 }
 
@@ -227,18 +238,42 @@ export const CUT_HOLDS = Object.freeze(['lock', 'snap', 'light', 'lift']);
 const NEW_HOLD = 'lock';
 
 /**
+ * A cut's part, kept as the document keeps it: a circle of radius `r` on the
+ * plane (world mm, round `position`), the side of the plane the part lies on
+ * (`side` +1 along the normal, −1 the other way) and whether it is still where
+ * the finder put it (`auto`). Null when there is no circle to take out.
+ */
+const copyPart = (part) => {
+  const r = Number(part?.r);
+  if (!(r > 0 && Number.isFinite(r))) return null;
+  return { r, side: Number(part.side) < 0 ? -1 : 1, auto: part.auto === true };
+};
+
+/**
+ * A part with `patch` over it, placed by the finder or not (`auto`). A radius
+ * that is no size leaves the circle as it was: an edit never takes the circle
+ * away, which would leave a cut across the whole model, through whatever the
+ * part was drawn round. Only unticking Comes apart, or removing the cut, does.
+ */
+const patchPart = (part, patch, auto) => {
+  const r = Number(patch?.r);
+  return copyPart({ ...part, ...patch, r: r > 0 && Number.isFinite(r) ? r : part?.r, auto });
+};
+
+/**
  * A cut as the document keeps it: its own arrays, and the take-apart flag with
  * a hold it knows only on a cut that comes apart, so an ordinary cut stays
  * `{ id, position, normal }`. A cut that comes apart with no hold yet locks;
  * one with a hold the document doesn't know clicks on, as it always did. Any
- * other joint is dropped.
+ * other joint is dropped. A cut that comes apart may take out only a part
+ * (`part`), whose hold is a twist-lock or none: it locks unless it lifts off.
  */
-const copyCut = ({ id, position, normal, joint, hold }) => ({
-  id,
-  position: [...position],
-  normal: [...normal],
-  ...(joint === 'apart' ? { joint, hold: hold == null ? NEW_HOLD : CUT_HOLDS.includes(hold) ? hold : 'snap' } : {}),
-});
+const copyCut = ({ id, position, normal, joint, hold, part }) => {
+  const apart = joint === 'apart';
+  const kept = apart ? copyPart(part) : null;
+  const held = kept ? (hold === 'lift' ? 'lift' : NEW_HOLD) : hold == null ? NEW_HOLD : CUT_HOLDS.includes(hold) ? hold : 'snap';
+  return { id, position: [...position], normal: [...normal], ...(apart ? { joint, hold: held } : {}), ...(kept ? { part: kept } : {}) };
+};
 
 /**
  * The split after `patch` (null switches it off): settings merged over the
@@ -263,8 +298,11 @@ const clone = (state) => ({
   ...state,
   base: state.base && { ...state.base, transforms: state.base.transforms.map((t) => [...t]), enhance: state.base.enhance ? { ...state.base.enhance } : null },
   items: state.items.map((i) => ({ ...i, lines: i.lines.map((l) => ({ ...l })), position: [...i.position], normal: [...i.normal] })),
-  // copied down to the cut arrays: a cut moved in place would otherwise move in the undo history as well
-  split: state.split && { ...state.split, cuts: state.split.cuts.map((c) => ({ ...c, position: [...c.position], normal: [...c.normal] })) },
+  // copied down to the cut arrays and parts: a cut moved in place would otherwise move in the undo history as well
+  split: state.split && {
+    ...state.split,
+    cuts: state.split.cuts.map((c) => ({ ...c, position: [...c.position], normal: [...c.normal], ...(c.part ? { part: { ...c.part } } : {}) })),
+  },
 });
 
 export class Document {
@@ -273,6 +311,7 @@ export class Document {
     this.history = [];
     this.future = [];
     this.coalesceKey = null;
+    this.moves = 0; // the model's transforms so far, so each is a step of its own that a refit can join
     this.listeners = new Set();
   }
 
@@ -371,16 +410,24 @@ export class Document {
     this.future = [];
   }
 
-  /** Apply a 4x4 transform (16 numbers, column-major) to the model and carry the items and cuts along. */
+  /**
+   * Apply a 4x4 transform (16 numbers, column-major) to the model and carry
+   * the items and cuts along. Returns the step it made, for `refitParts`.
+   */
   transformBase(matrix) {
-    if (!this.state.base) return;
+    if (!this.state.base) return null;
     const array = matrix instanceof Matrix4 ? matrix.toArray() : [...matrix];
-    this.commit((s) => {
-      s.base.transforms.push(array);
-      s.baseVersion += 1;
-      s.items = transformItems(s.items, array);
-      if (s.split) s.split = { ...s.split, cuts: transformItems(s.split.cuts, array) };
-    });
+    const step = `base:move:${++this.moves}`;
+    this.commit(
+      (s) => {
+        s.base.transforms.push(array);
+        s.baseVersion += 1;
+        s.items = transformItems(s.items, array);
+        if (s.split) s.split = { ...s.split, cuts: transformItems(s.split.cuts, array) };
+      },
+      { coalesce: step },
+    );
+    return step;
   }
 
   /** Simplify the model to `tolerance` (null = original). Items stay put. */
@@ -410,20 +457,29 @@ export class Document {
     );
   }
 
-  /** Back to the model as loaded (undo all transforms / simplify / enhancement); items and cuts move back with it. */
+  /**
+   * Back to the model as loaded (undo all transforms / simplify /
+   * enhancement); items and cuts move back with it. Returns the step it
+   * made, for `refitParts`.
+   */
   resetBase() {
-    if (!this.state.base) return;
+    if (!this.state.base) return null;
     // the engine composes M = T_n · … · T_1, so undo it with M⁻¹ as a whole
     const forward = this.state.base.transforms.reduce((acc, t) => new Matrix4().fromArray(t).multiply(acc), new Matrix4());
     const inverse = forward.invert();
-    this.commit((s) => {
-      s.base.transforms = [];
-      s.base.simplify = null;
-      s.base.enhance = null;
-      s.baseVersion += 1;
-      s.items = transformItems(s.items, inverse);
-      if (s.split) s.split = { ...s.split, cuts: transformItems(s.split.cuts, inverse) };
-    });
+    const step = `base:move:${++this.moves}`;
+    this.commit(
+      (s) => {
+        s.base.transforms = [];
+        s.base.simplify = null;
+        s.base.enhance = null;
+        s.baseVersion += 1;
+        s.items = transformItems(s.items, inverse);
+        if (s.split) s.split = { ...s.split, cuts: transformItems(s.split.cuts, inverse) };
+      },
+      { coalesce: step },
+    );
+    return step;
   }
 
   /* --------------------------------------------------------- the split */
@@ -448,29 +504,42 @@ export class Document {
 
   /**
    * Add a cut (a plane through `position`, square to `normal`; with `joint:
-   * 'apart'` one that comes apart, held as `hold` says) and return its id.
-   * With no split yet, one starts from `defaults` (the last-used settings)
-   * over SPLIT_DEFAULTS.
+   * 'apart'` one that comes apart, held as `hold` says, and with `part` one
+   * that takes out only the part inside a circle round `position`) and
+   * return its id. With no split yet, one starts from `defaults` (the
+   * last-used settings) over SPLIT_DEFAULTS.
    */
-  addCut({ position, normal, joint, hold }, { defaults = null } = {}) {
+  addCut({ position, normal, joint, hold, part }, { defaults = null } = {}) {
     const id = nextCutId(this.state.split?.cuts ?? []);
     this.commit((s) => {
       s.split ??= mergeSplit(null, { ...defaults, cuts: [] });
-      s.split.cuts.push(copyCut({ id, position, normal, joint, hold }));
+      s.split.cuts.push(copyCut({ id, position, normal, joint, hold, part }));
     });
     return id;
   }
 
   /**
    * Move a cut or turn it to another axis (`patch`: `position` and/or
-   * `normal`). Handle drags coalesce. A cut that comes apart still does once
-   * it is moved.
+   * `normal`), or change its part (`part`: `r`, `side`; on a cut that comes
+   * apart without one, it gets one). Handle drags coalesce. A cut that comes
+   * apart still does once it is moved. A part changed is the user's own and
+   * no longer the finder's pick, unless the patch is the finder's pick itself
+   * (`part.auto` true: the model clicked again).
    */
   updateCut(id, patch, { coalesce = null } = {}) {
     const cut = this.state.split?.cuts.find((c) => c.id === id);
     if (!cut) return;
-    const moved = (c) => copyCut({ ...c, id, position: patch.position ?? c.position, normal: patch.normal ?? c.normal });
-    if (JSON.stringify(moved(cut)) === JSON.stringify(cut)) return;
+    const auto = patch.part?.auto === true;
+    const moved = (c, keep = false) =>
+      copyCut({
+        ...c,
+        id,
+        position: patch.position ?? c.position,
+        normal: patch.normal ?? c.normal,
+        part: patchPart(c.part, patch.part, keep ? c.part?.auto : auto),
+      });
+    // a handle released where it started is no edit, and a part the finder placed stays its pick
+    if (JSON.stringify(moved(cut, true)) === JSON.stringify(cut) && !(auto && !cut.part?.auto)) return;
     this.commit(
       (s) => {
         s.split.cuts = s.split.cuts.map((c) => (c.id === id ? moved(c) : c));
@@ -480,10 +549,40 @@ export class Document {
   }
 
   /**
+   * Parts still where the finder put them (`auto`), placed again by it for
+   * the model as it now is: scaled with the model, a part's face lands off
+   * the printer's layers and away from the best face there. `fits` holds `{
+   * id, position, normal?, part }` for each (`part`: `r`, `side`); a part the
+   * user has changed since keeps its own place, and its hold stays. `base` is
+   * the placement key (`modelPlacementKey`) of the model the finder looked
+   * at: a refit that arrives once the model has moved again (the Scale was
+   * undone) does nothing. Given the `step` the transform returned, while that
+   * is still the last edit, the refit joins it, so one undo takes back the
+   * Scale and the refit together; otherwise it is a step of its own.
+   */
+  refitParts(fits, { base = null, step = null } = {}) {
+    if (base != null && base !== modelPlacementKey(this.state.base)) return;
+    const fitOf = new Map(fits.map((f) => [f.id, f]));
+    const refit = (c) => {
+      const f = c.part?.auto ? fitOf.get(c.id) : null;
+      return f ? copyCut({ ...c, position: f.position ?? c.position, normal: f.normal ?? c.normal, part: patchPart(c.part, f.part, true) }) : c;
+    };
+    const cuts = this.state.split?.cuts ?? [];
+    if (cuts.every((c) => JSON.stringify(refit(c)) === JSON.stringify(c))) return;
+    this.commit(
+      (s) => {
+        s.split.cuts = s.split.cuts.map(refit);
+      },
+      { coalesce: step },
+    );
+  }
+
+  /**
    * Make a cut one that comes apart (`apart`: `{ hold }`, where an empty `{}`
    * keeps the hold it has, or locks a cut newly ticked) or a glued one again
-   * (null, which drops its hold too). One undo step; nothing when the cut is
-   * that already.
+   * (null, which drops its hold too, and its part: a part only ever comes
+   * apart). One undo step; nothing when the cut is that already. A part's
+   * hold is no change to where it is, so it stays the finder's pick.
    */
   setCutJoint(id, apart) {
     const cut = this.state.split?.cuts.find((c) => c.id === id);

@@ -15,6 +15,9 @@
  */
 import { manifold } from './manifold.js';
 import { displayBuffers } from './mesh.js';
+import { lockSolids } from './lockGeometry.js';
+import { COVER_MOST, FINE_REACH, FINE_SPECK, OVER, SPECK, collarAt, coverOf, fineSlices, freeWindows, plugLockOf, reach, traceOver, wayOut } from './partFinder.js';
+import { sizes } from './locks.js';
 import { buildCrossSectionInfo, printLimits, thinStrokeReport } from './textGeometry.js';
 import {
   AUTO_DIAMETERS,
@@ -63,6 +66,7 @@ import {
   splitNote,
   teardropApex,
   translationMat4,
+  transposeMat4,
 } from './split.js';
 
 /** Shells smaller than this (mm³) are dust that a cut along a flat face of the model leaves behind, not material. */
@@ -314,6 +318,10 @@ const LIPS = keptShapes(16, (e) => {
   e?.tongue?.delete();
   e?.cutters?.delete();
 });
+// a part's lock in place, both pieces' solids: drilling each piece again takes them again
+const LOCKS = keptShapes(8, (e) => {
+  for (const side of [e?.body, e?.part]) for (const m of Object.values(side ?? {})) m?.delete?.();
+});
 
 /** Deletes the shapes kept between calls (when the engine lets go of everything it holds). */
 export function clearSplitCaches() {
@@ -322,6 +330,7 @@ export function clearSplitCaches() {
   PEGS.clear();
   LABELS.clear();
   LIPS.clear();
+  LOCKS.clear();
 }
 
 // ---------- holes and pins ----------
@@ -2460,6 +2469,365 @@ export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null
   }
 }
 
+// ---------- parts that come off ----------
+
+/** A half turn about x: a part lying on its plane's −side is worked out turned over, lying towards +z. */
+const HALF_TURN_X = Object.freeze([1, 0, 0, 0, 0, -1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1]);
+/** A part's prism is a polygon of this many sides drawn on its circle: 0.008 mm inside the circle at r 40. */
+const PART_SEGMENTS = 160;
+/** A base's prism starts this far past the model's end, and one with nothing over it ends this far past (mm). */
+const PART_PAST = 1;
+/** A shell of a part reaches its plane when it comes this near it (mm); one that does not goes back to the body. */
+const PART_TOUCH = 0.01;
+/** A face that does not print apart may move this many layers into the part; one that does is looked for this far. */
+const PART_MOVES = 2;
+const PART_SEARCH = 25;
+
+/**
+ * The frame a part is worked out in, world → part: its plane square to z and the part lying towards +z from it
+ * (`TO_PLANE`, then a half turn about x for a part on its plane's −side: a signed permutation, nothing mirrored), so
+ * every part is worked out as a lid on top. Null for a part across Z that lies upwards: it is worked out as it is.
+ * @param {{ axis: number, side: number }} part normalised (`normaliseSplit`'s `parts`)
+ * @returns {number[]|null} column-major 4×4
+ */
+export function partFrame({ axis, side }) {
+  if (axis === 2 && side > 0) return null;
+  return side > 0 ? [...TO_PLANE[axis]] : mulMat4(HALF_TURN_X, TO_PLANE[axis]);
+}
+
+/** A normalised part in its frame (`partFrame`): its circle's centre `c`, its plane's height `z0` and its radius `R`. */
+export function partInFrame({ at, centre, r, side }) {
+  return { c: [centre[0], side > 0 ? centre[1] : -centre[1]], z0: side > 0 ? at : -at, R: r };
+}
+
+/** An island's radii about a centre, [dmin, dmax]: a circle of radius R crosses it when dmin < R < dmax. */
+const spanAbout = (isl, c) => {
+  const r = reach(isl, c);
+  return [r.dmin, r.dmax];
+};
+
+/**
+ * What stands round a part's circle from its plane on, row by row, as `freeWindows` reads it: the model's slices
+ * every half layer over the plane up to `FINE_REACH` (each a hair over its height, off any flat face of the model
+ * there), then the levels of its slice stack on up. Each row is its islands as the radii they block about the centre.
+ * @param {object} stack the model's `sliceStack`, in the part's frame
+ * @param {(z: number) => object[]} fine the model's islands at a height, in the part's frame (`fineSlices`)
+ * @param {number[]} c the circle's centre
+ * @param {number} z0 the plane's height
+ * @param {number} hl the layer height
+ * @returns {{ rows: number[][][], zs: number[], near: number, face: object[] }} `zs` the height each row was read
+ *   at, `near` how many of the rows are fine slices, `face` the islands on the plane
+ */
+export function partRows(stack, fine, c, z0, hl) {
+  const half = hl / 2;
+  const rows = [];
+  const zs = [];
+  for (let j = 0; j * half <= FINE_REACH + 1e-9; j++) {
+    zs.push(z0 + j * half + OVER);
+    rows.push(fine(zs[j]).map((x) => spanAbout(x, c)));
+  }
+  const near = rows.length;
+  for (const lv of stack.levels) {
+    if (lv.z <= z0 + FINE_REACH) continue;
+    rows.push(lv.islands.map((x) => spanAbout(x, c)));
+    zs.push(lv.z);
+  }
+  return { rows, zs, near, face: fine(zs[0]) };
+}
+
+/**
+ * What a part's circle takes out of the model, from what stands round it (`partRows`): a 'lid' when its plane holds
+ * material inside the circle and the circle's wall crosses nothing up to the cap, the first row where its disc is
+ * empty – a 'full' one when nothing stands round the circle at all, so it takes all there is past the plane; a 'plug'
+ * when the plane is the model's own end (`end`) and the wall runs up through a solid floor – material across the
+ * circle that holds its centre, from the end or within `rag` of it where the model's bottom edge is rounded – with
+ * the model's inside over it, and crosses nothing once through it: a ragged floor top, crossed again within `rag`
+ * over the floor's last row, is the floor's (a scan's or a generated mesh's floor is seldom flat); 'mixed' when the
+ * wall crosses material over a plane that holds some, or past a floor; 'empty' when the plane holds nothing inside
+ * the circle.
+ * @param {number[][][]} rows each row's islands as [dmin, dmax]
+ * @param {number} R the circle's radius
+ * @param {{ end?: boolean, zs?: number[], rag?: number }} options `zs` each row's height, for `rag`
+ * @returns {{ kind: 'lid'|'full'|'plug'|'mixed'|'empty', cap: number, cross: number|null }} `cap` the cap's row
+ *   (`rows.length` when the disc never empties), `cross` the first row where the wall crosses material, for a lid
+ */
+export function partKind(rows, R, { end = false, zs = null, rag = 0 } = {}) {
+  const crosses = (row) => row.some(([a, b]) => a < R && b > R);
+  const inDisc = (row) => row.some(([a]) => a < R);
+  if (!rows.length || !inDisc(rows[0])) return { kind: 'empty', cap: 0, cross: null };
+  let cap = rows.findIndex((row, j) => j > 0 && !inDisc(row));
+  if (cap < 0) cap = rows.length;
+  const crossed = rows.slice(0, cap).map(crosses);
+  // a base: the floor is material across the circle that holds its centre, from the model's end – or within `rag`
+  // of it, where its bottom edge is rounded or its middle recessed
+  const floored = (row) => row.some(([a, b]) => a === 0 && b > R);
+  const into = crossed.findIndex((x, j) => x && floored(rows[j]));
+  if (end && into >= 0 && (into === 0 || (zs && zs[into] <= zs[0] + rag))) {
+    // the floor's rows (up to the cap, when nothing stands on it); then a ragged top, and nothing standing on it cut
+    // by the wall. Solid all the way up is no floor
+    let top = into;
+    while (top + 1 < cap && crossed[top + 1] && floored(rows[top + 1])) top++;
+    if (top + 1 >= rows.length) return { kind: 'mixed', cap, cross: null };
+    let floor = top;
+    for (let j = top + 1; j < cap; j++) if (crossed[j] && zs[j] <= zs[top] + rag) floor = j;
+    return { kind: crossed.indexOf(true, floor + 1) < 0 ? 'plug' : 'mixed', cap, cross: null };
+  }
+  const cross = crossed.indexOf(true);
+  if (cross >= 0) return { kind: 'mixed', cap, cross };
+  // anything past the plane outside the circle stays on the body round it
+  const round = rows.some((row) => row.some(([, b]) => b > R));
+  return { kind: round ? 'lid' : 'full', cap, cross: null };
+}
+
+/**
+ * Whether a part's face prints apart from the body beside it: the band of radii round the circle that is free from
+ * its plane up to its cap (`freeWindows`) is `gmin` wide at least – elephant's foot and the printer's spread on both
+ * sides, and the clearance – with the circle in it, and inside the circle one island on the plane: the part's own
+ * face, whole.
+ * @param {number[][][]} rows from `partRows`
+ * @param {object[]} face the islands on the plane
+ * @returns {{ ok: boolean, lo: number|null, hi: number|null, gap: number, islands: number }} `gap` 0 when the circle
+ *   lies in no free band (it runs into the model near its plane)
+ */
+export function partGap(rows, face, c, R, gmin) {
+  const w = freeWindows(rows).find((x) => x.lo < R && R < x.hi);
+  if (!w) return { ok: false, lo: null, hi: null, gap: 0, islands: 0 };
+  const islands = face.filter((x) => reach(x, c).dmax <= w.lo).length;
+  const gap = w.hi - w.lo;
+  return { ok: gap >= gmin - 1e-9 && islands === 1, lo: w.lo, hi: w.hi, gap, islands };
+}
+
+/**
+ * Where a part ends, from the model's slices in its frame: its cap, the first height past its plane where its disc
+ * holds no material, to a fine height – between `lo`, where it still holds some, and `hi`, the first height read
+ * empty (a level of the stack, which drops specks: a spire's tip running on past it is followed up first); the next
+ * material inside the disc over it; and `top`, where the part's prism ends – half-way between the two, or past the
+ * model's end when nothing is over it. Without `hi` the disc never empties.
+ * @returns {{ cap: number, next: number|null, top: number }}
+ */
+export function partCap(stack, fine, c, R, lo, hi) {
+  const inDisc = (z) => fine(z).some((x) => reach(x, c).dmin < R);
+  const end = { cap: stack.zmax, next: null, top: stack.zmax + PART_PAST };
+  if (hi == null) return end;
+  while (hi < stack.zmax && inDisc(hi)) {
+    lo = hi;
+    hi += stack.h;
+  }
+  if (hi >= stack.zmax) return end;
+  // between a where the disc is as `want` is not and b where it is
+  const bisect = (a, b, want) => {
+    for (let i = 0; i < 10; i++) {
+      const mid = (a + b) / 2;
+      if (inDisc(mid) === want) b = mid;
+      else a = mid;
+    }
+    return b;
+  };
+  const cap = bisect(lo, hi, false);
+  const L = stack.levels;
+  let j = L.findIndex((lv) => lv.z > cap);
+  while (j >= 0 && j < L.length && !L[j].islands.some((x) => reach(x, c).dmin < R)) j++;
+  if (j < 0 || j >= L.length) return { cap, next: null, top: stack.zmax + PART_PAST };
+  const next = bisect(Math.max(cap, L[j - 1]?.z ?? cap), L[j].z, true);
+  return { cap, next, top: (cap + next) / 2 };
+}
+
+/**
+ * Where a part's face goes, and what the part is there, from the model's slices in the part's frame. On the body's
+ * layers (`grid`: their boundaries in the frame, `{ from, step }`, null where the part's plane is not square to the
+ * layers) the face is the nearest boundary; where the part does not print apart from what stands beside it there
+ * (`partGap`), the next one into the part, up to `PART_MOVES` layers on. A base's face is the model's own end.
+ * Refused: 'empty' when the plane holds nothing inside the circle, 'mixed' when the circle's wall crosses material
+ * past the fine slices over the plane (or, for a base, above its floor), 'gap' when no face tried prints apart – with
+ * the nearest one that would, `PART_SEARCH` layers either way at most.
+ * @param {object} stack the model's `sliceStack` in the part's frame
+ * @param {(z: number) => object[]} fine its islands at a height (`fineSlices`)
+ * @param {{ c: number[], z0: number, R: number }} part in its frame (`partInFrame`)
+ * @param {{ hl: number, gmin: number, grid?: { from: number, step: number }|null }} options
+ * @returns {{ ok: boolean, why: 'empty'|'mixed'|'gap'|null, asked: number, z0: number, kind: string, end: boolean,
+ *   lo: number|null, hi: number|null, gap: number, islands: number, capRow: { lo: number, hi: number|null },
+ *   tried: { gap: number, islands: number }, nearest: number|null }} `asked` the face asked for, on the layers;
+ *   `z0` the face taken (`asked` when refused); `capRow` the heights between which the cap lies; `tried` how the
+ *   face asked for fared
+ */
+export function placePart(stack, fine, { c, z0: plane, R }, { hl, gmin, grid = null }) {
+  // the layers' boundaries to a millionth of a millimetre, so a face is 29.0 and never 29.000000000000004
+  const layer = (k) => +(grid.from + k * grid.step).toFixed(6);
+  const snap = (z) => (grid ? layer(Math.round((z - grid.from) / grid.step)) : z);
+  const end = plane <= stack.zmin + CUT_TOLERANCE;
+  const asked = end ? plane : snap(plane);
+  // a ragged floor top under a base: as the finder takes it (two levels, or a hundredth of the model's height)
+  const rag = Math.max(2 * stack.h, 0.01 * stack.height);
+  const looked = new Map();
+  const at = (z) => {
+    const key = z.toFixed(6);
+    if (!looked.has(key)) {
+      const { rows, zs, near, face } = partRows(stack, fine, c, z, hl);
+      const kind = partKind(rows, R, { end, zs, rag });
+      // a base holds by its own wall: what stands beside its face is the lock's to judge
+      const gap = kind.kind === 'plug' ? { ok: true, lo: null, hi: null, gap: 0, islands: 1 } : partGap(rows, face, c, R, gmin);
+      const capRow = { lo: zs[Math.max(0, kind.cap - 1)], hi: kind.cap < zs.length ? zs[kind.cap] : null };
+      looked.set(key, { z, kind, gap, near, capRow, ok: (kind.kind === 'plug' || kind.kind === 'lid' || kind.kind === 'full') && gap.ok });
+    }
+    return looked.get(key);
+  };
+  // the face j layers into the part (or out of it, j < 0)
+  const off = (j) => (j && grid ? layer(Math.round((asked - grid.from) / grid.step) + j) : asked);
+  const first = at(asked);
+  const result = (f, extra) => ({
+    asked, z0: f.z, kind: f.kind.kind, end, lo: f.gap.lo, hi: f.gap.hi, gap: f.gap.gap, islands: f.gap.islands, capRow: f.capRow,
+    tried: { gap: first.gap.gap, islands: first.gap.islands }, nearest: null, ...extra,
+  });
+  const moves = grid && !end ? PART_MOVES : 0;
+  for (let j = 0; j <= moves; j++) {
+    const f = at(off(j));
+    if (f.ok) return result(f, { ok: true, why: null });
+  }
+  if (first.kind.kind === 'empty') return result(first, { ok: false, why: 'empty' });
+  if (first.kind.kind === 'mixed' && (end || first.kind.cross >= first.near)) return result(first, { ok: false, why: 'mixed' });
+  // the nearest face that would print apart, the one into the part first where two are as near
+  let nearest = null;
+  for (let j = 1; j <= (moves ? PART_SEARCH : 0) && nearest == null; j++) {
+    for (const z of [off(j), off(-j)]) {
+      if (nearest == null && at(z).ok) nearest = z;
+    }
+  }
+  return result(first, { ok: false, why: 'gap', nearest });
+}
+
+/** A Manifold's lowest point along z in a part's frame (its box's corners, as the frame is a signed permutation). */
+function lowestIn(frame, m) {
+  const b = boxOf(m);
+  if (!frame) return b.min[2];
+  let low = Infinity;
+  for (let k = 0; k < 8; k++) low = Math.min(low, applyMat4(frame, [k & 1 ? b.max[0] : b.min[0], k & 2 ? b.max[1] : b.min[1], k & 4 ? b.max[2] : b.min[2]])[2]);
+  return low;
+}
+
+/** Whether box a holds box b. */
+const boxHolds = (a, b) => [0, 1, 2].every((k) => a.min[k] <= b.min[k] + 1e-6 && a.max[k] >= b.max[k] - 1e-6);
+
+/**
+ * The model with its parts taken out. Each part is the model inside its circle's prism – a `PART_SEGMENTS`-gon from
+ * its plane (from `PART_PAST` under it for a base, whose plane is the model's end) to its `top`, in its frame
+ * (`partFrame`) – and only the shells of that which reach its plane, with the sealed hollows inside them: any other
+ * shell in the prism (a loose piece of the model, not the part's) goes back to the body. One subtraction takes every
+ * prism out of the model.
+ * @param {Manifold} solid the model (borrowed)
+ * @param {{ frame: number[]|null, c: number[], z0: number, R: number, top: number, plug?: boolean }[]} parts
+ * @returns {{ body: Manifold, lids: { solid: Manifold|null, shells: number, loose: number }[] }} the caller's;
+ *   `shells` how many shells of each part reach its plane (one when it comes out whole), `loose` how many went back
+ */
+export function carveParts(solid, parts) {
+  const { CrossSection, Manifold } = manifold();
+  const t = scope();
+  const lids = [];
+  try {
+    const back = [];
+    const prisms = parts.map((p) => {
+      const from = p.plug ? p.z0 - PART_PAST : p.z0;
+      const disc = t.add(t.add(CrossSection.circle(p.R, PART_SEGMENTS)).translate(p.c));
+      const prism = t.add(t.add(disc.extrude(p.top - from)).translate([0, 0, from]));
+      return p.frame ? t.add(prism.transform(transposeMat4(p.frame))) : prism;
+    });
+    parts.forEach((p, k) => {
+      const all = t.add(solid.intersect(prisms[k]));
+      const shells = all.decompose().map((m) => t.add(m));
+      const outer = shells.filter((m) => m.volume() > 0);
+      const mine = outer.filter((m) => lowestIn(p.frame, m) < p.z0 + PART_TOUCH);
+      const away = outer.filter((m) => !mine.includes(m));
+      // a sealed hollow goes with the shell round it
+      const hollows = shells.filter((m) => !(m.volume() > 0));
+      const held = hollows.filter((h) => mine.some((m) => boxHolds(boxOf(m), boxOf(h))));
+      back.push(...away, ...hollows.filter((h) => !held.includes(h)));
+      const whole = mine.length === outer.length && held.length === hollows.length;
+      lids.push({ solid: !mine.length ? null : whole ? all.translate(0, 0, 0) : Manifold.compose([...mine, ...held]), shells: mine.length, loose: away.length });
+    });
+    const cut = solid.subtract(prisms.length > 1 ? t.add(Manifold.union(prisms)) : prisms[0]);
+    const body = back.length ? Manifold.union([t.add(cut), ...back]) : cut;
+    return { body, lids };
+  } catch (err) {
+    lids.forEach((l) => l.solid?.delete());
+    throw err;
+  } finally {
+    t.dispose();
+  }
+}
+
+/** How many shells a solid has: outer ones, and the sealed hollows `decompose` gives inside out. */
+export function shellCounts(solid) {
+  let solids = 0;
+  let hollows = 0;
+  for (const m of solid.decompose()) {
+    if (m.volume() > 0) solids++;
+    else hollows++;
+    m.delete();
+  }
+  return { solids, hollows };
+}
+
+/**
+ * What a part is and whether it comes off, from the model's slices in its frame: its face put on the layers
+ * (`placePart`), where it ends (`partCap`), what stands over it and what that is called, and – for a lid – the way it
+ * comes out (`wayOut`): straight off, or lifted and slid out. A base drops straight out of the model's end. What it
+ * is called, in its frame: 'Base' for a plug; 'Dome and cap' when something stands over it inside its circle covering
+ * at most a third of it (a lantern's handle), 'Top' when nothing does; `Part B` when more does (a cup under a roof).
+ * With `S` (the sizes of a part that locks), its twist-lock is sized at the face as placed (`partLock`): a lid's way
+ * out then starts at the lock's own lift, the neck's height and the play over it.
+ * @param {Manifold} solid the model in the part's frame (borrowed)
+ * @param {object} stack its `sliceStack`
+ * @param {(z: number) => object[]} fine its islands at a height (`fineSlices`)
+ * @param {{ c: number[], z0: number, R: number }} part in its frame (`partInFrame`)
+ * @param {{ hl: number, gmin: number, grid?: object|null, letter: string, minLift: number, S?: object|null }} options
+ *   `minLift` the least lift tried on the way out without a lock
+ * @returns {object} plain: `placePart`'s, with `cap`, `next`, `top`, `name`, `handle` (a handle stands over it),
+ *   `covered`, `span` (the handle's, in plan, or null), `lock` (`partLock`'s, null without `S`) and `way` `{ up,
+ *   lift, dir, dirs, reach }` in the frame (null when refused before it is looked for; `lift` null when it can't come
+ *   out)
+ */
+export function checkPart(solid, stack, fine, part, { hl, gmin, grid = null, letter, minLift, S = null }) {
+  const { c, R } = part;
+  const placed = placePart(stack, fine, part, { hl, gmin, grid });
+  const plug = placed.kind === 'plug';
+  const ends = partCap(stack, fine, c, R, placed.capRow.lo, placed.capRow.hi);
+  // what stands over it inside the circle, traced down, and how much of it that covers
+  const level = (z) => {
+    const k = stack.levels.findIndex((lv) => lv.z >= z);
+    return k < 0 ? stack.levels.length : k;
+  };
+  const lid = { c, R, k: Math.min(level(placed.z0), stack.levels.length - 1), cap: level(ends.cap), far: placed.lo ?? R };
+  const trace = plug || ends.next == null ? null : traceOver(stack, lid);
+  const covered = trace ? coverOf(stack, lid) : 0;
+  const handle = !!trace && covered <= COVER_MOST;
+  const name = plug ? 'Base' : handle ? 'Dome and cap' : trace ? `Part ${letter}` : 'Top';
+  const out = { ...placed, ...ends, name, handle, covered: +covered.toFixed(3), legs: trace?.legs ?? 0, span: handle ? trace.span : null, lock: null, way: null };
+  if (!placed.ok) return out;
+  const lock = S ? partLock(stack, fine, { c, R }, placed, S) : null;
+  if (plug) return { ...out, lock, way: { up: true, lift: 0, dir: null, dirs: [], reach: 0 } };
+  const way = wayOut(solid, stack, { c, r: R, face: placed.z0, cap: ends.cap }, lock?.mech ? S.H + S.cz : minLift);
+  return { ...out, lock, way: { up: way.up, lift: way.lift, dir: way.dir, dirs: way.dirs, reach: way.reach } };
+}
+
+/**
+ * The twist-lock a placed part gets, from the model's slices in its frame, as plain data: a lid's (or a full one's)
+ * collar twist-lock (`collarAt`), a base's plug twist-lock on its own circle (`plugLockOf`), each `{ mech, … }` with
+ * what its solids are built from; or `{ mech: null, why }` when none fits there.
+ * @returns {object} 'twist': `{ mech, r0, rn, rs, rf, opening, theta, tabs, tabR, slope, reach, shelf, above, below }`;
+ *   'plug': `{ mech, R, opening, theta, tabs, tabR, wall, camOutN, coin, zl }`
+ */
+export function partLock(stack, fine, { c, R }, placed, S) {
+  if (placed.kind === 'plug') {
+    const P = plugLockOf(stack, fine, c, R, S, placed.z0);
+    if (P.why) return { mech: null, why: P.why };
+    const { opening, theta, tabs, tabR, wall, camOutN, coin, zl } = P;
+    return { mech: 'plug', R, opening, theta, tabs, tabR, wall, camOutN, coin, zl };
+  }
+  const L = collarAt(fine, c, placed.z0, S, stack.zmin);
+  if (L.why) return { mech: null, why: L.why };
+  const { r0, rn, rs, rf, opening, theta, tabs, tabR, slope, reach: down, shelf, above, below } = L;
+  return { mech: 'twist', r0, rn, rs, rf, opening, theta, tabs, tabR, slope, reach: down, shelf, above, below };
+}
+
 // ---------- room for pins on a cut face ----------
 
 /**
@@ -2617,16 +2985,91 @@ function roomAround(cut, by, bounds) {
 }
 
 /**
+ * The collar twist-lock a full-plane cut that comes apart takes in place of a lip with no clips – a round wall, or an
+ * outline with no straight stretch long enough for one – sized as a lid's is (`collarAt`), on the model's slices round
+ * the cut: centred on its face's island, the neck standing up out of the piece on side k (the one the lip would
+ * stand out of) and the socket cut into the other, which lies on its cut face for it as a lid that comes off does. The
+ * socket's piece must go on round the axis as far as the socket ring reaches before the next cut or the model's end
+ * (`rooms`, how far each piece reaches along the axis), and the collar reaches no further into the neck's piece than
+ * that one does. In its frame (`partFrame`: the socket's piece lying towards +z), as the drill stage builds it; null
+ * when none fits.
+ * @param {{ slice: (t: number) => CrossSection }} band the model round the cut in its plane frame (borrowed; each slice
+ *   the caller's)
+ * @param {{ axis: number, at: number }} cut
+ * @param {0|1} k the side whose piece carries the neck: 0 the one below the cut
+ * @param {CrossSection} island the face's island, plane frame (borrowed)
+ * @param {{ S: object, rooms: number[], minArea: number }} options `S` the lock's sizes (`sizes`), `rooms` [below,
+ *   above], `minArea` the specks dropped from a slice
+ * @returns {{ mech: 'twist', kind: 'full', frame: number[]|null, c: number[], z0: number, S: object, r0: number,
+ *   rn: number, rs: number, rf: number, opening: number, theta: number, tabs: number, tabR: number, slope: number,
+ *   reach: number, shelf: number, above: number[][], below: number[][] }|null} plain
+ */
+export function cutTwist(band, cut, k, island, { S, rooms, minArea }) {
+  const side = k === 0 ? 1 : -1;
+  const lidRoom = S.sockTop + 4;
+  if (!(rooms[1 - k] >= lidRoom + S.hl)) return null;
+  const outer = polygonsOf(island).filter((r) => ringArea(r) > 0);
+  const middle = outer.length === 1 ? polygonsCentroid(outer) : null;
+  if (!middle) return null;
+  // the frame turns the plane frame half a turn about u for a socket under the cut: v and the axis change sign
+  const fine = fineSlices({
+    slice: (z) => {
+      const cs = band.slice(side * z);
+      if (side > 0) return cs;
+      try {
+        return cs.mirror([0, 1]);
+      } finally {
+        cs.delete();
+      }
+    },
+  }, minArea);
+  const c = [middle[0], side * middle[1]];
+  const z0 = side * cut.at;
+  const L = collarAt(fine, c, z0, S, z0 - rooms[k]);
+  // the socket's piece goes on round the axis all the way up the socket ring, or the ring would stand out of it
+  if (L.why || L.above[L.above.length - 1][1] < lidRoom - 1e-9) return null;
+  const { r0, rn, rs, rf, opening, theta, tabs, tabR, slope, reach: depth, shelf, above, below } = L;
+  return {
+    mech: 'twist', kind: 'full', frame: partFrame({ axis: cut.axis, side }), c, z0, S, r0, rn, rs, rf, opening, theta, tabs, tabR, slope,
+    reach: depth, shelf, above, below,
+  };
+}
+
+/**
  * The lips of the cuts that come apart, worked out face by face as the layout works them out: the shadow of the air
  * (and of what was placed before) at a reach, the obstacles on the groove's side, the lip each piece would carry
  * (`lipFor`), the better of two, and the cut tried a little way off for where a full lip fits (`moveFor`). Shared by
  * `layoutSplit` and `probeLip`, so a cut tried while it is being placed gets the lip and the move the download gives it.
+ * On a hold with clips, a face of one patch whose lip would get none – a clipless lip of any height, or no lip at all
+ * – is offered the collar twist-lock in their place on either side (`cutTwist`), sized for the printer's nozzle, layers
+ * (`hl`) and the clearance: the lip each piece would carry then counts it as it counts clips (`lipRank`).
  * @param {{ solid: Manifold, cuts: object[], bounds: { min: number[], max: number[] }, c: number, nozzle: number,
- *   keep: object, lipBand: number, source?: object|null }} options `keep` the scope that holds what is made until the
- *   caller is done; `source` where a cut's band, shadows and ceilings come from (`slicedSource`), the solid's own band
- *   and its booleans (`bandFor`, `shadowFor`, `overFor`) when not given
+ *   hl?: number, keep: object, lipBand: number, source?: object|null }} options `keep` the scope that holds what is
+ *   made until the caller is done; `source` where a cut's band, shadows and ceilings come from (`slicedSource`), the
+ *   solid's own band and its booleans (`bandFor`, `shadowFor`, `overFor`) when not given
  */
-function lipKit({ solid, cuts, bounds, c, nozzle, keep, lipBand, source = null }) {
+function lipKit({ solid, cuts, bounds, c, nozzle, hl = 0.2, keep, lipBand, source = null }) {
+  const S = sizes(nozzle, hl, c);
+  /**
+   * The twist-lock side k of a patch takes with the neck on it, where its lip (`plan`) has no clip on a hold with them
+   * because the face's outline takes none even with nothing in the way – a round wall, an odd outline (a full lip
+   * with nothing over it or beside it has no window for one) – whether its lip is clipless or there is none: only on a
+   * face of one patch (a speck too small for one left out, as the lip leaves it), and centred on it. Kept on the cut.
+   */
+  const twistAt = (ctx, patch, k, plan) => {
+    const hold = ctx.cut.apart?.hold ?? 'snap';
+    if (!catchSizes(hold, c) || plan?.windows.length > 0 || ctx.patches.length !== 1 || ctx.patches[0] !== patch || patch.skip) return null;
+    patch.bare ??= planLip(patch.lip, { island: patch.island, c, nozzle, H: LIP.heights[0], hold, key: false }) ?? false;
+    if (!patch.bare || patch.bare.windows.length > 0) return null;
+    ctx.twists ??= new Map();
+    if (!ctx.twists.has(k)) {
+      // specks of the slices dropped as the finder drops them
+      const width = Math.max(...planeAxes(ctx.cut.axis).map((a) => bounds.max[a] - bounds.min[a]));
+      ctx.twists.set(k, cutTwist(ctx.band, ctx.cut, k, patch.island, { S, rooms: ctx.rooms, minArea: (width * SPECK) ** 2 * FINE_SPECK }));
+    }
+    return ctx.twists.get(k);
+  };
+
   /** A cut's shadow at a reach (as `shadowFor`), kept for the layout: the air's once per reach, the earlier holes' added on top. */
   const shadowAt = (ctx, reach, withObstacles) => {
     const key = typeof reach === 'number' ? reach.toFixed(4) : `${reach.below.toFixed(4)}/${reach.above.toFixed(4)}`;
@@ -2683,20 +3126,23 @@ function lipKit({ solid, cuts, bounds, c, nozzle, keep, lipBand, source = null }
       patch.lipSides = [0, 1].map((k) => {
         const obstaclesAt = lipObstacles(ctx, patch, k);
         const { plan, kind } = lipFor(patch.lip, { island: patch.island, c, nozzle, hold, key: patch === largest, obstaclesAt });
-        return { plan, kind, obstaclesAt, roomAt: lipObstacles(ctx, patch, k, 0), rootAt: lipRootAt(ctx, patch, k) };
+        return { plan, kind, twist: twistAt(ctx, patch, k, plan), obstaclesAt, roomAt: lipObstacles(ctx, patch, k, 0), rootAt: lipRootAt(ctx, patch, k) };
       });
     }
   }
 
-  // the lip each piece of a pair would carry, the better first in order: one at all, with clips, taller, more clips,
-  // more tongue; the one below when they are as good
-  const lipRank = (q) => (q ? [1, q.clips > 0 ? 1 : 0, q.H, q.clips, q.area] : [0, 0, 0, 0, 0]);
+  // the lip each piece of a pair would carry, the better first in order: one at all (or the twist-lock), with clips or
+  // the twist-lock in their place, taller, more clips, more tongue; the one below when they are as good
+  const lipRank = (q) => (q ? [1, q.clips > 0 || q.twist ? 1 : 0, q.H, q.clips, q.area] : [0, 0, 0, 0, 0]);
   const qualityOfPlan = (plan) => (plan ? { H: plan.H, clips: plan.windows.length, area: plan.area } : null);
+  /** A side's lip as `qualityOfPlan` has it, with the twist-lock it takes instead, where it does (with no lip, of no height). */
+  const qualityOfSide = ({ plan, twist }) => (twist ? { ...(qualityOfPlan(plan) ?? { H: 0, clips: 0, area: 0 }), twist: true } : qualityOfPlan(plan));
   const betterLip = (pair) => {
     const [r0, r1] = pair.quality.map(lipRank);
     const i = r0.findIndex((x, n) => Math.abs(x - r1[n]) > 1e-6);
     const k = i < 0 || r0[i] > r1[i] ? 0 : 1;
-    return pair.quality[k] ? { male: k, piece: k === 0 ? pair.lo : pair.hi, down: `${k === 0 ? '-' : '+'}${AXES[pair.axis]}` } : null;
+    const q = pair.quality[k];
+    return q ? { male: k, piece: k === 0 ? pair.lo : pair.hi, down: `${k === 0 ? '-' : '+'}${AXES[pair.axis]}`, ...(q.twist ? { twist: true } : {}) } : null;
   };
 
   /**
@@ -2752,7 +3198,7 @@ function lipKit({ solid, cuts, bounds, c, nozzle, keep, lipBand, source = null }
     if (ctx.moveFor.has(key)) return ctx.moveFor.get(key);
     const hold = ctx.cut.apart?.hold ?? 'snap';
     const toward = k === 0 ? 1 : -1; // along the axis, the way to the groove's piece
-    const now = lipRank(qualityOfPlan(patch.lipSides[k].plan)).slice(0, 4);
+    const now = lipRank(qualityOfSide(patch.lipSides[k])).slice(0, 4);
     const clear = (at) => {
       const d = at - ctx.cut.at;
       if (within && !(at >= within[0] - 1e-9 && at <= within[1] + 1e-9)) return false;
@@ -2765,7 +3211,7 @@ function lipKit({ solid, cuts, bounds, c, nozzle, keep, lipBand, source = null }
     const full = (where, there, r) => {
       if (!r || r.shift > 0 || r.root) return null;
       const { plan } = lipFor(there.lip, { island: there.island, c, nozzle, hold, key: true, obstaclesAt: lipObstacles(where, there, k), heights: [LIP.heights[0]] });
-      const quality = qualityOfPlan(plan);
+      const quality = qualityOfSide({ plan, twist: twistAt(where, there, k, plan) });
       const rank = lipRank(quality).slice(0, 4);
       const n = rank.findIndex((x, i) => Math.abs(x - now[i]) > 1e-6);
       return (n < 0 ? least > 0 && rank[0] > 0 : rank[n] > now[n]) ? quality : null;
@@ -2818,7 +3264,7 @@ function lipKit({ solid, cuts, bounds, c, nozzle, keep, lipBand, source = null }
     ? null
     : ctx.movedLips.get(`${ctx.patches.indexOf(patch)}|${k}|${least}${within ? `|${within.join('/')}` : ''}`));
 
-  return { shadowAt, lipObstacles, lipRootAt, planLipSides, lipRank, qualityOfPlan, betterLip, movedTo, moveFor, movedLip };
+  return { shadowAt, lipObstacles, lipRootAt, planLipSides, lipRank, qualityOfPlan, qualityOfSide, betterLip, movedTo, moveFor, movedLip };
 }
 
 /**
@@ -2935,36 +3381,46 @@ export function slicedSource(sliceAt, { step = 0.5, keep, flats = [] } = {}) {
  * a move gives it room, the cut has no lip here, as in the download. No
  * lip is built, nor the band round the cut when slices are given. Where
  * the caller has no use for a move (`moves` false), or none beyond
- * `within`, none is looked for that far.
+ * `within`, none is looked for that far. A lip that would get no clips
+ * says what twist-lock the cut takes in its place, where one fits and the
+ * piece its socket would be cut into is guessed to print as well lying on
+ * its cut face (`socketsWell`, `socketsAsWell`), as `apartMales` judges it
+ * once the pieces are cut.
  * @param {Manifold} solid (borrowed)
  * @param {{ axis: number, at: number }} cut
- * @param {{ c?: number, nozzle?: number, hold?: string, bounds?: { min: number[], max: number[] }, asWell?: boolean[],
- *   sliceAt?: (t: number) => CrossSection, flats?: number[], moves?: boolean, within?: number[]|null }} options
- *   `bounds` the model's, as the layout has them;
+ * @param {{ c?: number, nozzle?: number, hl?: number, hold?: string, bounds?: { min: number[], max: number[] },
+ *   asWell?: boolean[], socketsWell?: boolean[], sliceAt?: (t: number) => CrossSection, flats?: number[], moves?: boolean,
+ *   within?: number[]|null }} options
+ *   `hl` the layer height (the twist-lock's heights are whole layers); `bounds` the model's, as the layout has them;
  *   `sliceAt` the model's slices along the cut's axis (plane frame, borrowed, kept by the caller), to read what stands
  *   round the cut from (`slicedSource`, with `flats` the heights of the model's faces square to the axis) – without it,
  *   the band round the cut and its booleans, as the layout reads them
- * @returns {{ patches: number, male: 0|1|null, lip: { H: number, clips: number, why: string|null, kind: string, broken: boolean }|null,
- *   noLip: 'miss'|'small'|'thin'|'room'|null, suggestedAt: number|null, suggestedLip: { H: number, clips: number }|null,
- *   quality: object[] }} `lip` over all the faces (the tallest, every clip; `why` as APART_NO_CLIPS has it, null with
- *   clips or on a hold with none; `broken` whether its main face's tongue comes in more than one stretch), `noLip`
- *   why there is none: the cut misses the model, its faces are too small (it
+ * @returns {{ patches: number, male: 0|1|null, lip: { H: number, clips: number, why: string|null, kind: string|null, broken: boolean,
+ *   twist?: { r0: number, opening: number, theta: number, tabs: number } }|null, noLip: 'miss'|'small'|'thin'|'room'|null,
+ *   suggestedAt: number|null, suggestedLip: { H: number, clips: number, twist?: true }|null, quality: object[] }} `lip`
+ *   over all the faces (the tallest, every clip; `why` as APART_NO_CLIPS has it, null with clips, with the twist-lock
+ *   or on a hold with none; `broken` whether its main face's tongue comes in more than one stretch; `twist` the
+ *   twist-lock it takes instead, `H` then 0 where no lip would fit at all), `noLip` why there is none: the cut misses
+ *   the model, its faces are too small (it
  *   runs through openings, or a small solid part), its walls too thin, or the piece past it has no room;
- *   `suggestedLip` the lip the move gives its main face – taller, or with clips; `quality` the lip each piece would
- *   carry, [below, above]
+ *   `suggestedLip` the lip the move gives its main face – taller, with clips or the twist-lock; `quality` the lip each
+ *   piece would carry, [below, above]
  */
-export function probeLip(solid, cut, { c = SPLIT_DEFAULTS.clearance, nozzle = 0.4, hold = 'snap', bounds = null, asWell = [true, true], sliceAt = null, flats = [], moves = true, within = null } = {}) {
+export function probeLip(solid, cut, {
+  c = SPLIT_DEFAULTS.clearance, nozzle = 0.4, hl = 0.2, hold = 'snap', bounds = null, asWell = [true, true], socketsWell = [true, true], sliceAt = null, flats = [],
+  moves = true, within = null,
+} = {}) {
   const b = bounds ?? boxOf(solid);
   const one = { id: 'probe', letter: 'A', axis: cut.axis, at: cut.at, apart: { hold } };
   const keep = scope();
   try {
     const lipBand = lipReach(LIP.heights[0], 'opening', c, catchSizes('snap', c).i, true, nozzle).reach;
-    const kit = lipKit({ solid, cuts: [one], bounds: b, c, nozzle, keep, lipBand, source: sliceAt ? slicedSource(sliceAt, { keep, flats }) : null });
+    const kit = lipKit({ solid, cuts: [one], bounds: b, c, nozzle, hl, keep, lipBand, source: sliceAt ? slicedSource(sliceAt, { keep, flats }) : null });
     // the cut's face, its patches and islands, as a cut moved here has them
     const ctx = kit.movedTo({ cut: one, obstacles: [], rooms: [one.at - b.min[one.axis], b.max[one.axis] - one.at] }, one.at);
     const live = ctx.patches;
     // the lip a move gives, as the readout says what the move is for
-    const lipOf = (q) => (q ? { H: q.H, clips: q.clips } : null);
+    const lipOf = (q) => (q ? { H: q.H, clips: q.clips, ...(q.twist ? { twist: true } : {}) } : null);
     const none = (noLip, suggestedAt = null, male = null, quality = [null, null], suggestedLip = null) => ({
       patches: live.length, male, lip: null, noLip, suggestedAt, suggestedLip: lipOf(suggestedLip), quality,
     });
@@ -2973,10 +3429,16 @@ export function probeLip(solid, cut, { c = SPLIT_DEFAULTS.clearance, nozzle = 0.
     // where the moves would give a full lip, for the readout: none asked (`moves`), or none past `within`
     const suggest = (patch, k) => (moves ? kit.moveFor(ctx, patch, k, 0, within) : null);
     const suggested = (patch, k) => (moves ? kit.movedLip(ctx, patch, k, 0, within) : null);
+    // the twist-lock side k takes in place of clips, if any (on a face that is one patch, that patch's), where the other
+    // piece would print as well lying on its cut face for the socket
+    const twistOf = (k) => (socketsWell[1 - k] ? live.find((patch) => patch.lipSides[k].twist)?.lipSides[k].twist ?? null : null);
     const qualityOf = (k) => {
       const plans = live.map((patch) => patch.lipSides[k].plan).filter(Boolean);
-      if (!plans.length) return null;
-      return { H: Math.max(...plans.map((x) => x.H)), clips: plans.reduce((n, x) => n + x.windows.length, 0), area: plans.reduce((n, x) => n + x.area, 0) };
+      const twist = twistOf(k) ? { twist: true } : null;
+      if (!plans.length) return twist ? { H: 0, clips: 0, area: 0, ...twist } : null;
+      return {
+        H: Math.max(...plans.map((x) => x.H)), clips: plans.reduce((n, x) => n + x.windows.length, 0), area: plans.reduce((n, x) => n + x.area, 0), ...twist,
+      };
     };
     const quality = [qualityOf(0), qualityOf(1)];
     const largest = (list) => list.reduce((x, y) => (y.area > x.area ? y : x));
@@ -2988,6 +3450,15 @@ export function probeLip(solid, cut, { c = SPLIT_DEFAULTS.clearance, nozzle = 0.
     }
     if (chosen) {
       const k = chosen.male;
+      const twist = twistOf(k);
+      if (twist) {
+        // the twist-lock in place of clips holds as a full lip with them does: no move is looked for
+        const plan = live[0].lipSides[k].plan;
+        return {
+          patches: live.length, male: k, noLip: null, suggestedAt: null, suggestedLip: null, quality,
+          lip: { H: quality[k].H, clips: 0, why: null, kind: plan?.kind ?? null, broken: false, twist: { r0: twist.r0, opening: twist.opening, theta: twist.theta, tabs: twist.tabs } },
+        };
+      }
       // the notes speak of the face with the most tongue
       const main = live.filter((patch) => patch.lipSides[k].plan).reduce((x, y) => (y.lipSides[k].plan.area > x.lipSides[k].plan.area ? y : x));
       const side = main.lipSides[k];
@@ -3055,15 +3526,23 @@ export function probeLip(solid, cut, { c = SPLIT_DEFAULTS.clearance, nozzle = 0.
  * before any pin, peg or label of the other cuts, which keep clear of them.
  * A lip short of full is tried at the places the notes would offer, and
  * only one found to have a full lip there is offered (`suggestedAt`). A
- * lip's face gets no label and counts towards no cap.
+ * lip's face gets no label and counts towards no cap. A cut whose lip
+ * would get no clips on a hold with them – a round wall, an odd outline –
+ * takes the collar twist-lock instead where one fits round its face
+ * (`cutTwist`) and the pair chosen to carry it says so (`twist`): the neck
+ * stands out of the piece the lip would, the socket is cut into the other,
+ * which lies on its cut face. That holds where the lip has no clips, and
+ * where no lip fits at all; the lip, if any, is kept (`twist` on it) for
+ * where the lock is not built after all, and what it gives (`fallbacks`).
  * @param {Manifold} solid the model (borrowed)
  * @param {{ id, letter, axis, at }[]} cuts normalised, in canonical order
  * @param {{ index: number, cell: number[], up?: string, boxes?: object[] }[]} pieces from `cutPieces`, or `layPieces`, with
  *   the way each prints up (`chooseOrientation(...).up`); a hole is a teardrop on a piece whose up is not along the cut.
  *   Where a cell holds more than one, `boxes` (its shells') tell which holds each face
  * @param {object} spec the normalised settings (joint, diameter, depth, clearance, count, labels)
- * @param {{ nozzle?: number, joints?: Object<string, string>, tabs?: object|null, font?: object, bounds?: object,
- *   progress?: function, pegMales?: function|null, apartMales?: function|null }} options
+ * @param {{ nozzle?: number, hl?: number, joints?: Object<string, string>, tabs?: object|null, font?: object, bounds?: object,
+ *   progress?: function, pegMales?: function|null, apartMales?: function|null }} options `hl` the layer height a
+ *   twist-lock's heights are whole layers of;
  *   `joints` per cut id (from `planDovetails`; dowels when missing, pegs when the joint is built-in pegs, a lip on a cut
  *   that comes apart); `tabs` its
  *   dovetail tabs, whose sockets reach past their cut right through the model, so the holes of a crossing cut keep out
@@ -3080,8 +3559,13 @@ export function probeLip(solid, cut, { c = SPLIT_DEFAULTS.clearance, nozzle = 0.
  *   `{ H, clips, area }` or null, `{ male, piece, down, alt? }` or null; `given` the ways down the lips of the cuts
  *   before have given pieces, a Map by number); when not given the one with the better lip, else the one below
  * @returns {{ diameter: number|null, pegSize: number|null, dowels: object[], pegs: object[], labels: object[],
- *   lips: object[], seams: object[], notes: object[], pinnable: string[] }} `pinnable` the ids of the cuts with pegs
- *   whose faces would take pins instead (3 mm or larger), for the note on pegs printed standing up
+ *   lips: object[], locks?: object[], seams: object[], notes: object[], pinnable: string[] }} `pinnable` the ids of the
+ *   cuts with pegs whose faces would take pins instead (3 mm or larger), for the note on pegs printed standing up;
+ *   `locks` the twist-locks of the cuts that take one (`cutTwist`'s, with `cutId`, `letter`, `axis`, `socket` 'ring', `male`
+ *   the side with the neck, `down` the way both pieces lie and `sides: [{ piece, role: 'body'|'part' }]`), only when
+ *   some cut does, and `fallbacks` by cut id what it gets where its lock is not built: `{ notes, apart, joint }`, the
+ *   notes and its seam's `apart` and `joint` ('none' where no lip fits either); the lip of such a cut, if it has one,
+ *   has `twist: true`
  *   dowel `{ cutId, letter, patch, axis, at, centre, uv, d, depth, R, h, ch, cell, sides: [{ piece, tear, apex }, …] }`
  *   (side 0 the lower piece, `cell` the pin's half-cell for the exploded view);
  *   peg `{ cutId, letter, patch, axis, at, centre, uv, s, length, c, half, ch, e, h, tip, a, cell, male, dir, sides:
@@ -3101,7 +3585,7 @@ export function probeLip(solid, cut, { c = SPLIT_DEFAULTS.clearance, nozzle = 0.
  */
 export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
   const { CrossSection, Manifold } = manifold();
-  const { nozzle = 0.4, joints = {}, tabs = null, font = null, progress = null, pegMales = null, apartMales = null } = options;
+  const { nozzle = 0.4, hl = 0.2, joints = {}, tabs = null, font = null, progress = null, pegMales = null, apartMales = null } = options;
   const bounds = options.bounds ?? boxOf(solid);
   const by = axisCuts(cuts);
   const c = Number.isFinite(spec.clearance) ? spec.clearance : SPLIT_DEFAULTS.clearance;
@@ -3158,7 +3642,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
   const lipForced = new Map(); // piece -> the letter of the cut whose lip says how it lies
   const keep = scope(); // bands, patches, shadows and obstacles that live until the layout is done
 
-  const { shadowAt, planLipSides, betterLip, moveFor } = lipKit({ solid, cuts, bounds, c, nozzle, keep, lipBand });
+  const { shadowAt, planLipSides, betterLip, moveFor } = lipKit({ solid, cuts, bounds, c, nozzle, hl, keep, lipBand });
 
   /**
    * How far a peg of these sizes reaches either side of its face with its socket in the piece on side k (0 the one
@@ -3567,6 +4051,17 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
   }
 
   /**
+   * The note of a cut that takes the collar twist-lock (`locks`): the piece
+   * with the socket twist-locks onto the one with the neck, and how.
+   */
+  function twistNote(lock, ctx) {
+    const [male, female] = ['body', 'part'].map((role) => lock.sides.find((x) => x.role === role).piece);
+    return splitNote('APART_TWIST', {
+      letter: ctx.cut.letter, cutId: ctx.cut.id, axis: ctx.cut.axis, above: lock.male === 1, male, female, turn: lock.theta, tabs: lock.tabs,
+    });
+  }
+
+  /**
    * The notes of a cut that comes apart: how it goes together, or why its
    * lip has no clips, or why it has no lip at all – its faces too small (it
    * runs through openings), its walls too thin, no piece that may lie with
@@ -3714,13 +4209,19 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     // the other cuts' teardrops then follow, and every pin, peg and label keeps clear of them ----
     const forced = new Map();
     const lips = [];
+    const locks = [];
+    const fallbacks = {}; // by cut id: what a cut with the twist-lock gets where the lock is not built after all
     if (lipped.length) {
       const byIndex = new Map(own.map((p) => [p.index, p]));
-      // the lip each piece of a pair would carry over all the pair's faces: the tallest, every clip, all the tongue
+      // the lip each piece of a pair would carry over all the pair's faces: the tallest, every clip, all the tongue, and
+      // the twist-lock in place of clips (a face of one patch only takes it)
       const qualityOf = (list, k) => {
         const plans = list.map((patch) => patch.lipSides[k].plan).filter(Boolean);
-        if (!plans.length) return null;
-        return { H: Math.max(...plans.map((x) => x.H)), clips: plans.reduce((n, x) => n + x.windows.length, 0), area: plans.reduce((n, x) => n + x.area, 0) };
+        const twist = list.some((patch) => patch.lipSides[k].twist) ? { twist: true } : null;
+        if (!plans.length) return twist ? { H: 0, clips: 0, area: 0, ...twist } : null;
+        return {
+          H: Math.max(...plans.map((x) => x.H)), clips: plans.reduce((n, x) => n + x.windows.length, 0), area: plans.reduce((n, x) => n + x.area, 0), ...twist,
+        };
       };
       // cut by cut, each keeping clear of the lips placed before it, as of air (two crossing cuts' tongues would fill
       // one corner), and of the ways their pieces must lie
@@ -3744,6 +4245,11 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
         groups.forEach((g, n) => {
           g.pair = list[n];
           g.male = chosen[n] ?? null;
+          // a twist-lock is drilled into whole pieces: never into one of the shells of a box that print apart
+          if (g.male?.twist && ![g.pair.lo, g.pair.hi].every((i) => inCell.get(byIndex.get(i).cell.join(','))?.length === 1)) {
+            const { twist, ...lip } = g.male;
+            g.male = lip;
+          }
           for (const patch of g.patches) patch.lipPair = g;
           // a piece that would print worse with the lip, where the other would print as well carrying it once the
           // cut moves: no lip here, and the note says where
@@ -3757,9 +4263,13 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
             }
           }
           if (!g.male) return;
-          forced.set(g.male.piece, g.male.down);
-          lipForced.set(g.male.piece, ctx.cut.letter);
-          byIndex.get(g.male.piece).up = oppositeDir(g.male.down);
+          // the twist-lock's socket is cut into the other piece, which lies on its cut face: the same way down
+          const lying = g.male.twist ? [g.male.piece, g.male.piece === g.pair.lo ? g.pair.hi : g.pair.lo] : [g.male.piece];
+          for (const piece of lying) {
+            forced.set(piece, g.male.down);
+            lipForced.set(piece, ctx.cut.letter);
+            byIndex.get(piece).up = oppositeDir(g.male.down);
+          }
         });
         const hold = ctx.cut.apart?.hold ?? 'snap';
         for (const g of groups) {
@@ -3768,6 +4278,15 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
           for (const patch of g.patches) {
             const side = patch.lipSides[k];
             const plan = side.plan;
+            // the twist-lock in place of the lip's clips, or of a lip where none fits; the lip is kept for where the
+            // lock is not built after all
+            if (g.male.twist && side.twist) {
+              patch.twistOn = {
+                cutId: ctx.cut.id, letter: ctx.cut.letter, axis: ctx.cut.axis, ...side.twist, socket: 'ring', male: k, down: g.male.down,
+                sides: [{ piece: (k === 0 ? patch.lo : patch.hi).index, role: 'body' }, { piece: (k === 0 ? patch.hi : patch.lo).index, role: 'part' }],
+              };
+              locks.push(patch.twistOn);
+            }
             if (!plan) continue;
             // short of a full lip (6 mm, with clips on a hold that has them): how much room the groove has, and where
             // the cut would have enough
@@ -3806,6 +4325,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
               root: Boolean(r?.root),
               suggestedAt: r ? moveFor(ctx, patch, k) : null,
             };
+            if (patch.twistOn) lip.twist = true;
             patch.lipOn = lip;
             lips.push(lip);
             // the tongue is its male's and the groove its female's: placed apart, as a hole's two halves are
@@ -3820,7 +4340,15 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
           if (!patch.skip) patch.apex = [teardropApex(patch.lo.up ?? '+z', ctx.cut.axis), teardropApex(patch.hi.up ?? '+z', ctx.cut.axis)];
         }
       }
-      for (const ctx of lipped) lipNotes(ctx);
+      for (const ctx of lipped) {
+        const from = notes.length;
+        lipNotes(ctx);
+        // a cut with the twist-lock says how it goes on; what the lip would have said is kept for where it is not built
+        const lock = locks.find((x) => x.cutId === ctx.cut.id);
+        if (!lock) continue;
+        fallbacks[ctx.cut.id] = { notes: notes.splice(from), apart: null };
+        notes.push(twistNote(lock, ctx));
+      }
     }
 
     // ---- which side of each pegged face has room for its sockets at all: the smallest peg the cut may fall back to,
@@ -4007,11 +4535,17 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
           seam.male = patch.lipOn.sides[patch.lipOn.male].piece;
           lipsOf.get(key).push(patch.lipOn);
         }
+        if (patch.twistOn) {
+          seam.male = patch.twistOn.sides[0].piece;
+          seam.twist = patch.twistOn;
+        }
         if (patch.label && !seam.labels) seam.labels = patch.label.sides.map((s) => s.text);
       }
       for (const [key, seam] of pairs) {
         const here = lipsOf.get(key);
-        const empty = { dowels: !seam.dowels.length, pegs: !seam.pegs.length, lip: !here.length };
+        const lock = seam.twist;
+        delete seam.twist;
+        const empty = { dowels: !seam.dowels.length, pegs: !seam.pegs.length, lip: !here.length && !lock };
         if (empty[seam.joint]) seam.joint = 'none';
         if (ctx.cut.apart) {
           // a cut that comes apart is never glued: how it holds instead, for the glue sheet and the pieces list
@@ -4024,14 +4558,198 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
               hold, lip: here.length > 0, clips: here.reduce((n, l) => n + l.clips, 0), height: here.length ? Math.max(...here.map((l) => l.H)) : 0,
               key: here.some((l) => Boolean(l.key)), faces: here.length, flat: seam.patches - here.length,
             };
+            // the twist-lock in place of the lip: how it holds, and the lip's for where it is not built after all
+            if (lock) {
+              Object.assign(fallbacks[seam.cutId], { apart: seam.apart, joint: here.length ? seam.joint : 'none' });
+              seam.apart = {
+                hold, lip: false, clips: 0, height: 0, key: false, faces: seam.patches, flat: 0, mech: 'twist', r0: lock.r0,
+                opening: lock.opening, theta: lock.theta, tabs: lock.tabs, socket: lock.socket, slope: lock.slope, shelf: lock.shelf,
+              };
+            }
           }
         }
         seams.push(seam);
       }
     }
-    return { diameter: D, pegSize: P, dowels, pegs, labels, lips, seams, notes, pinnable: pegged.filter((ctx) => ctx.pinnable).map((ctx) => ctx.cut.id) };
+    return {
+      diameter: D, pegSize: P, dowels, pegs, labels, lips, ...(locks.length ? { locks, fallbacks } : {}), seams, notes,
+      pinnable: pegged.filter((ctx) => ctx.pinnable).map((ctx) => ctx.cut.id),
+    };
   } finally {
     keep.dispose();
+  }
+}
+
+// ---------- the locks of the parts that come off ----------
+
+/**
+ * A part's lock's frame → world: the lock's frame (z = 0 its joint, centred on its circle) moved to the part's place
+ * in the part's frame (`partFrame`), then back to the world.
+ * @param {{ frame: number[]|null, c: number[], z0: number }} lock as the engine's `layout.locks` hold it
+ * @returns {number[]} column-major 4×4
+ */
+export function lockMatrix({ frame, c, z0 }) {
+  const move = translationMat4([c[0], c[1], z0]);
+  return frame ? mulMat4(transposeMat4(frame), move) : move;
+}
+
+/** The box in the world of a box in a lock's frame. */
+function boxThrough(M, { min, max }) {
+  const lo = [Infinity, Infinity, Infinity];
+  const hi = [-Infinity, -Infinity, -Infinity];
+  for (let k = 0; k < 8; k++) {
+    const p = applyMat4(M, [k & 1 ? max[0] : min[0], k & 2 ? max[1] : min[1], k & 4 ? max[2] : min[2]]);
+    for (let a = 0; a < 3; a++) {
+      lo[a] = Math.min(lo[a], p[a]);
+      hi[a] = Math.max(hi[a], p[a]);
+    }
+  }
+  return { min: lo, max: hi };
+}
+
+/** What a lock's solids are built from, as a key: the same lock in the same place builds the same solids. */
+const lockKey = (lock) => JSON.stringify([
+  lock.mech, lock.frame, lock.c, lock.z0, lock.S, lock.r0 ?? null, lock.theta ?? null, lock.slope ?? null, lock.above ?? null,
+  lock.below ?? null, lock.socket ?? null, lock.R ?? null, lock.top ?? null,
+]);
+
+/**
+ * A part's lock in place (world), both pieces' solids and the ids of its primitives (`lockSolids`), kept: never
+ * delete them, transform or copy them.
+ */
+function cachedLock(lock) {
+  return LOCKS.get(lockKey(lock), () => {
+    const s = lockSolids(lock);
+    const M = lockMatrix(lock);
+    const place = (m) => {
+      if (!m) return null;
+      const out = m.transform(M);
+      m.delete();
+      return out;
+    };
+    return {
+      body: { add: place(s.body.add), cut: place(s.body.cut) },
+      part: { add: place(s.part.add), cut: place(s.part.cut), after: place(s.part.after) },
+      fill: s.fill,
+      ids: s.ids,
+    };
+  });
+}
+
+/**
+ * The original ids of a part's lock's primitives (`lockSolids`): the runs of a drilled piece's mesh with one of these
+ * are the lock's own faces.
+ */
+export const lockIds = (lock) => [...cachedLock(lock).ids];
+
+/**
+ * A piece the collar was added to with the sealed pockets it closed filled: the hollow shells of `m` that `before`
+ * (the piece without it) did not have. Its solid shells are put back together (`compose`, which leaves every hollow
+ * out), and the hollows that were the model's own are taken out of that again – as solids of their own shape (each
+ * shell turned the right way out, as `decompose` gives a hollow inside out), lying in material then, with no face
+ * shared. Null when it closed none.
+ */
+function fillPockets(m, before) {
+  const { Manifold, Mesh } = manifold();
+  const shells = m.decompose();
+  const temps = [];
+  try {
+    const hollows = shells.filter((x) => !(x.volume() > 0));
+    if (!hollows.length) return null;
+    const own = [];
+    for (const x of before.decompose()) {
+      if (!(x.volume() > 0)) own.push(boxOf(x));
+      x.delete();
+    }
+    const same = (a, b) => [0, 1, 2].every((k) => Math.abs(a.min[k] - b.min[k]) < 1e-3 && Math.abs(a.max[k] - b.max[k]) < 1e-3);
+    const kept = hollows.filter((x) => own.some((b) => same(b, boxOf(x))));
+    if (kept.length === hollows.length) return null;
+    const solid = Manifold.compose(shells.filter((x) => x.volume() > 0));
+    if (!kept.length) return solid;
+    temps.push(solid);
+    for (const x of kept) {
+      const mesh = x.getMesh();
+      const tv = mesh.triVerts.slice();
+      for (let i = 0; i < tv.length; i += 3) [tv[i + 1], tv[i + 2]] = [tv[i + 2], tv[i + 1]];
+      temps.push(new Manifold(new Mesh({ numProp: mesh.numProp, vertProperties: mesh.vertProperties, triVerts: tv })));
+    }
+    const back = temps.length > 2 ? Manifold.union(temps.slice(1)) : temps[1];
+    if (back !== temps[1]) temps.push(back);
+    return solid.subtract(back);
+  } finally {
+    shells.forEach((x) => x.delete());
+    temps.forEach((x) => x.delete());
+  }
+}
+
+/**
+ * Whether a part's drilled piece came out whole with its lock: 'whole'; 'bore' when the only loose bits lie inside
+ * the socket's bore under its ceiling – the ring socket left them, and the full disc takes them – else 'pieces'.
+ * @param {Manifold} drilled the part's piece, drilled (borrowed)
+ * @param {object} lock its collar lock (`layout.locks`)
+ */
+export function lockPieces(drilled, lock) {
+  const shells = drilled.decompose();
+  try {
+    const outer = shells.filter((x) => x.volume() > 0);
+    if (outer.length <= 1) return 'whole';
+    // the socket's bore (the neck's, less the clearance), and world → the lock's frame
+    const bore = lock.r0 - lock.S.t - lock.S.c;
+    const back = mulMat4(translationMat4([-lock.c[0], -lock.c[1], -lock.z0]), lock.frame ?? [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    const largest = outer.reduce((a, b) => (b.volume() > a.volume() ? b : a));
+    // every corner of every loose bit, in the lock's frame (a ring's box reaches far past the ring itself)
+    const inBore = outer.filter((x) => x !== largest).every((x) => {
+      const { vertProperties: v, numProp } = x.getMesh();
+      for (let i = 0; i < v.length; i += numProp) {
+        const [px, py, pz] = applyMat4(back, [v[i], v[i + 1], v[i + 2]]);
+        if (Math.hypot(px, py) > bore + 0.01 || pz > lock.S.sockTop + 0.01) return false;
+      }
+      return true;
+    });
+    return inBore ? 'bore' : 'pieces';
+  } finally {
+    shells.forEach((x) => x.delete());
+  }
+}
+
+/** The way out is checked on the solids at this many even steps of its slide, and the start. */
+const WAY_SAMPLES = 8;
+/** Material a part may share with the body at a step of its way out (mm³): rounding, not a collision. */
+const WAY_TOUCH = 1e-3;
+
+/**
+ * The way out a part's slices found (`wayOut`), checked once on the solids themselves: the part turned to its open
+ * angle, lifted, then slid along its way out to its reach in `WAY_SAMPLES` steps, against the body round it (cut to
+ * the box the part sweeps). The slices are a share of the model's height apart; this sees what lies between them.
+ * @param {Manifold} body the body the part comes out of (borrowed)
+ * @param {Manifold} part the part as carved (borrowed)
+ * @param {{ frame: number[]|null, c: number[], z0: number, turn: number, lift: number, dir: number[], reach: number }}
+ *   way in the part's frame: its circle's centre and face, the turn (degrees, anticlockwise about its axis), the lift
+ *   along it and the slide's direction in its plane and length
+ * @returns {{ clear: boolean, overlaps: number[] }} the overlap (mm³) at the start and at each step
+ */
+export function wayOverlaps(body, part, { frame, c, z0, turn, lift, dir, reach: far }) {
+  const { Manifold } = manifold();
+  const t = scope();
+  try {
+    const M = lockMatrix({ frame, c, z0 });
+    const back = mulMat4(translationMat4([-c[0], -c[1], -z0]), frame ?? translationMat4([0, 0, 0]));
+    const a = (turn * Math.PI) / 180;
+    const spin = [Math.cos(a), Math.sin(a), 0, 0, -Math.sin(a), Math.cos(a), 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+    const at = (f) => mulMat4(M, mulMat4(translationMat4([dir[0] * f * far, dir[1] * f * far, lift]), mulMat4(spin, back)));
+    // the body where the part could meet it: the box it sweeps
+    const swept = [at(0), at(1)].map((m) => boxThrough(m, boxOf(part)));
+    const lo = [0, 1, 2].map((k) => Math.min(swept[0].min[k], swept[1].min[k]) - 1);
+    const hi = [0, 1, 2].map((k) => Math.max(swept[0].max[k], swept[1].max[k]) + 1);
+    const near = t.add(body.intersect(t.add(t.add(Manifold.cube(hi.map((v, k) => v - lo[k]))).translate(lo))));
+    const overlaps = [];
+    for (let i = 0; i <= WAY_SAMPLES; i++) {
+      const moved = t.add(part.transform(at(i / WAY_SAMPLES)));
+      overlaps.push(t.add(near.intersect(moved)).volume());
+    }
+    return { clear: overlaps.every((v) => v <= WAY_TOUCH), overlaps };
+  } finally {
+    t.dispose();
   }
 }
 
@@ -4042,15 +4760,22 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
  * half-holes, sockets, grooves and labels taken out: one boolean each, the
  * pegs and tongues and the cutters being disjoint by construction (pin and
  * peg spacing, label room, the other cuts keeping clear of the lips). A
- * piece with nothing to drill comes back as a copy.
+ * piece with nothing to drill comes back as a copy. A piece a part comes out
+ * of, or a part, also gets its side of the part's lock (`layout.locks`,
+ * `lockSolids`): added with the rest, so the big piece still takes one
+ * boolean, with the pockets a collar seals filled; cut with the rest; and the
+ * click ridges added last, as they stand in what the cutters take. So does
+ * each piece of a full-plane cut with the twist-lock, whose lip it replaces.
  * @param {Manifold} solid the piece (borrowed)
- * @param {{ dowels: object[], pegs?: object[], lips?: object[], labels: object[] }} layout from `layoutSplit`
+ * @param {{ dowels: object[], pegs?: object[], lips?: object[], labels: object[], locks?: object[] }} layout from
+ *   `layoutSplit`, with the engine's `locks`
  * @param {number} pieceIndex the piece's number (1-based)
- * @param {{ font?: object }} options the labels' font (needed when the piece has labels)
+ * @param {{ font?: object, marks?: number[]|null }} options the labels' font (needed when the piece has labels);
+ *   `marks` gets the original ids of the lock primitives the piece is made with
  * @returns {Manifold}
  * @throws {SplitError} `INTERNAL` when the drilled piece comes out broken
  */
-export function drillPiece(solid, layout, pieceIndex, { font = null } = {}) {
+export function drillPiece(solid, layout, pieceIndex, { font = null, marks = null } = {}) {
   const { Manifold } = manifold();
   const t = scope();
   try {
@@ -4064,7 +4789,10 @@ export function drillPiece(solid, layout, pieceIndex, { font = null } = {}) {
     for (const peg of layout.pegs ?? []) {
       for (const s of peg.sides) if (s.piece === pieceIndex) (s.peg ? grown : cutters).push(t.add(s.peg ? pegAt(peg) : socketAt(peg)));
     }
+    // a cut's lip gives way to its twist-lock while the lock is built
+    const twisted = new Set((layout.locks ?? []).filter((x) => x.kind === 'full').map((x) => x.cutId));
     for (const lip of layout.lips ?? []) {
+      if (twisted.has(lip.cutId)) continue;
       for (const s of lip.sides) if (s.piece === pieceIndex) (s.male ? grown : cutters).push(t.add(s.male ? lipAt(lip) : lipCavityAt(lip)));
     }
     for (const label of layout.labels ?? []) {
@@ -4075,9 +4803,31 @@ export function drillPiece(solid, layout, pieceIndex, { font = null } = {}) {
         if (m) cutters.push(t.add(m));
       }
     }
-    const whole = grown.length ? t.add(solid.add(t.add(Manifold.compose(grown)))) : solid;
-    if (!cutters.length) return whole.translate(0, 0, 0);
-    const drilled = whole.subtract(t.add(Manifold.compose(cutters)));
+    const locks = [];
+    for (const lock of layout.locks ?? []) {
+      for (const s of lock.sides) if (s.piece === pieceIndex) locks.push({ role: s.role, L: cachedLock(lock) });
+    }
+    marks?.push(...locks.flatMap((x) => x.L.ids));
+    let drilled;
+    if (!locks.length) {
+      const whole = grown.length ? t.add(solid.add(t.add(Manifold.compose(grown)))) : solid;
+      if (!cutters.length) return whole.translate(0, 0, 0);
+      drilled = whole.subtract(t.add(Manifold.compose(cutters)));
+    } else {
+      // the lock's solids may meet the pegs' and tongues', so they join them by a union
+      const join = (list, more) => {
+        if (!more.length) return list.length ? t.add(Manifold.compose(list)) : null;
+        return t.add(Manifold.union(list.length ? [t.add(Manifold.compose(list)), ...more] : more));
+      };
+      const adds = join(grown, locks.map((x) => x.L[x.role].add).filter(Boolean));
+      let whole = adds ? t.add(solid.add(adds)) : solid;
+      const filled = locks.some((x) => x.role === 'body' && x.L.fill) ? fillPockets(whole, solid) : null;
+      if (filled) whole = t.add(filled);
+      const cuts = join(cutters, locks.map((x) => x.L[x.role].cut).filter(Boolean));
+      const cut = cuts ? t.add(whole.subtract(cuts)) : whole;
+      const after = locks.filter((x) => x.role === 'part' && x.L.part.after).map((x) => x.L.part.after);
+      drilled = after.length ? cut.add(after.length > 1 ? t.add(Manifold.union(after)) : after[0]) : cut.translate(0, 0, 0);
+    }
     const status = drilled.status();
     if (status !== 'NoError') {
       drilled.delete();

@@ -1878,18 +1878,20 @@ function cutRow(id) {
  * built-in pegs when some face of it takes one (its note tells of those left
  * flat), tabs on a dovetail cut that had room for them, otherwise none. A cut
  * that comes apart says how it holds, every face of it counted: "locks (4
- * clips)", "clicks on (4 clips)", "light click (4 clips)", "lifts off" (a lip
- * with no clips), or tabs or none.
+ * clips)", "clicks on (4 clips)", "light click (4 clips)", "twist-lock (turn
+ * 10°)" (a round wall's, in place of clips), "lifts off" (a lip with no
+ * clips), or tabs or none.
  */
 function jointsOfSeams(seams = []) {
   const joints = new Map();
-  const lips = new Map(); // cutId -> { hold, lip, clips, tabs } over the cut's seams that come apart
+  const lips = new Map(); // cutId -> { hold, lip, clips, tabs, turn } over the cut's seams that come apart
   for (const s of seams) {
     if (s.apart) {
-      const l = lips.get(s.cutId) ?? { hold: s.apart.hold, lip: false, clips: 0, tabs: false };
+      const l = lips.get(s.cutId) ?? { hold: s.apart.hold, lip: false, clips: 0, tabs: false, turn: null };
       l.lip ||= !!s.apart.lip;
       l.clips += s.apart.lip ? s.apart.clips ?? 0 : 0;
       l.tabs ||= s.joint === 'dovetail' && !!s.tabs;
+      if (s.apart.mech === 'twist' && !s.part) l.turn = s.apart.theta;
       lips.set(s.cutId, l);
       continue;
     }
@@ -1900,7 +1902,7 @@ function jointsOfSeams(seams = []) {
     const clips = `${l.clips} ${l.clips === 1 ? 'clip' : 'clips'}`;
     const how = { lock: 'locks', light: 'light click' }[l.hold] ?? 'clicks on';
     const held = l.clips > 0 && l.hold !== 'lift' ? `${how} (${clips})` : 'lifts off';
-    joints.set(cutId, l.lip ? held : l.tabs ? 'dovetail' : 'none');
+    joints.set(cutId, l.turn != null ? `twist-lock (turn ${Math.round(l.turn)}°)` : l.lip ? held : l.tabs ? 'dovetail' : 'none');
   }
   return joints;
 }
@@ -1961,8 +1963,8 @@ function renderPieces() {
         // which piece carries a face's built-in pegs, and which has their sockets
         p.pegs ? `${p.pegs} ${p.pegs === 1 ? 'peg' : 'pegs'}` : '',
         p.sockets ? `${p.sockets} ${p.sockets === 1 ? 'socket' : 'sockets'}` : '',
-        // which piece a take-apart cut's lip stands out of, and which comes off it
-        ...(p.lips ?? []).map((l) => `lip at ${l.letter}${l.clips ? `, ${l.clips} ${l.clips === 1 ? 'clip' : 'clips'}` : ''}`),
+        // which piece a take-apart cut's lip (or the neck of its twist-lock) stands out of, and which comes off it
+        ...(p.lips ?? []).map((l) => (l.twist ? `twist-lock neck at ${l.letter}` : `lip at ${l.letter}${l.clips ? `, ${l.clips} ${l.clips === 1 ? 'clip' : 'clips'}` : ''}`)),
         p.lids?.length ? `comes off at ${listOf(p.lids)}` : '',
       ].filter(Boolean),
     }));
@@ -2290,7 +2292,9 @@ function showProbe(key) {
   // that target itself, which has no move of its own to suggest. It says when the lip there is short of a full one
   if (a.target?.kind !== 'lip') {
     const there = r.suggestedLip;
-    const lip = Number.isFinite(r.suggestedAt) ? { axis: a.axis, at: r.suggestedAt, full: !there || lipVerdict({ lip: there }, a.hold) === 'full', H: there?.H } : null;
+    const lip = Number.isFinite(r.suggestedAt)
+      ? { axis: a.axis, at: r.suggestedAt, full: !there || lipVerdict({ lip: there }, a.hold) === 'full', H: there?.H, ...(there?.twist ? { twist: true } : {}) }
+      : null;
     if (lip?.at !== lipTarget?.at || lip?.axis !== lipTarget?.axis || lip?.full !== lipTarget?.full) {
       lipTarget = lip;
       pushTargets();

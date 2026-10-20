@@ -12,11 +12,16 @@
  *  - a cut as the document stores it is `{ id, position, normal }`, with
  *    `joint: 'apart'` and its `hold` when it comes apart; once normalised it
  *    is `{ id, letter, axis, at }`, with `apart: { hold }` when it comes apart;
+ *  - a cut that comes apart may take out only a part, the model inside a
+ *    circle on one side of its plane (stored `part: { r, side, auto }`);
+ *    normalised, a part is `{ id, letter, axis, at, centre, r, side, hold,
+ *    auto }`, kept apart from the cuts, which make the grid;
  *  - matrices are 16 numbers, column-major, like `toMat4` and
  *    `Manifold.transform`;
  *  - a cell is `[i, j, k]`, the slot of a piece in the grid the cuts make;
  *  - piece numbers are 1-based, as in "piece 2 of 3" and the label "2A".
  */
+import { TEA_LIGHT, roundAngle, roundOpening, wayWords } from './locks.js';
 
 // ---------- printers ----------
 
@@ -65,8 +70,8 @@ export function usableBed(bed = BED_DEFAULTS) {
 
 /**
  * A split's settings as the document stores them (`cuts` hold `{ id, position, normal }` in model mm, and
- * `joint: 'apart'` with its `hold` on a cut that comes apart). They are for the glued cuts: one that comes apart has a
- * lip, whatever `joint` says.
+ * `joint: 'apart'` with its `hold` on a cut that comes apart, and its `part` on one that takes out only a part). They
+ * are for the glued cuts: one that comes apart has a lip, whatever `joint` says.
  */
 export const SPLIT_DEFAULTS = Object.freeze({
   cuts: Object.freeze([]),
@@ -170,18 +175,55 @@ function apartOf(cut) {
 }
 
 /**
+ * The part a cut takes out, stored (`part` on a cut that comes apart, its
+ * side read along the normal) or normalised (`centre`, `r` and `side` read
+ * along the axis), as `{ r, side, auto, hold }`; null for a cut across the
+ * whole model, or a circle with no size. A part twist-locks or lifts off, as
+ * the document keeps it.
+ */
+function partOf(cut) {
+  const p = Array.isArray(cut?.centre) ? cut : cut?.joint === 'apart' ? cut.part : null;
+  const r = Number(p?.r);
+  if (!(r > 0 && Number.isFinite(r))) return null;
+  return { r, side: Number(p.side) < 0 ? -1 : 1, auto: p.auto === true, hold: cut.hold === 'lift' ? 'lift' : 'lock' };
+}
+
+/**
+ * True when a part takes nothing out of the model in `bounds`: its side of
+ * the plane holds less than the tolerance, the plane lies past the model's
+ * end on its other side, or its circle misses the model's box. A part's
+ * plane may be the model's own end, as a base taken out from below is.
+ */
+function partMisses({ axis, at, centre, r, side }, bounds) {
+  const shift = side > 0 ? -CUT_TOLERANCE : CUT_TOLERANCE;
+  if (!(at > bounds.min[axis] + shift && at < bounds.max[axis] + shift)) return true;
+  // how far the circle's centre is from the box's outline across the plane, read as TO_PLANE reads it
+  const off = centre.map((c, i) => {
+    const a = (axis + 1 + i) % 3;
+    return Math.max(bounds.min[a] - c, 0, c - bounds.max[a]);
+  });
+  return Math.hypot(...off) >= r - CUT_TOLERANCE;
+}
+
+/**
  * Settings clamped to their ranges, and the cuts snapped to the axes,
  * checked against the model and put in their canonical order (x, then y,
  * then z, then position). Each cut keeps the letter of its place in the
  * stored list, so letters never jump about when a cut is left out. Cuts in
  * one place are one, and it comes apart when any of them did, held as the
- * first of those in the list is.
+ * first of those in the list is. A cut that takes out only a part is no
+ * plane of the grid: it is never merged with another, makes no cells and
+ * comes out in `parts`, in the order listed, though it counts as one of the
+ * 12 cuts. Its side and centre are read in its plane's frame (`TO_PLANE`):
+ * `side` +1 when the part lies towards +axis, and `centre` the circle's (u,
+ * v) there, which for a cut across Z is its (x, y).
  * @param {object|null} split the document's split (missing fields take their defaults)
  * @param {{ min: number[], max: number[] }|null} bounds the solid's bounds with the unrepaired triangles; null skips the miss test
  * @returns {{ spec: object, cuts: { id: string, letter: string, axis: number, at: number, apart?: { hold: string } }[],
- *   notes: object[], grid: number[] }} `spec` holds the clamped settings (no cuts), `grid` the number of cuts on each
- *   axis; `apart` only on a cut that comes apart. No cuts left means: export unsplit, with the notes.
- * @throws {SplitError} `SPLIT_INVALID` for more than 12 cuts or 64 pieces
+ *   parts: { id: string, letter: string, axis: number, at: number, centre: number[], r: number, side: number, hold: string,
+ *   auto: boolean }[], notes: object[], grid: number[] }} `spec` holds the clamped settings (no cuts), `grid` the number
+ *   of cuts on each axis; `apart` only on a cut that comes apart. No cuts left means: export unsplit, with the notes.
+ * @throws {SplitError} `SPLIT_INVALID` for more than 12 cuts and parts or 64 pieces
  */
 export function normaliseSplit(split, bounds = null) {
   const s = split ?? {};
@@ -200,6 +242,7 @@ export function normaliseSplit(split, bounds = null) {
   };
   const notes = [];
   const kept = [];
+  const parts = [];
   (Array.isArray(s.cuts) ? s.cuts : []).forEach((cut, index) => {
     const letter = letterFor(index);
     const id = cut?.id ?? `c${index + 1}`;
@@ -209,6 +252,18 @@ export function normaliseSplit(split, bounds = null) {
       return;
     }
     const { axis, at } = plane;
+    const part = partOf(cut);
+    if (part) {
+      const { r, auto, hold } = part;
+      const normalised = Array.isArray(cut.centre);
+      // a stored part's side is along its normal, which may point either way along the axis
+      const side = !normalised && Number(cut.normal?.[axis]) < 0 ? -part.side : part.side;
+      const centre = normalised ? [Number(cut.centre[0]), Number(cut.centre[1])] : [1, 2].map((i) => Number(cut.position?.[(axis + i) % 3]));
+      const found = { id, letter, axis, at, centre, r, side, hold, auto };
+      if (!Number.isFinite(at) || !centre.every(Number.isFinite) || (bounds && partMisses(found, bounds))) notes.push(splitNote('CUT_MISSES', { cutId: id, letter }));
+      else parts.push(found);
+      return;
+    }
     const misses = !Number.isFinite(at) || (bounds && (at <= bounds.min[axis] + CUT_TOLERANCE || at >= bounds.max[axis] - CUT_TOLERANCE));
     if (misses) {
       notes.push(splitNote('CUT_MISSES', { cutId: id, letter }));
@@ -236,10 +291,11 @@ export function normaliseSplit(split, bounds = null) {
   cuts.sort((a, b) => a.axis - b.axis || a.at - b.at);
   const grid = [0, 1, 2].map((a) => cuts.filter((c) => c.axis === a).length);
   const cells = (grid[0] + 1) * (grid[1] + 1) * (grid[2] + 1);
-  if (cuts.length > SPLIT_LIMITS.cuts || cells > SPLIT_LIMITS.cells) {
-    throw new SplitError('SPLIT_INVALID', `A split can have up to ${SPLIT_LIMITS.cuts} cuts and ${SPLIT_LIMITS.cells} pieces – remove some cuts.`, { cuts: cuts.length, cells });
+  const count = cuts.length + parts.length;
+  if (count > SPLIT_LIMITS.cuts || cells > SPLIT_LIMITS.cells) {
+    throw new SplitError('SPLIT_INVALID', `A split can have up to ${SPLIT_LIMITS.cuts} cuts and ${SPLIT_LIMITS.cells} pieces – remove some cuts.`, { cuts: count, cells });
   }
-  return { spec, cuts, notes, grid };
+  return { spec, cuts, parts, notes, grid };
 }
 
 /**
@@ -3171,14 +3227,19 @@ export function statsWithLip(stats, face, H = LIP_ALLOWANCE, boxes = null) {
  * where it can carry it. Pair by pair in the order given: a piece once given
  * a way down keeps it, as one given in `given` (by an earlier cut's lips)
  * does, so a pair whose lip would need it another way goes to the other
- * piece, or has no lip.
+ * piece, or has no lip. A lip that would get no clips may take the collar
+ * twist-lock in their place (`quality.twist`), which counts as clips do –
+ * but only where the other piece, whose socket it is, may lie on its cut
+ * face and prints as well so as it does anyway, the way a lid that comes
+ * off lies: that piece is then given its way down too (`twist` on the
+ * answer).
  * @param {{ index: number, stats: object, boxes?: object[], lying: { down: string, fits: boolean } }[]} laid from
  *   `layPieces`
  * @param {number[]} U the usable bed
  * @param {'auto'|'cut'|'model'} orient
  * @param {{ flat?: number|null }} options `flat` as for `chooseOrientation`
- * @returns {(pairs: { axis: number, lo: number, hi: number, quality?: ({ H: number, clips: number, area: number }|null)[] }[],
- *   given?: Map<number, string>|null) => ({ male: 0|1, piece: number, down: string, alt?: { k: 0|1, piece: number,
+ * @returns {(pairs: { axis: number, lo: number, hi: number, quality?: ({ H: number, clips: number, area: number, twist?: boolean }|null)[] }[],
+ *   given?: Map<number, string>|null) => ({ male: 0|1, piece: number, down: string, twist?: true, alt?: { k: 0|1, piece: number,
  *   down: string, why: 'room'|'tall', over?: number } }|null)[]} for each pair (the cut's axis, the numbers of the pieces
  *   below and above it, and the lip each would carry, [below, above], from the faces' plans: its height, clips and
  *   tongue area, null for none; any lip when not given) the one that carries the lip – 0 the one below the cut, 1 the
@@ -3189,8 +3250,26 @@ export function statsWithLip(stats, face, H = LIP_ALLOWANCE, boxes = null) {
 export function apartMales(laid, U, orient = 'auto', { flat = null } = {}) {
   const byIndex = new Map(laid.map((p) => [p.index, p]));
   const near = (a, b) => Math.abs(a - b) <= 1e-6 * Math.max(1, Math.abs(a), Math.abs(b));
-  // the lip a piece would carry, best first when compared in order: one at all, with clips, height, clips, tongue
-  const rank = (q) => (q ? [1, q.clips > 0 ? 1 : 0, q.H, q.clips ?? 0, q.area ?? 0] : [0, 0, 0, 0, 0]);
+  // the lip a piece would carry, best first when compared in order: one at all, with clips or the twist-lock in their
+  // place, height, clips, tongue
+  const rank = (q) => (q ? [1, q.clips > 0 || q.twist ? 1 : 0, q.H, q.clips ?? 0, q.area ?? 0] : [0, 0, 0, 0, 0]);
+  /** How a piece prints lying down `down`, against how it prints anyway: whether it may, fits as it did and does as well. */
+  const lyingAs = (p, stats, down) => {
+    const o = chooseOrientation(stats, U, orient, { pieceIndex: p.index, flat });
+    const bed = p.stats.dirs[p.lying.down].bed;
+    const was = orientationScore(p.stats, p.lying.down).need;
+    const need = orientationScore(stats, o.down).need;
+    return { o, fits: o.fits || !p.lying.fits, asWell: stats.dirs[o.down].bed >= 0.5 * bed && need <= was + Math.max(STEADY, 0.1 * bed), extra: need - was };
+  };
+  /** Whether the piece a twist-lock's socket is cut into may lie on its cut face (`down`), printing as well so. */
+  const socketLies = (p, down, forced) => {
+    if (forced.has(p.index) && forced.get(p.index) !== down) return false;
+    if (!(p.stats.allowed?.length ? p.stats.allowed : DIR_KEYS).includes(down)) return false;
+    const stats = restingOnly({ ...p.stats, allowed: [down] }, p.boxes);
+    if (!stats) return false;
+    const { fits, asWell } = lyingAs(p, stats, down);
+    return fits && asWell;
+  };
   const better = (x, y) => {
     if (x.asWell !== y.asWell) return x.asWell ? -1 : 1;
     const [rx, ry] = [rank(x.quality), rank(y.quality)];
@@ -3206,7 +3285,7 @@ export function apartMales(laid, U, orient = 'auto', { flat = null } = {}) {
       let tall = null; // a piece that would print as well carrying the lip but for the bed's height
       const options = [0, 1].flatMap((k) => {
         const quality = pair.quality ? pair.quality[k] ?? null : undefined;
-        const lip = quality === undefined || quality?.H > 0;
+        const offered = quality === undefined || quality?.H > 0 || Boolean(quality?.twist);
         const p = pieces[k];
         // the face the lip stands out of: the top of the piece below the cut, the bottom of the one above
         const face = `${k === 0 ? '+' : '-'}${AXES[pair.axis]}`;
@@ -3214,27 +3293,29 @@ export function apartMales(laid, U, orient = 'auto', { flat = null } = {}) {
         if (forced.has(p.index) && forced.get(p.index) !== down) return [];
         const stats = statsWithLip(p.stats, face, LIP_ALLOWANCE, p.boxes);
         if (!stats) return [];
-        const o = chooseOrientation(stats, U, orient, { pieceIndex: p.index, flat });
-        const bed = p.stats.dirs[p.lying.down].bed;
-        const was = orientationScore(p.stats, p.lying.down).need;
-        const need = orientationScore(stats, o.down).need;
-        const asWell = stats.dirs[o.down].bed >= 0.5 * bed && need <= was + Math.max(STEADY, 0.1 * bed);
+        const { o, asWell, extra } = lyingAs(p, stats, down);
         if (!o.fits && p.lying.fits) {
           // only its height is in the way: lower by `over`, it would stand on the bed with the lip
           const [a, b, h] = laidDims(stats.dims, down);
-          if (lip && asWell && footprintYaw(a, b, U) !== null) tall = { k, piece: p.index, down, why: 'tall', over: round6(h - U[2]) };
+          if (offered && asWell && footprintYaw(a, b, U) !== null) tall = { k, piece: p.index, down, why: 'tall', over: round6(h - U[2]) };
           return [];
         }
-        return [{ k, piece: p.index, down: o.down, asWell, lip, quality: quality ?? null, extra: need - was }];
+        // the twist-lock counts only where the other piece may lie on its cut face for its socket; without it, the lip
+        // it would have had, if any
+        const twist = Boolean(quality?.twist) && socketLies(pieces[1 - k], o.down, forced);
+        const own = quality?.twist && !twist ? { ...quality, twist: false } : quality ?? null;
+        const lip = quality === undefined || own?.H > 0 || twist;
+        return [{ k, piece: p.index, down: o.down, asWell, lip, quality: own, extra, twist }];
       });
       const lipped = options.filter((o) => o.lip).sort(better);
       if (!lipped.length) return null;
       const best = lipped[0];
       forced.set(best.piece, best.down);
+      if (best.twist) forced.set(pieces[1 - best.k].index, best.down);
       // one that prints worse with the lip, where the other would print as well with it given room
       const room = !best.asWell && options.find((o) => !o.lip && o.asWell);
       const alt = room ? { k: room.k, piece: room.piece, down: room.down, why: 'room' } : !best.asWell ? tall : null;
-      return { male: best.k, piece: best.piece, down: best.down, ...(alt ? { alt } : {}) };
+      return { male: best.k, piece: best.piece, down: best.down, ...(best.twist ? { twist: true } : {}), ...(alt ? { alt } : {}) };
     });
   };
 }
@@ -3620,8 +3701,9 @@ const clamp01 = (v) => Math.min(1, Math.max(0, v));
 
 /**
  * How good a spot for a cut that comes apart is, higher better. A full lip
- * counts most (3 with clips, 2 without, 1 less where its tongue comes in
- * stretches: an opening's edge in its foot cuts it), then the seam it hides
+ * counts most (3 with clips or the twist-lock in their place, 2 without, 1
+ * less where its tongue comes in stretches: an opening's edge in its foot
+ * cuts it), then the seam it hides
  * in – up to 1 for an outline that moves 3 mm or more there, and up to 0.5
  * more the closer the cut is to it, all of it only for a seam that shows on
  * the outside (where the walls close over inside, or at the tips of a row of
@@ -3631,12 +3713,12 @@ const clamp01 = (v) => Math.min(1, Math.max(0, v));
  * and towards 60 %, and past that the more of the model the worse. Each
  * island beyond one takes off 0.5 (a cut through fretwork, posts or a
  * handle's legs), and cutting through letters 2.
- * @param {{ full?: boolean, clips?: number, broken?: boolean, shift?: number, distance?: number, fraction?: number,
- *   islands?: number, crosses?: number }} spot `shift` how far the outline the outside shows moves at its seam (mm),
- *   `distance` from it (mm), `fraction` the share that comes off, `crosses` how many text items it cuts
+ * @param {{ full?: boolean, clips?: number, twist?: boolean, broken?: boolean, shift?: number, distance?: number,
+ *   fraction?: number, islands?: number, crosses?: number }} spot `shift` how far the outline the outside shows moves
+ *   at its seam (mm), `distance` from it (mm), `fraction` the share that comes off, `crosses` how many text items it cuts
  */
-export function spotScore({ full = true, clips = 0, broken = false, shift = 0, distance = 0, fraction = 0, islands = 1, crosses = 0 }) {
-  const lip = full ? (clips > 0 ? 3 : 2) - (broken ? 1 : 0) : 0;
+export function spotScore({ full = true, clips = 0, twist = false, broken = false, shift = 0, distance = 0, fraction = 0, islands = 1, crosses = 0 }) {
+  const lip = full ? (clips > 0 || twist ? 3 : 2) - (broken ? 1 : 0) : 0;
   const shows = clamp01(shift / SPOT.sharp);
   const seam = Math.min(1, Math.max(0, shift) / 3) + 0.5 * clamp01(1 - distance / SPOT.look) * shows;
   let part;
@@ -3705,6 +3787,24 @@ export function endsAsWell(beds, face, { lengths = null, spans = [0, 0], faceSpa
 }
 
 /**
+ * Whether each piece either side of a cut would print about as well lying
+ * on its cut face – where a twist-lock's socket is cut into it – as it does
+ * anyway, guessed before the model is cut from the model's ends, as
+ * `endsAsWell` guesses: only where the model ends on that side in nothing
+ * flat of 25 mm² or more and half the face's area, so the cut face is the
+ * flat it has (a lantern's top under its finial). A piece with such a flat
+ * end would rather stand on it: on its cut face a slender tower would stand
+ * on its small roof, and a closed tube would hang its end over its inside.
+ * `apartMales` judges the pieces themselves.
+ * @param {number[]} beds the flat area the model ends in on each side, [towards −axis, towards +axis] (mm²)
+ * @param {number} face the cut face's area (mm²)
+ * @returns {boolean[]} [the piece below, the one above]
+ */
+export function socketsAsWell(beds, face) {
+  return [0, 1].map((k) => !((beds[k] ?? 0) >= Math.max(STEADY, 0.5 * face)));
+}
+
+/**
  * The flat area a model ends in at each end of each axis, as `cellSupport`
  * counts a box's bed: facets facing that way squarely, wholly within 0.1 mm
  * of the furthest the model goes. One pass over the mesh, for `endsAsWell`.
@@ -3767,16 +3867,17 @@ export function endShape(mesh) {
  * Which piece carries a cut's lip before the model is cut, chosen as
  * `apartMales` chooses: of the pieces with a lip on offer, one that prints
  * as well with it (`asWell`, `endsAsWell`), then the better lip (one with
- * clips, taller, more clips, more tongue), then the one below. When the one
+ * clips or the twist-lock in their place, taller, more clips, more
+ * tongue), then the one below. When the one
  * chosen prints worse with it and the other would print as well but has no
  * room for one, that one is named (`alt`), so the cut can be moved to where
  * it can carry it.
- * @param {({ H: number, clips: number, area: number }|null)[]} quality the lip each would carry, [below, above]
+ * @param {({ H: number, clips: number, area: number, twist?: boolean }|null)[]} quality the lip each would carry, [below, above]
  * @param {boolean[]} [asWell]
  * @returns {{ male: 0|1, alt: 0|1|null }|null} null when neither has a lip on offer
  */
 export function lipMale(quality, asWell = [true, true]) {
-  const rank = (q) => (q ? [1, q.clips > 0 ? 1 : 0, q.H, q.clips ?? 0, q.area ?? 0] : [0, 0, 0, 0, 0]);
+  const rank = (q) => (q ? [1, q.clips > 0 || q.twist ? 1 : 0, q.H, q.clips ?? 0, q.area ?? 0] : [0, 0, 0, 0, 0]);
   const options = [0, 1].map((k) => ({ k, asWell: Boolean(asWell[k]), quality: quality[k] ?? null }));
   const better = (x, y) => {
     if (x.asWell !== y.asWell) return x.asWell ? -1 : 1;
@@ -3784,10 +3885,11 @@ export function lipMale(quality, asWell = [true, true]) {
     for (let i = 0; i < rx.length; i++) if (Math.abs(rx[i] - ry[i]) > 1e-6 * Math.max(1, Math.abs(rx[i]))) return ry[i] - rx[i];
     return x.k - y.k;
   };
-  const lipped = options.filter((o) => o.quality?.H > 0).sort(better);
+  const offered = (o) => o.quality?.H > 0 || Boolean(o.quality?.twist);
+  const lipped = options.filter(offered).sort(better);
   if (!lipped.length) return null;
   const best = lipped[0];
-  const room = !best.asWell ? options.find((o) => !(o.quality?.H > 0) && o.asWell) : null;
+  const room = !best.asWell ? options.find((o) => !offered(o) && o.asWell) : null;
   return { male: best.k, alt: room ? room.k : null };
 }
 
@@ -3804,36 +3906,46 @@ export function lipMale(quality, asWell = [true, true]) {
  * `pegMales` and `apartMales` choose only a piece that has such a way). One
  * left with nothing flat to stand on but the face its pegs or its lip stand
  * out of (a dome cut in two) is told that they are why, not its shape
- * (`PIECE_UNSTABLE` with `pegs` or `lip`).
+ * (`PIECE_UNSTABLE` with `pegs` or `lip`). A cut with the collar twist-lock
+ * in place of its lip (`locks` of kind 'full') has its neck stand out of
+ * the piece the lip would, as tall as the neck, and the piece its socket is
+ * cut into lies on its cut face, as a lid that comes off does.
  * @param {object[]} laid from `layPieces`
  * @param {{ pegs?: { sides: { piece: number, peg: boolean }[] }[], lips?: { axis: number, dir?: number, down?: string,
- *   H?: number, male?: number, sides?: { piece: number, male: boolean }[] }[] }} layout the lips' male (its number, or
+ *   H?: number, male?: number, sides?: { piece: number, male: boolean }[] }[], locks?: { kind: string, cutId: string,
+ *   down: string, S: object, sides: { piece: number, role: string }[] }[] }} layout the lips' male (its number, or
  *   the side with `male`), the way it lies (`down`, or from `dir`: +1 when the male is below the cut) and how far
  *   the lip stands out (`H`, `LIP_ALLOWANCE` when not given; none at 0)
  * @returns {object[]} `chooseOrientation`'s answer per piece of `laid`, with `pegged: true` on those laid again with
  *   pegs and `lip: true` on those with a lip
  */
-export function layGrown(laid, { pegs = [], lips = [] } = {}, U, orient = 'auto', { flat = null } = {}) {
+export function layGrown(laid, { pegs = [], lips = [], locks = [] } = {}, U, orient = 'auto', { flat = null } = {}) {
   const maleOf = (lip) => lip.sides?.find((s) => s.male)?.piece ?? lip.male;
   const faceOf = (lip) => (lip.down ? oppositeDir(lip.down) : `${lip.dir < 0 ? '-' : '+'}${AXES[lip.axis]}`);
+  const twisted = (locks ?? []).filter((x) => x.kind === 'full');
+  // a twist-lock's neck stands out of its piece as a lip would, the way its lip would have: in place of its cut's lip
+  const necks = twisted.map((x) => ({ sides: [{ piece: x.sides[0].piece, male: true }], down: x.down, H: x.S.H }));
+  const standing = [...(lips ?? []).filter((l) => !twisted.some((x) => x.cutId === l.cutId)), ...necks];
   return laid.map((p) => {
     const own = (pegs ?? []).filter((g) => g.sides.some((s) => s.peg && s.piece === p.index));
-    const tongues = (lips ?? []).filter((l) => maleOf(l) === p.index && (l.H ?? LIP_ALLOWANCE) > 0);
-    if (!own.length && !tongues.length) return p.lying;
+    const tongues = standing.filter((l) => maleOf(l) === p.index && (l.H ?? LIP_ALLOWANCE) > 0);
+    const sockets = twisted.filter((x) => x.sides.some((s) => s.role === 'part' && s.piece === p.index));
+    if (!own.length && !tongues.length && !sockets.length) return p.lying;
     // a cut's lip may stand out of a piece on several faces (four posts cut across), all in the one plane: the box
     // takes in the tallest once, not each
     const out = new Map();
     for (const lip of tongues) out.set(faceOf(lip), Math.max(out.get(faceOf(lip)) ?? 0, lip.H ?? LIP_ALLOWANCE));
     let stats = p.stats;
     for (const [face, H] of out) stats = { ...lipGrown(stats, face, H), allowed: [oppositeDir(faceOf(tongues[0]))] };
+    if (sockets.length) stats = { ...stats, allowed: [sockets[0].down] };
     if (own.length) stats = statsWithPegs(stats, own);
     const lip = tongues.length > 0;
     const o = chooseOrientation(restingOnly(stats, p.boxes) ?? stats, U, orient, { pieceIndex: p.index, flat });
     const steady = !p.lying.notes?.some((x) => x.code === 'PIECE_UNSTABLE');
-    const why = lip ? { lip: true } : { pegs: true };
+    const why = lip ? { lip: true } : own.length ? { pegs: true } : null;
     const notes = o.notes
-      .filter((x) => !(lip && x.code === 'ORIENT_FALLBACK'))
-      .map((x) => (x.code === 'PIECE_UNSTABLE' && steady ? splitNote('PIECE_UNSTABLE', { pieceIndex: p.index, ...why }) : x));
+      .filter((x) => !((lip || sockets.length) && x.code === 'ORIENT_FALLBACK'))
+      .map((x) => (x.code === 'PIECE_UNSTABLE' && steady && why ? splitNote('PIECE_UNSTABLE', { pieceIndex: p.index, ...why }) : x));
     return { ...o, notes, ...(own.length ? { pegged: true } : {}), ...(lip ? { lip: true } : {}) };
   });
 }
@@ -4090,6 +4202,18 @@ const mover = (axis, piece) => (axis == null || axis === 2 ? 'the top' : piecesO
 const manyMove = (axis, piece) => !(axis == null || axis === 2) && [piece].flat().filter((x) => x != null).length > 1;
 /** "Move the cut to 190.5 mm." when there is a place to move it to. */
 const moveTo = (at) => (Number.isFinite(at) ? ` Move the cut to ${mm(at)} mm.` : '');
+/** A part that comes off as a sentence names it ("Dome and cap" → "the dome and cap"; "Part B" → "the part"). */
+const partCalled = (name) => (!name || /^Part\b/.test(name) ? 'part' : String(name).toLowerCase());
+/** Whether a part's name reads as more than one thing, and its verb plural: the dome and cap lift off. */
+const partMany = (name) => / and /.test(name ?? '');
+/** Where along a part's axis its face is: "Z 115.6". */
+const partAt = (axis, z) => `${(AXES[axis] ?? 'z').toUpperCase()} ${mm1(z)}`;
+/** "piece 1", or what stands for it when the number is not known. */
+const partPiece = (n, otherwise) => (Number.isFinite(n) ? `piece ${n}` : otherwise);
+/** " (piece 2)" after a part's name, when its number is known. */
+const partNumber = (n) => (Number.isFinite(n) ? ` (piece ${n})` : '');
+/** How a part's collar twist-lock goes on: set on turned θ to the left, the wide lug in its wide slot, turned right. */
+const twistOn = (turn) => `set it on turned ${roundAngle(turn)}° to the left so the wide lug finds its wide slot, push down and turn it right until it clicks.`;
 
 const NOTE_LEVELS = Object.freeze({
   SPLIT: 'ok',
@@ -4100,6 +4224,7 @@ const NOTE_LEVELS = Object.freeze({
   PEGS_SMALLER: 'info',
   PEGS_UPRIGHT: 'info',
   APART: 'info',
+  APART_TWIST: 'info',
   APART_NO_CLIPS: 'warn',
   APART_FLAT: 'warn',
   APART_HEAVY: 'info',
@@ -4126,6 +4251,14 @@ const NOTE_LEVELS = Object.freeze({
   SPLIT_NOT_NEEDED: 'info',
   PLAN_TOO_MANY: 'warn',
   BED_TOO_SMALL: 'info',
+  PART_LIFTS: 'info',
+  PART_LOCK: 'info',
+  PART_PLUG: 'info',
+  PART_GAP: 'warn',
+  PART_STUCK: 'warn',
+  PART_SPLIT: 'warn',
+  PART_MIXED: 'warn',
+  PART_CROSSED: 'warn',
 });
 
 /** Every note code a split can give, with its level. */
@@ -4212,6 +4345,13 @@ const NOTE_TEXT = {
     // a face of the cut whose pieces already lie another way for another cut's lip, or would not fit the printer so
     if (lying > 0) s += ` On ${lying === 1 ? '1 other face' : `${lying} other faces`} neither piece can lie with a lip standing up, so the pieces there just rest on each other.`;
     return s;
+  },
+  APART_TWIST: ({ letter, axis = 2, above = false, male = 1, female = 2, turn = 0, tabs = 0 }) => {
+    // the piece with the socket goes on: the top of a Z cut, or the one under it where the top carries the neck
+    const z = axis == null || axis === 2;
+    const moving = z && !above ? `the top (${piecesOf(female, 2)})` : piecesOf(female, 2);
+    const onto = z && above ? `the top (${piecesOf(male, 1)})` : piecesOf(male, 1);
+    return `Cut ${letter} comes apart: ${moving} twist-locks onto ${onto} – 3 lugs and ${plural(tabs, 'click')}, as no clip fits its wall. To fit it: ${twistOn(turn)} To open it: turn it left until it clicks again and lift it off.`;
   },
   APART_NO_CLIPS: ({ letter, axis = 2, female = 2, why = 'height', height = 4.5, need = lipReach(LIP.heights[0]).reach, suggestedAt = null }) => {
     const off = `${mover(axis, female)} just ${manyMove(axis, female) ? 'lift' : 'lifts'} off`;
@@ -4311,6 +4451,45 @@ const NOTE_TEXT = {
   },
   PLAN_TOO_MANY: () => `This would need more than ${SPLIT_LIMITS.cells} pieces – scale the model down or choose a bigger printer.`,
   BED_TOO_SMALL: ({ size, bed }) => `${formatSize(size)} – bigger than your ${formatSize(bed)} printer.`,
+  PART_LOCK: ({ letter, name, piece = null, home = null, handle = false, turn = 0, lift = 0, dir = null, span = null }) => {
+    const verb = partMany(name) ? 'twist-lock' : 'twist-locks';
+    const onto = partPiece(home, 'the model');
+    const stays = handle ? ` and the handle stays on ${onto}` : '';
+    return `Cut ${letter}: the ${partCalled(name)}${partNumber(piece)} ${verb} onto ${onto}${stays}. To fit it: ${twistOn(turn)} To open it: turn it left until it clicks again, ${wayWords({ lift, dir }, span)}.`;
+  },
+  PART_PLUG: ({ letter, name, piece = null, home = null, turn = 0, opening = 0, teaLight = false, model = null }) => {
+    const called = partCalled(name);
+    const light = teaLight ? ` Its Ø ${roundOpening(opening)} mm opening takes a ${TEA_LIGHT} mm tea light.` : '';
+    return `Cut ${letter}: the ${called}${partNumber(piece)} twists off underneath. Turn ${model ?? partPiece(home, 'the model')} over, set the ${called} in turned ${roundAngle(turn)}° to the left, push it in and turn it right until it clicks – a coin in its slot helps. To open it: turn it left until it clicks and lift it out.${light}`;
+  },
+  PART_LIFTS: ({ letter, name }) => {
+    const many = partMany(name);
+    return `Cut ${letter}: the ${partCalled(name)} ${many ? 'lift' : 'lifts'} off – nothing holds ${many ? 'them' : 'it'}.`;
+  },
+  PART_GAP: ({ letter, name, axis = 2, z = 0, gap = 0, need = 0.9, by = 'the model beside it', islands = 0, movedTo = null, nearest = null }) => {
+    const where = `Cut ${letter}: at ${partAt(axis, z)} the ${partCalled(name)}'s`;
+    // the face in pieces, or its edge too near what stands beside it (or running into it) to print apart
+    const one = islands > 1;
+    const s = one
+      ? `${where} face is in ${islands} separate pieces – it needs one face to sit on.`
+      : `${where} edge ${gap > 0 ? `is ${mm(gap)} mm from` : 'runs into'} ${by} – it needs ${mm(need)} mm to print apart.`;
+    if (Number.isFinite(movedTo)) return `${s} Moved to ${partAt(axis, movedTo)}.`;
+    const none = one ? 'No face near here is one piece' : 'No face near here leaves it';
+    return `${s} ${none}${Number.isFinite(nearest) ? ` – the nearest that ${one ? 'is' : 'does'} is ${partAt(axis, nearest)}` : ''}.`;
+  },
+  PART_STUCK: ({ letter, name, over = null, beside = null, d = null }) => {
+    const what = over && beside ? `${over} is over it and ${beside} is beside it` : 'the rest of the model closes it in';
+    return `Cut ${letter}'s ${partCalled(name)} can't come out: ${what}. Try ${Number.isFinite(d) ? `a circle under Ø ${mm1(d)} mm` : 'a smaller circle'}, or a face higher up.`;
+  },
+  PART_SPLIT: ({ letter, name, pieces = 2, d = null, body = false }) => {
+    const smaller = Number.isFinite(d) ? `make it smaller than Ø ${mm1(d)} mm` : 'make it smaller';
+    if (body && !(pieces > 0)) return `Cut ${letter}'s circle takes the whole model – ${smaller} or use Find again.`;
+    return body
+      ? `Cut ${letter}'s circle leaves the rest of the model in ${pieces} pieces – ${smaller} or use Find again.`
+      : `Cut ${letter}'s circle cuts the ${partCalled(name)} into ${pieces} pieces – ${smaller} or use Find again.`;
+  },
+  PART_MIXED: ({ letter }) => `Cut ${letter}'s circle crosses the model above and around its plane – use a full cut there, or move it to where the circle crosses only air.`,
+  PART_CROSSED: ({ letter, part = '' }) => `Cut ${letter} runs through the part of cut ${part} – move one of them.`,
 };
 
 /**
@@ -4327,6 +4506,9 @@ const NOTE_TEXT = {
  * apart: `male` the pieces its lip stands out of, `female` those with its groove, `above` that the male is the piece
  * above a Z cut, `height` the lip's, `faces` how many of its faces have one, `flat` how many small ones just rest and
  * `lying` how many have no piece that may lie with a lip standing up);
+ * APART_TWIST `{ letter, cutId, axis, above, male, female, turn, tabs }` (a cut that takes the collar twist-lock in place
+ * of a lip with no clips: `male` the piece with its neck, `female` the one with its socket, `above` that the neck is on
+ * the piece above a Z cut, `turn` its twist in degrees, `tabs` its clicks);
  * APART_NO_CLIPS `{ letter, cutId, axis, female, why: 'height'|'short'|'edge'|'flex'|'skin', height, need, suggestedAt }`
  * (a lip with no clips: `height` the lip's, `need` the room a lip with clips needs in the female, 'edge' its tongue
  * broken by an opening right beside the cut, `suggestedAt` where the cut has a full lip); APART_FLAT `{ letter, cutId,
@@ -4356,6 +4538,20 @@ const NOTE_TEXT = {
  * (a part printed separately, or with `pins` a single pin, too big for the bed); SPLIT_NOT_NEEDED `{ yaw, down, apart }`
  * (down other than '-z' when it fits only on its side; `apart` the letters of the cuts that come apart, when the pieces
  * they make fit); BED_TOO_SMALL `{ size, bed, pieces }`.
+ * A cut that takes out a part (`name` the part's, "Dome and cap", "Top", "Base" or "Part B"): PART_LOCK `{ letter, cutId,
+ * name, piece, home, handle, turn, lift, dir, span }` (part `piece` twist-locks onto piece `home` turning `turn`°, and
+ * comes out lifted `lift` mm and slid along `dir`, under a handle spanning `span` – vectors in any frame, the two
+ * alike); PART_PLUG `{ letter, cutId, name, piece, home, turn, opening, teaLight, model }` (a base that twists off
+ * underneath, its opening Ø `opening`, said to take a tea light when `teaLight`; `model` what is turned over to fit
+ * it, "the lantern", else piece `home`); PART_LIFTS `{ letter, cutId, name }` (it comes off and nothing holds it);
+ * PART_GAP `{ letter, cutId, name, axis, z, gap, need, by,
+ * islands, movedTo, nearest }` (at `z` its edge is `gap` mm from what stands beside it, `by` – 0 when it runs into it
+ * – where it needs `need` to print apart, or its face is in `islands` pieces: moved to `movedTo`, or refused, with
+ * the `nearest` face that would do); PART_STUCK `{ letter, cutId, name, over, beside, d }` (no way out: what is over
+ * it and beside it, and a circle under Ø `d` that would come out, where known); PART_SPLIT `{ letter, cutId, name,
+ * pieces, d, body }` (the part, or with `body` the rest of the model, comes out in `pieces` pieces); PART_MIXED
+ * `{ letter, cutId }`; PART_CROSSED `{ letter, cutId, part, partId }` (cut `letter` runs through the part of cut
+ * `part`, which is left out).
  * Every field passed is kept on the note.
  */
 export function splitNote(code, fields = {}) {
@@ -4395,10 +4591,14 @@ const pegCount = (seam) => (Array.isArray(seam.pegs) ? seam.pegs.length : Number
  * cuts that come apart are never glued: they come last, once everything
  * else is set, each step saying so first.
  * @param {{ pieces: { index: number, cell: number[] }[], seams: { letter: string, axis: number, at: number, pieces: number[],
- *   joint: 'dowels'|'pegs'|'dovetail'|'lip'|'none', dowels: number|object[], pegs?: number|object[], male?: number|null,
- *   labels: string[]|null, apart?: { hold: string, lip: boolean, clips: number }|null }[] }} plan
+ *   joint: 'dowels'|'pegs'|'dovetail'|'lip'|'part'|'none', dowels: number|object[], pegs?: number|object[], male?: number|null,
+ *   labels: string[]|null, apart?: { hold: string, lip: boolean, clips: number, mech?: 'twist'|'plug'|null, theta?: number }|null,
+ *   part?: { name: string, way?: { lift: number, dir: number[]|null }, span?: number[]|null }|null }[] }} plan
  *   piece numbers are 1-based; `labels` are the two faces' labels in the order of `pieces`; `male` the piece that carries
- *   a seam's built-in pegs, or its lip; `apart` on a seam of a cut that comes apart
+ *   a seam's built-in pegs, its lip, or the neck of the twist-lock it takes instead (`apart.mech` 'twist' on a cut with
+ *   no part); `apart` on a seam of a cut that comes apart, and `part` on one that takes out a
+ *   part (its pieces the one it comes out of, then the part; `apart.mech` the twist-lock it has, if any, turning
+ *   `theta`°, and `part.way` how it comes out once turned free)
  * @returns {{ letter: string, axis: number, pieces: number[], joins: number[], pins: number, pegs: number, text: string,
  *   apart?: true }[]} `pieces` already in place, `joins` the ones put on in this step; `apart` on a cut that comes apart
  */
@@ -4420,7 +4620,7 @@ export function assemblySteps({ pieces = [], seams = [] } = {}) {
     // a cut that comes apart goes on after every glued one
     const apart = seam.apart ? 1 : 0;
     if (!groups.has(key)) groups.set(key, { sort: [apart, a, ...line, seam.at ?? 0], letter: seam.letter, axis: a, seams: [] });
-    groups.get(key).seams.push({ p, q, lp, lq, joint: seam.joint, pins: dowelCount(seam), pegs: pegCount(seam), male: seam.male ?? null, apart: seam.apart ?? null });
+    groups.get(key).seams.push({ p, q, lp, lq, joint: seam.joint, pins: dowelCount(seam), pegs: pegCount(seam), male: seam.male ?? null, apart: seam.apart ?? null, part: seam.part ?? null });
   }
   const list = [...groups.values()].sort((g, h) => {
     for (let i = 0; i < g.sort.length; i++) if (g.sort[i] !== h.sort[i]) return g.sort[i] - h.sort[i];
@@ -4447,8 +4647,26 @@ const pieceList = (list) => `${list.length > 1 ? 'pieces' : 'piece'} ${listOf(li
  */
 function apartStepText(letter, group, lower, upper, axis) {
   const lead = `Do not glue cut ${letter}: it comes apart.`;
+  // a part that comes off sits in its own place on the piece it came out of, and twist-locks there when it can
+  const held = group.find((s) => s.part);
+  if (held) {
+    const { part, apart } = held;
+    if (apart?.mech === 'twist') return `${lead} ${part.name}: ${twistOn(apart.theta)} To open: turn it left until it clicks again, ${wayWords(part.way, part.span)}.`;
+    if (apart?.mech === 'plug') {
+      const called = partCalled(part.name);
+      return `${lead} ${part.name}: turn ${pieceList(lower)} over, set the ${called} in turned ${roundAngle(apart.theta)}° to the left, push in and turn it right until it clicks (a coin in the slot helps). To open: turn it left and lift it out.`;
+    }
+    return `${lead} Set the ${partCalled(part.name)} in place on ${pieceList(lower)} – nothing holds ${partMany(part.name) ? 'them' : 'it'}.`;
+  }
   const z = axis === 2;
   const top = upper.length > 1 ? `the top (${pieceList(upper)})` : 'the top';
+  // a cut with the collar twist-lock in place of its lip: the piece with the socket goes on the neck, turned
+  const twisted = group.find((s) => s.apart?.mech === 'twist');
+  if (twisted) {
+    const socket = twisted.male === twisted.p ? twisted.q : twisted.p;
+    const who = z && socket === twisted.q ? top.replace(/^t/, 'T') : `Piece ${socket}`;
+    return `${lead} ${who}: ${twistOn(twisted.apart.theta)} To open: turn it left until it clicks again and lift it off.`;
+  }
   // across X or Y, several pieces beyond the cut go on together
   const many = !z && upper.length > 1;
   const verb = (one, more) => (many ? more : one);
@@ -4515,11 +4733,13 @@ const size1 = (dims) => `${dims.map((v) => v.toFixed(1)).join(' × ')} mm`;
  * (cuts only between letters), that there is nothing to glue. The cuts that
  * come apart are put together last, under a heading that says not to glue
  * them (or that nothing is glued, when no other cut is).
- * @param {{ name: string, pieces: { index: number, cell: number[], size: number[], lies: string, yaw?: number, fits?: boolean, shells?: number }[],
+ * @param {{ name: string, pieces: { index: number, cell: number[], size: number[], lies: string, yaw?: number, fits?: boolean, shells?: number,
+ *   part?: string, name?: string, lids?: string[] }[],
  *   seams: object[], pins?: { d: number, length: number, count: number, spares?: number, own?: boolean }[],
  *   parts?: { name: string }[], clearance?: number, bed?: number[], printer?: { size: number[], margin: number }|null, steps?: object[],
  *   bridges?: number[] }} plan
- *   `seams` as for `assemblySteps`; `pins` one group per pin size (count without spares); `bed` the usable bed;
+ *   `seams` as for `assemblySteps`; a piece that is a part taken out has its cut's id (`part`), its `name` and the
+ *   cut's letter (`lids`); `pins` one group per pin size (count without spares); `bed` the usable bed;
  *   `printer` the printer itself, when known, for the heading; `bridges` the clips' bridges' lengths as built (each
  *   hold's own on a 1.6 mm tongue when not given)
  * @returns {string}
@@ -4532,13 +4752,15 @@ export function howToGlueText(plan) {
   const anyPins = seams.some((s) => dowelCount(s) > 0);
   const anyPegs = seams.some((s) => pegCount(s) > 0);
   const anyTabs = seams.some((s) => s.joint === 'dovetail');
-  // the cuts that come apart on a lip, each once: whether it clicks on, the pieces with the lip and those that come off
-  // it – the top of a Z cut, whichever has the lip, and across X or Y the piece that goes on the other's lip
+  // the cuts that come apart on a lip, each once: whether it clicks on (or twist-locks, the collar twist-lock in place
+  // of a lip with no clips), the pieces with the lip and those that come off it – the top of a Z cut, whichever has
+  // the lip, and across X or Y the piece that goes on the other's lip
   const lips = new Map();
   for (const s of seams) {
     if (s.joint !== 'lip' || !s.apart) continue;
-    const lip = lips.get(s.letter) ?? { letter: s.letter, axis: s.axis, clicks: false, hold: s.apart.hold, male: new Set(), off: new Set() };
+    const lip = lips.get(s.letter) ?? { letter: s.letter, axis: s.axis, clicks: false, twist: false, hold: s.apart.hold, male: new Set(), off: new Set() };
     if (s.apart.clips > 0 && s.apart.hold !== 'lift') lip.clicks = true;
+    if (s.apart.mech === 'twist') lip.twist = true;
     const [p, q] = s.pieces;
     const male = s.male ?? p;
     lip.male.add(male);
@@ -4547,12 +4769,14 @@ export function howToGlueText(plan) {
   }
   const anyLip = lips.size > 0;
   const anyClips = [...lips.values()].some((l) => l.clicks);
+  const anyTwist = [...lips.values()].some((l) => l.twist);
+  const plainLips = [...lips.values()].some((l) => !l.twist);
   const where = printer?.size
     ? `a ${formatSize(printer.size)} printer${printer.margin ? ` (${mm(printer.margin)} mm margin)` : ''}`
     : bed ? `a printer with room for ${formatSize(bed)}` : 'your printer';
   const out = [`${name} – ${plural(n, 'piece')} for ${where} – STL Text`, ''];
 
-  const unsupported = [anyPins && 'holes', anyPegs && 'pegs and sockets', anyLip && (anyClips ? 'lips and clips' : 'lips')].filter(Boolean);
+  const unsupported = [anyPins && 'holes', anyPegs && 'pegs and sockets', plainLips && (anyClips ? 'lips and clips' : 'lips'), anyTwist && 'twist-locks'].filter(Boolean);
   out.push(`PRINT (each file is already turned the way to print it${unsupported.length ? `; ${listOf(unsupported)} need no supports` : ''})`);
   const sizes = pieces.map((p) => size1(p.size));
   const width = Math.max(0, ...sizes.map((s) => s.length));
@@ -4561,9 +4785,10 @@ export function howToGlueText(plan) {
     if (p.yaw && p.yaw !== 90) extra.push(`turned ${p.yaw}° to fit`); // a quarter turn is already in the file and looks ordinary
     if (p.shells > 1) extra.push(`${p.shells} parts`);
     for (const l of lips.values()) {
-      if (l.male.has(p.index)) extra.push(`lip for cut ${l.letter}`);
+      if (l.male.has(p.index)) extra.push(`${l.twist ? 'twist-lock neck' : 'lip'} for cut ${l.letter}`);
       if (l.off.has(p.index)) extra.push(`comes off at cut ${l.letter}`);
     }
+    if (p.part) extra.push(`comes off at cut ${listOf(p.lids ?? [])} (the ${partCalled(p.name)})`);
     out.push(`  ${pad(`piece ${p.index} of ${n}`, 12)}${pad(size1(p.size), width)}${pad(`lies ${p.lies}`, 0)}${extra.join(', ')}`);
   });
   const indent = ' '.repeat(17);
@@ -4601,7 +4826,9 @@ export function howToGlueText(plan) {
     const off = [...l.off].sort((p, q) => p - q);
     const who = l.axis === 2 ? `The top of cut ${l.letter}` : `${off.length > 1 ? 'Pieces' : 'Piece'} ${listOf(off)} of cut ${l.letter}`;
     const its = l.axis !== 2 && off.length > 1 ? 'their' : 'its';
-    if (!l.clicks) out.push(`  ${who} should drop onto ${its} lip and lift off freely.`);
+    if (l.twist) {
+      out.push(`  ${who} should twist on with a click and twist off again by hand. Too stiff to turn: raise Clearance by 0.05 mm; loose, or no click: lower it by 0.05 mm, and download again.`);
+    } else if (!l.clicks) out.push(`  ${who} should drop onto ${its} lip and lift off freely.`);
     else if (l.hold === 'lock') {
       out.push(`  ${who} should lock onto ${its} lip and come off only with a firm pull. Too stiff to open: raise Clearance by 0.05 mm (or set the cut to Clicks on); too loose: lower it by 0.05 mm, and download again.`);
     } else {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Matrix4 } from 'three';
-import { APART_HOLDS } from '../src/split.js';
+import { APART_HOLDS, normaliseSplit } from '../src/split.js';
 import { CUT_HOLDS, Document, SPLIT_DEFAULTS, coversKey, coversOf, createItem, createPart, createSpot, fontIds, frameOf, hasText, isSpot, itemLabel, itemText, linesOf, maxSize, modelPlacementKey, placeKey, shapeKey, spotsKey, stableKey, transformItems } from '../src/document.js';
 
 describe('keys', () => {
@@ -632,5 +632,263 @@ describe('cuts that come apart', () => {
     expect(CUT_HOLDS).toEqual(['lock', 'snap', 'light', 'lift']);
     expect(CUT_HOLDS).toEqual(APART_HOLDS);
     expect(Object.isFrozen(CUT_HOLDS)).toBe(true);
+  });
+});
+
+describe('parts that come off', () => {
+  const Z = [0, 0, 1];
+  const r6 = (v) => v.map((x) => Math.round(x * 1e6) / 1e6 + 0);
+  // the dome and cap inside the bat lantern's handle at 100 %: a circle round the lantern's axis at the face
+  const dome = () => ({ position: [-0.0049, 0.0111, 28.9], normal: [...Z], joint: 'apart', part: { r: 7.895, side: 1, auto: true } });
+  const lantern = () => {
+    const doc = new Document();
+    doc.setBase('stl', 'batlantern');
+    return doc;
+  };
+
+  it('a part is added in one step, a drag of its circle or its face is one step each, and undo and redo go between them', () => {
+    const doc = lantern();
+    const id = doc.addCut(dome());
+    expect(doc.split.cuts).toEqual([{ id, position: [-0.0049, 0.0111, 28.9], normal: Z, joint: 'apart', hold: 'lock', part: { r: 7.895, side: 1, auto: true } }]);
+    expect(doc.history).toHaveLength(1);
+    for (const r of [8, 8.5, 9]) doc.updateCut(id, { part: { r } }, { coalesce: `split:r:${id}` });
+    doc.endCoalescing();
+    for (const z of [29.1, 29.3]) doc.updateCut(id, { position: [-0.0049, 0.0111, z] }, { coalesce: 'split:drag' });
+    doc.endCoalescing();
+    expect(doc.history).toHaveLength(3);
+    expect(doc.split.cuts[0]).toEqual({ id, position: [-0.0049, 0.0111, 29.3], normal: Z, joint: 'apart', hold: 'lock', part: { r: 9, side: 1, auto: false } });
+    // the side turns over in the same way
+    doc.updateCut(id, { part: { side: -1 } });
+    expect(doc.split.cuts[0].part).toEqual({ r: 9, side: -1, auto: false });
+    doc.undo();
+    expect(doc.split.cuts[0].part).toEqual({ r: 9, side: 1, auto: false });
+    doc.undo();
+    expect(doc.split.cuts[0]).toMatchObject({ position: [-0.0049, 0.0111, 28.9], part: { r: 9, side: 1, auto: false } });
+    doc.undo();
+    expect(doc.split.cuts[0].part).toEqual({ r: 7.895, side: 1, auto: true });
+    doc.undo();
+    expect(doc.split).toBeNull();
+    doc.redo();
+    doc.redo();
+    doc.redo();
+    expect(doc.split.cuts[0]).toMatchObject({ position: [-0.0049, 0.0111, 29.3], part: { r: 9, side: 1, auto: false } });
+    // a part can be given to a cut that comes apart, never to a glued one
+    const full = doc.addCut({ position: [0, 0, 40], normal: Z, joint: 'apart', hold: 'snap' });
+    const glued = doc.addCut({ position: [0, 0, 10], normal: Z });
+    const steps = doc.history.length;
+    doc.updateCut(glued, { part: { r: 5 } });
+    expect(doc.history).toHaveLength(steps);
+    expect(doc.split.cuts.find((c) => c.id === glued)).toEqual({ id: glued, position: [0, 0, 10], normal: Z });
+    doc.updateCut(full, { part: { r: Number.NaN } }); // no circle to give it
+    expect(doc.history).toHaveLength(steps);
+    doc.updateCut(full, { part: { r: 5, side: 1 } });
+    expect(doc.split.cuts.find((c) => c.id === full)).toEqual({ id: full, position: [0, 0, 40], normal: Z, joint: 'apart', hold: 'lock', part: { r: 5, side: 1, auto: false } });
+    // a radius typed as no size keeps the circle, so the cut never becomes one through the handle
+    for (const r of [0, -3, Number.NaN, Infinity, '', null]) doc.updateCut(id, { part: { r, side: -1 } });
+    expect(doc.split.cuts[0].part).toEqual({ r: 9, side: -1, auto: false });
+    doc.updateCut(id, { part: { auto: true } });
+    const picked = doc.history.length;
+    doc.refitParts([{ id, part: { r: Number.NaN } }]);
+    expect(doc.split.cuts[0].part).toEqual({ r: 9, side: -1, auto: true });
+    expect(doc.history).toHaveLength(picked);
+  });
+
+  it('the document keeps a part only on a cut that comes apart, with a radius; its side is +1 or −1, and it twist-locks unless it lifts off', () => {
+    const doc = lantern();
+    const at = (z) => ({ position: [0, 0, z], normal: [...Z] });
+    doc.setSplit({
+      cuts: [
+        { id: 'c1', ...dome(), hold: 'lift' },
+        { id: 'c2', ...at(10), part: { r: 5, side: 1, auto: true } }, // glued: no part
+        { id: 'c3', ...at(20), joint: 'apart', part: { r: '6', side: -3, auto: 'yes', depth: 9 } },
+        { id: 'c4', ...at(30), joint: 'apart', hold: 'light', part: { r: 4, side: 0, auto: true } },
+        { id: 'c5', ...at(40), joint: 'apart', hold: 'snap', part: { r: 0, side: 1 } }, // no circle: a cut across the whole model
+        { id: 'c6', ...at(50), joint: 'apart', hold: 'firm', part: { r: Infinity } },
+        { id: 'c7', ...at(60), joint: 'apart', part: { r: -2 } },
+        { id: 'c8', ...at(70), joint: 'apart', hold: 'snap', part: null },
+      ],
+    });
+    expect(doc.split.cuts).toEqual([
+      { id: 'c1', position: [-0.0049, 0.0111, 28.9], normal: Z, joint: 'apart', hold: 'lift', part: { r: 7.895, side: 1, auto: true } },
+      { id: 'c2', ...at(10) },
+      { id: 'c3', ...at(20), joint: 'apart', hold: 'lock', part: { r: 6, side: -1, auto: false } },
+      { id: 'c4', ...at(30), joint: 'apart', hold: 'lock', part: { r: 4, side: 1, auto: true } }, // Clicks on lightly is no part's hold
+      { id: 'c5', ...at(40), joint: 'apart', hold: 'snap' },
+      { id: 'c6', ...at(50), joint: 'apart', hold: 'snap' },
+      { id: 'c7', ...at(60), joint: 'apart', hold: 'lock' },
+      { id: 'c8', ...at(70), joint: 'apart', hold: 'snap' },
+    ]);
+    // a part's hold is chosen as any other's, and one it doesn't have locks
+    doc.setCutJoint('c1', { hold: 'lock' });
+    expect(doc.split.cuts[0].hold).toBe('lock');
+    const steps = doc.history.length;
+    doc.setCutJoint('c1', { hold: 'snap' }); // it locks already
+    expect(doc.history).toHaveLength(steps);
+    doc.setCutJoint('c1', { hold: 'lift' });
+    expect(doc.split.cuts[0]).toMatchObject({ hold: 'lift', part: { r: 7.895, side: 1, auto: true } }); // the hold is no change to where it is
+  });
+
+  it('unticking Comes apart drops the part in the same step, and undo brings it back', () => {
+    const doc = lantern();
+    const id = doc.addCut(dome());
+    const steps = doc.history.length;
+    doc.setCutJoint(id, null);
+    expect(doc.split.cuts[0]).toEqual({ id, position: [-0.0049, 0.0111, 28.9], normal: Z });
+    expect(doc.history).toHaveLength(steps + 1);
+    // ticked again it is a cut across the whole model: the circle went with the flag
+    doc.setCutJoint(id, {});
+    expect(doc.split.cuts[0]).toEqual({ id, position: [-0.0049, 0.0111, 28.9], normal: Z, joint: 'apart', hold: 'lock' });
+    doc.undo();
+    doc.undo();
+    expect(doc.split.cuts[0]).toEqual({ id, position: [-0.0049, 0.0111, 28.9], normal: Z, joint: 'apart', hold: 'lock', part: { r: 7.895, side: 1, auto: true } });
+  });
+
+  it('a part moves and grows with the model: Scale, the inches fix, quarter turns and a mirror, and reset takes it back', () => {
+    const doc = lantern();
+    doc.addCut(dome());
+    doc.transformBase(new Matrix4().makeScale(4, 4, 4));
+    const [scaled] = doc.split.cuts;
+    expect(r6(scaled.position)).toEqual([-0.0196, 0.0444, 115.6]);
+    expect(scaled.part.r).toBeCloseTo(31.58, 9);
+    expect(scaled.part).toMatchObject({ side: 1, auto: true }); // still where the finder put it, for the refit
+    // a quarter turn keeps the circle's size; the part still lies along its normal, which turned with it
+    doc.transformBase(new Matrix4().makeRotationX(Math.PI / 2));
+    const [turned] = doc.split.cuts;
+    expect(turned.part.r).toBeCloseTo(31.58, 9);
+    expect(r6(turned.normal)).toEqual([0, -1, 0]);
+    expect(r6(turned.position)).toEqual([-0.0196, -115.6, 0.0444]);
+    expect(turned.part.side).toBe(1);
+    doc.resetBase();
+    expect(doc.split.cuts[0].part.r).toBeCloseTo(7.895, 9);
+    expect(r6(doc.split.cuts[0].position)).toEqual([-0.0049, 0.0111, 28.9]);
+    expect(r6(doc.split.cuts[0].normal)).toEqual(Z);
+    // millimetres from inches
+    doc.transformBase(new Matrix4().makeScale(25.4, 25.4, 25.4));
+    expect(doc.split.cuts[0].part.r).toBeCloseTo(200.533, 9);
+    expect(doc.split.cuts[0].position[2]).toBeCloseTo(734.06, 9);
+    doc.undo();
+    expect(doc.split.cuts[0].part.r).toBeCloseTo(7.895, 9);
+    // mirrored, the dome lies below its plane, along the normal that the mirror turned over
+    doc.transformBase(new Matrix4().makeScale(1, 1, -1));
+    const [mirrored] = doc.split.cuts;
+    expect(mirrored.part).toEqual({ r: 7.895, side: 1, auto: true });
+    expect(r6(mirrored.normal)).toEqual([0, 0, -1]);
+    const { parts } = normaliseSplit(doc.split, { min: [-12.5, -12.5, -50], max: [12.5, 12.5, 0] });
+    expect(parts).toEqual([{ id: 'c1', letter: 'A', axis: 2, at: -28.9, centre: [-0.0049, 0.0111], r: 7.895, side: -1, hold: 'lock', auto: true }]);
+    // a text item has no circle to grow
+    const [item] = transformItems([createItem({ position: [0, 0, 5], normal: Z })], new Matrix4().makeScale(4, 4, 4));
+    expect(item).not.toHaveProperty('part');
+  });
+
+  it('a JSON round trip is no change, and the history keeps its own copy of each part', () => {
+    const doc = lantern();
+    doc.addCut(dome());
+    doc.addCut({ position: [0, 0, 0], normal: Z, joint: 'apart', hold: 'lift', part: { r: 9.3, side: 1, auto: false } });
+    const saved = JSON.parse(JSON.stringify(doc.split));
+    const steps = doc.history.length;
+    doc.setSplit(saved);
+    expect(doc.history).toHaveLength(steps);
+    expect(doc.split).toEqual(saved);
+    // a part changed in place changes this step only
+    doc.commit((s) => {
+      s.split.cuts[0].part.r = 20;
+    });
+    expect(doc.split.cuts[0].part.r).toBe(20);
+    expect(doc.undo()).toBe(true);
+    expect(doc.split.cuts[0].part.r).toBe(7.895);
+    expect(doc.redo()).toBe(true);
+    expect(doc.split.cuts[0].part.r).toBe(20);
+    // the part handed in is copied, not kept
+    const given = dome();
+    doc.addCut(given);
+    given.part.r = 99;
+    expect(doc.split.cuts.at(-1).part.r).toBe(7.895);
+  });
+
+  it('a change to a part is the user\'s and the finder no longer moves it; a click on the model is the finder\'s pick again', () => {
+    const doc = lantern();
+    const id = doc.addCut(dome());
+    const steps = doc.history.length;
+    // released where it was: no step, and still the finder's
+    doc.updateCut(id, { position: [-0.0049, 0.0111, 28.9] });
+    doc.updateCut(id, { part: { r: 7.895 } });
+    expect(doc.history).toHaveLength(steps);
+    expect(doc.split.cuts[0].part.auto).toBe(true);
+    doc.updateCut(id, { position: [-0.0049, 0.0111, 29.1] });
+    expect(doc.split.cuts[0].part).toEqual({ r: 7.895, side: 1, auto: false });
+    // a typed value or a drag cannot make it the finder's again; picking it can
+    doc.updateCut(id, { part: { auto: false, r: 7.9 } });
+    expect(doc.split.cuts[0].part.auto).toBe(false);
+    const before = doc.history.length;
+    doc.updateCut(id, { position: [-0.0049, 0.0111, 29.0], part: { r: 7.872, side: 1, auto: true } });
+    expect(doc.split.cuts[0].part).toEqual({ r: 7.872, side: 1, auto: true });
+    // picked again where it already is, a part the user had changed is the finder's again, in a step of its own
+    doc.updateCut(id, { part: { r: 7.5 } });
+    doc.updateCut(id, { part: { r: 7.5, auto: true } });
+    expect(doc.split.cuts[0].part).toEqual({ r: 7.5, side: 1, auto: true });
+    expect(doc.history).toHaveLength(before + 3);
+    doc.undo();
+    expect(doc.split.cuts[0].part).toEqual({ r: 7.5, side: 1, auto: false });
+  });
+
+  it('the finder\'s refit after a Scale joins the Scale\'s step; one that comes too late does nothing, or is a step of its own', () => {
+    const doc = lantern();
+    const lid = doc.addCut(dome());
+    const own = doc.addCut({ position: [0, 0, 1], normal: Z, joint: 'apart', part: { r: 9.32, side: 1, auto: false } });
+    const top = doc.addCut({ position: [0, 0, 45], normal: Z, joint: 'apart', hold: 'lift' });
+    const steps = doc.history.length;
+    const step = doc.transformBase(new Matrix4().makeScale(4, 4, 4));
+    expect(doc.history).toHaveLength(steps + 1);
+    const seen = modelPlacementKey(doc.base);
+    // the finder's pick at 400 %, which need not be the face at 100 % scaled
+    const fits = [
+      { id: lid, position: [-0.0196, 0.0444, 115.4], part: { r: 31.505, side: 1 } },
+      { id: own, position: [0, 0, 0], part: { r: 37.28, side: 1 } }, // the user's own: left alone
+      { id: top, position: [0, 0, 100], part: { r: 30, side: 1 } }, // no part: left alone
+    ];
+    doc.refitParts(fits, { base: seen, step });
+    expect(doc.history).toHaveLength(steps + 1);
+    expect(doc.split.cuts.find((c) => c.id === lid)).toEqual({ id: lid, position: [-0.0196, 0.0444, 115.4], normal: Z, joint: 'apart', hold: 'lock', part: { r: 31.505, side: 1, auto: true } });
+    expect(doc.split.cuts.find((c) => c.id === own).part.r).toBeCloseTo(37.28, 9);
+    expect(r6(doc.split.cuts.find((c) => c.id === own).position)).toEqual([0, 0, 4]);
+    expect(doc.split.cuts.find((c) => c.id === top)).toEqual({ id: top, position: [0, 0, 180], normal: Z, joint: 'apart', hold: 'lift' });
+    // one undo takes back the Scale and the refit together
+    doc.undo();
+    expect(doc.history).toHaveLength(steps);
+    expect(doc.split.cuts[0]).toEqual({ id: lid, position: [-0.0049, 0.0111, 28.9], normal: Z, joint: 'apart', hold: 'lock', part: { r: 7.895, side: 1, auto: true } });
+    // the refit for a Scale that was undone does nothing
+    doc.refitParts(fits, { base: seen, step });
+    expect(doc.split.cuts[0].position).toEqual([-0.0049, 0.0111, 28.9]);
+    expect(doc.history).toHaveLength(steps);
+    // redo brings back the Scale with its refit
+    doc.redo();
+    expect(doc.split.cuts[0].position).toEqual([-0.0196, 0.0444, 115.4]);
+    doc.undo();
+    // after another edit the refit is a step of its own, and a refit that changes nothing is none
+    const again = doc.transformBase(new Matrix4().makeScale(4, 4, 4));
+    expect(again).not.toBe(step);
+    // two transforms in a row are two steps, and a refit for the model before the last does nothing
+    doc.transformBase(new Matrix4().makeScale(0.5, 0.5, 0.5));
+    expect(doc.history).toHaveLength(steps + 2);
+    doc.refitParts(fits, { base: seen, step: again });
+    expect(doc.split.cuts[0].part.r).toBeCloseTo(15.79, 9);
+    doc.undo();
+    doc.addItem({ text: 'BAT', position: [0, 0, 20], normal: [0, 1, 0] });
+    doc.refitParts(fits, { base: modelPlacementKey(doc.base), step: again });
+    expect(doc.history).toHaveLength(steps + 3);
+    expect(doc.split.cuts[0].position).toEqual([-0.0196, 0.0444, 115.4]);
+    doc.refitParts(fits, { base: modelPlacementKey(doc.base), step: again });
+    expect(doc.history).toHaveLength(steps + 3);
+    doc.undo();
+    expect(r6(doc.split.cuts[0].position)).toEqual([-0.0196, 0.0444, 115.6]);
+    expect(doc.items).toHaveLength(1);
+    // a reset is a step a refit can join too, and a transform with no model makes none
+    const back = doc.resetBase();
+    doc.refitParts([{ id: lid, position: [-0.0049, 0.0111, 29], part: { r: 7.872 } }], { base: modelPlacementKey(doc.base), step: back });
+    expect(doc.split.cuts[0].part).toEqual({ r: 7.872, side: 1, auto: true });
+    doc.undo();
+    expect(r6(doc.split.cuts[0].position)).toEqual([-0.0196, 0.0444, 115.6]);
+    expect(new Document().transformBase(new Matrix4())).toBeNull();
+    expect(new Document().resetBase()).toBeNull();
   });
 });

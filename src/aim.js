@@ -21,15 +21,27 @@ export const mm = (v) => String(Math.round(v * 10) / 10);
 
 /**
  * What the lip found at a place means for the outline: 'full' where a full
- * lip with clips fits (or a full one, on a hold that has no clips), 'short'
- * where only a shorter or clipless one does, 'none' where no lip does.
- * @param {{ lip: { H: number, clips: number }|null }|null} probe the engine's answer (mode 'probe')
+ * lip with clips fits – or the twist-lock in their place, on a round wall,
+ * with a lip or none – (or a full one, on a hold that has no clips),
+ * 'short' where only a shorter or clipless one does, 'none' where no lip
+ * does.
+ * @param {{ lip: { H: number, clips: number, twist?: object }|null }|null} probe the engine's answer (mode 'probe')
  * @param {string} hold the cut's hold: 'lock', 'snap', 'light' or 'lift'
  */
 export function lipVerdict(probe, hold) {
   const lip = probe?.lip;
+  // the twist-lock holds where no lip would fit at all, too (a cut through a round lantern's eave)
+  if (lip?.twist && hold !== 'lift') return 'full';
   if (!lip || !(lip.H > 0)) return 'none';
   return lip.H >= LIP.heights[0] && (lip.clips > 0 || hold === 'lift') ? 'full' : 'short';
+}
+
+/**
+ * The collar twist-lock a cut takes in place of clips, in a few words: "twist-lock, 3 lugs, 6 clicks – turn 10°".
+ * @param {{ theta: number, tabs: number }} twist the probe's `lip.twist`
+ */
+export function twistWords(twist) {
+  return `twist-lock, 3 lugs, ${twist.tabs} ${twist.tabs === 1 ? 'click' : 'clicks'} – turn ${Math.round(twist.theta)}°`;
 }
 
 /** Where to move a cut for a better lip: "move down to 190.5" along Z, "move to 12.5" across. */
@@ -68,8 +80,10 @@ function noLipWords(probe) {
  * "4.5 mm lip without clips – lifts off – move down to 190.5 for clips", "no
  * room for a lip – move down to 190.5" (the move where the layout gives the
  * cut a full lip). A move is said to be for clips only where the lip there
- * has them (`suggestedLip`): on a round wall, where no clip fits, it is for a
- * taller lip.
+ * has them (`suggestedLip`): on a round wall, where no clip fits, it is for
+ * the twist-lock the cut takes there instead, or for a taller lip. Where
+ * the cut takes the twist-lock, that is what it gets, whatever the hold
+ * that asked for clips: "twist-lock, 3 lugs, 6 clicks – turn 10°".
  * @param {object} probe the engine's answer (mode 'probe')
  * @param {string} hold
  * @param {number} axis
@@ -78,6 +92,7 @@ export function lipWords(probe, hold, axis) {
   if (!probe) return '';
   const lip = probe.lip;
   const move = Number.isFinite(probe.suggestedAt) ? moveWords(axis, probe.at, probe.suggestedAt) : '';
+  if (lip?.twist && hold !== 'lift') return twistWords(lip.twist);
   if (!lip || !(lip.H > 0)) {
     const why = noLipWords(probe);
     return move ? `${why} – ${move}` : why;
@@ -88,6 +103,7 @@ export function lipWords(probe, hold, axis) {
   const bare = `${mm(lip.H)} mm lip without clips – lifts off`;
   if (!move) return bare;
   const there = probe.suggestedLip;
+  if (there?.twist) return `${bare} – ${move} for a twist-lock`;
   return there && !(there.clips > 0) ? `${bare} – ${move} for a ${mm(there.H)} mm lip` : `${bare} – ${move} for clips`;
 }
 
@@ -129,14 +145,16 @@ export function aimLine(axis, at, probe, hold, { through = [] } = {}) {
  * "snapped to a good spot at 190.5 mm – under a ledge where the shape
  * widens", "snapped to where a full lip fits, at 190.5 mm" – or, where the
  * lip the move gives is short of that (no clips on a round wall), "snapped
- * to where a 6 mm lip fits".
- * @param {{ at: number, kind: 'seam'|'spot'|'lip', what?: string, why?: string, full?: boolean, H?: number }|null} target
+ * to where a 6 mm lip fits", and where the twist-lock takes their place,
+ * "snapped to where a twist-lock fits".
+ * @param {{ at: number, kind: 'seam'|'spot'|'lip', what?: string, why?: string, full?: boolean, H?: number, twist?: boolean }|null} target
  *   from `aimTargets`
  * @param {number} axis
  */
 export function snappedWords(target, axis) {
   if (!target) return '';
   if (target.kind === 'spot') return `snapped to a good spot at ${mm(target.at)} mm${target.why ? ` – ${target.why}` : ''}`;
+  if (target.kind === 'lip' && target.twist) return `snapped to where a twist-lock fits, at ${mm(target.at)} mm`;
   if (target.kind === 'lip') return `snapped to where a ${target.full === false && target.H > 0 ? `${mm(target.H)} mm` : 'full'} lip fits, at ${mm(target.at)} mm`;
   return `snapped to ${seamWords(target.what, axis)} at ${mm(target.at)} mm`;
 }
@@ -146,7 +164,7 @@ export function snappedWords(target, axis) {
  * 4 clips · under a ledge where the shape widens", and the letters it runs
  * through ("· through “LIGHT”", `through` the names of its `crosses`) or the
  * cut already there (`taken`, its letter: "· cut A is here").
- * @param {{ axis: string, at: number, why: string, lip: { H: number, clips: number }, comesOff: object }} spot from mode 'spots'
+ * @param {{ axis: string, at: number, why: string, lip: { H: number, clips: number, twist?: object }, comesOff: object }} spot from mode 'spots'
  * @param {string} hold the hold the spots were found for
  * @param {{ through?: string[], taken?: string|null }} [options]
  */
@@ -162,16 +180,18 @@ export function spotLabel(spot, hold, { through = [], taken = null } = {}) {
  * What a cut being placed snaps to along one axis: the model's seams, the
  * spots suggested and the nearest place a full lip fits (the probe's
  * `suggestedAt`; with `full` false and its height `H` where the lip there is
- * short of a full one), as `snapTarget` takes them.
+ * short of a full one, `twist` where the twist-lock takes the clips' place),
+ * as `snapTarget` takes them.
  * @param {{ seams?: { at: number, kind: string }[], spots?: { at: number, why: string }[],
- *   lip?: number|{ at: number, full?: boolean, H?: number }|null }} from
+ *   lip?: number|{ at: number, full?: boolean, H?: number, twist?: boolean }|null }} from
  */
 export function aimTargets({ seams = [], spots = [], lip = null } = {}) {
   const near = typeof lip === 'number' ? { at: lip } : lip;
+  const what = near?.twist ? { twist: true } : near?.full === false ? { full: false, H: near.H } : {};
   return [
     ...seams.map((s) => ({ at: s.at, kind: 'seam', what: s.kind })),
     ...spots.map((s) => ({ at: s.at, kind: 'spot', why: s.why })),
-    ...(Number.isFinite(near?.at) ? [{ at: near.at, kind: 'lip', ...(near.full === false ? { full: false, H: near.H } : {}) }] : []),
+    ...(Number.isFinite(near?.at) ? [{ at: near.at, kind: 'lip', ...what }] : []),
   ];
 }
 

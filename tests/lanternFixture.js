@@ -300,3 +300,75 @@ export function slenderTowerSolid() {
     for (const m of temps) m.delete();
   }
 }
+
+/**
+ * A small bat lantern like the user's, at its 100 % size (25 × 25 × 50 mm): a solid base disc with a recessed band
+ * (r 10, 9.35 from z 1 to 4.5, 10.3 from 4.5 to 6.6) on 8 feet, a floor cup, 8 posts to z 26, a 1.5 mm ring band, a
+ * conical dome shell 30° from horizontal (0.6 mm thick square to it) from the band to a flange, a cupola of 12 columns
+ * with a spire to z 38.7, 8 spires on the band and a handle in the XZ plane: two legs whose feet bend in and fuse into
+ * the dome's outside at r 7.75–9.3, z 27.9–28.9, a boss on each and an arch over the cap to its crown at z 50. One
+ * shell, genus 26, 8,004 triangles. The lid that leaves the handle on is the dome and cap over z ≈ 29 inside r ≈ 7.9.
+ */
+export function batLanternSolid({ seg = 96 } = {}) {
+  const { Manifold, CrossSection } = manifold();
+  const temps = [];
+  const t = (m) => {
+    temps.push(m);
+    return m;
+  };
+  try {
+    const parts = [];
+    const cyl = (h, r1, r2 = r1, z = 0) => t(t(Manifold.cylinder(h, r1, r2, seg)).translate([0, 0, z]));
+    const tube = (h, rin, rout, z) => t(cyl(h, rout, rout, z).subtract(cyl(h + 0.02, rin, rin, z - 0.01)));
+    const b = (min, max) => t(box(min, max));
+    const rev = (pts) => {
+      const cs = t(new CrossSection(pts, 'Positive'));
+      return t(cs.revolve(seg));
+    };
+    // the base and the 8 feet under the posts
+    parts.push(cyl(1, 10.0), cyl(3.5, 9.35, 9.35, 1), cyl(2.1, 10.3, 10.3, 4.5));
+    for (let k = 0; k < 8; k++) {
+      const a = (k * Math.PI) / 4;
+      parts.push(t(b([-1.2, -1.2, 0], [1.2, 1.2, 6.6]).translate([11.3 * Math.cos(a), 11.3 * Math.sin(a), 0])));
+    }
+    parts.push(tube(1.95, 3.3, 4.3, 6.55));
+    // the posts, every other one wider
+    for (let k = 0; k < 8; k++) {
+      const a = (k * Math.PI) / 4;
+      const w = k % 2 ? 2.8 : 1.5;
+      parts.push(t(t(b([-w / 2, -w / 2, 6.5], [w / 2, w / 2, 26]).rotate([0, 0, (a * 180) / Math.PI])).translate([10.6 * Math.cos(a), 10.6 * Math.sin(a), 0])));
+    }
+    parts.push(tube(1.5, 9.1, 10.45, 25.9));
+    // the dome: a conical shell from the band (z 27.3, r 10.1 outside) to the flange (z 30.05, r 5.3), 1.25 mm across
+    parts.push(rev([[10.1 - 1.25 - 0.6, 27.3], [10.1, 27.3], [5.3, 30.05], [5.3 - 1.25, 30.05]]));
+    // the flange and the cupola: 12 columns, a roof cone, a drum and the spire
+    parts.push(tube(0.7, 3.3, 5.5, 30.0));
+    for (let k = 0; k < 12; k++) parts.push(t(t(b([-0.5, -0.58, 30.6], [0.5, 0.58, 32.5]).translate([3.6, 0, 0])).rotate([0, 0, k * 30])));
+    parts.push(rev([[0, 32.45], [4.35, 32.45], [4.35, 32.8], [1.9, 34.5], [1.4, 34.5], [1.4, 36.3], [0.9, 36.3], [0, 38.7]]));
+    // 8 spires on the band, their tips at z 29.4 (between the axes) and 30 (on them)
+    for (let k = 0; k < 8; k++) {
+      const a = (k * Math.PI) / 4;
+      const r = k % 2 ? 10.9 : 10.6;
+      const top = k % 2 ? 29.4 : 30.0;
+      parts.push(t(t(Manifold.cylinder(top - 27.0, 0.8, 0.05, 16)).translate([r * Math.cos(a), r * Math.sin(a), 27.0])));
+    }
+    // the handle: legs at x ±(9.65–10.5), y ±1.15, z 28.9–41.2, their feet bent in onto the dome; a boss Ø 2.4 on
+    // each at z 31.6; the arch from z 41 to its crown at z 50, 0.85 thick
+    for (const sx of [-1, 1]) {
+      const leg = b([9.65, -1.15, 28.9], [10.5, 1.15, 41.2]);
+      const foot = t(Manifold.hull([b([9.65, -1.15, 28.9], [10.5, 1.15, 29.6]), b([7.75, -1.15, 27.9], [9.3, 1.15, 28.5])]));
+      const boss = t(t(Manifold.sphere(1.2, 24)).translate([11.0, 0, 31.6]));
+      const one = t(Manifold.union([leg, foot, boss]));
+      parts.push(sx > 0 ? one : t(one.mirror([1, 0, 0])));
+    }
+    const ring = t(t(t(CrossSection.circle(10.5, seg)).subtract(t(CrossSection.circle(9.65, seg)))).intersect(t(t(CrossSection.square([22, 11])).translate([-11, 0]))));
+    parts.push(t(t(t(t(t(ring.extrude(2.3)).translate([0, 0, -1.15])).rotate([90, 0, 0])).scale([1, 1, 9 / 10.5])).translate([0, 0, 41])));
+    // worked out while its parts are still held, as the lantern was measured: let go first, the union batches its
+    // booleans another way and the same solid comes out in 8,008 triangles
+    const solid = Manifold.union(parts);
+    solid.numTri();
+    return solid;
+  } finally {
+    for (const m of temps) m.delete();
+  }
+}

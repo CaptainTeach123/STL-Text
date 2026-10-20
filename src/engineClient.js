@@ -300,6 +300,17 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
     },
 
     /**
+     * The parts that come off (`{ printing, split }`, mode 'parts'): a lid
+     * inside a handle, a base from underneath, each with the twist-lock it
+     * gets or the least scale one needs, best first. Seconds on a dense
+     * model the first time, at once after that, so on a channel of its own:
+     * a newer request replaces one still waiting, and no probe or spots.
+     */
+    parts(items, baseVersion, options = {}) {
+      return request('split.parts', 'split.plan', { items, baseVersion, ...options, mode: 'parts' });
+    },
+
+    /**
      * The best places along an axis for a cut that comes apart (`{ axis,
      * hold, printing, split }`, mode 'spots'), best first. Seconds on a dense
      * model, so on a channel of its own, and asked for a slice of time at a

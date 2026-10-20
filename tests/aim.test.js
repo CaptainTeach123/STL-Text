@@ -74,16 +74,33 @@ describe('placing a cut on the model', () => {
     expect(lipWords({ ...at100, islands: 3 }, 'lock', 2)).toBe('cuts through 3 small parts – no room for a lip');
   });
 
-  it('says a move is for clips only where the lip there has them: on a round wall it is for a taller lip', () => {
-    // a round lantern under its eaves: 4.5 mm without clips at 147, 6 mm without them at 146.5 – no clip fits a round wall
-    const round = { ...at192, at: 147, suggestedAt: 146.5, suggestedLip: { H: 6, clips: 0 } };
-    expect(lipWords(round, 'lock', 2)).toBe('4.5 mm lip without clips – lifts off – move down to 146.5 for a 6 mm lip');
+  it('says a move is for clips only where the lip there has them: on a round wall it is for the twist-lock, or a taller lip', () => {
+    // a round wall takes no clip: where the twist-lock fits it takes their place, with a lip or none, whatever the hold
+    // that asked for clips (the synthetic round lantern under its eaves, and the user's through its eave)
+    const twist = { r0: 46.72, opening: 90.24, theta: 9, tabs: 6 };
+    const round = { ...at192, at: 147, lip: { H: 4.5, clips: 0, why: null, twist }, suggestedAt: null, suggestedLip: null };
+    for (const hold of ['lock', 'snap', 'light']) expect(lipWords(round, hold, 2)).toBe('twist-lock, 3 lugs, 6 clicks – turn 9°');
+    const eave = { ...at196, at: 150, lip: { H: 0, clips: 0, why: null, twist: { r0: 44.02, opening: 84.84, theta: 10, tabs: 6 } }, noLip: null, suggestedAt: null };
+    expect(aimLine(2, 150, eave, 'lock')).toBe('Z 150 mm · twist-lock, 3 lugs, 6 clicks – turn 10° · top 95 mm comes off');
+    expect([lipVerdict(round, 'lock'), lipVerdict(eave, 'snap')]).toEqual(['full', 'full']);
+    // Lifts off asks for no hold: the lip, as before
+    expect(lipWords({ ...round, lip: { H: 4.5, clips: 0, why: null } }, 'lift', 2)).toBe('4.5 mm lip – lifts off');
+    // where none fits here, a move is for the one there, or for a taller lip where that one has none either
+    const low = { ...at192, at: 13.5, lip: { H: 3, clips: 0, why: 'height' }, suggestedAt: 10.5, suggestedLip: { H: 6, clips: 0, twist: true } };
+    expect(lipWords(low, 'lock', 2)).toBe('3 mm lip without clips – lifts off – move down to 10.5 for a twist-lock');
+    expect(lipWords({ ...low, suggestedLip: { H: 6, clips: 0 } }, 'lock', 2)).toBe('3 mm lip without clips – lifts off – move down to 10.5 for a 6 mm lip');
     expect(lipWords(at192, 'lock', 2)).toBe('4.5 mm lip without clips – lifts off – move down to 190.5 for clips');
-    // and the place it snaps to there is where a 6 mm lip fits, not a full one
-    const [lip] = aimTargets({ lip: { at: 146.5, full: false, H: 6 } });
-    expect(lip).toEqual({ at: 146.5, kind: 'lip', full: false, H: 6 });
-    expect(snappedWords(lip, 2)).toBe('snapped to where a 6 mm lip fits, at 146.5 mm');
+    // and the place it snaps to there is where the twist-lock fits, or a 6 mm lip, not a full one
+    const [lip] = aimTargets({ lip: { at: 10.5, full: true, H: 6, twist: true } });
+    expect(lip).toEqual({ at: 10.5, kind: 'lip', twist: true });
+    expect(snappedWords(lip, 2)).toBe('snapped to where a twist-lock fits, at 10.5 mm');
+    const [short] = aimTargets({ lip: { at: 146.5, full: false, H: 6 } });
+    expect(short).toEqual({ at: 146.5, kind: 'lip', full: false, H: 6 });
+    expect(snappedWords(short, 2)).toBe('snapped to where a 6 mm lip fits, at 146.5 mm');
     expect(snappedWords(aimTargets({ lip: { at: 190.5, full: true, H: 6 } })[0], 2)).toBe('snapped to where a full lip fits, at 190.5 mm');
+    // a suggestion with the twist-lock says so on its button
+    const spotted = { ...spot, at: 147.5, lip: { H: 0, clips: 0, twist: { r0: 41.72, opening: 80.24, theta: 11, tabs: 6 } }, comesOff: { side: 1, length: 90.5, fraction: 0.29 } };
+    expect(spotLabel(spotted, 'lock')).toBe('Z 147.5 mm – top 90.5 mm comes off · twist-lock, 3 lugs, 6 clicks – turn 11° · under a ledge where the shape widens');
   });
 
   it('names the letters a cut would run through, in the readout and on a suggestion', () => {

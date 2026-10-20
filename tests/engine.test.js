@@ -9,6 +9,7 @@ import { manifold } from '../src/manifold.js';
 import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
 import { setup, soupOf as soupGeometry } from './helpers.js';
+import { batLanternSolid, roundLanternSolid } from './lanternFixture.js';
 
 const soupOf = (solid, opts) => soupGeometry(solid, opts).attributes.position.array;
 
@@ -544,5 +545,587 @@ describe('client scheduler', () => {
     const ping = await client.call('ping', {});
     expect(ping.caches.flat).toBeLessThanOrEqual(16);
     expect(ping.caches.conformed).toBeLessThanOrEqual(16);
+  });
+});
+
+describe('parts that come off', () => {
+  it("mode 'parts' finds the lid and the base, keeps the model's slices and answers again at once", async () => {
+    const fx = batLanternSolid();
+    const big = fx.scale([3, 3, 3]);
+    await client.loadBase({ kind: 'stl', bytes: stlOf(big), name: 'bat', version: ++version });
+    fx.delete();
+    big.delete();
+    // the slices of the model the engine reads, counted
+    const binding = Object.getPrototypeOf(wasm.Manifold.prototype);
+    const slice = binding.slice;
+    let sliced = 0;
+    binding.slice = function counted(...args) {
+      sliced++;
+      return slice.apply(this, args);
+    };
+    try {
+      const printing = { nozzle: 0.4, layerHeight: 0.2 };
+      const parts = (clearance) => client.parts([], version, { printing, split: { clearance } });
+      progress.length = 0;
+      const first = await parts(0.15);
+      expect(progress).toContain('Finding the parts that come off…');
+      const firstSliced = sliced;
+      expect(firstSliced).toBeGreaterThan(240);
+      expect(first.parts.map((e) => [e.kind, e.name])).toEqual([['lid', 'Dome and cap'], ['plug', 'Base']]);
+      expect(first.parts[0]).toMatchObject({ face: 86, lock: { mech: 'twist', theta: 27, tabs: 3 }, handle: { legs: 2 } });
+      expect(first.parts[0].lock.r0).toBeCloseTo(15.88, 1);
+      expect(first.parts[1].lock).toMatchObject({ mech: 'plug', R: 21.4 });
+      expect(first.scale).toBe(1);
+      // the final result is not built yet: read off the model alone, and said so
+      expect(first.estimate).toBe(true);
+      expect((await client.call('ping', {})).caches.parts).toBe(1);
+      // asked again: the same table, no slice read
+      progress.length = 0;
+      sliced = 0;
+      expect(await parts(0.15)).toEqual(first);
+      expect(progress).not.toContain('Finding the parts that come off…');
+      expect(sliced).toBe(0);
+      // another clearance moves the faces and sizes the locks again from the levels kept: only the slices near the
+      // faces and the way out are read
+      const looser = await parts(0.3);
+      expect(sliced).toBeGreaterThan(0);
+      expect(sliced).toBeLessThanOrEqual(firstSliced - 240);
+      expect(looser.parts[0].lock.r0).toBeLessThan(first.parts[0].lock.r0);
+      expect((await client.call('ping', {})).caches.parts).toBe(2);
+      // once the result is built the table is the result's, the same parts
+      await client.result([], version, { printing });
+      const built = await parts(0.15);
+      expect(built.estimate).toBeUndefined();
+      expect(built.parts).toEqual(first.parts);
+      // scaled on: the table says how far, against the model loaded
+      await client.updateBase({ version: ++version, transforms: [new Matrix4().makeScale(4 / 3, 4 / 3, 4 / 3).toArray()], simplify: null });
+      const at4 = await parts(0.15);
+      expect(at4.scale).toBeCloseTo(4 / 3, 6);
+      expect(at4.parts[0]).toMatchObject({ face: 114.6, lock: { theta: 18, tabs: 6, teaLight: true } });
+    } finally {
+      binding.slice = slice;
+    }
+  });
+
+  it('a model with gaps has no parts to offer, and says why', async () => {
+    const open = new Float32Array([0, 0, 0, 10, 0, 0, 0, 10, 0]);
+    await client.loadBase({ kind: 'stl', bytes: writeBinarySTL(open), name: 'open', version: ++version });
+    const r = await client.parts([], version, { printing: { nozzle: 0.4, layerHeight: 0.2 }, split: {} });
+    expect(r).toMatchObject({ parts: [], handles: [], open: null, solid: false });
+    expect(r.notes.map((n) => n.code)).toEqual(['SPLIT_UNAVAILABLE']);
+  });
+});
+
+describe('a split that takes parts out', () => {
+  const printing = { nozzle: 0.4, layerHeight: 0.2 };
+  /** A cut that takes out a part, as the document stores it: a circle on a plane across Z. */
+  const partCut = (id, centre, at, r, { hold = 'lock', side = 1, normal = [0, 0, 1] } = {}) => ({
+    id, position: [centre[0], centre[1], at], normal, joint: 'apart', hold, part: { r, side, auto: false },
+  });
+  const load = async (solid, name = 'bat') => {
+    await client.loadBase({ kind: 'stl', bytes: stlOf(solid), name, version: ++version });
+    solid.delete();
+  };
+  const exportFiles = (split, p = printing) => client.export([], version, 'bat', { printing: p, split: { clearance: 0.15, ...split }, archive: 'files' });
+  /** Slices the engine reads while `run` runs, counted. */
+  const slicesDuring = async (run) => {
+    const binding = Object.getPrototypeOf(wasm.Manifold.prototype);
+    const slice = binding.slice;
+    let n = 0;
+    binding.slice = function counted(...args) {
+      n++;
+      return slice.apply(this, args);
+    };
+    try {
+      return { value: await run(), slices: n };
+    } finally {
+      binding.slice = slice;
+    }
+  };
+  const solidOf = (file) => geometryToManifold(parseSTL(file.stl));
+
+  it('takes the dome and cap and the base out of the lantern at 300 %, each twist-locking: the handle stays, each lies on its face', async () => {
+    const model = batLanternSolid().scale([3, 3, 3]);
+    // the material the lid has on its face, inside its circle
+    const faceArea = (() => {
+      const cs = model.slice(86 + 1e-4);
+      const islands = cs.decompose();
+      const area = islands.filter((x) => {
+        const b = x.bounds();
+        return Math.max(...[b.min[0], b.min[1], b.max[0], b.max[1]].map(Math.abs)) < 23.6;
+      }).reduce((sum, x) => sum + x.area(), 0);
+      islands.forEach((x) => x.delete());
+      cs.delete();
+      return area;
+    })();
+    await load(model);
+    const table = await client.parts([], version, { printing, split: {} });
+    const lid = table.parts.find((e) => e.kind === 'lid');
+    const base = table.parts.find((e) => e.kind === 'plug');
+    expect([lid.face, lid.r, base.face, base.r]).toEqual([86, 23.6286, 0, 21.4]);
+    const cuts = (hold) => [partCut('c1', lid.centre, lid.face, lid.r, { hold }), partCut('c2', base.centre, base.face, base.r, { hold })];
+    progress.length = 0;
+    const ex = await exportFiles({ cuts: cuts('lock') });
+    expect(progress).toContain('Cutting the dome and cap…');
+    expect(progress).toContain('Cutting the base…');
+    expect(progress).toContain('Building the twist-lock…');
+    expect(ex.pieces.map((p) => [p.index, p.name, p.lies, p.down, p.part ?? null, p.lids])).toEqual([
+      [1, 'Lantern, with the handle', 'flat as modelled', '-z', null, []],
+      [2, 'Dome and cap', 'on a cut face', '-z', 'c1', ['A']],
+      [3, 'Base', 'flat as modelled', '-z', 'c2', ['B']],
+    ]);
+    // the part's cell is past the grid, for its colour and number only
+    expect(ex.pieces.map((p) => p.cell)).toEqual([[0, 0, 0], [0, 0, 1], [0, 0, 2]]);
+    expect(ex.seams).toHaveLength(2);
+    // the lock the table offered, built: the lid comes out turned 27° free, lifted from the lock's own lift
+    expect(ex.seams[0]).toMatchObject({
+      cutId: 'c1', letter: 'A', axis: 2, at: 86, pieces: [1, 2], joint: 'part', labels: null,
+      apart: { hold: 'lock', lip: false, clips: 0, mech: 'twist', r0: lid.lock.r0, opening: lid.lock.opening, theta: 27, tabs: 3, teaLight: false, socket: 'ring', slope: 1.72 },
+      part: { kind: 'lid', name: 'Dome and cap', centre: lid.centre, r: lid.r, side: 1, handle: true, span: [-1, 0, 0], way: { turn: 27, up: false, lift: 4.1, dir: [0, 1, 0], out: [0, 0, 1] } },
+    });
+    expect(ex.seams[0].apart.shelf).toBeCloseTo(0.894, 3);
+    expect(ex.seams[0].part.cap).toBeCloseTo(lid.cap, 2);
+    expect(ex.seams[0].part.top).toBeCloseTo(lid.top, 2);
+    expect(ex.seams[1]).toMatchObject({
+      letter: 'B', at: 0, pieces: [1, 3], apart: { hold: 'lock', mech: 'plug', R: 21.4, opening: 42.8, theta: 23, tabs: 3, teaLight: true, coin: 36.5 },
+      part: { kind: 'plug', name: 'Base', way: { turn: 23, up: true, lift: 0, dir: null, out: [0, 0, -1] } },
+    });
+    const notes = ex.notes.map((n) => `${n.code}: ${n.text}`);
+    expect(notes).toEqual([
+      "SPLIT: Cut into 3 pieces. Cuts A and B come apart – don't glue them.",
+      'PART_LOCK: Cut A: the dome and cap (piece 2) twist-lock onto piece 1 and the handle stays on piece 1. To fit it: set it on turned 27° to the left so the wide lug finds its wide slot, push down and turn it right until it clicks. To open it: turn it left until it clicks again, lift it 4.5 mm and slide it out under the handle, square to it.',
+      'PART_PLUG: Cut B: the base (piece 3) twists off underneath. Turn the lantern over, set the base in turned 23° to the left, push it in and turn it right until it clicks – a coin in its slot helps. To open it: turn it left until it clicks and lift it out. Its Ø 43 mm opening takes a 38 mm tea light.',
+    ]);
+    expect(ex.notes.slice(1).map((n) => n.level)).toEqual(['info', 'info']);
+    expect(ex.assembly).toEqual([
+      'Do not glue cut B: it comes apart. Base: turn piece 1 over, set the base in turned 23° to the left, push in and turn it right until it clicks (a coin in the slot helps). To open: turn it left and lift it out.',
+      'Do not glue cut A: it comes apart. Dome and cap: set it on turned 27° to the left so the wide lug finds its wide slot, push down and turn it right until it clicks. To open: turn it left until it clicks again, lift it 4.5 mm and slide it out under the handle, square to it.',
+    ]);
+    const glue = ex.files.find((f) => f.kind === 'text').text;
+    expect(glue).toContain('comes off at cut A (the dome and cap)');
+    expect(glue).toContain('comes off at cut B (the base)');
+    // the same parts lifting off, for what the locks add and take
+    const plain = await exportFiles({ cuts: cuts('lift') });
+    expect(plain.seams.map((x) => x.apart.mech)).toEqual([null, null]);
+    expect(plain.notes.map((n) => n.code)).toEqual(['SPLIT', 'PART_LIFTS', 'PART_LIFTS']);
+    // the files: each one piece; the body stands as modelled with the handle's crown on it and the collar under the
+    // face; the lid lies on its face, its socket ring added inside it; the plug on its bottom, its lugs standing out
+    const [body, dome, plug] = ex.files.filter((f) => f.stl).map(solidOf);
+    const [body0, dome0, plug0] = plain.files.filter((f) => f.stl).map(solidOf);
+    try {
+      expect([body, dome, plug].map((m) => m.decompose().map((x) => (x.delete(), 1)).length)).toEqual([1, 1, 1]);
+      expect(body.volume()).toBeGreaterThan(body0.volume() + 5000);
+      expect(dome.volume()).not.toBeCloseTo(dome0.volume(), 0);
+      const bb = body.boundingBox();
+      expect([bb.min[2], bb.max[2]]).toEqual([0, expect.closeTo(150, 3)]);
+      expect(bb.max[0] - bb.min[0]).toBeCloseTo(75, 3);
+      const db = dome.boundingBox();
+      expect(db.min[2]).toBe(0);
+      // its spire's tip, a little over the cap the slices read
+      expect(db.max[2]).toBeCloseTo(38.7 * 3 - 86, 3);
+      const bottom = dome.slice(0.1);
+      expect(bottom.area()).toBeGreaterThanOrEqual(0.9 * faceArea);
+      bottom.delete();
+      const pb = plug.boundingBox();
+      expect(pb.max[2]).toBeCloseTo(25.5, 2);
+      // its lugs reach 0.8 mm past the bore; lifting off, it is turned down to the bore less the clearance
+      expect(Math.max(pb.max[0] - pb.min[0], pb.max[1] - pb.min[1])).toBeGreaterThan(2 * 21.4);
+      const qb = plug0.boundingBox();
+      expect(Math.max(qb.max[0] - qb.min[0], qb.max[1] - qb.min[1])).toBeLessThanOrEqual(2 * (21.4 - 0.15) + 0.01);
+    } finally {
+      [body, dome, plug, body0, dome0, plug0].forEach((m) => m.delete());
+    }
+    // the pieces view: one range per piece
+    const shown = await client.result([], version, { printing, split: { cuts: [partCut('c1', lid.centre, lid.face, lid.r)] } });
+    expect(shown.display.parts).toEqual([{ kind: 'piece', index: 1 }, { kind: 'piece', index: 2 }]);
+    expect((await client.call('ping', {})).caches.carved).toBe(1);
+    // the parts gone, so is what they kept: with no cut at all, or only full ones
+    await client.result([], version, { printing });
+    expect((await client.call('ping', {})).caches.carved).toBe(0);
+    await client.result([], version, { printing, split: { cuts: [partCut('c1', lid.centre, lid.face, lid.r)] } });
+    expect((await client.call('ping', {})).caches.carved).toBe(1);
+    await client.result([], version, { printing, split: { cuts: [{ id: 'c1', position: [0, 0, 100], normal: [0, 0, 1] }] } });
+    expect((await client.call('ping', {})).caches.carved).toBe(0);
+  });
+
+  it('builds the lock again for a new clearance, nozzle or layer height, and carves nothing while the face stays', async () => {
+    const model = batLanternSolid().scale([3, 3, 3]);
+    await load(model);
+    const split = (extra = {}) => ({ clearance: 0.15, cuts: [partCut('c1', [0, 0], 86, 23.6286)], ...extra });
+    const run = async (s, p = printing) => {
+      progress.length = 0;
+      const ex = await exportFiles(s, p);
+      return { ex, carved: progress.includes('Cutting the dome and cap…'), built: progress.includes('Building the twist-lock…') };
+    };
+    let r = await run(split());
+    expect([r.carved, r.built]).toEqual([true, true]);
+    expect(r.ex.seams[0].apart).toMatchObject({ mech: 'twist', r0: 15.88, theta: 27 });
+    // asked again: nothing carved or built, and the way out not checked on the solids again
+    const binding = Object.getPrototypeOf(wasm.Manifold.prototype);
+    const { intersect } = binding;
+    let intersects = 0;
+    binding.intersect = function counted(...args) {
+      intersects++;
+      return intersect.apply(this, args);
+    };
+    try {
+      r = await run(split());
+    } finally {
+      binding.intersect = intersect;
+    }
+    expect([r.carved, r.built]).toEqual([false, false]);
+    expect(intersects).toBe(0);
+    // a tighter clearance keeps the face (86): the lock is sized and built again, the carve kept
+    r = await run(split({ clearance: 0.1 }));
+    expect([r.carved, r.built]).toEqual([false, true]);
+    expect(r.ex.seams[0].at).toBe(86);
+    expect(r.ex.seams[0].apart.r0).toBeGreaterThan(15.88);
+    // a finer nozzle, then a layer height whose layers have 86 too
+    r = await run(split(), { nozzle: 0.25, layerHeight: 0.2 });
+    expect([r.carved, r.built]).toEqual([false, true]);
+    expect(r.ex.seams[0].apart.r0).toBeGreaterThan(15.88);
+    r = await run(split(), { nozzle: 0.4, layerHeight: 0.25 });
+    expect([r.carved, r.built]).toEqual([false, true]);
+    expect(r.ex.seams[0].at).toBe(86);
+    // lifting off: no lock, nothing built
+    r = await run({ ...split(), cuts: [partCut('c1', [0, 0], 86, 23.6286, { hold: 'lift' })] });
+    expect([r.carved, r.built]).toEqual([false, false]);
+    expect(r.ex.seams[0].apart.mech).toBeNull();
+    expect(r.ex.seams[0].part.way).toMatchObject({ turn: 0, lift: 4.35 });
+  });
+
+  it('builds the same lock on a part under its plane: the lantern at 300 % turned over', async () => {
+    const upright = batLanternSolid().scale([3, 3, 3]);
+    const turned = upright.rotate([180, 0, 0]);
+    await load(upright);
+    const a = await exportFiles({ cuts: [partCut('c1', [0, 0], 86, 23.6286)] });
+    await load(turned);
+    const b = await exportFiles({ cuts: [partCut('c1', [0, 0], -86, 23.6286, { side: -1 })] });
+    expect(b.seams[0].apart).toEqual(a.seams[0].apart);
+    expect(b.seams[0].part.way).toMatchObject({ turn: 27, lift: 4.1, out: [0, 0, -1] });
+    expect(b.seams[0].part.way.dir[1]).toBeCloseTo(-1, 6);
+    expect(b.notes.map((n) => n.text)).toEqual(a.notes.map((n) => n.text));
+    // the same pieces, turned: each file holds as much as the upright one
+    const volumes = (ex) => ex.files.filter((f) => f.stl).map((f) => volumeOfStl(f.stl));
+    const [va, vb] = [volumes(a), volumes(b)];
+    expect(vb).toHaveLength(2);
+    vb.forEach((v, i) => expect(v).toBeCloseTo(va[i], 1));
+  });
+
+  it('takes the full disc for the socket where the ring would leave a sliver loose in the bore: the round lantern at its eave', async () => {
+    await load(roundLanternSolid());
+    const ex = await exportFiles({ cuts: [partCut('c1', [0, 0], 150, 80)] });
+    expect(ex.seams[0].apart).toMatchObject({ hold: 'lock', mech: 'twist', theta: 10, tabs: 6, socket: 'disc', slope: 1, shelf: 0 });
+    expect(ex.seams[0].apart.r0).toBeCloseTo(44.02, 2);
+    const files = ex.files.filter((f) => f.stl).map(solidOf);
+    try {
+      expect(files.map((m) => m.decompose().map((x) => (x.delete(), 1)).length)).toEqual([1, 1]);
+    } finally {
+      files.forEach((m) => m.delete());
+    }
+    // under the eave, through its 3 mm wall, the ring is enough
+    const low = await exportFiles({ cuts: [partCut('c1', [0, 0], 146.6, 80)] });
+    expect(low.seams[0].apart).toMatchObject({ mech: 'twist', socket: 'ring' });
+  });
+
+  it('checks the way out on the solids: lifts higher past what lies between the slices, and refuses what it cannot clear', async () => {
+    const { Manifold } = wasm;
+    // the lid lifts off 0.95 mm and slides out along +Y; a thin sheet over its way, loose in the model, between the
+    // heights the slices are read at: at z 30.1 the lid clears it two steps higher, at 31.1 never
+    const lift = async (z) => {
+      const fx = batLanternSolid();
+      const sheet = Manifold.cube([6, 3, 0.2]).translate([-3, 9, z]);
+      await load(z == null ? fx : Manifold.compose([fx, sheet]));
+      if (z != null) fx.delete();
+      sheet.delete();
+      return exportFiles({ cuts: [partCut('c1', [0, 0], 29, 7.8732, { hold: 'lift' })] });
+    };
+    let ex = await lift(null);
+    expect(ex.seams[0].part.way).toMatchObject({ lift: 0.95, dir: [0, 1, 0] });
+    ex = await lift(30.1);
+    expect(ex.seams.find((x) => x.part).part.way).toMatchObject({ lift: 1.45, dir: [0, 1, 0] });
+    ex = await lift(31.1);
+    expect(ex.notes.map((n) => `${n.code}: ${n.text}`)).toEqual([
+      "PART_STUCK: Cut A's dome and cap can't come out: the handle's crown is over it and a leg is beside it. Try a smaller circle, or a face higher up.",
+    ]);
+    expect(ex.pieces).toBeUndefined();
+  });
+
+  it("does not build a lock that would leave the part in pieces, socket ring or full disc: it lifts off, the body left as carved", async () => {
+    const { Manifold } = wasm;
+    // a tube with a web across it and a column standing on the web: the socket cuts the web where it meets the tube,
+    // leaving the web and its column loose – more than a sliver inside the bore, so no lock goes on
+    const tube = Manifold.cylinder(40, 24, 24, 96).subtract(Manifold.cylinder(40.02, 20, 20, 96).translate([0, 0, -0.01]));
+    const web = Manifold.cylinder(2, 20.5, 20.5, 96).translate([0, 0, 20.5]);
+    const column = Manifold.cylinder(17.5, 10, 10, 96).translate([0, 0, 22.5]);
+    await load(Manifold.union([tube, web, column]));
+    [tube, web, column].forEach((m) => m.delete());
+    const ex = await exportFiles({ cuts: [partCut('c1', [0, 0], 20, 26)] });
+    expect(ex.seams[0].apart).toMatchObject({ hold: 'lock', mech: null, why: 'pieces' });
+    expect(ex.seams[0].part.way.turn).toBe(0);
+    expect(ex.notes.map((n) => n.code)).toEqual(['SPLIT', 'PART_LIFTS']);
+    const [body, top] = ex.files.filter((f) => f.stl).map(solidOf);
+    try {
+      expect([body, top].map((m) => m.decompose().map((x) => (x.delete(), 1)).length)).toEqual([1, 1]);
+      // the tube under the face as it was: no collar, no neck
+      // a 96-sided tube, 20 mm of it
+      expect(body.volume()).toBeCloseTo(48 * Math.sin((2 * Math.PI) / 96) * (24 ** 2 - 20 ** 2) * 20, 1);
+      expect(body.boundingBox().max[2]).toBeCloseTo(20, 6);
+    } finally {
+      body.delete();
+      top.delete();
+    }
+  });
+
+  it("carves again only for a part's new shape: the same split, a clearance or layer height that keeps the face, carve nothing", async () => {
+    await load(batLanternSolid());
+    const lid = { centre: [0, 0], face: 29, r: 7.8732 };
+    const at = (r = lid.r) => ({ cuts: [partCut('c1', lid.centre, lid.face, r)] });
+    progress.length = 0;
+    await exportFiles(at());
+    expect(progress).toContain('Cutting the dome and cap…');
+    // asked again: no slice read, nothing carved
+    progress.length = 0;
+    let run = await slicesDuring(() => exportFiles(at()));
+    expect(run.slices).toBe(0);
+    expect(progress).not.toContain('Cutting the dome and cap…');
+    // a wider clearance checks the face again (1.2 mm now) and finds it as it was: the carve stays
+    progress.length = 0;
+    run = await slicesDuring(() => exportFiles({ ...at(), clearance: 0.3 }));
+    expect(run.slices).toBeGreaterThan(0);
+    expect(progress).not.toContain('Cutting the dome and cap…');
+    // so does another layer height, whose layers have 29.0 too
+    progress.length = 0;
+    run = await slicesDuring(() => exportFiles(at(), { nozzle: 0.4, layerHeight: 0.25 }));
+    expect(run.slices).toBeGreaterThan(0);
+    expect(progress).not.toContain('Cutting the dome and cap…');
+    // another radius is another part
+    progress.length = 0;
+    const wider = await exportFiles(at(8.2));
+    expect(progress).toContain('Cutting the dome and cap…');
+    expect(wider.seams[0].part.r).toBe(8.2);
+    // turned the other way, its circle is under the plane: there the legs' feet fuse into the dome, and it is refused
+    const under = await exportFiles({ cuts: [partCut('c1', lid.centre, lid.face, lid.r, { normal: [0, 0, -1] })] });
+    expect(under.notes.map((n) => n.code)).toContain('PART_GAP');
+  });
+
+  it('moves a face too near the legs to print apart, and refuses what cannot come off, saying why', async () => {
+    await load(batLanternSolid());
+    const one = async (cut) => {
+      const ex = await exportFiles({ cuts: [cut] });
+      return { ex, notes: ex.notes.filter((n) => n.code !== 'SPLIT').map((n) => `${n.level} ${n.code}: ${n.text}`) };
+    };
+    // a layer under the face: moved up to it
+    let r = await one(partCut('c1', [0, 0], 28.8, 7.8732));
+    expect(r.notes).toEqual([
+      "warn PART_GAP: Cut A: at Z 28.8 the dome and cap's edge is 0.79 mm from the handle's feet – it needs 0.9 mm to print apart. Moved to Z 29.",
+      'info PART_LIFTS: Cut A: the dome and cap lift off – nothing holds them.',
+    ]);
+    expect(r.ex.seams[0].at).toBe(29);
+    // where the legs fuse into the dome: refused, with the nearest face that would do; the model comes out whole
+    r = await one(partCut('c1', [0, 0], 28.4, 7.8732));
+    expect(r.notes).toEqual([
+      "warn PART_GAP: Cut A: at Z 28.4 the dome and cap's edge runs into the handle's feet – it needs 0.9 mm to print apart. No face near here leaves it – the nearest that does is Z 29.",
+    ]);
+    expect(r.ex.stl).not.toBeNull();
+    expect(r.ex.pieces).toBeUndefined();
+    // the cupola's columns: a face in 12 pieces
+    r = await one(partCut('c1', [0, 0], 31.6, 4.5));
+    expect(r.notes).toEqual([
+      "warn PART_GAP: Cut A: at Z 31.6 the dome and cap's face is in 12 separate pieces – it needs one face to sit on. No face near here is one piece – the nearest that is is Z 32.6.",
+    ]);
+    // the floor cup under the dome: nothing gets it out
+    r = await one(partCut('c1', [0, 0], 7.6, 6));
+    expect(r.notes).toEqual(["warn PART_STUCK: Cut A's part can't come out: the rest of the model closes it in. Try a smaller circle, or a face higher up."]);
+    // a circle in the air under the dome takes nothing
+    r = await one(partCut('c1', [0, 0], 20, 5));
+    expect(r.notes).toEqual(["warn CUT_MISSES: Cut A doesn't cross the model – it cuts nothing."]);
+    // a full cut through the lid: the part is left out, the cut cuts the lantern as ever
+    r = await one(partCut('c1', [0, 0], 29, 7.8732));
+    const crossed = await exportFiles({ cuts: [partCut('c1', [0, 0], 29, 7.8732), { id: 'c2', position: [0, 0, 33], normal: [0, 0, 1] }] });
+    expect(crossed.notes.map((n) => `${n.code}: ${n.text}`)).toContain('PART_CROSSED: Cut B runs through the part of cut A – move one of them.');
+    expect(crossed.pieces).toHaveLength(2);
+    expect(crossed.pieces.some((p) => p.part)).toBe(false);
+    // one under it: three pieces, the lid's face on the layers of the piece over the cut
+    const under = await exportFiles({ cuts: [partCut('c1', [0, 0], 29.1, 7.8732), { id: 'c2', position: [0, 0, 20.1], normal: [0, 0, 1] }] });
+    expect(under.pieces.map((p) => p.name)).toEqual(['piece 1 of 3', 'piece 2 of 3', 'Dome and cap']);
+    expect(under.seams.find((x) => x.joint === 'part')).toMatchObject({ at: 29.1, pieces: [2, 3] });
+    // the piece the lid comes out of stands as modelled
+    expect(under.pieces[1].down).toBe('-z');
+  });
+
+  it("can't take the dome and cap out from under a crown lowered onto them, and says what is in the way", async () => {
+    const fx = batLanternSolid();
+    const bar = wasm.Manifold.cube([21, 2.3, 1], true).translate([0, 0, 39.5]);
+    await load(wasm.Manifold.union([fx, bar]));
+    fx.delete();
+    bar.delete();
+    const ex = await exportFiles({ cuts: [partCut('c1', [0, 0], 29, 7.8732)] });
+    expect(ex.notes.map((n) => `${n.code}: ${n.text}`)).toEqual([
+      "PART_STUCK: Cut A's dome and cap can't come out: the handle's crown is over it and a leg is beside it. Try a smaller circle, or a face higher up.",
+    ]);
+    expect(ex.stl).not.toBeNull();
+  });
+
+  it("refuses a circle that crosses the model above its plane, or leaves the rest of it in pieces", async () => {
+    const { Manifold } = wasm;
+    // a post on a disc under a flange: round the post, the circle runs into the flange
+    const cyl = (h, r, z = 0) => Manifold.cylinder(h, r, r, 64).translate([0, 0, z]);
+    const parts = [cyl(5, 10), cyl(15, 5, 5), cyl(2, 15, 20)];
+    await load(Manifold.union(parts));
+    parts.forEach((m) => m.delete());
+    let ex = await exportFiles({ cuts: [partCut('c1', [0, 0], 10, 8)] });
+    expect(ex.notes.map((n) => `${n.code}: ${n.text}`)).toEqual([
+      "PART_MIXED: Cut A's circle crosses the model above and around its plane – use a full cut there, or move it to where the circle crosses only air.",
+    ]);
+    // a bar with a post at each end: a base taken out of its middle leaves the two ends apart
+    const bits = [Manifold.cube([30, 6, 3], true).translate([0, 0, 1.5]), Manifold.cube([3, 4, 17], true).translate([12.5, 0, 11.5]), Manifold.cube([3, 4, 17], true).translate([-12.5, 0, 11.5])];
+    await load(Manifold.union(bits));
+    bits.forEach((m) => m.delete());
+    ex = await exportFiles({ cuts: [partCut('c1', [0, 0], 0, 10)] });
+    expect(ex.notes.map((n) => `${n.code}: ${n.text}`)).toEqual(["PART_SPLIT: Cut A's circle leaves the rest of the model in 2 pieces – make it smaller or use Find again."]);
+    // with a post's top as a part too: the one that breaks the body is found and left out, the other carved (their
+    // boxes meet, their circles do not)
+    const both = { cuts: [partCut('c1', [12.5, 0], 15, 3), partCut('c2', [0, 0], 0, 9.2)] };
+    progress.length = 0;
+    ex = await exportFiles(both);
+    // (the post's top stands on 12 mm²: unsteady, as any piece that small)
+    expect(ex.notes.map((n) => n.code)).toEqual(['SPLIT', 'PART_SPLIT', 'PART_LIFTS', 'PIECE_UNSTABLE']);
+    expect(ex.notes[1]).toMatchObject({ letter: 'B', body: true, pieces: 2 });
+    expect(ex.pieces.map((p) => p.name)).toEqual(['piece 1 of 2', 'Top']);
+    expect(progress.filter((x) => x === 'Cutting the base…')).toHaveLength(1);
+    // asked again, the carve that broke the body is known: nothing carved
+    progress.length = 0;
+    ex = await exportFiles(both);
+    expect(ex.notes.map((n) => n.code)).toEqual(['SPLIT', 'PART_SPLIT', 'PART_LIFTS', 'PIECE_UNSTABLE']);
+    expect(progress.filter((x) => /^Cutting the/.test(x))).toEqual([]);
+    // a part the slices see whole but that comes out in two: a sliver of a post beside it on the plane
+    const sliver = [Manifold.cylinder(3, 20, 20, 64), Manifold.cylinder(7, 3, 3, 64).translate([0, 0, 3]), Manifold.cube([0.005, 0.005, 3]).translate([5, 0, 3])];
+    await load(Manifold.compose([Manifold.union(sliver.slice(0, 2)), sliver[2]]));
+    sliver.forEach((m) => m.delete());
+    ex = await exportFiles({ cuts: [partCut('c1', [0, 0], 5, 8)] });
+    expect(ex.notes.map((n) => `${n.code}: ${n.text}`)).toEqual(["PART_SPLIT: Cut A's circle cuts the top into 2 pieces – make it smaller or use Find again."]);
+    // a circle round the whole of a block's bottom takes all of it
+    const block = Manifold.cube([10, 10, 10]);
+    await load(block.translate([0, 0, 0]));
+    block.delete();
+    ex = await exportFiles({ cuts: [partCut('c1', [5, 5], 0, 20)] });
+    expect(ex.notes.map((n) => `${n.code}: ${n.text}`)).toEqual(["PART_SPLIT: Cut A's circle takes the whole model – make it smaller or use Find again."]);
+    // a base and a post's top whose boxes meet but whose circles do not: both come out
+    const diagonal = [Manifold.cube([40, 40, 3], true).translate([0, 0, 1.5]), Manifold.cube([3, 3, 17], true).translate([10, 10, 11.5])];
+    await load(Manifold.union(diagonal));
+    diagonal.forEach((m) => m.delete());
+    ex = await exportFiles({ cuts: [partCut('c1', [0, 0], 0, 9), partCut('c2', [10, 10], 15, 3)] });
+    expect(ex.pieces.map((p) => p.name)).toEqual(['piece 1 of 3', 'Base', 'Top']);
+    // the same part twice: the second runs into the first, and is left out
+    ex = await exportFiles({ cuts: [partCut('c1', [10, 10], 15, 3), partCut('c2', [10, 10], 15.2, 3)] });
+    expect(ex.notes.map((n) => `${n.code}: ${n.text}`)).toContain('PART_CROSSED: Cut A runs through the part of cut B – move one of them.');
+    expect(ex.pieces).toHaveLength(2);
+  });
+
+  it('pieces too big to keep are cut again with the parts, and no turned copy of the model is kept while they are', async () => {
+    const lean = createEngine({ wasm, splitKeepTriangles: 1000 });
+    const c = createEngineClient({ createWorker: () => createLocalWorker(Promise.resolve(lean)) });
+    await c.addFont('inter', fontBytes('inter', 'inter-latin-700-normal.woff'));
+    const fx = batLanternSolid();
+    await c.loadBase({ kind: 'stl', bytes: stlOf(fx), name: 'bat', version: 1 });
+    fx.delete();
+    const split = { clearance: 0.15, cuts: [partCut('c1', [0, 0], 29, 7.8732)] };
+    // a cut across X measured: the model turned for it is kept for the next measure
+    const measure = () => c.planSplit([], 1, { printing, split: { cuts: [{ id: 'c2', position: [3, 0, 0], normal: [1, 0, 0] }] }, mode: 'measure' });
+    await c.result([], 1, { printing });
+    // the turned copies the measure makes, and whether they are let go by the time the body is carved
+    const binding = Object.getPrototypeOf(wasm.Manifold.prototype);
+    const { transform, intersect } = binding;
+    const turned = [];
+    let atCarve = null;
+    binding.transform = function kept(m, ...rest) {
+      const out = transform.call(this, m, ...rest);
+      if (Array.isArray(m) && m.join() === [0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1].join()) turned.push(out);
+      return out;
+    };
+    binding.intersect = function first(...args) {
+      atCarve ??= turned.map((m) => m.isDeleted());
+      return intersect.apply(this, args);
+    };
+    let first;
+    try {
+      await measure();
+      expect((await c.call('ping', {})).caches.frame).toBe(1);
+      // carving the parts lets it go first
+      first = await c.export([], 1, 'bat', { printing, split, archive: 'files' });
+    } finally {
+      binding.transform = transform;
+      binding.intersect = intersect;
+    }
+    expect(atCarve).toEqual([true]);
+    expect((await c.call('ping', {})).caches.frame).toBe(0);
+    // and cutting the body's pieces again for another download too
+    await measure();
+    expect((await c.call('ping', {})).caches.frame).toBe(1);
+    const again = await c.export([], 1, 'bat', { printing, split, archive: 'files' });
+    expect((await c.call('ping', {})).caches.frame).toBe(0);
+    // the same pieces as an engine that kept them, the part with them
+    const kept = await (async () => {
+      await load(batLanternSolid());
+      return exportFiles(split);
+    })();
+    for (const ex of [first, again]) {
+      expect(ex.pieces.map((p) => p.name)).toEqual(['Lantern, with the handle', 'Dome and cap']);
+      const files = ex.files.filter((f) => f.stl);
+      files.forEach((f, k) => expect(volumeOfStl(f.stl)).toBeCloseTo(volumeOfStl(kept.files.filter((x) => x.stl)[k].stl), 6));
+    }
+    c.dispose();
+  });
+
+  it('lets go of the body and the parts once no part is asked for', async () => {
+    await load(batLanternSolid());
+    await client.result([], version, { printing });
+    // what the carve makes, followed
+    const binding = Object.getPrototypeOf(wasm.Manifold.prototype);
+    const { subtract } = binding;
+    const made = [];
+    binding.subtract = function followed(...args) {
+      const out = subtract.apply(this, args);
+      made.push(out);
+      return out;
+    };
+    try {
+      await client.result([], version, { printing, split: { cuts: [partCut('c1', [0, 0], 29, 7.8732)] } });
+    } finally {
+      binding.subtract = subtract;
+    }
+    expect(made.filter((m) => !m.isDeleted())).toHaveLength(1);
+    await client.result([], version, { printing });
+    expect(made.filter((m) => !m.isDeleted())).toHaveLength(0);
+  });
+
+  it('a part lies on its face, however else it would rather lie', async () => {
+    // a mushroom: the top of its stem and its cap come off, and would lie best on the cap
+    const { Manifold } = wasm;
+    const bits = [Manifold.cylinder(5, 10, 10, 64), Manifold.cylinder(10, 2, 2, 64).translate([0, 0, 5]), Manifold.cylinder(2, 8, 8, 64).translate([0, 0, 15])];
+    await load(Manifold.union(bits));
+    bits.forEach((m) => m.delete());
+    const ex = await exportFiles({ cuts: [partCut('c1', [0, 0], 10, 9)] });
+    expect(ex.pieces.map((p) => [p.name, p.down, p.lies])).toEqual([['piece 1 of 2', '-z', 'flat as modelled'], ['Top', '-z', 'on a cut face']]);
+  });
+
+  it('takes a part out of a lantern turned over: under its plane, lying on its face', async () => {
+    const upright = batLanternSolid();
+    await load(upright.rotate([180, 0, 0]));
+    upright.delete();
+    // the dome hangs under z −29 now: the part lies along −Z from its plane
+    const ex = await exportFiles({ cuts: [partCut('c1', [0, 0], -29, 7.8732, { side: -1 })] });
+    // the body stands as modelled, on the handle's crown now, and the part lies on its face
+    expect(ex.pieces.map((p) => [p.name, p.down, p.lies])).toEqual([['Lantern, with the handle', '-z', 'on a curve'], ['Dome and cap', '+z', 'on a cut face']]);
+    expect(ex.seams[0]).toMatchObject({ at: -29, part: { side: -1, way: { up: false, lift: 0.95, out: [0, 0, -1] } } });
+    expect(ex.seams[0].part.way.dir[1]).toBeCloseTo(-1, 6);
+    const lid = solidOf(ex.files[1]);
+    try {
+      expect(lid.volume()).toBeCloseTo(203.99, 1);
+      expect(lid.boundingBox().min[2]).toBe(0);
+    } finally {
+      lid.delete();
+    }
   });
 });

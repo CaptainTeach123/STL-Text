@@ -1979,6 +1979,96 @@ describe('cuts that come apart', () => {
     expect(ex.pieces.map((p) => [p.lips, p.lids])).toEqual([[[], []], [[], []]]);
   });
 
+  it('a round lantern\'s top twist-locks on where its wall takes no clips, even through its eave where no lip fits; Lifts off keeps today\'s', async () => {
+    await load(own(roundLanternSolid()), 'round');
+    const twist = { mech: 'twist', lip: false, clips: 0, height: 0, faces: 1, flat: 0, theta: 10, tabs: 6, slope: 1, shelf: 0 };
+    for (const hold of ['lock', 'snap', 'light']) {
+      const ex = await exportSplit(S({ cuts: [apartAt(2, 150, 'c1', hold)], labels: false }), { name: 'round' });
+      // through the eave the ring socket would leave the eave's inner sliver loose in the bore: the full disc takes it
+      expect([hold, ex.seams]).toMatchObject([hold, [{ joint: 'lip', pieces: [1, 2], male: 1, apart: { hold, ...twist, socket: 'disc' } }]]);
+      expect(ex.seams[0].apart.r0).toBeCloseTo(44.02, 2);
+      expect(codes(ex)).toEqual(['SPLIT', 'APART_TWIST']);
+    }
+    const ex = await exportSplit(S({ cuts: [apartAt(2, 150, 'c1', 'lock')], labels: false }), { name: 'round' });
+    expect(noteOf(ex, 'APART_TWIST').text).toBe(
+      'Cut A comes apart: the top (piece 2) twist-locks onto piece 1 – 3 lugs and 6 clicks, as no clip fits its wall. To fit it: set it on turned 10° to the left so the wide lug finds its wide slot, push down and turn it right until it clicks. To open it: turn it left until it clicks again and lift it off.',
+    );
+    expect(ex.assembly).toEqual([
+      'Do not glue cut A: it comes apart. The top: set it on turned 10° to the left so the wide lug finds its wide slot, push down and turn it right until it clicks. To open: turn it left until it clicks again and lift it off.',
+    ]);
+    const sheet = ex.files.find((f) => f.kind === 'text').text;
+    expect(sheet).toContain('twist-locks need no supports');
+    expect(sheet).toContain('The top of cut A should twist on with a click and twist off again by hand.');
+    // the body stands as modelled with the neck 2.4 mm over its face; the top lies on its cut face, where the socket is
+    expect(ex.pieces.map((p) => [p.down, p.lies, +p.size[2].toFixed(1), p.lips, p.lids])).toEqual([
+      ['-z', 'flat as modelled', 152.4, [{ letter: 'A', clips: 0, twist: true }], []],
+      ['-z', 'on a cut face', 88, [], ['A']],
+    ]);
+    // as built: one shell each, seated with nothing shared; pulled straight off the lugs hold it, turned free it lifts off
+    const [body, top] = piecesOf(ex).map((f) => own(assembled(f).translate([0, 0, -150])));
+    expect([body, top].map((m) => m.decompose().map((x) => (x.delete(), 1)).length)).toEqual([1, 1]);
+    expect(overlap(body, top)).toBe(0);
+    expect(overlap(body, own(top.translate([0, 0, 0.3])))).toBeGreaterThan(0.3);
+    expect(overlap(body, own(own(top.rotate([0, 0, 10])).translate([0, 0, 3])))).toBe(0);
+    // under the eave, a 3 mm wall: the ring socket is enough
+    const low = await exportSplit(S({ cuts: [apartAt(2, 146.5, 'c1', 'lock')], labels: false }), { name: 'round' });
+    expect(low.seams[0].apart).toMatchObject({ ...twist, theta: 11, socket: 'ring', r0: 41.72 });
+    // Lifts off asks for no hold: the cut keeps what it had, no room for a lip through the eave
+    const lifted = await exportSplit(S({ cuts: [apartAt(2, 150, 'c1', 'lift')], labels: false }), { name: 'round' });
+    expect(lifted.seams[0]).toMatchObject({ joint: 'none', apart: { hold: 'lift', lip: false } });
+    expect(lifted.seams[0].apart.mech).toBeUndefined();
+    expect(codes(lifted)).toEqual(['SPLIT', 'APART_FLAT']);
+  });
+
+  it('the twist-lock is the same lying on its side across X, and stood on its head with the neck on the piece above', async () => {
+    const lock = { mech: 'twist', r0: 44.02, theta: 10, tabs: 6, socket: 'disc' };
+    await load(own(own(roundLanternSolid()).rotate([0, 90, 0])), 'side');
+    const side = await exportSplit(S({ cuts: [apartAt(0, 150, 'c1', 'lock')], labels: false }), { name: 'side' });
+    expect(side.seams[0]).toMatchObject({ male: 1, apart: lock });
+    expect(side.pieces.map((p) => p.down)).toEqual(['-x', '-x']);
+    await load(own(own(roundLanternSolid()).rotate([180, 0, 0])), 'head');
+    const head = await exportSplit(S({ cuts: [apartAt(2, -150, 'c1', 'lock')], labels: false }), { name: 'head' });
+    // the body is now the piece above: it carries the neck and stands on its foot, the top lies on its cut face
+    expect(head.seams[0]).toMatchObject({ pieces: [1, 2], male: 2, apart: lock });
+    expect(head.pieces.map((p) => [p.down, p.lies, p.lips.length])).toEqual([['+z', 'on a cut face', 0], ['+z', 'upside down', 1]]);
+    expect(noteOf(head, 'APART_TWIST').text).toMatch(/^Cut A comes apart: piece 1 twist-locks onto the top \(piece 2\)/);
+    const [lower, upper] = piecesOf(head).map((f) => own(assembled(f).translate([0, 0, 150])));
+    expect(overlap(lower, upper)).toBe(0);
+    expect(overlap(upper, own(lower.translate([0, 0, -0.3])))).toBeGreaterThan(0.3);
+  });
+
+  it('a twist-lock that would cut its socket\'s piece in two is not built: the cut gets what it would have without it, and says so', async () => {
+    // a round tube with a plate across it and a post standing on the plate, cut through the plate: the ring socket
+    // would cut the plate's middle, and the post on it, off the top
+    const { Manifold } = wasm;
+    const tube = own(own(Manifold.cylinder(200, 50, 50, 128)).subtract(own(own(Manifold.cylinder(200, 46, 46, 128)).translate([0, 0, 2]))));
+    const plate = own(own(Manifold.cylinder(2, 47, 47, 128)).translate([0, 0, 99]));
+    const post = own(own(Manifold.cylinder(49, 5, 5, 32)).translate([0, 0, 101]));
+    await load(own(Manifold.union([tube, plate, post])), 'post');
+    const ex = await exportSplit(S({ cuts: [apartAt(2, 100, 'c1', 'lock')], labels: false }), { name: 'post' });
+    expect(ex.seams[0]).toMatchObject({ joint: 'none', male: null, apart: { hold: 'lock', lip: false, clips: 0, flat: 1 } });
+    expect(ex.seams[0].apart.mech).toBeUndefined();
+    expect(codes(ex)).toEqual(['SPLIT', 'APART_FLAT']);
+    expect(ex.assembly).toEqual(['Do not glue cut A: it comes apart. Set the top on piece 1 and line the edges up – nothing holds it.']);
+    expect(ex.files.find((f) => f.kind === 'text').text).not.toMatch(/twist/);
+    expect(ex.pieces.map((p) => p.lips)).toEqual([[], []]);
+    // the top in one piece, the post on it
+    const top = assembled(piecesOf(ex)[1]);
+    expect(top.decompose().map((x) => (x.delete(), 1))).toHaveLength(1);
+  });
+
+  it('a square lantern keeps its lip where only its height leaves no clips, and a cut through its windows takes no twist-lock', async () => {
+    await lantern();
+    // under the roof's eaves there is no room for a 6 mm lip, but its straight walls would take clips
+    const ex = await exportSplit(S({ cuts: [apartAt(2, 192, 'c1', 'lock')], labels: false }), { name: 'lantern' });
+    expect(ex.seams[0].apart).toMatchObject({ lip: true, clips: 0, height: 4.5 });
+    expect(ex.seams[0].apart.mech).toBeUndefined();
+    expect(codes(ex)).toContain('APART_NO_CLIPS');
+    // through the windows' posts: a face of several islands centres no lock
+    const posts = await exportSplit(S({ cuts: [apartAt(2, 100, 'c1', 'lock')], labels: false }), { name: 'lantern' });
+    expect(posts.seams.every((x) => x.apart?.mech === undefined)).toBe(true);
+  });
+
   it('splitting with cuts that come apart again and again leaves no solids behind', async () => {
     await lantern();
     /** Every way through a split: the pieces view, the measure, the download, a fit test and Fit to my printer. */
@@ -2173,7 +2263,7 @@ describe('placing a cut that comes apart', () => {
     expect(r.spots.filter((s) => /ledge/.test(s.why)).map((s) => s.seam)).toEqual([230]);
   });
 
-  it('a round lantern takes no clips anywhere: the spots for Locks are where a full lip fits, and a move says what it gives', async () => {
+  it('a round lantern takes no clips anywhere: the spots for Locks are where the twist-lock takes their place, and a move says what it gives', async () => {
     // a tube r 50/46 with eight windows from z 30 to 120, eaves r 56 from 150 to 156 and a dome over them
     const { Manifold } = wasm;
     const tube = turned([[0, 50], [150, 50]], [[4, 46], [151, 46]]);
@@ -2184,10 +2274,17 @@ describe('placing a cut that comes apart', () => {
     await load(own(Manifold.union([own(tube.subtract(windows)), eaves, dome])), 'round');
     const r = await spots();
     expect(r.spots.length).toBeGreaterThan(0);
-    for (const s of r.spots) expect([s.at, s.lip]).toEqual([s.at, { H: 6, clips: 0 }]);
-    expect(r.spots[0]).toMatchObject({ at: 146.5, why: 'under a ledge where the shape widens' });
-    // short of a full lip, the move is for a taller one, not for clips
-    expect(await probe(147)).toMatchObject({ lip: { H: 4.5, clips: 0 }, suggestedAt: 146.5, suggestedLip: { H: 6, clips: 0 } });
+    for (const s of r.spots) expect([s.at, s.lip.clips, s.lip.twist]).toEqual([s.at, 0, expect.objectContaining({ tabs: 6 })]);
+    // right under the eaves' ledge: a 3 mm lip, and the twist-lock in place of its clips, which scores as clips do
+    expect(r.spots[0]).toMatchObject({ at: 149.5, why: 'under a ledge where the shape widens', lip: { H: 3, clips: 0, twist: { r0: 46.72, opening: 90.24, theta: 9, tabs: 6 } } });
+    // a 4.5 mm lip without clips takes it too, so no move is looked for
+    expect(await probe(147)).toMatchObject({ lip: { H: 4.5, clips: 0, why: null, twist: { r0: 46.72, theta: 9 } }, suggestedAt: null, suggestedLip: null });
+    // where none fits – the socket's piece stops going round the axis at the windows, 6.5 mm over the cut – the move
+    // is for one, and says so
+    await load(own(roundLanternSolid()), 'user');
+    const low = await probe(13.5);
+    expect(low).toMatchObject({ lip: { H: 3, clips: 0, why: 'height' }, suggestedAt: 10.5, suggestedLip: { H: 6, clips: 0, twist: true } });
+    expect(low.lip.twist).toBeUndefined();
     await lantern();
     expect(await probe(192)).toMatchObject({ suggestedAt: 190.5, suggestedLip: { H: 6, clips: 4 } });
   });
@@ -2196,8 +2293,13 @@ describe('placing a cut that comes apart', () => {
     for (const eaveR of [50, 47, 0]) {
       await load(own(roundLanternSolid({ eaveR })), `round-${eaveR}`);
       const r = await spots();
-      // where the roof stands on the body, its eave ring 5 mm or 2 mm over it or none: a lip without clips under it
-      expect([eaveR, r.spots[0]]).toMatchObject([eaveR, { seam: 148, why: 'under a ledge where the shape widens', lip: { H: 6, clips: 0 }, islands: 1 }]);
+      // where the roof stands on the body, its eave ring 5 mm or 2 mm over it or none: the twist-lock just under it, where
+      // no lip has room
+      expect([eaveR, r.spots[0]]).toMatchObject([eaveR, {
+        at: 147.5, seam: 148, why: 'under a ledge where the shape widens', lip: { H: 0, clips: 0, twist: { r0: 41.72, theta: 11, tabs: 6 } }, islands: 1,
+      }]);
+      // Lifts off asks for no hold: a lip without clips under it, as before
+      expect([eaveR, (await spots({ hold: 'lift' })).spots[0]]).toMatchObject([eaveR, { seam: 148, lip: { H: 6, clips: 0 } }]);
       // over the windows' pointed tips the outline the outside shows does not move: a spot there gets nothing for it
       const tips = r.spots.find((s) => Math.abs(s.seam - 124.66) < 0.01);
       if (tips) expect(tips.score).toBeLessThan(r.spots[0].score - 1);
@@ -2208,10 +2310,11 @@ describe('placing a cut that comes apart', () => {
     await load(own(roundLanternSolid({ eaveR: 47 })), 'round');
     expect((await probe(125)).lip).toMatchObject({ H: 6, clips: 0, why: 'edge', broken: true });
     expect((await probe(125.5)).lip).toEqual({ H: 6, clips: 0, why: 'short' });
-    for (const hold of ['lock', 'lift']) {
-      const tips = (await spots({ hold })).spots.find((s) => Math.abs(s.seam - 124.66) < 0.01);
-      expect([hold, tips]).toMatchObject([hold, { at: 125.5, why: 'above the openings', lip: { H: 6 } }]);
-    }
+    const tips = async (hold) => (await spots({ hold })).spots.find((s) => Math.abs(s.seam - 124.66) < 0.01);
+    expect(await tips('lift')).toMatchObject({ at: 125.5, why: 'above the openings', lip: { H: 6 } });
+    // for Locks the twist-lock fits under the eave, but not over the windows' tips, where no wall under the cut goes
+    // round the axis to carry its collar: a lip without clips there is no spot for a hold that asked for one
+    expect(await tips('lock')).toBeUndefined();
   });
 
   it('a slender tower\'s top would stand on its small flat roof to carry a lip: the probe and the spots say the lip the download makes', async () => {
@@ -2284,7 +2387,15 @@ describe('placing a cut that comes apart', () => {
     const p = await probe(174.5, { split });
     expect(p).toMatchObject({ lip: { H: 4.5, clips: 0, why: 'height' }, suggestedAt: 174 });
     expect(noteOf(await exportSplit({ ...split, cuts: [apartAt(174.5)] }), 'APART_NO_CLIPS')).toMatchObject({ why: 'height', height: 4.5, suggestedAt: 174 });
-    for (const s of (await spots({ split })).spots) expect([s.at, (await exportSplit({ ...split, cuts: [apartAt(s.at)] })).seams[0].apart]).toMatchObject([s.at, { lip: true, height: s.lip.H, clips: s.lip.clips }]);
+    // each spot as the download makes it: a lip, or the twist-lock in place of its clips (the spire's square, too short
+    // for a clip at this clearance)
+    const found = (await spots({ split })).spots;
+    expect(found.filter((s) => s.lip.twist).map((s) => s.at)).toEqual([194.5]);
+    for (const s of found) {
+      const made = (await exportSplit({ ...split, cuts: [apartAt(s.at)] })).seams[0].apart;
+      if (s.lip.twist) expect([s.at, made]).toMatchObject([s.at, { mech: 'twist', r0: s.lip.twist.r0, theta: s.lip.twist.theta, tabs: s.lip.twist.tabs }]);
+      else expect([s.at, made]).toMatchObject([s.at, { lip: true, height: s.lip.H, clips: s.lip.clips }]);
+    }
   });
 
   it('spots are looked for a slice of time at a time: a probe asked meanwhile is answered first, and they are the spots found in one go', async () => {

@@ -1496,10 +1496,19 @@ describe('take-apart lips', () => {
       const inner = own(Manifold.union([own(own(Manifold.cylinder(97, 42, 42, 96)).translate([0, 0, 3])), own(own(Manifold.cylinder(20, 42, 15, 96)).translate([0, 0, 100])), own(own(Manifold.cylinder(27, 15, 15, 96)).translate([0, 0, 120]))]));
       return own(outer.subtract(inner));
     };
-    for (const at of [110, 100.5]) expect(apartSplit(jar(), [[2, at]]).notes.map((n) => [n.code, n.why, n.suggestedAt])).toEqual([['APART_FLAT', 'room', 90.5]]);
-    expect(apartSplit(jar(), [[2, 91]]).notes.map((n) => [n.code, n.why, n.suggestedAt])).toEqual([['APART', undefined, undefined], ['APART_NO_CLIPS', 'height', 90.5]]);
+    // its round wall takes no clip anywhere, so on these holds the collar twist-lock holds the top at each height (§9);
+    // the notes are what the cut gets where the lock is not built after all, as before it, and Lifts off keeps them
+    const jarAt = (at) => {
+      const r = apartSplit(jar(), [[2, at]]);
+      expect(r.notes.map((n) => n.code)).toEqual(['APART_TWIST']);
+      expect(r.layout.locks).toMatchObject([{ mech: 'twist', kind: 'full' }]);
+      return r.layout.fallbacks.c1.notes.map((n) => [n.code, n.why, n.suggestedAt]);
+    };
+    for (const at of [110, 100.5]) expect(jarAt(at)).toEqual([['APART_FLAT', 'room', 90.5]]);
+    expect(apartSplit(jar(), [[2, 110]], { hold: 'lift' }).notes.map((n) => [n.code, n.why, n.suggestedAt])).toEqual([['APART_FLAT', 'room', 90.5]]);
+    expect(jarAt(91)).toEqual([['APART', undefined, undefined], ['APART_NO_CLIPS', 'height', 90.5]]);
     // there it has as good a lip as a round wall takes – no straight stretch for a clip – and no more move
-    expect(apartSplit(jar(), [[2, 90.5]]).notes.map((n) => [n.code, n.why, n.suggestedAt])).toEqual([['APART', undefined, undefined], ['APART_NO_CLIPS', 'short', undefined]]);
+    expect(jarAt(90.5)).toEqual([['APART', undefined, undefined], ['APART_NO_CLIPS', 'short', undefined]]);
   });
 
   it('a cut through the windows has only small faces: no lip, and the note says to cut through a solid band', () => {
@@ -1880,8 +1889,12 @@ describe('take-apart lips on other shapes', () => {
     // at 0.45 mm clearance a 3 mm wall has room for the lip, not for the catches' recesses outside it
     const tight = apartSplit(tray([100, 100, 100], 3), [[2, 50]], { clearance: 0.45 });
     expect(tight.layout.lips[0]).toMatchObject({ H: 6, clips: 0, why: ['skin'] });
-    expect(tight.notes[1]).toMatchObject({ code: 'APART_NO_CLIPS', why: 'skin' });
-    expect(tight.notes[1].text).toBe('Cut A\'s walls are too thin for the clips\' catches, so the top just lifts off.');
+    // with no clip on it the collar twist-lock holds the top instead (§9); where that is not built after all, the
+    // note says why the lip has none
+    expect(tight.notes.map((n) => n.code)).toEqual(['APART_TWIST']);
+    const fallback = tight.layout.fallbacks.c1.notes;
+    expect(fallback[1]).toMatchObject({ code: 'APART_NO_CLIPS', why: 'skin' });
+    expect(fallback[1].text).toBe('Cut A\'s walls are too thin for the clips\' catches, so the top just lifts off.');
     expect(apartSplit(tray([100, 100, 100], 3), [[2, 50]], { clearance: 0.3 }).layout.lips[0].clips).toBe(4);
     // a solid post with a Ø2 hole 6 mm in from one side: that side's clip would bow into a relief too near the hole
     const hole = own(own(Manifold.cylinder(120, 1, 1, 32)).translate([24, 0, -10]));
@@ -1955,7 +1968,9 @@ describe('take-apart lips on other shapes', () => {
     const small = apartSplit(round(100, 4, 100, 96), [[2, 50]]);
     expect(small.layout.lips[0]).toMatchObject({ clips: 0 });
     expect(small.layout.lips[0].key).not.toBeNull();
-    expect(small.notes.find((n) => n.code === 'APART_NO_CLIPS').text).toBe('Cut A\'s lip has no straight stretch 46 mm long for a clip, so the top just lifts off.');
+    // the collar twist-lock holds it instead (§9); the lip's note is what it gets where that is not built after all
+    expect(small.notes.map((n) => n.code)).toEqual(['APART_TWIST']);
+    expect(small.layout.fallbacks.c1.notes.find((n) => n.code === 'APART_NO_CLIPS').text).toBe('Cut A\'s lip has no straight stretch 46 mm long for a clip, so the top just lifts off.');
     for (const piece of small.drilled) expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
     const big = apartSplit(round(300, 4, 60, 256), [[2, 30]]);
     expect(big.layout.lips[0].clips).toBe(8);
@@ -2209,6 +2224,7 @@ describe('take-apart lips over a sweep of outlines', () => {
     const models = sweepModels();
     expect(models).toHaveLength(73);
     let built = 0;
+    let twisted = 0;
     models.forEach((m, k) => {
       const c = [0.1, 0.15, 0.2][k % 3];
       const r = apartSplit(m, [[2, 30]], { clearance: c });
@@ -2226,14 +2242,24 @@ describe('take-apart lips over a sweep of outlines', () => {
         expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
       }
       expect(lift(body, lid)).toBeLessThan(1e-6);
+      // a wall with no clip window takes the collar twist-lock in place of the lip, which is not built (§9)
+      if (r.layout.locks) {
+        twisted++;
+        expect(r.layout.locks).toMatchObject([{ mech: 'twist', kind: 'full' }]);
+        expect(r.layout.lips[0]).toMatchObject({ clips: 0, twist: true });
+        return;
+      }
       expect(lipParts(r.layout.lips[0]).tongue.minGap(lid, 1)).toBeGreaterThanOrEqual(c - 0.005);
     });
     expect(built).toBeGreaterThanOrEqual(70);
+    // the polygons of 8 sides and more, whose sides are all under the 46 mm a clip needs
+    expect(twisted).toBe(21);
   });
 
   it('every lip that locks, over the same outlines and clearances, is as clean, seated and clear, and its clips still let go', () => {
     const models = sweepModels();
     let built = 0;
+    let twisted = 0;
     let clipped = 0;
     models.forEach((m, k) => {
       const c = [0.1, 0.15, 0.2][k % 3];
@@ -2250,12 +2276,20 @@ describe('take-apart lips over a sweep of outlines', () => {
         expect(stlCheck(piece)).toEqual({ degenerate: 0, open: 0 });
       }
       expect(lift(body, lid)).toBeLessThan(1e-6);
+      // a wall with no clip window takes the collar twist-lock in place of the lip, which is not built (§9)
+      if (r.layout.locks) {
+        twisted++;
+        expect(r.layout.locks).toMatchObject([{ mech: 'twist', kind: 'full' }]);
+        expect(r.layout.lips[0]).toMatchObject({ clips: 0, twist: true });
+        return;
+      }
       expect(lipParts(r.layout.lips[0]).tongue.minGap(lid, 1)).toBeGreaterThanOrEqual(c - 0.005);
       if (!r.layout.lips[0].clips) return;
       clipped++;
       expect(release(r.layout.lips, lid, r.layout.lips[0].i + 0.05, { step: 0.5 })).toBeLessThan(1e-6);
     });
     expect(built).toBeGreaterThanOrEqual(70);
+    expect(twisted).toBe(21);
     expect(clipped).toBeGreaterThanOrEqual(45); // 48: the round ones and the narrow ones have no straight stretch for a clip
   });
 });
@@ -2323,6 +2357,21 @@ describe('take-apart cuts tried before the model is cut', () => {
         if (lip) expect(tryCut(lantern, at, { hold }).male).toBe(lip.male);
       }
     }
+  });
+
+  it('a move is for the twist-lock where the lip here has neither clips nor it: a round tube, its windows just over the cut', () => {
+    const { Manifold } = wasm;
+    const tube = own(own(Manifold.cylinder(200, 50, 50, 128)).subtract(own(own(Manifold.cylinder(200, 46, 46, 128)).translate([0, 0, 2]))));
+    const windows = own(Manifold.union(Array.from({ length: 8 }, (_, i) => own(own(own(Manifold.cube([20, 12, 30])).translate([40, -6, 106.5])).rotate([0, 0, i * 45])))));
+    const solid = own(tube.subtract(windows));
+    const b = solid.boundingBox();
+    // the lip on the piece below, which alone prints as well with it: 6.5 mm of wall over the cut takes a 6 mm lip, not
+    // the socket; 3 mm lower it takes both, and the twist-lock counts as clips do, so the move is for it
+    const probe = (at) => probeLip(solid, { axis: 2, at }, { hold: 'lock', bounds: { min: [...b.min], max: [...b.max] }, asWell: [true, false] });
+    const here = probe(100);
+    expect(here).toMatchObject({ male: 0, lip: { H: 6, clips: 0 }, suggestedAt: 97, suggestedLip: { H: 6, clips: 0, twist: true } });
+    expect(here.lip.twist).toBeUndefined();
+    expect(probe(97)).toMatchObject({ male: 0, lip: { H: 6, clips: 0, twist: { tabs: 6 } }, suggestedAt: null });
   });
 
   it('read from slices it agrees with the band all the way up the lantern\'s top and the Gothic one\'s', () => {

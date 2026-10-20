@@ -1,0 +1,638 @@
+// The twist-locks built: the collar twist-lock a lid gets and the plug twist-lock a base gets, on the fixture modelled
+// on the user's lantern (design §10.1) and a few models made for one rule each. Each lock is built as the engine builds
+// it – sized on the model's slices (`checkPart`), carved (`carveParts`) and drilled (`drillPiece`) – with the model
+// moved so the joint is at z = 0 on the circle's axis, and checked as the two pieces would meet: seated, pulled,
+// turned, entered, clicked, turned the wrong way and slid out. The engine's side of it is in engine.test.js.
+import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { manifold } from '../src/manifold.js';
+import { FINE_SPECK, SPECK, WAY_START, findParts, fineSlices, plugLockOf, sliceStack } from '../src/partFinder.js';
+import { bandFor, carveParts, checkPart, cutTwist, drillPiece, lockIds, lockMatrix, lockPieces, wayOverlaps } from '../src/splitGeometry.js';
+import { LOCK_SEGMENTS, lockSolids, plugLockSolids, twistLockSolids } from '../src/lockGeometry.js';
+import { layout, plugLayoutOk, sizes } from '../src/locks.js';
+import { setup } from './helpers.js';
+import { batLanternSolid, overhangs, roundLanternSolid, stlCheck } from './lanternFixture.js';
+
+let wasm;
+beforeAll(async () => {
+  await setup();
+  wasm = manifold();
+});
+
+// every Manifold a test makes goes in here and is deleted after it
+const made = [];
+const own = (m) => {
+  made.push(m);
+  return m;
+};
+afterEach(() => {
+  for (const m of made.splice(0)) m.delete();
+});
+
+const r4 = (v) => +v.toFixed(4);
+/** An (r, z) outline revolved about z. */
+const rev = (pts, seg = LOCK_SEGMENTS) => own(own(new wasm.CrossSection(pts, 'Positive')).revolve(seg));
+const volume = (m) => m.volume();
+/** How much two solids share (mm³). */
+const overlap = (a, b) => own(a.intersect(b)).volume();
+/** The piece turned phi° about the joint's axis and lifted dz, and what it shares with the body there. */
+const fitAt = (body, piece, phi, dz) => overlap(body, own(own(piece.rotate([0, 0, phi])).translate([0, 0, dz])));
+/** A point in the plane turned a° about the axis. */
+const turned = (a, [x, y]) => {
+  const t = (a * Math.PI) / 180;
+  return [x * Math.cos(t) - y * Math.sin(t), x * Math.sin(t) + y * Math.cos(t)];
+};
+/** Whether the piece has material at (x, y, z): a 0.02 mm square there on its slice. */
+const solidAt = (piece, [x, y], z) => own(own(piece.slice(z)).intersect(own(own(wasm.CrossSection.square([0.02, 0.02], true)).translate([x, y])))).area() > 1e-6;
+/** The same, at radius r and angle a (degrees). */
+const solidPolar = (piece, r, a, z) => solidAt(piece, turned(a, [r, 0]), z);
+
+/**
+ * A part of `model` – its face at z0, its circle's centre c and radius R – sized, carved and drilled as the engine
+ * does it, with the model moved so the face is at z = 0 on the circle's axis: the lock's own frame.
+ */
+function built(model, { c = [0, 0], z0, R }, { S = sizes(), socket = 'ring' } = {}) {
+  const m = own(model.translate([-c[0], -c[1], -z0]));
+  const stack = sliceStack(m);
+  const fine = fineSlices(m, stack.speck * FINE_SPECK);
+  const grid = { from: m.boundingBox().min[2], step: S.hl };
+  const got = checkPart(m, stack, fine, { c: [0, 0], z0: 0, R }, { hl: S.hl, gmin: S.gmin, grid, letter: 'A', minLift: WAY_START * stack.height, S });
+  const plug = got.kind === 'plug';
+  const carved = carveParts(m, [{ frame: null, c: [0, 0], z0: got.z0, R, top: got.top, plug }]);
+  own(carved.body);
+  own(carved.lids[0].solid);
+  const mech = got.lock?.mech ?? null;
+  const lock = {
+    cutId: 'c1', letter: 'A', mech, kind: plug ? 'plug' : 'lid', frame: null, c: [0, 0], z0: got.z0, S,
+    ...(mech === 'twist' ? { r0: got.lock.r0, theta: got.lock.theta, slope: got.lock.slope, above: got.lock.above, below: got.lock.below, socket } : {}),
+    ...(plug ? { R, top: got.top - got.z0 } : {}),
+    sides: [{ piece: 1, role: 'body' }, { piece: 2, role: 'part' }],
+  };
+  const plan = { dowels: [], pegs: [], lips: [], labels: [], locks: mech || plug ? [lock] : [] };
+  const marks = { body: [], part: [] };
+  const body = own(drillPiece(carved.body, plan, 1, { marks: marks.body }));
+  const part = own(drillPiece(carved.lids[0].solid, plan, 2, { marks: marks.part }));
+  // the part as the lock leaves it before its click's ridges go on: the lock's own fit, without the click (its
+  // solids are in its own frame, the face at z = 0: where a face moved up a layer, they move with it)
+  let rigid = part;
+  if (mech) {
+    const L = lockSolids(lock);
+    const at = (x) => (x ? own(own(x).transform(lockMatrix(lock))) : null);
+    const add = at(L.part.add);
+    const cut = at(L.part.cut);
+    for (const x of [L.body.add, L.body.cut, L.part.after]) if (x) own(x);
+    rigid = own(own(add ? carved.lids[0].solid.add(add) : carved.lids[0].solid.translate([0, 0, 0])).subtract(cut));
+  }
+  return { m, got, lock, plan, carved, body, part, rigid, marks };
+}
+
+/** The bat lantern fixture at s times its size. */
+const bat = (s) => own(own(batLanternSolid()).scale([s, s, s]));
+/** The fixture's dome and cap and its base, as the finder places them (§10.1). */
+const LID = { 3: { z0: 86, R: 23.6286 }, 4: { z0: 114.6, R: 31.5052 } };
+const BASE = { 3: { z0: 0, R: 21.4 }, 4: { z0: 0, R: 28.8 } };
+
+describe("the dome and cap's collar twist-lock, on the fixture modelled on the user's lantern", () => {
+  it('is the lock the finder offers, built in one piece each: seated, held, turned free, clicked and opened as designed', () => {
+    const want = {
+      3: { r0: 15.88, opening: 28.56, theta: 27, tabs: 3, lift: 4.1, reach: 8.25, shelf: 0.894, pulled: 0.7711, click: 0.5912 },
+      4: { r0: 23.71, opening: 44.22, theta: 18, tabs: 6, lift: 5.6, reach: 9.75, shelf: 0, pulled: 0.7641, click: 1.1727 },
+    };
+    for (const s of [3, 4]) {
+      const model = bat(s);
+      const w = want[s];
+      const b = built(model, LID[s]);
+      const { got, lock, body, part, rigid } = b;
+      expect(got).toMatchObject({ ok: true, kind: 'lid', z0: 0, name: 'Dome and cap', handle: true });
+      // sized as the finder's table sizes it, on the same slices: the lock offered is the lock built
+      const offered = findParts(model).parts.find((e) => e.kind === 'lid').lock;
+      expect(got.lock).toMatchObject({ mech: 'twist', r0: w.r0, opening: w.opening, theta: w.theta, tabs: w.tabs, slope: 1.72, reach: w.reach });
+      expect([offered.r0, offered.opening, offered.theta, offered.tabs]).toEqual([w.r0, w.opening, w.theta, w.tabs]);
+      expect(got.lock.shelf).toBeCloseTo(w.shelf, 3);
+      // the way out starts at the lock's own lift, the neck and the play over it: 2.6 mm, then up by 0.25·s
+      expect(got.way).toMatchObject({ up: false, lift: w.lift, dir: [0, 1] });
+      // one piece each, the ring socket enough, and no hollow sealed in the body
+      expect(lockPieces(part, lock)).toBe('whole');
+      expect([body, part].map((x) => x.decompose().map((y) => (y.delete(), 1)).length)).toEqual([1, 1]);
+      // as a slicer reads them, the lock leaves no sliver of no area in either piece
+      expect(stlCheck(part)).toEqual({ degenerate: 0, open: 0 });
+      expect(stlCheck(body)).toEqual(stlCheck(b.carved.body));
+      // the lock adds to the body and takes from inside the lid
+      expect(volume(body)).toBeGreaterThan(volume(b.carved.body) + 1000);
+      const near = own(body.intersect(rev([[0, -16], [40, -16], [40, 16], [0, 16]])));
+      expect(overlap(near, part)).toBe(0);
+      // pulled up the axial play and a tenth: the lugs bear on the ledges
+      expect(r4(fitAt(near, rigid, 0, lock.S.cz + 0.1))).toBeCloseTo(w.pulled, 3);
+      expect(fitAt(near, rigid, 0, lock.S.cz + 0.1)).toBeGreaterThan(0.3);
+      // turned the open way, nothing but the click meets: free at both ends, the ridges over the neck between
+      for (let phi = 0; phi <= lock.theta; phi += 2) expect(fitAt(near, rigid, phi, 0)).toBe(0);
+      expect([fitAt(near, part, 0, 0), fitAt(near, part, lock.theta, 0)]).toEqual([0, 0]);
+      expect(r4(fitAt(near, part, lock.theta / 2, 0))).toBeCloseTo(w.click, 3);
+      // and at the open angle it lifts straight off the neck
+      for (let dz = 0; dz <= lock.S.H + 1; dz += 0.5) expect(fitAt(near, part, lock.theta, dz)).toBe(0);
+      // the wrong way, the lugs run into the slots' ends
+      expect(fitAt(near, rigid, -lock.theta, 0)).toBeGreaterThan(0.5);
+    }
+  });
+
+  it('comes out the way the slices found: clear along ±Y at their lift once turned free, blocked along X', () => {
+    const b = built(bat(3), LID[3]);
+    const { got } = b;
+    const way = { frame: null, c: [0, 0], z0: 0, turn: got.lock.theta, lift: got.way.lift, reach: got.way.reach };
+    for (const dir of [[0, 1], [0, -1]]) expect(wayOverlaps(b.carved.body, b.carved.lids[0].solid, { ...way, dir })).toMatchObject({ clear: true });
+    const alongX = wayOverlaps(b.carved.body, b.carved.lids[0].solid, { ...way, dir: [1, 0] });
+    expect(alongX.clear).toBe(false);
+    expect(Math.max(...alongX.overlaps)).toBeGreaterThan(100);
+    // the start, then eight steps to the reach
+    expect(alongX.overlaps).toHaveLength(9);
+    expect(alongX.overlaps[0]).toBe(0);
+  });
+
+  it('keeps the skin: nothing of the lock shows outside either piece, and its lugs, slots and tabs are where the layout says', () => {
+    const b = built(bat(4), LID[4]);
+    const { lock, body, part } = b;
+    const S = lock.S;
+    const L = twistLockSolids(S, lock.r0, { theta: lock.theta });
+    for (const x of [L.neck, L.lugs, L.grooves, L.cutters, L.disc, L.ridges]) own(x);
+    // the lid's cutters stay two lines inside its real outside: none of them in the air round it, moved in by the skin
+    const above = lock.above;
+    const big = 50;
+    const env = rev([[0, 0], ...above, [0, above[above.length - 1][1]]]);
+    const filled = own(b.carved.lids[0].solid.add(own(rev([[0, 0], [big, 0], [big, 12], [0, 12]]).intersect(env))));
+    const air = own(rev([[0, 0.01], [big, 0.01], [big, 10], [0, 10]]).subtract(filled));
+    const d = S.skin;
+    const near = own(wasm.Manifold.union([air, ...[[0, 0, -d], [0.7 * d, 0, -0.7 * d], [-0.7 * d, 0, -0.7 * d], [0, 0.7 * d, -0.7 * d], [0, -0.7 * d, -0.7 * d]].map((v) => own(air.translate(v)))]));
+    expect(overlap(L.cutters, near)).toBe(0);
+    // the body's additions stay two lines inside its own least outside radius under the face, or inside the lid's
+    // socket over it
+    const added = own(body.subtract(b.carved.body));
+    const skinIn = [...lock.below].reverse().map(([r, z]) => [r - S.skin + 0.01, z]);
+    const inside = own(rev([[0, lock.below[lock.below.length - 1][1]], ...skinIn, [0, 0]]).add(rev([[0, 0], [L.rs + 1, 0], [L.rs + 1, S.H + 1], [0, S.H + 1]])));
+    expect(volume(added)).toBeGreaterThan(1000);
+    expect(volume(own(added.subtract(inside)))).toBeLessThan(1e-3);
+    // the lugs: three arcs of the neck at 0°, 120° and 240°, the key lug 6.5 mm wide against 5
+    const arcs = (cs) => cs.decompose().map((p) => {
+      const bb = p.bounds();
+      const a = (Math.atan2((bb.min[1] + bb.max[1]) / 2, (bb.min[0] + bb.max[0]) / 2) * 180) / Math.PI;
+      const out = { at: (a + 360) % 360, area: p.area() };
+      p.delete();
+      return out;
+    }).filter((x) => x.area > 0.02);
+    const ring = (r1, r2) => own(own(wasm.CrossSection.circle(r2, 720)).subtract(own(wasm.CrossSection.circle(r1, 720))));
+    const lugs = arcs(own(own(body.slice(S.zl + S.a / 2)).intersect(ring(lock.r0 + 0.08, lock.r0 + S.c + S.e - 0.05)))).sort((p, q) => p.at - q.at);
+    const lay = layout(S, lock.r0, { theta: lock.theta });
+    expect(lugs.map((x) => Math.round(x.at))).toEqual(lay.lugs.map((x) => x.phi));
+    expect(lugs[0].area / lugs[1].area).toBeCloseTo(6.5 / 5, 1);
+    // the click tabs: the slit behind each, where the layout puts it
+    const rs = lock.r0 + S.c;
+    const slits = arcs(own(ring(rs + S.td + 0.1, rs + S.td + S.g - 0.1).subtract(own(part.slice(0.6))))).sort((p, q) => p.at - q.at);
+    const base = S.fb + 2 * (S.dd + S.c + 0.2);
+    const deg = (x) => (x * 180) / Math.PI;
+    const mid = lay.tabs.map(({ psi }) => {
+      const freeEnd = psi - deg((base / 2 + 0.1) / rs);
+      return (freeEnd - deg(S.g / rs) + freeEnd + deg(S.Ld / rs)) / 2;
+    });
+    expect(slits).toHaveLength(6);
+    slits.forEach((x, i) => expect(Math.abs(x.at - mid[i])).toBeLessThan(0.5));
+  });
+
+  it("has every margin a printer needs: mouths on the bed edges, lead-ins, slits clear of the tab, room in the grooves", () => {
+    const b = built(bat(4), LID[4]);
+    const { lock, body, part } = b;
+    const S = lock.S;
+    const deg = (x) => (x * 180) / Math.PI;
+    const { r0, theta } = lock;
+    const rs = r0 + S.c;
+    const rf = r0 + 2 * S.c + S.e;
+    const lay = layout(S, r0, { theta });
+    const { phi, w, half } = lay.lugs[1];
+    const cw = deg(S.c / r0);
+    // the socket's 45° mouth on the bed: at 0.1 mm up it is 0.3 mm wider than the socket, under a slot's ledge too
+    expect(solidPolar(part, rs + 0.15, phi, 0.1)).toBe(false);
+    expect(solidPolar(part, rs + 0.5, phi, 0.1)).toBe(true);
+    // each slot's entry widens towards the bed, past the slot's outer wall
+    expect(solidPolar(part, rf + 0.15, phi - theta, 0.1)).toBe(false);
+    expect(solidPolar(part, rf + 0.15, phi - theta, 0.5)).toBe(true);
+    // the ledge's end at the entry is led in 45°, 0.3 mm: lower 0.15 mm into it, whole 1 mm in
+    const ledgeEnd = phi - theta + half + cw;
+    const r = r0 + S.c + 0.2;
+    expect(solidPolar(part, r, ledgeEnd + deg(0.15 / r), S.armFloor - 0.08)).toBe(false);
+    expect(solidPolar(part, r, ledgeEnd + deg(1 / r), S.armFloor - 0.08)).toBe(true);
+    // each click tab is free at its end – a slit across it, with a mouth on the bed – and fixed at its root
+    const base = S.fb + 2 * (S.dd + S.c + 0.2);
+    for (const { psi } of lay.tabs) {
+      const freeEnd = psi - deg((base / 2 + 0.1) / rs);
+      const mid = rs + S.td / 2;
+      expect(solidPolar(part, mid, freeEnd - deg(S.g / rs) / 2, 0.6)).toBe(false);
+      expect(solidPolar(part, mid, freeEnd + deg(1 / rs), 0.6)).toBe(true);
+      expect(solidPolar(part, mid, freeEnd + deg(0.1 / rs), 0.05)).toBe(false);
+      expect(solidPolar(part, mid, freeEnd + deg(0.1 / rs), 0.6)).toBe(true);
+      // the neck's groove at the locked angle reaches the ridge's depth and a tenth more than the clearance under it
+      expect(solidPolar(body, r0 - S.dd - S.c - 0.05, psi, 0.6)).toBe(false);
+      expect(solidPolar(body, r0 - S.dd - S.c - 0.2, psi, 0.6)).toBe(true);
+    }
+    // the lug's root is sunk into the neck, filling under the neck's chamfered top; beside the lug the chamfer is bare
+    expect(solidPolar(body, r0 - 0.05, phi, S.zl + S.a - 0.1)).toBe(true);
+    expect(solidPolar(body, r0 - 0.05, phi + half + 1, S.zl + S.a - 0.1)).toBe(false);
+    // the lug's tip has its corners led in 45° in plan, 0.3 mm…
+    const tip = r0 + S.c + S.e + 0.01;
+    const x = r0 + 0.4;
+    const plan = w / 2 - S.lead + (tip - x);
+    expect(plan).toBeLessThan(x * Math.tan((half * Math.PI) / 180) - 0.04);
+    expect(solidAt(body, turned(phi, [x, plan + 0.05]), S.zl + S.a / 2)).toBe(false);
+    expect(solidAt(body, turned(phi, [x, plan - 0.05]), S.zl + S.a / 2)).toBe(true);
+    // …and both its ends' undersides: 0.12 mm in from its end, 0.1 mm over its underside, is air
+    const endIn = turned(phi + half, [r0 + S.c + 0.1, -0.12]);
+    expect(solidAt(body, endIn, S.zl + 0.1)).toBe(false);
+    expect(solidAt(body, endIn, S.zl + S.a / 2)).toBe(true);
+  });
+
+  it('prints as it is saved: the lid adds only bridged ceilings, the body its lugs\' shoulders and the collar\'s steps', () => {
+    const b = built(bat(4), LID[4]);
+    const { lock, body, part } = b;
+    const S = lock.S;
+    // what hangs over the layer under it that the plain carve did not have (the same layer, the same area)
+    const added = (with_, without) => with_.filter((o) => !without.some((p) => p.z === o.z && Math.abs(p.area - o.area) <= 0.01 * o.area));
+    // the lid prints on its face: what the lock adds that hangs out is a ceiling bridged across a slot, a slit or the
+    // socket – the slits' 1.78 mm across – never wider than 2 mm
+    const near = rev([[0, 0], [50, 0], [50, S.sockTop + 2], [0, S.sockTop + 2]]);
+    const lidNew = added(overhangs(own(part.intersect(near)), 0.1, S.sockTop + 1.8), overhangs(own(b.carved.lids[0].solid.intersect(near)), 0.1, S.sockTop + 1.8));
+    expect(lidNew.filter((o) => o.width > 1.7)).toHaveLength(6);
+    for (const o of lidNew) expect(o.width).toBeLessThanOrEqual(2);
+    // the body stands as modelled: under the face only the collar's steps and the lugs' shoulders hang out, under
+    // half a millimetre; the dome's own underside, over the collar now, no longer does
+    const under = rev([[0, -12], [50, -12], [50, S.H + 0.3], [0, S.H + 0.3]]);
+    const plainUnder = overhangs(own(b.carved.body.intersect(under)), -12, S.H);
+    const bodyUnder = overhangs(own(body.intersect(under)), -12, S.H);
+    const bodyNew = added(bodyUnder, plainUnder);
+    expect(bodyNew.length).toBeGreaterThan(0);
+    for (const o of bodyNew) expect(o.width).toBeLessThanOrEqual(0.5);
+    expect(added(plainUnder, bodyUnder).some((o) => o.width > 3)).toBe(true);
+  });
+
+  it('a looser clearance gives a smaller neck that still fits, its face a layer up; at 200 % no tab fits, and nothing is drilled', () => {
+    const b = built(bat(4), LID[4], { S: sizes(0.4, 0.2, 0.3) });
+    expect(b.got.lock).toMatchObject({ mech: 'twist', theta: 19, tabs: 6 });
+    expect(b.got.lock.r0).toBeLessThan(23.71);
+    expect([b.body, b.part].map((x) => x.decompose().map((y) => (y.delete(), 1)).length)).toEqual([1, 1]);
+    const near = own(b.body.intersect(rev([[0, -16], [40, -16], [40, 16], [0, 16]])));
+    expect(overlap(near, b.part)).toBeLessThan(1e-9);
+    expect(fitAt(near, b.rigid, 0, b.lock.S.cz + 0.1)).toBeGreaterThan(0.3);
+    expect(fitAt(near, b.part, b.lock.theta, 0)).toBeLessThan(1e-9);
+    expect(fitAt(near, b.part, b.lock.theta / 2, 0)).toBeGreaterThan(0.1);
+    // at c 0.4 the rim needs 1.4 mm to the legs: the face goes up a layer, and the lock the table offers there is built
+    const m3 = bat(3);
+    const loose = built(m3, LID[3], { S: sizes(0.4, 0.2, 0.4) });
+    expect(loose.got.z0).toBeCloseTo(0.2, 9);
+    expect(loose.got.lock).toMatchObject({ mech: 'twist', r0: 14.98, opening: 26.76, theta: 30, tabs: 3 });
+    expect(findParts(m3, { c: 0.4 }).parts.find((e) => e.kind === 'lid').lock).toMatchObject({ r0: 14.98, theta: 30, tabs: 3 });
+    expect(lockPieces(loose.part, loose.lock)).toBe('whole');
+    // at 200 % the neck (r0 8.09) has no room for a click tab in every gap: no lock, and the lid lifts off as carved
+    const small = built(bat(2), { z0: 57.4, R: 15.752 });
+    expect(small.got.lock).toEqual({ mech: null, why: 'tabs' });
+    expect(small.plan.locks).toEqual([]);
+    expect(volume(small.part)).toBeCloseTo(volume(small.carved.lids[0].solid), 6);
+  });
+
+  it("is built from the layout's own numbers: each primitive revolved at 160 segments a turn, the key lug first", () => {
+    const S = sizes();
+    const L = twistLockSolids(S, 21.39);
+    for (const x of [L.neck, L.lugs, L.grooves, L.cutters, L.disc, L.ridges]) own(x);
+    expect(L.layout.tabs.map((t) => +t.psi.toFixed(2))).toEqual([16.02, 46.88, 134.01, 164.87, 254.01, 284.87]);
+    expect([L.rn, L.rs, +L.rf.toFixed(6), L.theta]).toEqual([19.79, 21.54, 22.19, 20]);
+    // the neck is a 160-gon ring from the bore to r0, 0.5 under the face to H
+    const nb = L.neck.boundingBox();
+    expect(nb.min[2]).toBe(-0.5);
+    expect(nb.max[2]).toBeCloseTo(S.H, 6);
+    expect(Math.max(nb.max[0], nb.max[1])).toBeCloseTo(21.39, 6);
+    // five edges of its outline, each swept round in 160 steps
+    expect(L.neck.numTri()).toBe(5 * 2 * LOCK_SEGMENTS);
+    // the full disc: a 160-gon on the socket's face, from under the bed to the socket's ceiling
+    expect(volume(L.disc)).toBeCloseTo((LOCK_SEGMENTS / 2) * 21.54 ** 2 * Math.sin((2 * Math.PI) / LOCK_SEGMENTS) * (S.sockTop + 1), 3);
+    // every primitive's id, and none twice
+    expect(new Set(L.ids).size).toBe(L.ids.length);
+    expect(L.ids.length).toBeGreaterThan(40);
+  });
+});
+
+describe("the base's plug twist-lock, on the fixture", () => {
+  it('locks at 300 % and 400 %: one piece each, seated, held pulled down, turned free, clicked, out at the entry', () => {
+    const want = {
+      3: { R: 21.4, theta: 23, wall: 5.68, camOutN: 1840, pulled: 1.4108, click: 0.4918, wrong: 28.7382, coin: 36.5 },
+      4: { R: 28.8, theta: 17, wall: 7.63, camOutN: 1858, pulled: 1.4031, click: 0.4958, wrong: 28.585, coin: 51.3 },
+    };
+    for (const s of [3, 4]) {
+      const w = want[s];
+      const b = built(bat(s), BASE[s]);
+      const { got, body, part, rigid } = b;
+      const { theta } = got.lock;
+      expect(got).toMatchObject({ ok: true, kind: 'plug', name: 'Base', way: { up: true, lift: 0 } });
+      expect(got.lock).toMatchObject({ mech: 'plug', R: w.R, opening: 2 * w.R, theta: w.theta, tabs: 3, camOutN: w.camOutN, coin: w.coin, zl: 2.8 });
+      expect(got.lock.wall).toBeCloseTo(w.wall, 2);
+      expect([body, part].map((x) => x.decompose().map((y) => (y.delete(), 1)).length)).toEqual([1, 1]);
+      const near = own(body.intersect(rev([[0, -2], [w.R + 14, -2], [w.R + 14, 30], [0, 30]])));
+      expect(overlap(near, part)).toBe(0);
+      // pulled down 0.3 mm the lugs bear on the body's 45° ledges: held
+      expect(r4(fitAt(near, rigid, 0, -0.3))).toBeCloseTo(w.pulled, 3);
+      // it locks turning anticlockwise seen from above – clockwise as one fits it, the lantern upside down – so it is
+      // free turned back clockwise to its entry, clicks between, and drops out there
+      for (let phi = 0; phi <= theta; phi += 1) expect(fitAt(near, rigid, -phi, 0)).toBe(0);
+      expect(fitAt(near, part, -theta, 0)).toBe(0);
+      expect(r4(fitAt(near, part, -theta / 2, 0))).toBeCloseTo(w.click, 3);
+      for (let dz = -0.25; dz >= -(got.lock.zl + 4); dz -= 0.25) expect(fitAt(near, rigid, -theta, dz)).toBe(0);
+      expect(r4(fitAt(near, rigid, theta, 0))).toBeCloseTo(w.wrong, 2);
+    }
+  });
+
+  it('adds no overhang and no bridge, keeps its wall clear of the bore, and has a coin slot across its bottom', () => {
+    const b = built(bat(3), BASE[3]);
+    const { lock, part, body } = b;
+    const S = lock.S;
+    // printed on its bottom, nothing the plug's lock makes hangs out more than a layer's slope; nor does the body's,
+    // standing on its own
+    const plainPlug = overhangs(own(b.carved.lids[0].solid.intersect(rev([[0, -1], [40, -1], [40, 9], [0, 9]]))), 0.1, 8);
+    const plug = overhangs(own(part.intersect(rev([[0, -1], [40, -1], [40, 9], [0, 9]]))), 0.1, 8);
+    for (const o of plug) expect(o.width).toBeLessThanOrEqual(0.25);
+    expect(plug.length).toBeGreaterThanOrEqual(plainPlug.length);
+    for (const o of overhangs(own(body.intersect(rev([[0, -1], [40, -1], [40, 9], [0, 9]]))), 0.1, 8)) expect(o.width).toBeLessThanOrEqual(0.25);
+    // its bottom edge has a 45° mouth: 0.1 mm up, 0.2 mm in from its face is air, at a lug and between them
+    const rp = lock.R - S.c;
+    for (const a of [90, 150]) {
+      expect(solidPolar(part, rp - 0.2, a, 0.1)).toBe(false);
+      expect(solidPolar(part, rp - 0.2, a, 2)).toBe(true);
+    }
+    // between its lugs the plug is turned down to its wall's gap, R − c, so it goes into the bore as printed
+    const mid = own(part.slice(1.4));
+    const bb = mid.bounds();
+    expect(Math.max(...bb.max, ...bb.min.map((v) => -v))).toBeLessThanOrEqual(lock.R - S.c + 0.01);
+    // the coin slot runs along X, 36.5 mm long: 2.4 wide between vertical walls 1.2 high, then a 45° gable to 2.4
+    const strip = (z, x0, x1, w) => own(own(part.slice(z)).intersect(own(wasm.CrossSection.square([x1 - x0, w]).translate([x0, -w / 2])))).area();
+    expect(strip(0.6, -18.2, 18.2, 2.3)).toBe(0);
+    expect(strip(0.6, 18.4, 19, 2.3)).toBeGreaterThan(0.1);
+    expect(strip(1.8, -10, 10, 1.1)).toBe(0);
+    expect(strip(1.8, -10, 10, 1.4)).toBeGreaterThan(0);
+    expect(strip(2.5, -10, 10, 0.2)).toBeGreaterThan(3);
+  });
+
+  it('is laid out as the plug layout says, mirrored: lugs at −30° − 120k, the key lug first, three tabs between', () => {
+    const S = sizes();
+    const P = plugLockSolids(S, 21.4);
+    for (const x of [P.lugs, P.bodyCut, P.plugCut, P.ridges]) own(x);
+    const L = plugLayoutOk(S, 21.4);
+    expect(P.layout).toEqual(L);
+    expect(L.lugs.map((x) => Math.round(x.phi))).toEqual([330, 210, 90]);
+    // each lug where the layout says: the plug sliced through the lugs' tips, outside its own face
+    const cs = own(own(P.lugs.slice(L.lugs.length && 3.3)).intersect(own(own(wasm.CrossSection.circle(23, 720)).subtract(own(wasm.CrossSection.circle(21.5, 720))))));
+    const at = cs.decompose().map((p) => {
+      const bb = p.bounds();
+      const a = (Math.atan2((bb.min[1] + bb.max[1]) / 2, (bb.min[0] + bb.max[0]) / 2) * 180) / Math.PI;
+      p.delete();
+      return Math.round((a + 360) % 360);
+    }).sort((a, b) => a - b);
+    expect(at).toEqual([90, 210, 330]);
+  });
+
+  it('a base that lifts off gets only its wall\'s gap: it drops in and out of the bore as printed', () => {
+    const b = built(bat(3), BASE[3], { S: sizes() });
+    // as a part whose hold is to lift off: no lock sized, the plain plug turned down by the clearance
+    const plain = { ...b.lock, mech: null };
+    const plan = { dowels: [], pegs: [], lips: [], labels: [], locks: [plain] };
+    const part = own(drillPiece(b.carved.lids[0].solid, plan, 2));
+    const body = own(drillPiece(b.carved.body, plan, 1));
+    expect(volume(body)).toBeCloseTo(volume(b.carved.body), 6);
+    const bb = part.boundingBox();
+    expect(Math.max(...bb.max.slice(0, 2), ...bb.min.slice(0, 2).map((v) => -v))).toBeLessThanOrEqual(21.4 - 0.15 + 0.01);
+    expect(overlap(body, part)).toBe(0);
+    // it drops straight out, and nothing is cut in it but the gap
+    expect(fitAt(body, part, 0, -2)).toBe(0);
+    expect(volume(b.carved.lids[0].solid) - volume(part)).toBeCloseTo(volume(own(b.carved.lids[0].solid.subtract(rev([[0, -3], [21.25, -3], [21.25, 60], [0, 60]])))), 3);
+  });
+});
+
+describe('when the lock meets something else', () => {
+  it('takes the full disc for its socket where the ring leaves bits inside the bore: the round lantern\'s eave', () => {
+    const model = own(roundLanternSolid());
+    // at z 150 the face runs through the eave: the ring socket leaves a sliver of it loose inside the bore
+    const ring = built(model, { z0: 150, R: 80 });
+    expect(ring.got).toMatchObject({ kind: 'full', lock: { mech: 'twist', theta: 10, tabs: 6, slope: 1, shelf: 0 } });
+    expect(ring.got.lock.r0).toBeCloseTo(44.02, 2);
+    expect(ring.part.decompose().map((y) => (y.delete(), 1)).length).toBe(2);
+    expect(lockPieces(ring.part, ring.lock)).toBe('bore');
+    const disc = built(model, { z0: 150, R: 80 }, { socket: 'disc' });
+    expect(lockPieces(disc.part, disc.lock)).toBe('whole');
+    const near = own(disc.body.intersect(rev([[0, -12], [60, -12], [60, 12], [0, 12]])));
+    expect(overlap(near, disc.part)).toBe(0);
+    expect(r4(fitAt(near, disc.rigid, 0, disc.lock.S.cz + 0.1))).toBeCloseTo(0.7578, 3);
+    expect(fitAt(near, disc.part, disc.lock.theta, 0)).toBe(0);
+    // under the eave, a 3 mm wall: the ring is enough. The neck is held to the wall under the eave, its slits' mouths
+    // 2n inside it (the top corners alone, in the eave, allowed 42.43 and left the slits 0.54 mm from the outside)
+    const low = built(model, { z0: 146.6, R: 80 });
+    expect(low.got.lock.r0).toBeCloseTo(41.72, 2);
+    expect(lockPieces(low.part, low.lock)).toBe('whole');
+    // the wall under it is upright, so the collar slopes out at 45°: 1.5 mm down it reaches 0.3 mm past its bore
+    const rn = low.got.lock.rn;
+    expect(solidPolar(low.body, rn + 0.4, 30, -1.5)).toBe(true);
+    expect(solidPolar(low.body, rn + 0.4, 30, -1.7)).toBe(false);
+  });
+
+  it('fills a pocket the collar seals against the model under it, and keeps the model\'s own sealed hollows', () => {
+    const { Manifold } = wasm;
+    const tube = (h, rin, rout, z) => own(own(own(Manifold.cylinder(h, rout, rout, 96)).subtract(own(Manifold.cylinder(h + 0.02, rin, rin, 96).translate([0, 0, -0.01])))).translate([0, 0, z]));
+    // a cup with a gutter just under its rim and a thick lid on it; a hollow sealed in the lid's foot, far from the lock
+    const bits = [
+      tube(30, 19, 21, 0), tube(0.5, 16.6, 19, 15), tube(3, 16.6, 17.1, 15.5), own(Manifold.cylinder(2, 21, 21, 96).translate([0, 0, 30])),
+    ];
+    const solid = own(own(Manifold.union(bits)).subtract(own(Manifold.cube([2, 2, 2], true).translate([0, 18, 10]))));
+    const sealed = own(Manifold.union([solid, own(Manifold.cube([4, 4, 4], true).translate([0, 18, 10]))]));
+    const hollow = own(sealed.subtract(own(Manifold.cube([2, 2, 2], true).translate([0, 18, 10]))));
+    const shells = (m) => {
+      const out = { solids: 0, hollows: 0 };
+      for (const x of m.decompose()) {
+        if (x.volume() > 0) out.solids++;
+        else out.hollows++;
+        x.delete();
+      }
+      return out;
+    };
+    expect(shells(hollow)).toEqual({ solids: 1, hollows: 1 });
+    const b = built(hollow, { z0: 20, R: 25 });
+    expect(b.got.lock).toMatchObject({ mech: 'twist', slope: 1, shelf: 0 });
+    // the collar lands on the cup's wall and roofs the gutter over: the air left under it is filled, the model's own
+    // hollow kept
+    expect(shells(b.body)).toEqual({ solids: 1, hollows: 1 });
+    const unfilled = own(b.carved.body.add(own(lockSolids(b.lock).body.add)));
+    expect(shells(unfilled)).toEqual({ solids: 1, hollows: 2 });
+    expect(volume(b.body)).toBeGreaterThan(volume(unfilled) + 1);
+    // the lid is a tube like the cup: its socket ring fills its inside from the socket out, 4 mm over the socket's ceiling
+    const rs = b.got.lock.rs;
+    expect(solidPolar(b.part, (rs + 19) / 2, 30, b.lock.S.sockTop + 3)).toBe(true);
+    expect(solidPolar(b.part, (rs + 19) / 2, 30, b.lock.S.sockTop + 5)).toBe(false);
+  });
+
+  it('puts no collar where no wall goes round the axis under the face to carry it: a stool\'s seat on its legs', () => {
+    const { Manifold } = wasm;
+    const legs = [[12, 0], [-12, 0], [0, 12], [0, -12]].map(([x, y]) => own(Manifold.cylinder(10, 2, 2, 32).translate([x, y, 0])));
+    const stool = own(Manifold.union([...legs, own(Manifold.cylinder(6, 20, 20, 96).translate([0, 0, 10]))]));
+    const b = built(stool, { z0: 10, R: 25 });
+    expect(b.got).toMatchObject({ ok: true, kind: 'full' });
+    expect(b.got.lock).toEqual({ mech: null, why: 'collar' });
+    expect(b.plan.locks).toEqual([]);
+  });
+
+  it("tells loose bits in the bore, which the full disc takes, from a part the socket cuts in two", () => {
+    const { Manifold } = wasm;
+    // a tube with a web across it and a column on the web: the socket cuts the web where it meets the tube
+    const parts = [
+      own(own(Manifold.cylinder(40, 24, 24, 96)).subtract(own(Manifold.cylinder(40.02, 20, 20, 96).translate([0, 0, -0.01])))),
+      own(Manifold.cylinder(2, 20.5, 20.5, 96).translate([0, 0, 20.5])), own(Manifold.cylinder(17.5, 10, 10, 96).translate([0, 0, 22.5])),
+    ];
+    const b = built(own(Manifold.union(parts)), { z0: 20, R: 26 });
+    expect(b.got.lock).toMatchObject({ mech: 'twist' });
+    expect(b.part.decompose().map((y) => (y.delete(), 1)).length).toBe(2);
+    expect(lockPieces(b.part, b.lock)).toBe('pieces');
+  });
+
+  it('a square box\'s collar ends where it meets the box\'s outside, inset by the skin: its inside corners are further out', () => {
+    const { Manifold } = wasm;
+    const box = own(own(Manifold.cube([40, 40, 26], true)).translate([0, 0, 13]));
+    const inside = own(own(Manifold.cube([36, 36, 20.02], true)).translate([0, 0, 10]));
+    const b = built(own(box.subtract(inside)), { z0: 20, R: 30 });
+    // the neck 0.3 narrower than its slits' faces alone allow, for their mouths at the bed: the collar lands lower
+    expect(b.got.lock).toMatchObject({ mech: 'twist', r0: 16.75, slope: 1, shelf: 0, reach: 5.25 });
+    expect([b.body, b.part].map((x) => x.decompose().map((y) => (y.delete(), 1)).length)).toEqual([1, 1]);
+    expect(lockPieces(b.part, b.lock)).toBe('whole');
+  });
+
+  it("a base too thin over its lock takes none, and a solid one is no floor; the plug's gap is cut all the same", () => {
+    const { Manifold } = wasm;
+    const cup = own(own(Manifold.cylinder(20, 15, 15, 96)).subtract(own(Manifold.cylinder(20, 12, 12, 96).translate([0, 0, 3]))));
+    const b = built(cup, { z0: 0, R: 10 });
+    expect(b.got).toMatchObject({ ok: true, kind: 'plug', lock: { mech: null, why: 'floor' } });
+    expect(b.plan.locks).toHaveLength(1);
+    expect(volume(b.part)).toBeLessThan(volume(b.carved.lids[0].solid) - 1);
+    const rod = own(Manifold.cylinder(20, 15, 15, 96));
+    const stack = sliceStack(rod);
+    expect(plugLockOf(stack, fineSlices(rod, stack.speck * FINE_SPECK), [0, 0], 10, sizes(), 0)).toEqual({ R: 10, why: 'floor' });
+  });
+
+  it('turns the part to its open angle before it slides out: a bar goes through a gate one way round only', () => {
+    const { Manifold } = wasm;
+    // a bar 3 mm wide and 10 long, its centre at (5, 0); a gate 4 mm wide across its way out along +y
+    const bar = own(own(Manifold.cube([3, 10, 2], true)).translate([5, 0, 1]));
+    const gate = own(Manifold.union([own(Manifold.cube([18, 2, 10]).translate([-15, 8, 0])), own(Manifold.cube([18, 2, 10]).translate([7, 8, 0]))]));
+    const way = { frame: null, c: [5, 0], z0: 0, lift: 1, dir: [0, 1], reach: 20 };
+    expect(wayOverlaps(gate, bar, { ...way, turn: 0 }).clear).toBe(true);
+    expect(wayOverlaps(gate, bar, { ...way, turn: 90 }).clear).toBe(false);
+    // lifted, never lowered: at the start it is clear of a plate under its face
+    const plate = own(Manifold.cube([40, 40, 1]).translate([-15, -20, -1]));
+    expect(wayOverlaps(plate, bar, { ...way, turn: 0 }).overlaps[0]).toBe(0);
+  });
+
+  it("marks the lock's own faces: each piece's mesh keeps its primitives' ids through the drilling", () => {
+    const b = built(bat(3), LID[3]);
+    const ids = new Set(lockIds(b.lock));
+    expect(ids.size).toBeGreaterThan(40);
+    expect(new Set(b.marks.body)).toEqual(ids);
+    expect(new Set(b.marks.part)).toEqual(ids);
+    const runsOf = (m) => {
+      const mesh = m.getMesh();
+      const runs = new Map();
+      for (let r = 0; r < mesh.runOriginalID.length; r++) {
+        const tris = (mesh.runIndex[r + 1] - mesh.runIndex[r]) / 3;
+        if (ids.has(mesh.runOriginalID[r])) runs.set(mesh.runOriginalID[r], (runs.get(mesh.runOriginalID[r]) ?? 0) + tris);
+      }
+      return runs;
+    };
+    // the body's neck, lugs and collar; the lid's socket, slots, tabs and ridges
+    const body = runsOf(b.body);
+    const part = runsOf(b.part);
+    expect(body.size).toBeGreaterThan(5);
+    expect(part.size).toBeGreaterThan(10);
+    expect([...body.values()].reduce((x, y) => x + y, 0)).toBeGreaterThan(500);
+    expect([...part.values()].reduce((x, y) => x + y, 0)).toBeGreaterThan(500);
+    // the model's own faces carry none of them
+    expect(runsOf(b.carved.body).size).toBe(0);
+  });
+});
+
+/**
+ * A full-plane cut through `model` at z = at, with the collar twist-lock in place of its lip as the layout sizes it
+ * (`cutTwist`, the neck on the piece below) and the drill stage builds it on the two pieces, in the lock's frame (the
+ * face at z = 0 on its axis). `rigid` is the top before its click's ridges go on.
+ */
+function fullBuilt(model, at, { S = sizes(), socket = 'ring' } = {}) {
+  const { Manifold } = wasm;
+  const bb = model.boundingBox();
+  const cut = { axis: 2, at };
+  const band = own(bandFor(model, cut, 12));
+  const islands = own(band.slice(at)).decompose().map(own);
+  const width = Math.max(bb.max[0] - bb.min[0], bb.max[1] - bb.min[1]);
+  const twist = cutTwist(band, cut, 0, islands[0], { S, rooms: [at - bb.min[2], bb.max[2] - at], minArea: (width * SPECK) ** 2 * FINE_SPECK });
+  if (!twist) return { islands, twist };
+  const lock = { cutId: 'c1', letter: 'A', ...twist, socket, sides: [{ piece: 1, role: 'body' }, { piece: 2, role: 'part' }] };
+  const plan = { dowels: [], pegs: [], lips: [], labels: [], locks: [lock] };
+  const half = (z0, z1) => own(model.intersect(own(Manifold.cube([300, 300, z1 - z0]).translate([-150, -150, z0]))));
+  const [below, above] = [half(bb.min[2] - 1, at), half(at, bb.max[2] + 1)];
+  const toFrame = (m) => own(m.translate([-twist.c[0], -twist.c[1], -at]));
+  const drilled = [own(drillPiece(below, plan, 1)), own(drillPiece(above, plan, 2))];
+  const [body, top] = drilled.map(toFrame);
+  const L = lockSolids(lock);
+  for (const x of [L.body.add, L.body.cut, L.part.after]) if (x) own(x);
+  const rigid = own(own(toFrame(above).add(own(L.part.add))).subtract(own(L.part.cut)));
+  return { islands, twist, lock, plan, below: toFrame(below), above: toFrame(above), body, top, rigid, L, drilled };
+}
+
+describe('the collar twist-lock on a full-plane cut through a round wall', () => {
+  it("the round lantern cut through its eave at z 150: the full disc socket, one piece each, seated, held, turned free and clicked", () => {
+    const model = own(roundLanternSolid());
+    const ring = fullBuilt(model, 150);
+    expect(ring.twist).toMatchObject({ mech: 'twist', kind: 'full', frame: null, z0: 150, theta: 10, tabs: 6, slope: 1, shelf: 0 });
+    expect(ring.twist.r0).toBeCloseTo(44.02, 2);
+    expect(Math.hypot(...ring.twist.c)).toBeLessThan(1e-6);
+    // the ring socket leaves the eave's inner sliver loose in the bore; the full disc takes it
+    expect(lockPieces(own(ring.top.translate([0, 0, 150])), { ...ring.lock, z0: 150 })).toBe('bore');
+    const b = fullBuilt(model, 150, { socket: 'disc' });
+    const pieces = (m) => m.decompose().map((y) => (y.delete(), 1)).length;
+    expect([pieces(b.body), pieces(b.top)]).toEqual([1, 1]);
+    // as a slicer reads them, saved where they stand: no sliver of no area in either
+    expect(b.drilled.map((m) => stlCheck(m))).toEqual([{ degenerate: 0, open: 0 }, { degenerate: 0, open: 0 }]);
+    // the body gets the collar, the neck and the lugs; the top its socket ring, less the socket, slots and slits
+    expect(volume(b.body)).toBeGreaterThan(volume(b.below) + 500);
+    const near = own(b.body.intersect(rev([[0, -12], [60, -12], [60, 12], [0, 12]])));
+    const { cz, H } = b.lock.S;
+    expect(overlap(near, b.top)).toBe(0);
+    expect(r4(fitAt(near, b.rigid, 0, cz + 0.1))).toBeCloseTo(0.7578, 3);
+    for (let phi = 0; phi <= b.lock.theta; phi += 2) expect(fitAt(near, b.rigid, phi, 0)).toBe(0);
+    expect(fitAt(near, b.top, b.lock.theta, 0)).toBe(0);
+    expect(fitAt(near, b.top, b.lock.theta / 2, 0)).toBeGreaterThan(0.5);
+    for (let dz = 0; dz <= H + 1; dz += 0.5) expect(fitAt(near, b.top, b.lock.theta, dz)).toBe(0);
+    expect(fitAt(near, b.rigid, -b.lock.theta, 0)).toBeGreaterThan(0.5);
+  });
+
+  it('under the eave, a 3 mm wall: the ring socket is enough, and nothing it cuts comes within 2n of the outside', () => {
+    const model = own(roundLanternSolid());
+    const b = fullBuilt(model, 146.5);
+    expect(b.twist).toMatchObject({ r0: 41.72, rn: 40.12, opening: 80.24, theta: 11, tabs: 6, slope: 1, reach: 3.25, shelf: 0 });
+    expect(lockPieces(own(b.top.translate([0, 0, 146.5])), { ...b.lock, z0: 146.5 })).toBe('whole');
+    expect(b.drilled.map((m) => stlCheck(m))).toEqual([{ degenerate: 0, open: 0 }, { degenerate: 0, open: 0 }]);
+    const near = own(b.body.intersect(rev([[0, -12], [60, -12], [60, 12], [0, 12]])));
+    expect(overlap(near, b.top)).toBe(0);
+    expect(fitAt(near, b.rigid, 0, b.lock.S.cz + 0.1)).toBeGreaterThan(0.3);
+    expect(fitAt(near, b.top, b.lock.theta, 0)).toBe(0);
+    expect(fitAt(near, b.rigid, -b.lock.theta, 0)).toBeGreaterThan(0.5);
+    // the skin: the top's cutters within 2n of its outside (the profile it was sized on, revolved) – facets only
+    const { above } = b.twist;
+    const S = b.lock.S;
+    const topZ = above[above.length - 1][1];
+    const shell = rev([[above[0][0], -1], ...above, [above[above.length - 1][0], topZ], ...[...above].reverse().map(([r, z]) => [r - S.skin, z]), [above[0][0] - S.skin, -1]]);
+    expect(overlap(b.L.part.cut, shell)).toBeLessThan(0.01);
+    // and the body's additions – the collar under the face, the neck and lugs over it – stay inside its own outside, in
+    // from it by the skin
+    expect(volume(own(own(b.body.subtract(b.below)).subtract(rev([[0, -20], [45 - S.skin + 0.01, -20], [45 - S.skin + 0.01, S.H + 1], [0, S.H + 1]]))))).toBeLessThan(0.01);
+  });
+
+  it('takes none where no wall goes round the axis under the face to carry the collar: just over a row of windows', () => {
+    const b = fullBuilt(own(roundLanternSolid()), 125.5);
+    expect(b.islands).toHaveLength(1);
+    expect(b.twist).toBeNull();
+  });
+});

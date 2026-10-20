@@ -1,0 +1,253 @@
+{
+ "commit": "c97a1b5 with changes to src",
+ "cases": {
+  "lantern/lock-190": {
+   "files": {
+    "lantern-piece-1-of-2.stl": "0409b15b5ac4cbe5",
+    "lantern-piece-2-of-2.stl": "767f8d2459d3f50c",
+    "lantern-how-to-glue.txt": "52bad500e51ee552"
+   },
+   "notes": "4c87f67e16909d02",
+   "fit": "5f63525278f4f979 a60a2fbee2c20942"
+  },
+  "lantern/snap-190": {
+   "files": {
+    "lantern-piece-1-of-2.stl": "ab6c5c062a07d6de",
+    "lantern-piece-2-of-2.stl": "f4dd31a4de56d382",
+    "lantern-how-to-glue.txt": "982bd67424e7eb9c"
+   },
+   "notes": "fd8604f59751dba5",
+   "fit": "abc065c77a1e08e4 c2ea74c3dc656dea"
+  },
+  "lantern/light-190": {
+   "files": {
+    "lantern-piece-1-of-2.stl": "0b1614fda54a51db",
+    "lantern-piece-2-of-2.stl": "5f1b16303707eee9",
+    "lantern-how-to-glue.txt": "40a6708344b19ed9"
+   },
+   "notes": "01f4032e517a0715",
+   "fit": "6cab7838370c8faa a6c7c0de10940640"
+  },
+  "lantern/lift-190": {
+   "files": {
+    "lantern-piece-1-of-2.stl": "d938f022810d79d6",
+    "lantern-piece-2-of-2.stl": "676b9152ccd66b98",
+    "lantern-how-to-glue.txt": "cfae699da24c698f"
+   },
+   "notes": "d0891780db629c60",
+   "fit": "e313212bb6cb636f 9229a016c75a12e2"
+  },
+  "lantern/lock-192": {
+   "files": {
+    "lantern-piece-1-of-2.stl": "a26acc55231ff5b8",
+    "lantern-piece-2-of-2.stl": "82433e5eb3789a3c",
+    "lantern-how-to-glue.txt": "abbf2f142984f080"
+   },
+   "notes": "0cf27c4c7e554b4c",
+   "fit": "8cf1b3dff85f4a16 9229a016c75a12e2"
+  },
+  "lantern/glued-100": {
+   "files": {
+    "lantern-piece-1-of-2.stl": "8c1fe6b152b1a9dc",
+    "lantern-piece-2-of-2.stl": "fb53ba9c782702c9",
+    "lantern-how-to-glue.txt": "5115e0c7c89c52b4"
+   },
+   "notes": "3e725f92c3bb34d5",
+   "fit": "- 83d4f3762a62d7fb"
+  },
+  "lantern/lock-190-glued-30": {
+   "files": {
+    "lantern-piece-1-of-3.stl": "c41b8a6cbabdd869",
+    "lantern-piece-2-of-3.stl": "bf6ad06fd0f47be5",
+    "lantern-piece-3-of-3.stl": "6470aac92badc02a",
+    "lantern-how-to-glue.txt": "700ab7108e595c17"
+   },
+   "notes": "3bdde8086211610e",
+   "fit": "2b72b313823da5c7 a60a2fbee2c20942"
+  },
+  "lantern/dovetail-x0": {
+   "files": {
+    "lantern-piece-1-of-2.stl": "d7ee153e41d21f49",
+    "lantern-piece-2-of-2.stl": "2a61dc7c32aad1de",
+    "lantern-how-to-glue.txt": "bd2e62019d176621"
+   },
+   "notes": "8967ac8b298cf182",
+   "fit": "bcf3dfa295ce8a7d 50c91caed4662ee4"
+  },
+  "lantern/fit-mini": {
+   "plan": "cb9c4c0b2b53f9ba",
+   "files": {
+    "lantern-piece-1-of-3.stl": "5ac05d5972fb9c90",
+    "lantern-piece-2-of-3.stl": "b720f4d4bf51982f",
+    "lantern-piece-3-of-3.stl": "347b72112e947b7b",
+    "lantern-how-to-glue.txt": "7bf5ca16107efbdb"
+   },
+   "notes": "b92d6858b6db59f5",
+   "fit": "756398deb04dc203 c2ea74c3dc656dea"
+  },
+  "gothic/lock-174.5": {
+   "files": {
+    "gothic-piece-1-of-2.stl": "445ab01316225fe7",
+    "gothic-piece-2-of-2.stl": "04a3b806441c88a1",
+    "gothic-how-to-glue.txt": "1891a27a0885f02f"
+   },
+   "notes": "4c87f67e16909d02",
+   "fit": "41052f525c0f558f 5240c580d88d54dc"
+  },
+  "gothic/pins-190": {
+   "files": {
+    "gothic-piece-1-of-2.stl": "c11e963b40d708fd",
+    "gothic-piece-2-of-2.stl": "787d20a0cf76e1d6",
+    "gothic-pins-7x-5x16mm.stl": "ea26105f493c98ce",
+    "gothic-how-to-glue.txt": "d5c89a9b75e191d7"
+   },
+   "notes": "dfca4992dcffb490",
+   "fit": "bc2f739e1f5c55f8 bdddeaa12da2311b"
+  },
+  "gothic/own-pins-190": {
+   "files": {
+    "gothic-piece-1-of-2.stl": "0097254ce0b3df27",
+    "gothic-piece-2-of-2.stl": "0d07dabe6fc29718",
+    "gothic-how-to-glue.txt": "f9e0ca607022d5c3"
+   },
+   "notes": "73a3d523b759741a",
+   "fit": "94dd10f1ef97a761 2ba62e7fd693b7e0"
+  },
+  "gothic/pegs-190": {
+   "files": {
+    "gothic-piece-1-of-2.stl": "884ad2412fde4560",
+    "gothic-piece-2-of-2.stl": "312632e863fc38dc",
+    "gothic-how-to-glue.txt": "6e7a7d9fc48c5ad6"
+   },
+   "notes": "c88156ce1de954f7",
+   "fit": "c98549fbf238f6c4 147132b9aa9727f4"
+  },
+  "gothicHollow/lock-174.5": {
+   "files": {
+    "gothicHollow-piece-1-of-2.stl": "472dbb4db6e40f95",
+    "gothicHollow-piece-2-of-2.stl": "5f3700537d286b94",
+    "gothicHollow-how-to-glue.txt": "48327be3fb97dc36"
+   },
+   "notes": "4c87f67e16909d02",
+   "fit": "0b0db006ab1ee7f4 edb13c55115663e8"
+  },
+  "gothicHollow/lift-174.5": {
+   "files": {
+    "gothicHollow-piece-1-of-2.stl": "869e7b5a2352c7b0",
+    "gothicHollow-piece-2-of-2.stl": "58add44558b56cc9",
+    "gothicHollow-how-to-glue.txt": "c4fde11851f76364"
+   },
+   "notes": "d0891780db629c60",
+   "fit": "832ee48a238e0bb2 8ec19f25cd35e457"
+  },
+  "lidBox/lock-49.5": {
+   "files": {
+    "lidBox-piece-1-of-2.stl": "b2ab8b04d968bc5c",
+    "lidBox-piece-2-of-2.stl": "5da27a43fa1337db",
+    "lidBox-how-to-glue.txt": "86274bf81aaad04b"
+   },
+   "notes": "75806a5fbc501e79",
+   "fit": "1456ad1ad2d333e0 78e0c6fc77c9e360"
+  },
+  "lidBox/glued-30": {
+   "files": {
+    "lidBox-piece-1-of-2.stl": "2807f9034280f63e",
+    "lidBox-piece-2-of-2.stl": "188d5cadd1624d20",
+    "lidBox-how-to-glue.txt": "6ab238180de714ae"
+   },
+   "notes": "d81ec7a546c7cd11",
+   "fit": "- f1150247aa05a64c"
+  },
+  "loggia/lock-220.5": {
+   "files": {
+    "loggia-piece-1-of-2.stl": "ebbb9e99454fd6b6",
+    "loggia-piece-2-of-2.stl": "f6bfa498c1c1a225",
+    "loggia-how-to-glue.txt": "8acc50aa3215e532"
+   },
+   "notes": "6968f43c8fc67d7a",
+   "fit": "eebf9b152825614e 60b65c895ba1d3b5"
+  },
+  "loggia/glued-150": {
+   "files": {
+    "loggia-piece-1-of-2.stl": "6cf147ab148c21f8",
+    "loggia-piece-2-of-2.stl": "03300d06c5528983",
+    "loggia-pins-10x-3x10mm.stl": "cc0ccb89e5393e89",
+    "loggia-how-to-glue.txt": "fe4631236969efe2"
+   },
+   "notes": "1dc5bae807fe9713",
+   "fit": "7569cfab23a0a28f 6a23f54a5c990895"
+  },
+  "slender/lock-35": {
+   "files": {
+    "slender-piece-1-of-2.stl": "7fb52dbeb3e211f6",
+    "slender-piece-2-of-2.stl": "07217b3e2fb566cc",
+    "slender-how-to-glue.txt": "93e0672d3b830869"
+   },
+   "notes": "c4b4e3d9c20a6af3",
+   "fit": "- bd07222077f649da"
+  },
+  "slender/lock-39.5": {
+   "files": {
+    "slender-piece-1-of-2.stl": "96177f544e8f7a02",
+    "slender-piece-2-of-2.stl": "9934cc12f87ff8f4",
+    "slender-how-to-glue.txt": "6568780fcc78f7ef"
+   },
+   "notes": "c4b4e3d9c20a6af3",
+   "fit": "- bd07222077f649da"
+  },
+  "round/lock-150": {
+   "files": {
+    "round-piece-1-of-2.stl": "0cb8ffc7cb7b8e97",
+    "round-piece-2-of-2.stl": "b35686ebc49965d0",
+    "round-how-to-glue.txt": "2b28630277a848e4"
+   },
+   "notes": "a6b67efa9d72dbbe",
+   "fit": "- dadeb3d8f82a4c00"
+  },
+  "round/snap-150": {
+   "files": {
+    "round-piece-1-of-2.stl": "0cb8ffc7cb7b8e97",
+    "round-piece-2-of-2.stl": "b35686ebc49965d0",
+    "round-how-to-glue.txt": "2b28630277a848e4"
+   },
+   "notes": "a6b67efa9d72dbbe",
+   "fit": "- dadeb3d8f82a4c00"
+  },
+  "round/lift-150": {
+   "files": {
+    "round-piece-1-of-2.stl": "2059732b476ef6d9",
+    "round-piece-2-of-2.stl": "dc9059dda9a42fd1",
+    "round-how-to-glue.txt": "91a1f5164277da0e"
+   },
+   "notes": "4feb697c819dd067",
+   "fit": "- dadeb3d8f82a4c00"
+  },
+  "round/lock-146.5": {
+   "files": {
+    "round-piece-1-of-2.stl": "eb84fa84f35f53a3",
+    "round-piece-2-of-2.stl": "ee2a73958aeb54ab",
+    "round-how-to-glue.txt": "c02440c7b2085024"
+   },
+   "notes": "354cb35a9594d684",
+   "fit": "- dadeb3d8f82a4c00"
+  },
+  "round/lock-142.5": {
+   "files": {
+    "round-piece-1-of-2.stl": "bbbab090e7039d25",
+    "round-piece-2-of-2.stl": "e3dafe0a6ff0f3f6",
+    "round-how-to-glue.txt": "9ec8f8d0b744673d"
+   },
+   "notes": "354cb35a9594d684",
+   "fit": "1beeae452c3d0306 1c9b9802ddcbcaa1"
+  },
+  "plate/dovetail-x0": {
+   "files": {
+    "plate-piece-1-of-2.stl": "06c1315598a9d552",
+    "plate-piece-2-of-2.stl": "a96d701ca9bf81a4",
+    "plate-how-to-glue.txt": "e4f26907cd3b83ae"
+   },
+   "notes": "aca88f78f4ece80e",
+   "fit": "8aea4f3225fd8834 85ca8b390ba9e31f"
+  }
+ }
+}

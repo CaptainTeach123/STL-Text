@@ -1,6 +1,7 @@
 // Models for finding the parts that come off, besides the lanterns of lanternFixture.js: a jar with a lid and a
-// knob, a box with a bail standing on its lid, a mug open at the top with a handle on its side, a solid block and a
-// hexagonal lantern whose chimney cap carries a bail. Call setup() first.
+// knob, a box with a bail standing on its lid, a mug open at the top with a handle on its side, a solid block, a
+// hexagonal lantern whose chimney cap carries a bail, a hurricane lantern whose bail pivots on its sides, a pavilion
+// whose dome stands on a band over posts and a lantern standing on a plate. Call setup() first.
 import { manifold } from '../src/manifold.js';
 import { box } from './lanternFixture.js';
 
@@ -93,5 +94,61 @@ export function chimneyBoxSolid() {
     const window = t(box([-10, -45, 10], [10, -35, 30]));
     const body = t(t(t(Manifold.union([shell, collar])).subtract(hole)).subtract(window));
     return Manifold.union([body, cap, knob, post]);
+  });
+}
+
+/**
+ * A hurricane lantern: a tube r 30 (3 mm wall and 4 mm floor) up to z 80 with six windows, a hollow dome r 30 (2.5 mm)
+ * on it with a finial to z 120, and a wire bail on bosses at the tube's sides, its arms at x ±36 arching over to z 140:
+ * the arch comes down near the cap only over the rim of the dome, 40 mm under it.
+ */
+export function hurricaneSolid() {
+  return made((t, { Manifold, CrossSection }) => {
+    let tube = t(cone(t, Manifold, 30, 30, 0, 80).subtract(cone(t, Manifold, 27, 27, 4, 81)));
+    const windows = [];
+    for (let k = 0; k < 6; k++) windows.push(t(t(box([20, -6, 15], [40, 6, 65])).rotate([0, 0, k * 60 + 30])));
+    tube = t(tube.subtract(t(Manifold.union(windows))));
+    const shell = t(t(Manifold.sphere(30, 96)).subtract(t(Manifold.sphere(27.5, 96))));
+    const dome = t(t(shell.intersect(t(box([-40, -40, 0], [40, 40, 40])))).translate([0, 0, 80]));
+    const parts = [tube, dome, cone(t, Manifold, 4, 1.5, 109, 120, 48)];
+    for (const sx of [-1, 1]) {
+      parts.push(t(t(t(Manifold.cylinder(8, 3, 3, 24)).rotate([0, 90, 0])).translate([sx > 0 ? 29 : -37, 0, 50])));
+      parts.push(t(cone(t, Manifold, 2, 2, 50, 104, 24).translate([sx * 36, 0, 0])));
+    }
+    const wire = t(t(CrossSection.circle(2, 24)).translate([36, 0]));
+    parts.push(t(t(t(Manifold.revolve(wire, 96, 180)).rotate([90, 0, 0])).translate([0, 0, 104])));
+    return Manifold.union(parts);
+  });
+}
+
+/**
+ * A pavilion: a floor r 40, six posts at r 34 up to z 100, a ring band r 27.5–38 `band` mm tall at z 60, a hollow dome
+ * r 30 (2.5 mm) on the band with a finial, and a crown ring over it on the posts.
+ */
+export function pavilionSolid(band) {
+  return made((t, { Manifold }) => {
+    const parts = [cone(t, Manifold, 40, 40, 0, 4)];
+    for (let k = 0; k < 6; k++) parts.push(t(cone(t, Manifold, 2.5, 2.5, 0, 100, 24).translate([34 * Math.cos((k * Math.PI) / 3), 34 * Math.sin((k * Math.PI) / 3), 0])));
+    parts.push(t(cone(t, Manifold, 38, 38, 60, 60 + band).subtract(cone(t, Manifold, 27.5, 27.5, 59, 62 + band))));
+    const shell = t(t(Manifold.sphere(30, 96)).subtract(t(Manifold.sphere(27.5, 96))));
+    parts.push(t(t(shell.intersect(t(box([-40, -40, 0], [40, 40, 40])))).translate([0, 0, 60 + band])));
+    parts.push(cone(t, Manifold, 4, 1.5, 89 + band, 96, 48), t(cone(t, Manifold, 38, 38, 97, 100).subtract(cone(t, Manifold, 30, 30, 96, 101))));
+    return Manifold.union(parts);
+  });
+}
+
+/**
+ * A lantern on a plate a little wider than itself: a plate r `plate` (`thick` mm) under a tube r 30 (3 mm wall) to
+ * z 90 with six windows, a hollow dome r 30 (2.5 mm) and a finial to z 128.
+ */
+export function plinthLanternSolid(plate = 34, thick = 5) {
+  return made((t, { Manifold }) => {
+    let tube = t(cone(t, Manifold, 30, 30, thick, 90).subtract(cone(t, Manifold, 27, 27, thick - 1, 91)));
+    const windows = [];
+    for (let k = 0; k < 6; k++) windows.push(t(t(box([20, -6, 20], [40, 6, 75])).rotate([0, 0, k * 60 + 30])));
+    tube = t(tube.subtract(t(Manifold.union(windows))));
+    const shell = t(t(Manifold.sphere(30, 96)).subtract(t(Manifold.sphere(27.5, 96))));
+    const dome = t(t(shell.intersect(t(box([-40, -40, 0], [40, 40, 40])))).translate([0, 0, 90]));
+    return Manifold.union([cone(t, Manifold, plate, plate, 0, thick), tube, dome, cone(t, Manifold, 4, 1.5, 119, 128, 48)]);
   });
 }

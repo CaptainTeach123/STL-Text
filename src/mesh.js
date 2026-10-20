@@ -2,6 +2,7 @@ import { BufferGeometry, Float32BufferAttribute, Uint32BufferAttribute, Vector3 
 import { MeshBVH } from 'three-mesh-bvh';
 import { toCreasedNormals } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { manifold } from './manifold.js';
+import { cornerNormals, normalsTopology } from './normals.js';
 import { triangleSoup } from './stl.js';
 
 export class NotWatertightError extends Error {
@@ -111,6 +112,27 @@ export function manifoldToSoup(m) {
   return out;
 }
 
+/**
+ * A triangle soup without the triangles two of whose corners are the same
+ * point as written (float32): a boolean's hair-thin sliver can round to one,
+ * which a slicer reports as a degenerate facet and an open edge and removes.
+ * Removing it is collapsing the sliver's short edge, so the rest still meets
+ * edge to edge. The soup itself when it has none.
+ */
+export function withoutCollapsed(soup) {
+  const same = (i, j) => soup[i] === soup[j] && soup[i + 1] === soup[j + 1] && soup[i + 2] === soup[j + 2];
+  const keep = [];
+  const n = soup.length / 9;
+  for (let t = 0; t < n; t++) {
+    const i = t * 9;
+    if (!same(i, i + 3) && !same(i + 3, i + 6) && !same(i, i + 6)) keep.push(t);
+  }
+  if (keep.length === n) return soup;
+  const out = new Float32Array(keep.length * 9);
+  keep.forEach((t, k) => out.set(soup.subarray(t * 9, t * 9 + 9), k * 9));
+  return out;
+}
+
 /** Concatenate triangle soups. */
 export function concatSoups(soups) {
   const parts = soups.filter((s) => s && s.length);
@@ -125,9 +147,67 @@ export function concatSoups(soups) {
 }
 
 /**
+ * A solid's shaded vertices: one per vertex and smooth group, creased at
+ * `creaseDeg` – what Manifold's `calculateNormals(0, creaseDeg)` gives, worked
+ * out in plain JavaScript (`cornerNormals`, checked against it corner by
+ * corner). Manifold's own takes time with every sharp edge, a minute on a
+ * scanned or generated model of a million triangles, where this takes a
+ * fraction of a second. A mesh with properties of its own (its vertices split
+ * along their seams) is shaded by Manifold, which sees through the seams.
+ */
+function shadedMesh(solid, creaseDeg) {
+  const mesh = solid.getMesh();
+  const index = mesh.triVerts;
+  if (mesh.numProp !== 3) {
+    const shaded = solid.calculateNormals(0, creaseDeg);
+    const m = shaded.getMesh(0);
+    shaded.delete();
+    const count = m.vertProperties.length / m.numProp;
+    const positions = new Float32Array(count * 3);
+    const normals = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++) {
+      for (let a = 0; a < 3; a++) {
+        positions[i * 3 + a] = m.vertProperties[i * m.numProp + a];
+        normals[i * 3 + a] = m.vertProperties[i * m.numProp + 3 + a];
+      }
+    }
+    return { positions, normals, index: m.triVerts.slice() };
+  }
+  const xyz = mesh.vertProperties;
+  const topology = normalsTopology(index, xyz.length / 3);
+  const corner = cornerNormals(xyz, index, creaseDeg, topology);
+  // each corner takes the shaded vertex of the first corner at its vertex with the same normal
+  const { offsets, corners } = topology;
+  const out = new Uint32Array(index.length);
+  const first = [];
+  const same = (c, d) => corner[3 * c] === corner[3 * d] && corner[3 * c + 1] === corner[3 * d + 1] && corner[3 * c + 2] === corner[3 * d + 2];
+  for (let v = 0; v + 1 < offsets.length; v++) {
+    const from = first.length;
+    for (let i = offsets[v]; i < offsets[v + 1]; i++) {
+      const c = corners[i];
+      let k = from;
+      while (k < first.length && !same(first[k], c)) k++;
+      if (k === first.length) first.push(c);
+      out[c] = k;
+    }
+  }
+  const positions = new Float32Array(first.length * 3);
+  const normals = new Float32Array(first.length * 3);
+  first.forEach((c, k) => {
+    const v = index[c] * 3;
+    for (let a = 0; a < 3; a++) {
+      positions[k * 3 + a] = xyz[v + a];
+      normals[k * 3 + a] = corner[3 * c + a];
+    }
+  });
+  return { positions, normals, index: out };
+}
+
+/**
  * Renderable buffers for a solid plus (optionally) a soup of triangles that
- * are not part of it (unrepairable pieces). Normals come from Manifold
- * (creased at 36°) for the solid and are flat per face for the soup.
+ * are not part of it (unrepairable pieces). Normals are creased at 36° for
+ * the solid, as Manifold shades it (`shadedMesh`), and flat per face for the
+ * soup.
  *
  * Returns { positions, normals, index, passthroughStart } where
  * passthroughStart is the first *triangle* index belonging to the soup
@@ -137,25 +217,7 @@ export function displayBuffers(solid, passthrough = null) {
   let sPos = new Float32Array(0);
   let sNor = new Float32Array(0);
   let sIdx = new Uint32Array(0);
-  if (solid && !solid.isEmpty()) {
-    const shaded = solid.calculateNormals(0, 36);
-    const mesh = shaded.getMesh(0);
-    shaded.delete();
-    const stride = mesh.numProp;
-    const count = mesh.vertProperties.length / stride;
-    sPos = new Float32Array(count * 3);
-    sNor = new Float32Array(count * 3);
-    for (let i = 0; i < count; i++) {
-      const v = i * stride;
-      sPos[i * 3] = mesh.vertProperties[v];
-      sPos[i * 3 + 1] = mesh.vertProperties[v + 1];
-      sPos[i * 3 + 2] = mesh.vertProperties[v + 2];
-      sNor[i * 3] = mesh.vertProperties[v + 3];
-      sNor[i * 3 + 1] = mesh.vertProperties[v + 4];
-      sNor[i * 3 + 2] = mesh.vertProperties[v + 5];
-    }
-    sIdx = mesh.triVerts.slice();
-  }
+  if (solid && !solid.isEmpty()) ({ positions: sPos, normals: sNor, index: sIdx } = shadedMesh(solid, 36));
   const pTris = passthrough ? Math.floor(passthrough.length / 9) : 0;
   const total = sPos.length / 3 + pTris * 3;
   const positions = new Float32Array(total * 3);

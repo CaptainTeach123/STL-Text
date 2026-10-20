@@ -470,6 +470,9 @@ function rowOf(shells, gap) {
   }
 }
 
+/** Fit-test coupons laid in a row as `fitTestCoupon` lays its own: centred, standing on z = 0 (the caller's). */
+export const couponRow = (shells) => rowOf(shells, COUPON_GAP);
+
 /** The box of one pin as the pins file lays it. */
 function lyingPinBox(d, length) {
   const one = lyingPin({ r: d / 2, L: length, e: Math.min(0.4, 0.1 * d) });
@@ -2544,7 +2547,8 @@ export function partRows(stack, fine, c, z0, hl) {
  * the model's inside over it, and crosses nothing once through it: a ragged floor top, crossed again within `rag`
  * over the floor's last row, is the floor's (a scan's or a generated mesh's floor is seldom flat); 'mixed' when the
  * wall crosses material over a plane that holds some, or past a floor; 'empty' when the plane holds nothing inside
- * the circle.
+ * the circle – on the model's end, nothing within `rag` of it (a foot's rim round a recessed bottom, or a tilted
+ * bottom's low edge, stands outside the circle there).
  * @param {number[][][]} rows each row's islands as [dmin, dmax]
  * @param {number} R the circle's radius
  * @param {{ end?: boolean, zs?: number[], rag?: number }} options `zs` each row's height, for `rag`
@@ -2554,8 +2558,15 @@ export function partRows(stack, fine, c, z0, hl) {
 export function partKind(rows, R, { end = false, zs = null, rag = 0 } = {}) {
   const crosses = (row) => row.some(([a, b]) => a < R && b > R);
   const inDisc = (row) => row.some(([a]) => a < R);
-  if (!rows.length || !inDisc(rows[0])) return { kind: 'empty', cap: 0, cross: null };
-  let cap = rows.findIndex((row, j) => j > 0 && !inDisc(row));
+  // a base's bottom may be recessed inside a foot's rim, uneven or a little tilted: its floor starts within `rag` of the
+  // model's end, the rows under it holding only what lies round the circle
+  let from = 0;
+  if (end && zs && rows.length && !inDisc(rows[0])) {
+    const j = rows.findIndex((row) => inDisc(row));
+    if (j > 0 && zs[j] <= zs[0] + rag) from = j;
+  }
+  if (!rows.length || !inDisc(rows[from])) return { kind: 'empty', cap: 0, cross: null };
+  let cap = rows.findIndex((row, j) => j > from && !inDisc(row));
   if (cap < 0) cap = rows.length;
   const crossed = rows.slice(0, cap).map(crosses);
   // a base: the floor is material across the circle that holds its centre, from the model's end – or within `rag`
@@ -2646,9 +2657,9 @@ export function partCap(stack, fine, c, R, lo, hi) {
  * @param {{ hl: number, gmin: number, grid?: { from: number, step: number }|null }} options
  * @returns {{ ok: boolean, why: 'empty'|'mixed'|'gap'|null, asked: number, z0: number, kind: string, end: boolean,
  *   lo: number|null, hi: number|null, gap: number, islands: number, capRow: { lo: number, hi: number|null },
- *   tried: { gap: number, islands: number }, nearest: number|null }} `asked` the face asked for, on the layers;
- *   `z0` the face taken (`asked` when refused); `capRow` the heights between which the cap lies; `tried` how the
- *   face asked for fared
+ *   tried: { gap: number, islands: number }, nearest: number|null, floor?: number }} `asked` the face asked for, on
+ *   the layers; `z0` the face taken (`asked` when refused); `capRow` the heights between which the cap lies; `tried`
+ *   how the face asked for fared; `floor`, for a base, where its own material starts
  */
 export function placePart(stack, fine, { c, z0: plane, R }, { hl, gmin, grid = null }) {
   // the layers' boundaries to a millionth of a millimetre, so a face is 29.0 and never 29.000000000000004
@@ -2664,6 +2675,8 @@ export function placePart(stack, fine, { c, z0: plane, R }, { hl, gmin, grid = n
     if (!looked.has(key)) {
       const { rows, zs, near, face } = partRows(stack, fine, c, z, hl);
       const kind = partKind(rows, R, { end, zs, rag });
+      // where a base's own material starts over the model's end: a foot's rim round it may stand lower
+      if (kind.kind === 'plug') kind.floor = zs[rows.findIndex((row) => row.some(([a]) => a < R))];
       // a base holds by its own wall: what stands beside its face is the lock's to judge
       const gap = kind.kind === 'plug' ? { ok: true, lo: null, hi: null, gap: 0, islands: 1 } : partGap(rows, face, c, R, gmin);
       const capRow = { lo: zs[Math.max(0, kind.cap - 1)], hi: kind.cap < zs.length ? zs[kind.cap] : null };
@@ -2676,7 +2689,7 @@ export function placePart(stack, fine, { c, z0: plane, R }, { hl, gmin, grid = n
   const first = at(asked);
   const result = (f, extra) => ({
     asked, z0: f.z, kind: f.kind.kind, end, lo: f.gap.lo, hi: f.gap.hi, gap: f.gap.gap, islands: f.gap.islands, capRow: f.capRow,
-    tried: { gap: first.gap.gap, islands: first.gap.islands }, nearest: null, ...extra,
+    tried: { gap: first.gap.gap, islands: first.gap.islands }, nearest: null, ...(f.kind.floor != null ? { floor: f.kind.floor } : {}), ...extra,
   });
   const moves = grid && !end ? PART_MOVES : 0;
   for (let j = 0; j <= moves; j++) {
@@ -2714,7 +2727,8 @@ const boxHolds = (a, b) => [0, 1, 2].every((k) => a.min[k] <= b.min[k] + 1e-6 &&
  * shell in the prism (a loose piece of the model, not the part's) goes back to the body. One subtraction takes every
  * prism out of the model.
  * @param {Manifold} solid the model (borrowed)
- * @param {{ frame: number[]|null, c: number[], z0: number, R: number, top: number, plug?: boolean }[]} parts
+ * @param {{ frame: number[]|null, c: number[], z0: number, R: number, top: number, plug?: boolean, floor?: number }[]} parts
+ *   `floor` where a base's own material starts over the model's end (`placePart`), its shells reaching that
  * @returns {{ body: Manifold, lids: { solid: Manifold|null, shells: number, loose: number }[] }} the caller's;
  *   `shells` how many shells of each part reach its plane (one when it comes out whole), `loose` how many went back
  */
@@ -2734,7 +2748,8 @@ export function carveParts(solid, parts) {
       const all = t.add(solid.intersect(prisms[k]));
       const shells = all.decompose().map((m) => t.add(m));
       const outer = shells.filter((m) => m.volume() > 0);
-      const mine = outer.filter((m) => lowestIn(p.frame, m) < p.z0 + PART_TOUCH);
+      // a base's own material may start over the model's end, inside a foot's rim (`floor`)
+      const mine = outer.filter((m) => lowestIn(p.frame, m) < Math.max(p.z0, p.floor ?? p.z0) + PART_TOUCH);
       const away = outer.filter((m) => !mine.includes(m));
       // a sealed hollow goes with the shell round it
       const hollows = shells.filter((m) => !(m.volume() > 0));
@@ -2812,7 +2827,7 @@ export function checkPart(solid, stack, fine, part, { hl, gmin, grid = null, let
  * The twist-lock a placed part gets, from the model's slices in its frame, as plain data: a lid's (or a full one's)
  * collar twist-lock (`collarAt`), a base's plug twist-lock on its own circle (`plugLockOf`), each `{ mech, … }` with
  * what its solids are built from; or `{ mech: null, why }` when none fits there.
- * @returns {object} 'twist': `{ mech, r0, rn, rs, rf, opening, theta, tabs, tabR, slope, reach, shelf, above, below }`;
+ * @returns {object} 'twist': `{ mech, r0, rn, rs, rf, opening, theta, tabs, tabR, slope, reach, hang, above, below }`;
  *   'plug': `{ mech, R, opening, theta, tabs, tabR, wall, camOutN, coin, zl }`
  */
 export function partLock(stack, fine, { c, R }, placed, S) {
@@ -2824,8 +2839,8 @@ export function partLock(stack, fine, { c, R }, placed, S) {
   }
   const L = collarAt(fine, c, placed.z0, S, stack.zmin);
   if (L.why) return { mech: null, why: L.why };
-  const { r0, rn, rs, rf, opening, theta, tabs, tabR, slope, reach: down, shelf, above, below } = L;
-  return { mech: 'twist', r0, rn, rs, rf, opening, theta, tabs, tabR, slope, reach: down, shelf, above, below };
+  const { r0, rn, rs, rf, opening, theta, tabs, tabR, slope, reach: down, hang, above, below } = L;
+  return { mech: 'twist', r0, rn, rs, rf, opening, theta, tabs, tabR, slope, reach: down, hang, above, below };
 }
 
 // ---------- room for pins on a cut face ----------
@@ -3002,7 +3017,7 @@ function roomAround(cut, by, bounds) {
  *   above], `minArea` the specks dropped from a slice
  * @returns {{ mech: 'twist', kind: 'full', frame: number[]|null, c: number[], z0: number, S: object, r0: number,
  *   rn: number, rs: number, rf: number, opening: number, theta: number, tabs: number, tabR: number, slope: number,
- *   reach: number, shelf: number, above: number[][], below: number[][] }|null} plain
+ *   reach: number, hang: number, above: number[][], below: number[][] }|null} plain
  */
 export function cutTwist(band, cut, k, island, { S, rooms, minArea }) {
   const side = k === 0 ? 1 : -1;
@@ -3028,12 +3043,23 @@ export function cutTwist(band, cut, k, island, { S, rooms, minArea }) {
   const L = collarAt(fine, c, z0, S, z0 - rooms[k]);
   // the socket's piece goes on round the axis all the way up the socket ring, or the ring would stand out of it
   if (L.why || L.above[L.above.length - 1][1] < lidRoom - 1e-9) return null;
-  const { r0, rn, rs, rf, opening, theta, tabs, tabR, slope, reach: depth, shelf, above, below } = L;
+  // nor may the socket cut its piece in two: something in the bore under the socket's ceiling (a plate across a
+  // tube) with something standing on it wholly inside the socket (a post, a candle's) – the ring would leave the plate
+  // loose in the bore, and the full disc would cut the post off with it. Judged on the slices, so the readout and
+  // the suggested spots promise the lock the download builds
+  const bore = L.rn - S.c;
+  let held = false;
+  for (let h = 0; h <= S.sockTop + 1e-9 && !held; h += S.hl / 2) held = fine(z0 + h + OVER).some((x) => reach(x, c).dmin < bore);
+  if (held && fine(z0 + S.sockTop + S.hl / 2 + OVER).some((x) => reach(x, c).dmax < L.rs)) return null;
+  const { r0, rn, rs, rf, opening, theta, tabs, tabR, slope, reach: depth, hang, above, below } = L;
   return {
     mech: 'twist', kind: 'full', frame: partFrame({ axis: cut.axis, side }), c, z0, S, r0, rn, rs, rf, opening, theta, tabs, tabR, slope,
-    reach: depth, shelf, above, below,
+    reach: depth, hang, above, below,
   };
 }
+
+/** How thick a wall too thin for a lip is taken to be (mm) when its outline is asked whether it would take clips. */
+const THICK_WALL = 4;
 
 /**
  * The lips of the cuts that come apart, worked out face by face as the layout works them out: the shadow of the air
@@ -3054,13 +3080,24 @@ function lipKit({ solid, cuts, bounds, c, nozzle, hl = 0.2, keep, lipBand, sourc
    * The twist-lock side k of a patch takes with the neck on it, where its lip (`plan`) has no clip on a hold with them
    * because the face's outline takes none even with nothing in the way – a round wall, an odd outline (a full lip
    * with nothing over it or beside it has no window for one) – whether its lip is clipless or there is none: only on a
-   * face of one patch (a speck too small for one left out, as the lip leaves it), and centred on it. Kept on the cut.
+   * face of one patch (a speck too small for one left out, as the lip leaves it), and centred on it. A wall too thin
+   * for any lip is judged by its outline with a wall thick enough for one (`THICK_WALL`): a round jar's 2 mm wall takes
+   * the twist-lock, which needs no such wall, where a square tower's would take clips. Kept on the cut.
    */
   const twistAt = (ctx, patch, k, plan) => {
     const hold = ctx.cut.apart?.hold ?? 'snap';
     if (!catchSizes(hold, c) || plan?.windows.length > 0 || ctx.patches.length !== 1 || ctx.patches[0] !== patch || patch.skip) return null;
     patch.bare ??= planLip(patch.lip, { island: patch.island, c, nozzle, H: LIP.heights[0], hold, key: false }) ?? false;
-    if (!patch.bare || patch.bare.windows.length > 0) return null;
+    if (!patch.bare) {
+      if (patch.thick === undefined) {
+        const { CrossSection } = manifold();
+        const outline = keep.add(new CrossSection(polygonsOf(patch.island).filter((r) => ringArea(r) > 0), 'Positive'));
+        const thick = keep.add(outline.subtract(keep.add(outline.offset(-THICK_WALL, 'Round', 2, 32))));
+        patch.thick = planLip(thick, { island: thick, c, nozzle, H: LIP.heights[0], hold, key: false }) ?? false;
+      }
+      if (patch.thick && patch.thick.windows.length > 0) return null;
+    }
+    if (patch.bare && patch.bare.windows.length > 0) return null;
     ctx.twists ??= new Map();
     if (!ctx.twists.has(k)) {
       // specks of the slices dropped as the finder drops them
@@ -4081,8 +4118,9 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
       return list.length === 1 ? list[0] : list;
     };
     const here = live.filter((patch) => patch.lipOn).map((patch) => patch.lipOn);
-    // the faces with a lip on offer that no piece may carry, lying as it must already, and those with none
-    const lying = live.filter((patch) => !patch.lipPair?.male && !patch.lipPair?.moved && patch.lipPair?.pair.quality.some(Boolean));
+    // the faces with a lip on offer that no piece may carry, lying as it must already, and those with none: a
+    // twist-lock alone on offer, whose socket's piece may not lie on its cut face, is no lip (its walls may be too thin)
+    const lying = live.filter((patch) => !patch.lipPair?.male && !patch.lipPair?.moved && patch.lipPair?.pair.quality.some((q) => q?.H > 0));
     if (here.length) {
       const male = new Set(here.map((l) => l.sides[l.male].piece));
       const female = new Set(here.map((l) => l.sides[1 - l.male].piece));
@@ -4563,7 +4601,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
               Object.assign(fallbacks[seam.cutId], { apart: seam.apart, joint: here.length ? seam.joint : 'none' });
               seam.apart = {
                 hold, lip: false, clips: 0, height: 0, key: false, faces: seam.patches, flat: 0, mech: 'twist', r0: lock.r0,
-                opening: lock.opening, theta: lock.theta, tabs: lock.tabs, socket: lock.socket, slope: lock.slope, shelf: lock.shelf,
+                opening: lock.opening, theta: lock.theta, tabs: lock.tabs, socket: lock.socket, slope: lock.slope, hang: lock.hang,
               };
             }
           }

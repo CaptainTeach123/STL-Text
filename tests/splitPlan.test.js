@@ -2480,7 +2480,11 @@ describe('cuts that come apart', () => {
     expect(lipMale([{ H: 0, clips: 0, area: 0, twist: true }, clipless], [true, true])).toEqual({ male: 0, alt: null });
     expect(lipMale([clipless, twisted], [true, true])).toEqual({ male: 1, alt: null });
     expect(socketsAsWell([10000, 0], 1728)).toEqual([false, true]);
-    expect(socketsAsWell([800, 1600], 1728)).toEqual([true, false]);
+    // an end no larger than the face lies as well either way – an open tube's rim, a solid cylinder's end – and one
+    // larger would hang past the face upside down: a closed tube's
+    expect(socketsAsWell([800, 1600], 1728)).toEqual([true, true]);
+    expect(socketsAsWell([1728, 1728], 1728)).toEqual([true, true]);
+    expect(socketsAsWell([1900, 20], 1728)).toEqual([false, true]);
     // and a spot with it scores as one with clips
     expect(spotScore({ clips: 0, twist: true, shift: 3.92, distance: 9.5, fraction: 0.28 })).toBe(spotScore({ clips: 4, shift: 3.92, distance: 9.5, fraction: 0.28 }));
     // laid: the neck stands 2.4 mm out of the body's face, the cut's lip given way to it; the top lies on its cut face

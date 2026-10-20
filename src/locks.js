@@ -83,6 +83,19 @@ export const ddOf = (c) => Math.min(0.3, Math.max(0.15, r6(0.45 - c)));
 export const gminOf = (c) => r6(2 * (PRINTERS.typical.ef + PRINTERS.typical.delta) + 2 * c);
 
 /**
+ * The click tab's length (mm): the shortest whole half millimetre over 8 whose bending strain at its root, pushed
+ * where its ridge is (`ridgeIn` from its free end) by the interference a typical printer prints – the most a ridge is
+ * drawn, 0.3 mm, and twice its wall error – stays under PLA's limit (`MATERIALS.PLA.strain`), with 3 % to spare for
+ * the tab's curve round the neck. The strain grows with the tab's thickness and falls with the square of its lever,
+ * so the thicker tab of a wide nozzle is longer: 9 mm for a 1.2 mm tab, 11 for 1.8 and 12.5 for 2.4.
+ */
+function tabLength(td, ridgeIn) {
+  const i = 0.3 + 2 * PRINTERS.typical.delta;
+  const lever = Math.sqrt((3 * i * td) / (2 * ((0.97 * MATERIALS.PLA.strain) / 100)));
+  return Math.max(8, Math.ceil((lever + ridgeIn) * 2 - 1e-9) / 2);
+}
+
+/**
  * Every size of the twist-lock that follows from the printer (mm). Heights
  * are whole layers from the joint face, since half a layer off left a lid
  * almost no play as printed; every flat ceiling over a moving part has one
@@ -106,6 +119,10 @@ export function sizes(n = 0.4, hl = 0.2, c = 0.15) {
   const g = r6(Math.max(0.8, 2 * n, 2 * c + 0.2)); // the slits beside and behind the tab
   const b = up(1.2, hl); // the tab's height
   const gTop = r6(Math.max(0.8, up(3 * hl, hl) + sag)); // the slit over the tab: three layers and the sag
+  const dd = ddOf(c);
+  const fb = 0.3;
+  // the ridge's middle, where the neck pushes the tab, this far in from the tab's free end: half its base and a tenth
+  const ridgeIn = r6((fb + 2 * (dd + c + 0.2)) / 2 + 0.1);
   return {
     n, hl, c, cz, sag, ledge, zl, a, t, H, td, g, b, gTop,
     e: 0.5, // how far the lug's square shoulder bears: one line drawn out over air at most
@@ -113,8 +130,8 @@ export function sizes(n = 0.4, hl = 0.2, c = 0.15) {
     lead: 0.3, // 45° lead-ins on the lugs' ends and the ledges' ends, so a drooped edge rides up instead of snagging
     mouth: 0.4, // a 45° mouth on every bed edge a mating part passes, for the elephant's foot
     slitMouth: 0.3,
-    dd: ddOf(c), fb: 0.3, // the ridge: how far it reaches past the neck, its flat tip
-    Ld: 8, // the tab's length: at 8 mm its strain stays under PLA's 1.5 % as a typical printer prints it (7 mm was 1.85 %)
+    dd, fb, ridgeIn, // the ridge: how far it reaches past the neck, its flat tip, where it stands on the tab
+    Ld: tabLength(td, ridgeIn), // the tab's length: 9 mm for a 1.2 mm tab, longer for a wide nozzle's thicker one
     skin: r6(2 * n), // kept over every cutter, so nothing of the lock shows outside
     sockTop: r6(H + cz + sag), // the socket's ceiling
     armTop: r6(zl + a + cz + sag), // the slot arm's ceiling
@@ -253,18 +270,24 @@ export function domeRoom(outer, S, { step = 0.01 } = {}) {
  * socket's (`rs`) and the slots' (`rf`) radii, the twist, the click tabs and
  * where they flex (`tabR`, their middle). When none fits, `{ r0, why }`:
  * 'room' when the skin leaves no neck wider than its wall and 2 mm, 'tabs'
- * when some gap between the slots has no room for a click tab.
+ * when some gap between the slots has no room for a click tab, or the tabs
+ * would bend further than PLA takes over and over (`click`).
  */
 export function collarFor(outer, S, { phi0 = 0 } = {}) {
   const r0 = domeRoom(outer, S);
   if (r0 == null || r0 - S.t <= 2) return { r0, why: 'room' };
   const L = layout(S, r0, { phi0 });
-  if (!L.ok) return { r0, why: 'tabs', layout: L };
+  const tabR = r6(r0 + S.c + S.td / 2);
+  // a tab that would bend further than the plastic takes over and over cracks or takes a set, and the click goes
+  if (!L.ok || !clickHolds(S, tabR)) return { r0, why: 'tabs', layout: L };
   return {
     r0, rn: r6(r0 - S.t), rs: r6(r0 + S.c), rf: r6(r0 + 2 * S.c + S.e), opening: r6(2 * (r0 - S.t)),
-    theta: L.theta, tabs: L.tabs.length, tabR: r6(r0 + S.c + S.td / 2), layout: L,
+    theta: L.theta, tabs: L.tabs.length, tabR, layout: L,
   };
 }
+
+/** Whether click tabs at radius r keep PLA under its strain as a typical printer prints them (`click`). */
+const clickHolds = (S, r) => click(S, r, 1, { printer: 'typical' }).ok;
 
 /** The collar's underside never slopes out further than this (r per z): 59.8° from vertical. */
 export const STEEP = 1.72;
@@ -287,10 +310,11 @@ export function collarSlope(below, S) {
 /**
  * How deep under the face the collar reaches: where its underside, sloping out from the neck's bore rn, lands on the
  * wall's inside – from there down it lies inside the wall – or meets the wall's outside inset by the skin, where it
- * ends (the inside of a square tube's corner lies past its outside's nearest point); or, where the wall round the axis
- * ends before either (a lantern's band over its windows), at that end, with `shelf` the width the collar's bottom
- * stands in from the wall there, over air. Null when `below` does not reach under the collar's bore.
- * @returns {{ depth: number, shelf: number }|null}
+ * ends (the inside of a square tube's corner lies past its outside's nearest point). Where the wall round the axis
+ * ends before either (a lantern's band over its windows), the collar runs on under the wall's end, `hang` further,
+ * its outside standing straight down from the wall's at `r`, until its underside meets that: its bottom cut flat
+ * there would be a shelf over air, which needs support. Null when `below` does not reach under the collar's bore.
+ * @returns {{ depth: number, hang: number, r: number|null }|null} `r` null when the collar lands on the wall
  */
 export function collarReach(below, rn, S, slope) {
   let last = null;
@@ -299,10 +323,12 @@ export function collarReach(below, rn, S, slope) {
     if (d < S.Hc - 1e-9) continue;
     const line = rn + slope * (d - S.Hc);
     const wall = Math.min(rin, r - S.skin);
-    if (line >= wall - 1e-9) return { depth: d, shelf: 0 };
-    last = { depth: d, shelf: wall - line };
+    if (line >= wall - 1e-9) return { depth: d, hang: 0, r: null };
+    last = { d, wall, line };
   }
-  return last;
+  if (!last) return null;
+  const hang = r6((last.wall - last.line) / slope);
+  return { depth: r6(last.d + hang), hang, r: r6(last.wall) };
 }
 
 // ---------- the plug twist-lock (bases) ----------
@@ -430,7 +456,8 @@ export function plugFor(S, { Rwindow, solidTop, ringOutAt }) {
  * why none: 'floor' when the bottom is not solid a millimetre over the lock,
  * 'wall' when the ring behind the slots is too thin, 'cam' when it would
  * spread before the plug's hold is reached, 'tabs' when a gap between the
- * slots has no room for a click tab.
+ * slots has no room for a click tab, or the tabs would bend further than PLA
+ * takes over and over (`click`).
  * @returns {object} as `plugFor`'s, or `{ R, why }`
  */
 export function plugAt(S, R, { solidTop, ringOutAt }) {
@@ -444,10 +471,11 @@ export function plugAt(S, R, { solidTop, ringOutAt }) {
   const cam = camOut(S, R, d, ringOut);
   if (cam < need) return { R, why: 'cam' };
   const L = plugLayoutOk(S, R, d);
-  if (!L.ok) return { R, why: 'tabs' };
+  const tabR = r6(R - S.c - S.td / 2);
+  if (!L.ok || !clickHolds(S, tabR)) return { R, why: 'tabs' };
   return {
     R, opening: r6(2 * R), theta: L.theta, wall: r6(wall), camOutN: Math.round(cam), ringOut: r6(ringOut),
-    zl: d.zl, top: d.top, rp: d.rp, coin: d.coin, tabs: L.tabs.length, tabR: r6(R - S.c - S.td / 2), layout: L,
+    zl: d.zl, top: d.top, rp: d.rp, coin: d.coin, tabs: L.tabs.length, tabR, layout: L,
   };
 }
 
@@ -607,9 +635,10 @@ export function plugHold(S, material = 'PLA') {
 /**
  * The click: the turn it takes to snap the tabs' ridges out of their
  * grooves (N·m), and the strain each tab bends to. Each tab is a curved
- * cantilever `S.Ld` long at radius r (its middle), pushed aside by the
- * ridge's printed interference – drawn `S.dd`, printed that and twice the
- * printer's wall error – over a 45° flank with friction.
+ * cantilever at radius r (its middle) pushed aside where its ridge is,
+ * `S.ridgeIn` short of its free end – what lies past the ridge bends nothing
+ * – by the ridge's printed interference – drawn `S.dd`, printed that and
+ * twice the printer's wall error – over a 45° flank with friction.
  * @param {object} S `sizes()`
  * @param {number} r the tabs' middle radius (`collarFor` / `plugFor` `tabR`)
  * @param {number} tabs how many
@@ -621,7 +650,8 @@ export function click(S, r, tabs, { printer = 'tuned', material = 'PLA', nominal
   const M = MATERIALS[material];
   const { E, mu } = nominal ? M.nominal : M.weak;
   const i = r6(S.dd + 2 * PRINTERS[printer].delta);
-  const beam = arcBeam({ R: r, span: S.Ld, b: S.b, t: S.td, E, ends: 'one' });
+  // a point load bends a beam's elements as cubics, which a few dozen of them follow exactly
+  const beam = arcBeam({ R: r, span: S.Ld - S.ridgeIn, b: S.b, t: S.td, E, ends: 'one', n: 24 });
   const strain = beam.strainPerMm * i * 100;
   return { torque: ((tabs * beam.k * i * (1 + mu)) / (1 - mu)) * (r / 1000), strain, ok: strain <= M.strain + 1e-9, i };
 }

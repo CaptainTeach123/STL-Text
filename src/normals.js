@@ -258,9 +258,7 @@ export function cornerNormals(positions, index, creaseDeg = 36, topology = null)
     let closed = false;
     for (;;) {
       visited[cur] = 1;
-      fan[n] = cur;
-      if (n > 0) cut[n] = isSharp(tri(fan[n - 1]), tri(cur)) ? 1 : 0;
-      n++;
+      fan[n++] = cur;
       const tw = twin[cur];
       if (tw < 0 || n > degree) break; // open edge (or a damaged fan)
       const nxt = next(tw);
@@ -270,7 +268,17 @@ export function cornerNormals(positions, index, creaseDeg = 36, topology = null)
       }
       cur = nxt;
     }
-    cut[0] = closed ? (isSharp(tri(fan[n - 1]), tri(start)) ? 1 : 0) : 1; // an open edge is sharp
+    // Each face is judged against the last face before it with a direction –
+    // round the end of a closed fan – seeing through degenerate ones, so a
+    // sliver between two faces at right angles does not smooth them together.
+    let last = -1;
+    if (closed) for (let j = n - 1; j >= 0 && last < 0; j--) if (!isZero(tri(fan[j]))) last = tri(fan[j]);
+    for (let j = 0; j < n; j++) {
+      const t = tri(fan[j]);
+      cut[j] = !isZero(t) && last >= 0 && isSharp(last, t) ? 1 : 0;
+      if (!isZero(t)) last = t;
+    }
+    if (!closed) cut[0] = 1; // an open edge is sharp
     // Start at the first cut so every group is contiguous in the walk; one
     // group when there is none (or a single sharp edge, which cuts nothing).
     let s = 0;

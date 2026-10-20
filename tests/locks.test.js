@@ -25,20 +25,21 @@ const cone = (s) => {
 
 describe('the twist-lock\'s sizes', () => {
   it('every size follows the printer as the table has it: whole layers, a layer more under ceilings, wide slits', () => {
-    const rows = ['cz', 'ledge', 'zl', 'a', 't', 'H', 'td', 'g', 'b', 'gTop', 'sockTop', 'armTop', 'armFloor', 'slitTop', 'Hc', 'skin', 'dd', 'gmin'];
+    const rows = ['cz', 'ledge', 'zl', 'a', 't', 'H', 'td', 'Ld', 'g', 'b', 'gTop', 'sockTop', 'armTop', 'armFloor', 'slitTop', 'Hc', 'skin', 'dd', 'gmin'];
     const table = [
-      // n, hl, c: cz ledge zl a t H td g b gTop sockTop armTop armFloor slitTop Hc skin dd gmin
-      [[0.4, 0.2, 0.15], [0.2, 0.8, 1, 1, 1.6, 2.4, 1.2, 0.8, 1.2, 0.8, 2.8, 2.4, 0.8, 2, 1.2, 0.8, 0.3, 0.9]],
-      [[0.4, 0.2, 0.3], [0.4, 0.8, 1.2, 1, 1.6, 2.6, 1.2, 0.8, 1.2, 0.8, 3.2, 2.8, 0.8, 2, 1.2, 0.8, 0.15, 1.2]],
-      [[0.4, 0.2, 0.4], [0.4, 0.8, 1.2, 1, 1.6, 2.6, 1.2, 1, 1.2, 0.8, 3.2, 2.8, 0.8, 2, 1.2, 0.8, 0.15, 1.4]],
-      [[0.25, 0.12, 0.15], [0.24, 0.8, 1.04, 1.08, 1.6, 2.36, 1.2, 0.8, 1.2, 0.8, 2.72, 2.48, 0.8, 2, 1.2, 0.5, 0.3, 0.9]],
-      [[0.6, 0.3, 0.15], [0.3, 1.2, 1.5, 1.5, 2.4, 3.6, 1.8, 1.2, 1.2, 1.2, 4.2, 3.6, 1.2, 2.4, 1.2, 1.2, 0.3, 0.9]],
+      // n, hl, c: cz ledge zl a t H td Ld g b gTop sockTop armTop armFloor slitTop Hc skin dd gmin
+      [[0.4, 0.2, 0.15], [0.2, 0.8, 1, 1, 1.6, 2.4, 1.2, 9, 0.8, 1.2, 0.8, 2.8, 2.4, 0.8, 2, 1.2, 0.8, 0.3, 0.9]],
+      [[0.4, 0.2, 0.3], [0.4, 0.8, 1.2, 1, 1.6, 2.6, 1.2, 9, 0.8, 1.2, 0.8, 3.2, 2.8, 0.8, 2, 1.2, 0.8, 0.15, 1.2]],
+      [[0.4, 0.2, 0.4], [0.4, 0.8, 1.2, 1, 1.6, 2.6, 1.2, 9, 1, 1.2, 0.8, 3.2, 2.8, 0.8, 2, 1.2, 0.8, 0.15, 1.4]],
+      [[0.25, 0.12, 0.15], [0.24, 0.8, 1.04, 1.08, 1.6, 2.36, 1.2, 9, 0.8, 1.2, 0.8, 2.72, 2.48, 0.8, 2, 1.2, 0.5, 0.3, 0.9]],
+      // a wide nozzle's tab is three of its lines thick, and so longer, to bend no further
+      [[0.6, 0.3, 0.15], [0.3, 1.2, 1.5, 1.5, 2.4, 3.6, 1.8, 11, 1.2, 1.2, 1.2, 4.2, 3.6, 1.2, 2.4, 1.2, 1.2, 0.3, 0.9]],
     ];
     for (const [[n, hl, c], values] of table) {
       const S = sizes(n, hl, c);
       expect([n, hl, c, rows.map((k) => S[k])]).toEqual([n, hl, c, values]);
-      // what the printer does not change: the lugs, the tab's length, the lead-ins and the mouths
-      expect(S).toMatchObject({ n, hl, c, e: 0.5, N: 3, w: 5, wKey: 6.5, Ld: 8, fb: 0.3, lead: 0.3, mouth: 0.4, slitMouth: 0.3 });
+      // what the printer does not change: the lugs, the lead-ins and the mouths
+      expect(S).toMatchObject({ n, hl, c, e: 0.5, N: 3, w: 5, wKey: 6.5, fb: 0.3, lead: 0.3, mouth: 0.4, slitMouth: 0.3 });
     }
     expect(sizes()).toEqual(sizes(0.4, 0.2, 0.15));
   });
@@ -57,9 +58,9 @@ describe('the collar twist-lock\'s layout', () => {
     const at300 = layout(S, 14.62);
     expect([at300.ok, at300.theta, psis(at300)]).toEqual([true, 29, [23.41, 140.47, 260.47]]);
     const at400 = layout(S, 22.4);
-    expect([at400.ok, at400.theta, psis(at400)]).toEqual([true, 19, [15.3, 44.78, 133.38, 162.86, 253.38, 282.86]]);
+    expect([at400.ok, at400.theta, psis(at400)]).toEqual([true, 19, [15.3, 47.32, 133.38, 165.4, 253.38, 285.4]]);
     const print = layout(S, 21.39);
-    expect([print.ok, print.theta, psis(print)]).toEqual([true, 20, [16.02, 46.88, 134.01, 164.87, 254.01, 284.87]]);
+    expect([print.ok, print.theta, psis(print)]).toEqual([true, 20, [16.02, 49.54, 134.01, 167.53, 254.01, 287.53]]);
     // the lugs: the key first, wider, the slots' arms running back θ from each to its entry
     expect(at400.lugs.map((l) => [l.phi, l.w])).toEqual([[0, 6.5], [120, 5], [240, 5]]);
     expect(at400.arms[1][0]).toBeCloseTo(120 - 19 - (2.5 / 22.4 + 0.15 / 22.4) * (180 / Math.PI), 9);
@@ -70,8 +71,9 @@ describe('the collar twist-lock\'s layout', () => {
     const small = layout(S, 6.54);
     expect(small.ok).toBe(false);
     expect(small.theta).toBe(64);
-    // at c 0.4 the lantern's 300 % neck fits one tab only
-    const one = layout(sizes(0.4, 0.2, 0.4), 13.73);
+    // at c 0.4 the lantern's 300 % neck fits no tab, and one a little wider fits one only
+    expect(layout(sizes(0.4, 0.2, 0.4), 13.73).tabs).toHaveLength(0);
+    const one = layout(sizes(0.4, 0.2, 0.4), 13.95);
     expect([one.ok, one.tabs.length]).toEqual([false, 1]);
   });
 
@@ -207,28 +209,34 @@ describe('the collar under the joint', () => {
     expect(collarSlope([], S)).toBeNull();
   });
 
-  it('reaches down to where it lands on the wall\'s inside, or stands in from it where the wall ends', () => {
+  it('reaches down to where it lands on the wall\'s inside, or runs on under the wall\'s end until it meets it there', () => {
     // the round lantern under its eave: from the bore 42.41 out at 45°, onto the wall's inside at 42 at once
     const eave = wall(() => 44.98, () => 42, 20);
-    expect(collarReach(eave, 42.41, S, 1)).toEqual({ depth: 1.25, shelf: 0 });
+    expect(collarReach(eave, 42.41, S, 1)).toEqual({ depth: 1.25, hang: 0, r: null });
     // the fixture at 400 %: lands on the band's inside (36.4) 9.75 mm down
     const band = (d) => (d < 4.75 ? 24.75 + 1.527 * d : 36.4);
-    expect(collarReach(wall((d) => 41.78, band, 10.75), 22.11, S, 1.72)).toEqual({ depth: 9.75, shelf: 0 });
-    // at 300 % the band ends 8.25 mm down, the collar's underside 0.894 mm short of its inside
+    expect(collarReach(wall((d) => 41.78, band, 10.75), 22.11, S, 1.72)).toEqual({ depth: 9.75, hang: 0, r: null });
+    // at 300 % the band ends 8.25 mm down, the collar's underside 0.894 mm short of its inside: rather than stop there
+    // in a flat shelf over air, it runs on under the band's end, its outside straight down from the band's inside,
+    // until its underside meets that, 0.894 / 1.72 further down
     const short = collarReach(wall(() => 31.33, (d) => (d < 4 ? 18.49 + 1.527 * d : 27.3), 8.25), 14.28, S, 1.72);
-    expect(short.depth).toBe(8.25);
-    expect(short.shelf).toBeCloseTo(27.3 - (14.28 + 1.72 * 7.05), 9);
+    const gap = 27.3 - (14.28 + 1.72 * 7.05);
+    expect(gap).toBeCloseTo(0.894, 9);
+    expect(short.r).toBe(27.3);
+    expect(short.hang).toBeCloseTo(gap / 1.72, 6);
+    expect(short.depth).toBeCloseTo(8.25 + gap / 1.72, 6);
     // a wall solid over the axis carries it straight away, at the collar's own depth; none under it, nothing
-    expect(collarReach(wall(() => 30, () => 0, 3), 20, S, 1.72)).toEqual({ depth: 1.25, shelf: 0 });
+    expect(collarReach(wall(() => 30, () => 0, 3), 20, S, 1.72)).toEqual({ depth: 1.25, hang: 0, r: null });
     expect(collarReach(wall(() => 30, () => 25, 1), 20, S, 1.72)).toBeNull();
     // a square tube 40 mm across and 2 mm thick: its inside's corner (25.46) lies past its outside's nearest point (20),
     // so the collar ends where it meets the outside inset by the skin, 19.2 mm out
     const square = wall(() => 20, () => 18 * Math.SQRT2, 8);
-    expect(collarReach(square, 15.45, S, 1)).toEqual({ depth: 5, shelf: 0 });
-    // and ended by a wall that stops short of both: what it stands in from the nearer
+    expect(collarReach(square, 15.45, S, 1)).toEqual({ depth: 5, hang: 0, r: null });
+    // and ended by a wall that stops short of both: it runs on from the nearer, the outside inset
     const stops = collarReach(wall(() => 20, () => 18 * Math.SQRT2, 3), 15.45, S, 1);
-    expect(stops.depth).toBe(3);
-    expect(stops.shelf).toBeCloseTo(19.2 - 17.25, 9);
+    expect(stops.r).toBe(19.2);
+    expect(stops.hang).toBeCloseTo(19.2 - 17.25, 6);
+    expect(stops.depth).toBeCloseTo(3 + 19.2 - 17.25, 6);
   });
 });
 
@@ -266,16 +274,20 @@ describe('the plug twist-lock', () => {
     expect(camOut(S, 21.3, d, 22.25)).toBe(0);
     expect(Math.round(camOut(S, 21.3, d, 27.96))).toBe(1881);
     expect(plugFor(S, { Rwindow: 21.3, solidTop: 20, ringOutAt: () => 25 })).toMatchObject({ R: 19, camOutN: 1830, wall: 5.05 });
-    // round a 27.8 mm bore one click tab fits, whatever the ring, and nothing smaller has room for more
+    // round a 27.8 mm bore no click tab fits, whatever the ring, and round a 28.8 mm one only
     expect(plugLayoutOk(S, 13.9)).toMatchObject({ ok: false, theta: 35 });
-    expect(plugLayoutOk(S, 13.9).tabs).toHaveLength(1);
-    expect(plugFor(S, { Rwindow: 13.9, solidTop: 20, ringOutAt: () => 40 })).toBeNull();
+    expect(plugLayoutOk(S, 13.9).tabs).toHaveLength(0);
+    expect(plugLayoutOk(S, 14.4).tabs).toHaveLength(1);
+    expect(plugFor(S, { Rwindow: 14.4, solidTop: 20, ringOutAt: () => 40 })).toBeNull();
     // three times the plug's hold is 1815 N: a ring spread at 1814.8 N is not enough
     const s = 2.65;
     expect(Math.round(camOut(S, 18.1, plugDims(S, 18.1), 9 * s) * 10) / 10).toBe(1814.8);
     expect(plugFor(S, { Rwindow: 8.6 * s, solidTop: 6.5 * s, ringOutAt: () => 9 * s })).toMatchObject({ R: 18, camOutN: 1934 });
-    // a 2 mm nozzle's ring keeps two of its lines and a millimetre behind the slots, though a 4.9 mm ring would hold
-    expect(plugFor(sizes(2, 0.3, 0.3), { Rwindow: 25, solidTop: 30, ringOutAt: () => 25 })).toMatchObject({ R: 18.9, wall: 5 });
+    // a 2 mm nozzle's ring keeps two of its lines and a millimetre behind the slots: 4.9 mm is too thin, though it
+    // would hold (and its tabs, six of its lines thick, are then too long to go round the bore)
+    const wide = { solidTop: 30, ringOutAt: () => 25 };
+    expect(plugAt(sizes(2, 0.3, 0.3), 19, wide)).toEqual({ R: 19, why: 'wall' });
+    expect(plugAt(sizes(2, 0.3, 0.3), 18.9, wide)).toEqual({ R: 18.9, why: 'tabs' });
     // the lock stands 5.26 mm over the bed: a bottom solid less than a millimetre over that takes none
     expect(plugFor(S, { Rwindow: 30, solidTop: 6.26, ringOutAt: () => 60 })).toBeNull();
     expect(plugFor(S, { Rwindow: 30, solidTop: 6.27, ringOutAt: () => 60 })).not.toBeNull();
@@ -375,14 +387,14 @@ describe('springs, holds and clicks', () => {
     expect(lugHold(sizes(), 'PETG').pull).toBeCloseTo(lugHold(sizes()).pull, 9);
   });
 
-  it('the clicks take the turns worked out for the lantern\'s lid and base, and the 8 mm tab keeps PLA under its strain', () => {
+  it('the clicks take the turns worked out for the lantern\'s lid and base, and the 9 mm tab keeps PLA under its strain', () => {
     // [tab radius, tabs, c] → PLA weak/nominal on a tuned printer, the same on a typical one, PETG weak tuned (N·m)
     const rows = [
-      [15.37, 3, 0.15, [0.074, 0.128, 0.092, 0.16, 0.05]],
-      [23.15, 6, 0.15, [0.216, 0.374, 0.27, 0.468, 0.147]],
-      [20.55, 3, 0.15, [0.096, 0.167, 0.121, 0.209, 0.066]],
-      [27.95, 3, 0.15, [0.129, 0.224, 0.162, 0.28, 0.088]],
-      [23.15, 6, 0.3, [0.135, 0.234, 0.189, 0.328, 0.092]],
+      [15.37, 3, 0.15, [0.071, 0.124, 0.089, 0.154, 0.048]],
+      [23.15, 6, 0.15, [0.208, 0.361, 0.26, 0.451, 0.142]],
+      [20.55, 3, 0.15, [0.093, 0.161, 0.116, 0.202, 0.063]],
+      [27.95, 3, 0.15, [0.125, 0.216, 0.156, 0.27, 0.085]],
+      [23.15, 6, 0.3, [0.13, 0.226, 0.182, 0.316, 0.089]],
     ];
     for (const [r, tabs, c, want] of rows) {
       const S = sizes(0.4, 0.2, c);
@@ -392,16 +404,47 @@ describe('springs, holds and clicks', () => {
     // the printed interference: drawn 0.3, and twice the printer's wall error
     expect(click(sizes(), 23.15, 6).i).toBe(0.4);
     expect(click(sizes(), 23.15, 6, { printer: 'typical' }).i).toBe(0.5);
-    expect(two(click(sizes(), 23.15, 6).strain)).toBe(1.13);
+    expect(two(click(sizes(), 23.15, 6).strain)).toBe(1.1);
     const typical = click(sizes(), 23.15, 6, { printer: 'typical' });
-    expect([two(typical.strain), typical.ok]).toEqual([1.41, true]);
-    expect(two(click(sizes(0.4, 0.2, 0.3), 23.15, 6, { printer: 'typical' }).strain)).toBe(0.99);
-    // a 7 mm tab bends 1.85 % as a typical printer prints it: too much for PLA, though PETG takes it
-    const short = { ...sizes(), Ld: 7 };
-    const seven = click(short, 15.37, 3, { printer: 'typical' });
-    expect([two(seven.strain), seven.ok]).toEqual([1.85, false]);
+    expect([two(typical.strain), typical.ok]).toEqual([1.38, true]);
+    expect(two(click(sizes(0.4, 0.2, 0.3), 23.15, 6, { printer: 'typical' }).strain)).toBe(0.96);
+    // an 8 mm tab, pushed where its ridge is, 0.9 mm from its free end, bends 1.8 % as a typical printer prints it: too
+    // much for PLA, though PETG takes it
+    const short = { ...sizes(), Ld: 8 };
+    const eight = click(short, 15.37, 3, { printer: 'typical' });
+    expect([two(eight.strain), eight.ok]).toEqual([1.8, false]);
     expect(click(short, 15.37, 3, { printer: 'typical', material: 'PETG' }).ok).toBe(true);
     expect(MATERIALS.PLA.strain).toBe(1.5);
+  });
+
+  it('a wide nozzle\'s thicker tab is longer, so every tab bends under PLA\'s 1.5 % where its ridge pushes it', () => {
+    // the tab is three lines thick and its strain grows with its thickness: kept 8 mm long, a 0.6 mm nozzle's would
+    // bend 2.7 % and a 0.8 mm one's 3.6 %, and crack or take a set after a few turns
+    const at = (n) => sizes(n, n / 2, 0.15);
+    expect([0.25, 0.4, 0.5, 0.6, 0.8].map((n) => [at(n).td, at(n).Ld])).toEqual([[1.2, 9], [1.2, 9], [1.5, 10], [1.8, 11], [2.4, 12.5]]);
+    let accepted = 0;
+    for (const n of [0.25, 0.4, 0.5, 0.6, 0.8, 1]) {
+      for (const c of [0.1, 0.15, 0.3, 0.4]) {
+        const S = sizes(n, Math.min(0.3, n / 2), c);
+        for (const r of [15, 25, 45]) expect([n, c, r, click(S, r, 3, { printer: 'typical' }).strain <= 1.5]).toEqual([n, c, r, true]);
+        // and on every lid a lock is laid out for, however small
+        for (let k = 20; k <= 80; k += 4) {
+          const lock = collarFor(cone(k / 10), S);
+          if (lock.why) continue;
+          accepted++;
+          expect([n, c, k, click(S, lock.tabR, lock.tabs, { printer: 'typical' }).strain <= 1.5]).toEqual([n, c, k, true]);
+        }
+      }
+    }
+    expect(accepted).toBeGreaterThan(200);
+    // nor is a lock built whose tabs would: a 0.6 mm nozzle's tab as long as a 0.4 mm one's is turned away, lid or base
+    const S6 = sizes(0.6, 0.3, 0.15);
+    const outer = cone(4);
+    expect(collarFor(outer, S6)).toMatchObject({ tabs: 3, tabR: 19.62 });
+    expect(collarFor(outer, { ...S6, Ld: 8 })).toMatchObject({ why: 'tabs' });
+    const base4 = { Rwindow: 8.6 * 4, solidTop: 6.5 * 4, ringOutAt: () => 9.32 * 4 };
+    expect(plugFor(S6, base4)).toMatchObject({ R: 28.8, tabs: 3 });
+    expect(plugAt({ ...S6, Ld: 8 }, 28.8, base4)).toEqual({ R: 28.8, why: 'tabs' });
   });
 });
 
@@ -423,7 +466,7 @@ describe('the least scale', () => {
       }
     }
     const S = sizes();
-    expect(scalePercent(leastScale((s) => !collarFor(cone(s), S).why))).toBe(290);
+    expect(scalePercent(leastScale((s) => !collarFor(cone(s), S).why))).toBe(295);
   }, 240_000);
 
   it('a larger clearance or a wider nozzle never lowers it', () => {

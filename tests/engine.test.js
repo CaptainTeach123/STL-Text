@@ -9,7 +9,8 @@ import { manifold } from '../src/manifold.js';
 import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
 import { setup, soupOf as soupGeometry } from './helpers.js';
-import { batLanternSolid, roundLanternSolid } from './lanternFixture.js';
+import { batLanternSolid, roundLanternSolid, stlFileCheck } from './lanternFixture.js';
+import { hurricaneSolid } from './partFixtures.js';
 
 const soupOf = (solid, opts) => soupGeometry(solid, opts).attributes.position.array;
 
@@ -683,7 +684,8 @@ describe('a split that takes parts out', () => {
       apart: { hold: 'lock', lip: false, clips: 0, mech: 'twist', r0: lid.lock.r0, opening: lid.lock.opening, theta: 27, tabs: 3, teaLight: false, socket: 'ring', slope: 1.72 },
       part: { kind: 'lid', name: 'Dome and cap', centre: lid.centre, r: lid.r, side: 1, handle: true, span: [-1, 0, 0], way: { turn: 27, up: false, lift: 4.1, dir: [0, 1, 0], out: [0, 0, 1] } },
     });
-    expect(ex.seams[0].apart.shelf).toBeCloseTo(0.894, 3);
+    // the band ends 0.894 mm short of where the collar's underside meets its inside: the collar runs on under it
+    expect(ex.seams[0].apart.hang).toBeCloseTo(0.894 / 1.72, 3);
     expect(ex.seams[0].part.cap).toBeCloseTo(lid.cap, 2);
     expect(ex.seams[0].part.top).toBeCloseTo(lid.top, 2);
     expect(ex.seams[1]).toMatchObject({
@@ -708,6 +710,8 @@ describe('a split that takes parts out', () => {
     const plain = await exportFiles({ cuts: cuts('lift') });
     expect(plain.seams.map((x) => x.apart.mech)).toEqual([null, null]);
     expect(plain.notes.map((n) => n.code)).toEqual(['SPLIT', 'PART_LIFTS', 'PART_LIFTS']);
+    // saved as a slicer reads them: no sliver of the locks' booleans rounded to nothing, in any file
+    for (const f of ex.files.filter((x) => x.stl)) expect([f.file, stlFileCheck(f.stl)]).toEqual([f.file, { degenerate: 0, open: 0 }]);
     // the files: each one piece; the body stands as modelled with the handle's crown on it and the collar under the
     // face; the lid lies on its face, its socket ring added inside it; the plug on its bottom, its lugs standing out
     const [body, dome, plug] = ex.files.filter((f) => f.stl).map(solidOf);
@@ -815,7 +819,7 @@ describe('a split that takes parts out', () => {
   it('takes the full disc for the socket where the ring would leave a sliver loose in the bore: the round lantern at its eave', async () => {
     await load(roundLanternSolid());
     const ex = await exportFiles({ cuts: [partCut('c1', [0, 0], 150, 80)] });
-    expect(ex.seams[0].apart).toMatchObject({ hold: 'lock', mech: 'twist', theta: 10, tabs: 6, socket: 'disc', slope: 1, shelf: 0 });
+    expect(ex.seams[0].apart).toMatchObject({ hold: 'lock', mech: 'twist', theta: 10, tabs: 6, socket: 'disc', slope: 1, hang: 0 });
     expect(ex.seams[0].apart.r0).toBeCloseTo(44.02, 2);
     const files = ex.files.filter((f) => f.stl).map(solidOf);
     try {
@@ -952,6 +956,64 @@ describe('a split that takes parts out', () => {
     expect(under.seams.find((x) => x.joint === 'part')).toMatchObject({ at: 29.1, pieces: [2, 3] });
     // the piece the lid comes out of stands as modelled
     expect(under.pieces[1].down).toBe('-z');
+  });
+
+  it('takes the base out of a bottom that is not one flat face: recessed inside a foot\'s rim, or a little tilted', async () => {
+    const { Manifold } = wasm;
+    const bat4 = () => batLanternSolid().scale([4, 4, 4]);
+    const recess = Manifold.cylinder(1.2, 30, 30, 96).translate([0, 0, -1]);
+    const models = { tilted: bat4().rotate([0.2, 0, 0]), footed: bat4().subtract(recess) };
+    recess.delete();
+    for (const [name, model] of Object.entries(models)) {
+      await load(model, name);
+      const base = (await client.parts([], version, { printing, split: {} })).parts.find((e) => e.kind === 'plug');
+      expect([name, base.lock]).toMatchObject([name, { mech: 'plug' }]);
+      const ex = await exportFiles({ cuts: [partCut('c1', base.centre, base.face, base.r)] });
+      // (the tilted base's bottom is tilted too: it has nothing flat to stand on, and says so)
+      expect([name, ex.notes.map((n) => n.code).slice(0, 2)]).toEqual([name, ['SPLIT', 'PART_PLUG']]);
+      expect(ex.seams[0].apart).toMatchObject({ mech: 'plug', R: base.r });
+    }
+  });
+
+  it('takes a dome out from under a bail on side pivots: lifted the lock\'s own lift, it slides out under the arch', async () => {
+    // the arch comes down near the cap only over the rim of the dome, 40 mm under it: lifted 2.6 mm the cap is far
+    // under the arch, and the dome slides out along ±Y between the arms
+    await load(hurricaneSolid(), 'hurricane');
+    const table = await client.parts([], version, { printing, split: {} });
+    const lid = table.parts.find((e) => e.kind === 'lid');
+    expect(lid).toMatchObject({ name: 'Dome and cap', lock: { mech: 'twist' }, way: { up: false, lift: 2.6 } });
+    expect(Math.abs(lid.way.dir[1])).toBeCloseTo(1, 6);
+    const ex = await exportFiles({ cuts: [partCut('c1', lid.centre, lid.face, lid.r)] });
+    expect(ex.notes.map((n) => n.code)).toEqual(['SPLIT', 'PART_LOCK']);
+    expect(ex.seams[0].apart.mech).toBe('twist');
+    expect(ex.seams[0].part.way).toMatchObject({ up: false, lift: 2.6 });
+  });
+
+  it('Fit to my printer keeps a part that comes off as it is stored, and plans the other cuts on the body round it', async () => {
+    await load(batLanternSolid().scale([3, 3, 3]));
+    const table = await client.parts([], version, { printing, split: {} });
+    const lid = table.parts.find((e) => e.kind === 'lid');
+    const part = partCut('c1', lid.centre, lid.face, lid.r);
+    const plan = (cuts, bed) => client.planSplit([], version, { printing, split: { clearance: 0.15, cuts }, bed, mode: 'fit' });
+    // it fits whole: a glued cut goes and the part stays, the pieces offered the body and the part
+    const whole = await plan([part, { id: 'c2', position: [0, 0, 40], normal: [0, 0, 1] }], [250, 250, 250]);
+    expect(whole.cuts).toEqual([part]);
+    expect(whole.notes.map((n) => n.text)).toEqual(['This model fits your printer with cut A as it is – no more cuts needed.']);
+    expect(whole.pieces).toHaveLength(2);
+    // 75 mm across on a 70 mm bed: the part comes first, as stored, then cuts across X and Y that miss the dome it
+    // holds (±23.1 mm), where the model's own plan cuts through the middle
+    const small = await plan([part], [70, 70, 160]);
+    expect(small.cuts[0]).toEqual(part);
+    expect(small.cuts.slice(1).map((c) => c.normal)).toEqual([[1, 0, 0], [0, 1, 0]]);
+    expect(small.cuts.slice(1).every((c, i) => Math.abs(c.position[i]) > 23.2)).toBe(true);
+    expect(small.notes.map((n) => n.code)).toEqual(['APART_KEPT']);
+    // taken as the document numbers it, the split keeps the part: the files are the pieces offered
+    const cuts = small.cuts.map((c, i) => (c.id ? c : { ...c, id: `c${i + 1}` }));
+    const ex = await exportFiles({ cuts });
+    expect(ex.notes.map((n) => n.code)).toContain('PART_LOCK');
+    expect(ex.notes.map((n) => n.code)).not.toContain('PART_CROSSED');
+    expect(ex.pieces.map((p) => p.name)).toEqual(['piece 1 of 4', 'piece 2 of 4', 'piece 3 of 4', 'Dome and cap']);
+    expect(small.pieces).toHaveLength(ex.pieces.length);
   });
 
   it("can't take the dome and cap out from under a crown lowered onto them, and says what is in the way", async () => {

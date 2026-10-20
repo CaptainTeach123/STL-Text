@@ -10,7 +10,7 @@ import { unzipSync, strFromU8 } from 'three/examples/jsm/libs/fflate.module.js';
 import { initManifold, manifold } from '../src/manifold.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold, manifoldToSoup } from '../src/mesh.js';
-import { box as boxAt, lanternSolid, lidBoxSolid } from '../tests/lanternFixture.js';
+import { box as boxAt, lanternSolid, lidBoxSolid, roundLanternSolid } from '../tests/lanternFixture.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const out = path.join(root, 'e2e', 'out');
@@ -1989,9 +1989,51 @@ try {
       await page.click('#splitClearBtn');
       await idle();
 
-      // a plate with a thin tube standing on it: the plate's cut has dovetail tabs, and the tube's, which comes apart, is
-      // too thin for a lip. The fit test is the dovetail alone, and the tube's row then says it has no lip
-      await openStl(standFile, 'plate-and-tube');
+      // a round lantern's top twist-locks where its round wall takes no clips: its fit test is the twist-lock on two
+      // rings, and trying it leaves the row saying it twist-locks
+      const round = roundLanternSolid();
+      const roundFile = writeFixture('round-lantern.stl', soupOf(round));
+      round.delete();
+      await page.waitForTimeout(1000);
+      await openStl(roundFile, 'round-lantern');
+      await page.click('#addCutBtn');
+      await idle();
+      await page.fill('#cutList input[data-cut-at]', '150');
+      await page.dispatchEvent('#cutList input[data-cut-at]', 'change');
+      await measured();
+      await page.click('#cutList li:first-child label.cut-apart');
+      await measured();
+      await page.check('#resultToggle');
+      await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
+      await piecesAgain();
+      const twisting = (await apartRow()).meta;
+      await page.waitForTimeout(1000); // Chromium lets a page start about ten downloads a second
+      const twistTest = await fitTest('round-twist-fit-test.stl');
+      await idle();
+      const afterTest = (await apartRow()).meta;
+      check(
+        /· comes apart: twist-lock \(turn 10°\)$/.test(twisting) && twistTest.shells.length === 2 &&
+          /Two rings Ø \d+ mm with the twist-lock at this size \(about \d+ g\): they should twist together with a click and hold when pulled\./.test(twistTest.status) &&
+          afterTest === twisting,
+        "a round lantern's twist-lock has its own fit test, two rings, and the row still says it twist-locks after it",
+        `${twisting} | ${twistTest.shells.length} bodies | ${twistTest.status} | ${afterTest}`,
+      );
+      await page.uncheck('#resultToggle');
+      await page.click('#splitClearBtn');
+      await idle();
+
+      // a plate with a thin tube standing on it, closed at the top: the plate's cut has dovetail tabs, and the tube's,
+      // which comes apart, is too thin for a lip (an open tube's top twist-locks, as its lock needs no such wall; this
+      // one's would print on its cut face, its roof hung over its inside). The fit test is the dovetail alone, and the
+      // tube's row then says it has no lip
+      const capped = Manifold.union(
+        Manifold.cube([200, 60, 5], true).translate([0, 0, 2.5]),
+        Manifold.cylinder(75, 20, 20, 64).subtract(Manifold.cylinder(73, 18, 18, 64).translate([0, 0, -1])).translate([50, 0, 4]),
+      );
+      const cappedFile = writeFixture('plate-and-capped-tube.stl', soupOf(capped));
+      capped.delete();
+      await page.waitForTimeout(1000);
+      await openStl(cappedFile, 'plate-and-capped-tube');
       await page.click('#addCutBtn');
       await idle();
       await page.click('#addCutBtn');
@@ -2026,7 +2068,7 @@ try {
       await page.click('#splitSettings label:has(input[data-split="joint"][value="auto"])');
       await measured();
       await page.waitForTimeout(1000);
-      const tubeTest = await fitTest('plate-and-tube-apart-fit-test.stl');
+      const tubeTest = await fitTest('plate-and-capped-tube-fit-test.stl');
       const tubeMeta = await page.locator('#cutList .meta').allInnerTexts();
       check(
         tubeMixed.hint === 'Joints are for the glued cuts; cut B comes apart.' && !tubeMixed.joints && /· comes apart$/.test(tubeMixed.meta[1]) &&

@@ -23,7 +23,7 @@
  * returned is the caller's.
  */
 import { manifold } from './manifold.js';
-import { layout, plugDims, plugLayoutOk, twistFor } from './locks.js';
+import { collarReach, layout, plugDims, plugLayoutOk, twistFor } from './locks.js';
 
 /** Segments for a full turn of every revolve: 0.008 mm inside the circle at r 40, far under any clearance. */
 export const LOCK_SEGMENTS = 160;
@@ -252,10 +252,13 @@ export function twistLockSolids(S, r0, { theta = twistFor(S, r0), phi0 = 0 } = {
 /**
  * The collar under the joint: a revolved ring from the neck's bore rn outwards, `S.Hc` deep at the bore, its
  * underside sloping out and down at `slope` (`collarSlope`), clipped to the body's least outside radius under the face
- * (`below`) inset by the skin, so nothing of it shows outside. It carries the neck.
+ * (`below`) inset by the skin, so nothing of it shows outside. It carries the neck. Where the wall ends before the
+ * underside lands on it (`collarReach`), the collar runs on under the wall's end, its outside standing straight down
+ * a hair into the wall's inside, to where its underside meets that: no flat shelf over air.
  * @param {number} rn the neck's bore
  * @param {object} S `sizes()`
- * @param {number[][]} below `[[r, z], …]` by falling z from z = 0, down to where the collar reaches (`collarReach`)
+ * @param {number[][]} below `[[r, z, rin], …]` by falling z from z = 0, down to where the collar lands on the wall or
+ *   the wall ends (`collarAt`)
  * @param {number} slope r per z (`collarSlope`)
  * @returns {{ solid: Manifold, ids: number[] }} the caller's
  */
@@ -263,8 +266,12 @@ export function collarSolid(rn, S, below, slope) {
   const k = kit();
   try {
     const low = below[below.length - 1][1];
+    const inset = (r) => Math.max(0.01, r - S.skin);
+    const down = collarReach(below, rn, S, slope);
+    const hang = down?.hang > 0 ? Math.min(down.r + INTO, inset(below[below.length - 1][0])) : null;
+    const bottom = hang == null ? [[0, low]] : [[0, -down.depth - 1], [hang, -down.depth - 1], [hang, low]];
     const big = Math.max(...below.map(([r]) => r)) + 1;
-    const env = revolve(k, [[0, low], ...[...below].reverse().map(([r, z]) => [Math.max(0.01, r - S.skin), z]), [0, 0]]);
+    const env = revolve(k, [...bottom, ...[...below].reverse().map(([r, z]) => [inset(r), z]), [0, 0]]);
     const cone = revolve(k, [[rn, 0], [big, 0], [big, -S.Hc - (big - rn) / slope], [rn, -S.Hc]]);
     return { solid: cone.intersect(env), ids: [...k.ids] };
   } finally {
@@ -323,7 +330,9 @@ export function plugLockSolids(S, R) {
     const c45 = c * Math.SQRT2;
     const inner = rb - 0.05 - (rp - SINK);
     const armPoly = [[rb - 0.05, zl - rise - c45 + inner], [tipR + c, zl - c45 + c], [tipR + c, zl + a + c45 - c], [rb - 0.05, zl + a + rise + c45 - inner]];
-    const entryPoly = [[rb - 0.05, -1], [tipR + c, -1], ...armPoly.slice(2)];
+    // the entry a hair wider and higher than the arm it opens into, its roof as steep: two revolves of other spans on
+    // one face would meet chord against chord
+    const entryPoly = [[rb - 0.05, -1], [tipR + c + INTO, -1], [tipR + c + INTO, armPoly[2][1]], [rb - 0.05, armPoly[3][1] + INTO]];
     const lugs = [];
     const bodyCut = [];
     const plugCut = [];
@@ -335,7 +344,8 @@ export function plugLockSolids(S, R) {
       // the lug locks at phi and goes in at phi + θ
       bodyCut.push(revolve(k, armPoly, phi - half - cw, phi + theta + half + cw));
       bodyCut.push(revolve(k, entryPoly, phi + theta - half - cw, phi + theta + half + cw));
-      bodyCut.push(arcHull(k, [[-0.01, mouth], [mouth, 0]], phi + theta - half - cw, phi + theta + half + cw, rb - 0.05, tipR + c, rb));
+      // the entry's mouth on the bed, running on into the entry past its face
+      bodyCut.push(arcHull(k, [[-0.01, mouth], [mouth + INTO, -INTO]], phi + theta - half - cw, phi + theta + half + cw, rb - 0.05, tipR + c, rb));
     });
     // the bed mouths: the body's bore and the plug's bottom edge
     bodyCut.push(revolve(k, [[rb - 0.05, -1], [rb + mouth + 1, -1], [rb - 0.05, mouth + 0.05]]));
@@ -352,12 +362,13 @@ export function plugLockSolids(S, R) {
       plugCut.push(revolve(k, [[ri, -1], [rp - td, -1], [rp - td, b], [rp + 0.05, b], [rp + 0.05, roofTop], [ri, b + gTop]], freeEnd - gA, root));
       plugCut.push(revolve(k, [[ri, -1], [rp + 0.05, -1], [rp + 0.05, roofTop], [ri, b + gTop]], freeEnd - gA, freeEnd));
       plugCut.push(revolve(k, [[ri - sm, -1], [rp - td + sm, -1], [rp - td + sm, 0], [rp - td, sm], [ri, sm], [ri - sm, 0]], freeEnd - gA, root));
-      // the ridge: from the tab's face out to dd past the bore, 45° flanks, its bed edge eased
+      // the ridge: from the tab's face out to dd past the bore, 45° flanks, its bed edge eased, its top a hair into the
+      // slit over the tab rather than flush with the tab's top
       const pts = [];
       for (const [r, w] of [[rb + dd, fb], [rp - 0.2, base]]) {
         for (const s of [-1, 1]) {
           const ang = psi + s * deg(w / 2 / r);
-          for (const z of [0.3, b]) pts.push(at(r, ang, z));
+          for (const z of [0.3, b + INTO]) pts.push(at(r, ang, z));
           pts.push(at(Math.max(rp - 0.2, r - 0.3), ang, 0));
         }
       }
@@ -372,11 +383,11 @@ export function plugLockSolids(S, R) {
         bodyCut.push(hull(k, gp));
       }
     }
-    // the coin slot along x, stopping a millimetre inside the tabs' slits
+    // the coin slot along x, stopping a millimetre inside the tabs' slits: its walls and its gable one hull, so no face
+    // of one lies on the other's
     const { width: cwd, wall, ridge } = COIN;
-    const slot = extrude(k, [[-d.coin / 2, -cwd / 2], [d.coin / 2, -cwd / 2], [d.coin / 2, cwd / 2], [-d.coin / 2, cwd / 2]], -1, wall);
-    const gable = hull(k, [[-d.coin / 2, -cwd / 2, wall], [d.coin / 2, -cwd / 2, wall], [-d.coin / 2, cwd / 2, wall], [d.coin / 2, cwd / 2, wall], [-d.coin / 2, 0, ridge], [d.coin / 2, 0, ridge]]);
-    plugCut.push(slot, gable);
+    const ends = [-d.coin / 2, d.coin / 2];
+    plugCut.push(hull(k, ends.flatMap((x) => [[x, -cwd / 2, -1], [x, cwd / 2, -1], [x, -cwd / 2, wall], [x, cwd / 2, wall], [x, 0, ridge]])));
     const mirror = (m) => {
       const out = m.mirror([0, 1, 0]);
       m.delete();
@@ -401,6 +412,37 @@ export function plugWall(S, R, top, lugs = null) {
   try {
     const ring = revolve(k, [[R - S.c, -WALL_PAST - 1], [R + 2, -WALL_PAST - 1], [R + 2, top + WALL_PAST], [R - S.c, top + WALL_PAST]]);
     return { solid: lugs ? ring.subtract(lugs) : ring.translate([0, 0, 0]), ids: [...k.ids] };
+  } finally {
+    k.dispose();
+  }
+}
+
+/**
+ * The twist-lock's fit test: the lock exactly as the pieces get it – the same neck, lugs, slots, click tabs, mouths
+ * and layer heights – on two small rings, so a print of a few grams tries the clearance before the model. The body's
+ * half is the neck and its lugs on a flat ring 12 layers thick, standing on the bed; the lid's half is the socket in
+ * a ring with a flat top a millimetre over it, a wall of three lines round its inside so its ceiling is bridged,
+ * lying on its cut face as the lid does. Both rings reach two lines and 1.2 mm past the tabs' slits.
+ * @param {object} S `sizes()`
+ * @param {number} r0 the neck's radius
+ * @param {{ theta?: number }} options
+ * @returns {{ body: Manifold, lid: Manifold, d: number }} the caller's, each standing on z = 0 about the axis; `d` the
+ *   rings' outer diameter
+ */
+export function twistCoupon(S, r0, { theta = twistFor(S, r0) } = {}) {
+  const { Manifold } = manifold();
+  const k = kit();
+  try {
+    const L = twistLockSolids(S, r0, { theta });
+    [L.neck, L.lugs, L.grooves, L.cutters, L.disc, L.ridges].forEach((m) => k.add(m));
+    const rOut = r0 + S.c + S.td + S.g + S.skin + 1.2;
+    const floor = 12 * S.hl;
+    const ring = revolve(k, [[L.rn, -floor], [rOut, -floor], [rOut, 0], [L.rn, 0]]);
+    const neck = k.add(k.add(Manifold.union([ring, L.neck, L.lugs])).subtract(L.grooves));
+    const rIn = L.rn - S.c - Math.max(1.2, 3 * S.n);
+    const socket = revolve(k, [[rIn, 0], [rOut, 0], [rOut, S.sockTop + 1], [rIn, S.sockTop + 1]]);
+    const lid = k.add(socket.subtract(L.cutters)).add(L.ridges);
+    return { body: neck.translate([0, 0, floor]), lid, d: 2 * rOut };
   } finally {
     k.dispose();
   }

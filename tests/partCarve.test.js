@@ -106,6 +106,13 @@ describe('what a circle takes out (rows of [dmin, dmax])', () => {
     expect(partKind([[[4, 10]], [[4, 10]], [[8, 9]], [[8, 9]]], 6, { end: true, zs, rag: 0.15 }).kind).toBe('mixed');
     // a floor with nothing over it inside the circle: its top is the cap
     expect(partKind([[[0, 10]], [[0, 10]], [[8, 9]], [[8, 9]]], 6, { end: true, zs, rag: 0.15 })).toEqual({ kind: 'plug', cap: 2, cross: null });
+    // a foot's rim round a bottom recessed a layer, outside the circle on the model's end: the floor starts within the
+    // rag, and the base is there all the same; recessed further than the rag, the circle holds nothing on the end
+    const footed = [[[7, 10]], [[7, 10]], [[0, 10]], [[0, 10]], [[3, 4], [8, 9]], [[8, 9]], []];
+    expect(partKind(footed, 6, { end: true, zs, rag: 0.25 })).toEqual({ kind: 'plug', cap: 5, cross: null });
+    expect(partKind(footed, 6, { end: true, zs, rag: 0.15 })).toEqual({ kind: 'empty', cap: 0, cross: null });
+    // a plane above the end is a lid's: nothing under it is looked past
+    expect(partKind(footed, 6, { zs, rag: 0.25 }).kind).toBe('empty');
   });
 });
 

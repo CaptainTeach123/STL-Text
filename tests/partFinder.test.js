@@ -1,10 +1,11 @@
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
-import { PART_LEVELS, axisOf, findLoops, findParts, freeWindows, pickPart, reach, sliceStack } from '../src/partFinder.js';
-import { gminOf, scalePercent } from '../src/locks.js';
+import { FINE_SPECK, PART_LEVELS, WAY_START, axisOf, findLoops, findParts, fineSlices, freeWindows, pickPart, reach, sliceStack } from '../src/partFinder.js';
+import { carveParts, checkPart } from '../src/splitGeometry.js';
+import { gminOf, scalePercent, sizes } from '../src/locks.js';
 import { setup } from './helpers.js';
 import { batLanternSolid, box, gothicSolid, lanternSolid, lidBoxSolid, loggiaSolid, roundLanternSolid, slenderTowerSolid } from './lanternFixture.js';
-import { bailBoxSolid, blockSolid, chimneyBoxSolid, hexLanternSolid, jarSolid, mugSolid } from './partFixtures.js';
+import { bailBoxSolid, blockSolid, chimneyBoxSolid, hexLanternSolid, jarSolid, mugSolid, pavilionSolid, plinthLanternSolid } from './partFixtures.js';
 
 let wasm;
 beforeAll(async () => {
@@ -168,25 +169,25 @@ describe('the bat lantern fixture (n 0.4, layers 0.2, clearance 0.15)', () => {
     }
   });
 
-  it('works out the least scales: a lid lock from 265 %, a tea light through it from 365 %; the base 205 % and 275 %', () => {
+  it('works out the least scales: a lid lock from 275 %, a tea light through it from 365 %; the base 215 % and 275 %', () => {
     const { least } = lidOf(tables[1]);
-    expect([scalePercent(least.lock), scalePercent(least.tea)]).toEqual([265, 365]);
+    expect([scalePercent(least.lock), scalePercent(least.tea)]).toEqual([275, 365]);
     const b = baseOf(tables[1]).least;
-    expect([scalePercent(b.lock), scalePercent(b.tea)]).toEqual([205, 275]);
-    // as factors on the size now, whole 5 % of the model as loaded: at 200 % the lid locks from 132.5 % of it, and
+    expect([scalePercent(b.lock), scalePercent(b.tea)]).toEqual([215, 275]);
+    // as factors on the size now, whole 5 % of the model as loaded: at 200 % the lid locks from 137.5 % of it, and
     // with a lock there is none to give
-    expect(lidOf(tables[2]).least.lock * 2).toBeCloseTo(2.65, 9);
+    expect(lidOf(tables[2]).least.lock * 2).toBeCloseTo(2.75, 9);
     expect(lidOf(tables[4]).least).toEqual({ lock: null, tea: null });
     expect(lidOf(tables[3]).least.lock).toBeNull();
     expect(lidOf(tables[3]).least.tea * 3).toBeCloseTo(3.65, 9);
   });
 
   it('the least scale it names is one where the finder finds the lock, and 5 % under it it does not', () => {
-    // with a 0.8 mm nozzle the window read quickly at 100 %, between half layers, puts the face at 340 % a layer
-    // lower than the finder finds it there, where the tabs fit; at that size they first fit at 350 %
+    // the least scale is read quickly at 100 %, between half layers, then checked at the size it names, where the face
+    // can be a layer off the quick reading's: with a 0.8 mm nozzle, whose tabs are 12.5 mm long, they first fit at 370 %
     const fx = own(batLanternSolid());
     const stack = sliceStack(fx);
-    for (const [n, hl, c, want] of [[0.4, 0.2, 0.3, 275], [0.8, 0.4, 0.15, 350]]) {
+    for (const [n, hl, c, want] of [[0.4, 0.2, 0.3, 285], [0.8, 0.4, 0.15, 370]]) {
       const pc = scalePercent(lidOf(findParts(fx, { n, hl, c, stack })).least.lock);
       const at = (p) => !!lidOf(findParts(scaled(fx, p / 100), { n, hl, c })).lock;
       expect([pc, at(pc), at(pc - 5)]).toEqual([want, true, false]);
@@ -195,7 +196,7 @@ describe('the bat lantern fixture (n 0.4, layers 0.2, clearance 0.15)', () => {
 
   it('lists the lid first when both lock or neither does, and the one that locks first otherwise', () => {
     for (const s of [1, 2, 3, 4]) expect(tables[s].parts.map((e) => e.kind)).toEqual(['lid', 'plug']);
-    // at 250 % the base locks (from 205 %) and the lid does not yet (from 265 %)
+    // at 250 % the base locks (from 215 %) and the lid does not yet (from 275 %)
     const t = findParts(scaled(own(batLanternSolid()), 2.5), { scale: 2.5 });
     expect(t.parts.map((e) => [e.kind, !!e.lock])).toEqual([['plug', true], ['lid', false]]);
   });
@@ -335,6 +336,64 @@ describe('what is no lid, and what is', () => {
     expect(baseOf(findParts(footed, { n: 0.25, hl: 0.12 })).lock).toMatchObject({ R: 28.8 });
   });
 
+  it('a hanging hole through the handle\'s crown, or a vent down the finial, is no open top: the dome and the base are still found', () => {
+    // the fixture's crown is solid over its axis from z 49.31 to its top at 50: a Ø 0.5 mm hole through it (Ø 2 mm
+    // at 400 %) leaves the air under it leading 6 mm down, more than the hole is wide
+    for (const d of [0.25, 0.5, 0.75]) {
+      const hung = minus(own(batLanternSolid()), cyl(d / 2, 49, 51));
+      const t = findParts(hung, {});
+      expect([d, t.open, t.parts.map((e) => [e.kind, e.name])]).toEqual([d, null, [['lid', 'Dome and cap'], ['plug', 'Base']]]);
+    }
+    // the round lantern with a Ø 2 mm vent down its finial into its dome
+    const vented = findParts(minus(own(roundLanternSolid()), cyl(1, 150, 201)), {});
+    expect([vented.open, vented.parts.map((e) => e.kind)]).toEqual([null, ['plug', 'lid']]);
+    // a mug's top is open: Ø 72 of its 80 mm
+    expect(findParts(own(mugSolid()), {}).open.d).toBeCloseTo(72, 0);
+  });
+
+  it('a lid that cannot come out is not offered: a crown lowered onto the dome and cap', () => {
+    const bar = own(own(wasm.Manifold.cube([21, 2.3, 1], true)).translate([0, 0, 39.5]));
+    expect(findParts(union([own(batLanternSolid()), bar]), {}).parts.map((e) => e.kind)).toEqual(['plug']);
+  });
+
+  it('offers the lock the engine builds: none where no wall under the face is deep enough to carry its collar', () => {
+    const S = sizes();
+    for (const band of [1, 4]) {
+      const model = own(pavilionSolid(band));
+      const stack = sliceStack(model);
+      const lid = lidOf(findParts(model, { stack }));
+      const got = checkPart(model, stack, fineSlices(model, stack.speck * FINE_SPECK), { c: lid.centre, z0: lid.face, R: lid.r },
+        { hl: 0.2, gmin: S.gmin, grid: { from: stack.zmin, step: 0.2 }, letter: 'A', minLift: WAY_START * stack.height, S });
+      expect([band, lid.lock?.mech ?? null, lid.why]).toEqual([band, got.lock.mech, got.lock.why ?? null]);
+      if (band === 1) {
+        // a 1 mm band under a collar 1.2 mm deep, which it must reach twice as deep: none now, and at the least scale
+        // the table names (read off its levels, which never find the band deeper than it is) there is one
+        expect(got.lock.why).toBe('collar');
+        expect(lid.least.lock).toBeGreaterThan(2.4);
+        expect(lidOf(findParts(scaled(model, lid.least.lock), {})).lock).toMatchObject({ mech: 'twist' });
+      }
+    }
+  });
+
+  it('a lantern on a plate wider than itself: the base is the plate inside the lantern\'s wall, not the lantern on it', () => {
+    const S = sizes();
+    for (const [plate, thick, scale] of [[34, 5, 1], [46, 9, 1], [34, 5, 1.5]]) {
+      const model = scaled(own(plinthLanternSolid(plate, thick)), scale);
+      const stack = sliceStack(model);
+      const base = baseOf(findParts(model, { stack }));
+      // inside the tube's 27 mm inside (scaled), and standing no higher than the plate
+      expect([plate, scale, base.r < 27 * scale, base.top < thick * scale + 5]).toEqual([plate, scale, true, true]);
+      const got = checkPart(model, stack, fineSlices(model, stack.speck * FINE_SPECK), { c: base.centre, z0: base.face, R: base.r },
+        { hl: 0.2, gmin: S.gmin, grid: { from: stack.zmin, step: 0.2 }, letter: 'A', minLift: WAY_START * stack.height, S });
+      const { body, lids } = carveParts(model, [{ frame: null, c: base.centre, z0: got.z0, R: base.r, top: got.top, plug: true }]);
+      own(body);
+      own(lids[0].solid);
+      // the lantern stays on the body: its whole height, nearly all of it
+      expect(body.boundingBox().max[2]).toBeCloseTo(128 * scale, 3);
+      expect(lids[0].solid.volume() / model.volume()).toBeLessThan(0.2);
+    }
+  });
+
   it('a dish on a block is not an open top', () => {
     expect(findParts(minus(cube([-30, -30, 0], [30, 30, 40]), cyl(20, 39, 41)), {}).open).toBeNull();
   });
@@ -403,7 +462,7 @@ describe('what the finder leaves behind', () => {
       return slice.apply(this, args);
     };
     try {
-      expect(lidOf(findParts(fx, {})).least.lock).toBe(2.65);
+      expect(lidOf(findParts(fx, {})).least.lock).toBe(2.75);
     } finally {
       binding.slice = slice;
     }

@@ -2682,7 +2682,7 @@ async function downloadFitTest() {
     // (nor tabs, with no file)
     const planned = (c) => measured?.cuts.get(c.id)?.joint;
     const none = active
-      ? split.cuts.filter((c) => !r.stl || (planned(c) === 'dowels' && !r.pins) || (planned(c) === 'pegs' && !r.pegs) || (planned(c) === 'lip' && !r.apart))
+      ? split.cuts.filter((c) => !r.stl || (planned(c) === 'dowels' && !r.pins) || (planned(c) === 'pegs' && !r.pegs) || (planned(c) === 'lip' && !r.apart && !r.twist))
       : [];
     if (none.length) {
       rememberJoints(splitFor, requestedFor, none.map((c) => [c.id, 'none']));
@@ -2717,13 +2717,17 @@ async function downloadFitTest() {
     const clicks = r.apart === 'snap' || r.apart === 'light';
     if (clicks) checks.push(`the lid clicks${r.apart === 'light' ? ' lightly' : ''} onto the box and pulls off again`);
     else if (r.apart && r.apart !== 'lock') checks.push('the lid drops onto the box and lifts off freely');
+    // a twist-lock's two rings: they twist together and click, and hold when pulled
+    const rings = r.twist
+      ? ` Two rings Ø ${Math.round(r.twist.d)} mm with the twist-lock at this size (about ${r.twist.grams} g): they should twist together with a click and hold when pulled. Too tight to turn: raise the Clearance by 0.05 mm. Loose, or no click: lower it.`
+      : '';
     const tried = checks.length
       ? ` Print it and check that ${checks.join(' and that ')} by hand – too tight: raise Clearance by 0.05 mm${clicks ? '; no click or too loose: lower it by 0.05 mm' : ''}.`
-      : ' Print it:';
+      : r.apart === 'lock' || !rings ? ' Print it:' : '';
     const lock = r.apart === 'lock'
       ? `${checks.length ? ' The lid' : ' the lid'} should lock onto the box and come off only with a firm pull – too stiff to open, raise the clearance by 0.05 mm; too loose, lower it.`
       : '';
-    setStatus(`Downloaded ${file.name} (${file.kb} KB).${tried}${lock}`, 'ok');
+    setStatus(`Downloaded ${file.name} (${file.kb} KB).${tried}${lock}${rings}`, 'ok');
   } catch (err) {
     setStatus(friendly(err), 'error');
   } finally {

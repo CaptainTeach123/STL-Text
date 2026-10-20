@@ -45,6 +45,10 @@ const LID_VOLUME = 0.005;
 const LID_FACE = 0.05;
 /** The opening under a lid leads this share of the model's height down at least (or its own width, if less). */
 const LEADS = 0.1;
+/** An open top is this share of the model's width across at least: a hanging hole or a vent is no open top. */
+const OPEN_SHARE = 0.2;
+/** What stands on a base's floor and comes away with it is this share of the model's volume at most. */
+const PLUG_MOST = 1 / 3;
 /** One lid at several faces: caps this many levels apart at most, centres this share of the width. */
 const FAMILY_LEVELS = 2;
 const FAMILY_CENTRE = 0.05;
@@ -805,10 +809,11 @@ function capOf(stack, fam, fine, c, R) {
 // ---------- the way out ----------
 
 /**
- * How a lid comes out, from slices: straight up, when its shadow meets nothing over it; else lifted L (from the
- * lock's own lift, in steps) and slid out in one of 16 directions in the plane, each slice of the lid swept as the
- * hull of itself and its moved copy against the body at its height lifted, the lid's own islands left out of it.
- * The first lift with a clear direction wins; `dir` is the middle of the widest run of clear directions there.
+ * How a lid comes out, from slices: straight up, when none of its slices meets anything over it; else lifted L (from
+ * the lock's own lift, in steps, no higher than it lifts clear straight up, `upClear`) and slid out in one of 16
+ * directions in the plane, each slice of the lid swept as the hull of itself and its moved copy against the body at
+ * its height lifted, the lid's own islands left out of it. The first lift with a clear direction wins; `dir` is the
+ * middle of the widest run of clear directions there.
  * @returns {{ up: boolean, lift: number|null, dir: number[]|null, dirs: number[], reach: number, upClear: number }}
  */
 export function wayOut(solid, stack, lid, minLift) {
@@ -851,15 +856,24 @@ export function wayOut(solid, stack, lid, minLift) {
     }
     const reachOut = Math.hypot(stack.box.max[0] - stack.box.min[0], stack.box.max[1] - stack.box.min[1]) / 2 + R + 1;
     if (!slices.length) return { up: true, lift: 0, dir: null, dirs: [], reach: reachOut, upClear: Infinity };
-    const shadow = temps.add(CrossSection.union(slices.map((s) => s.cs)));
-    let upClear = null;
-    for (let d = 0; cap + d <= stack.zmax + step; d += step / 2) {
-      if (hits(sliceAt(cap + d).body, shadow)) {
-        upClear = d;
-        break;
+    // how far the lid lifts straight up before one of its slices meets what stands over its cap (under the cap nothing
+    // round the circle reaches into it), each slice from its own height: a bail's arch comes down beside a narrow cap
+    // and over the dome's wide rim, which lies far below it
+    const over = [];
+    const overAt = (j) => {
+      while (over.length <= j) over.push(sliceAt(cap + (over.length * step) / 2).body);
+      return over[j];
+    };
+    let upClear = Infinity;
+    for (let i = slices.length - 1; i >= 0 && cap - slices[i].z < upClear; i--) {
+      for (let j = 0; cap + (j * step) / 2 <= stack.zmax + step; j++) {
+        if (hits(overAt(j), slices[i].cs)) {
+          upClear = Math.min(upClear, cap + (j * step) / 2 - slices[i].z);
+          break;
+        }
       }
     }
-    if (upClear == null) return { up: true, lift: 0, dir: null, dirs: [], reach: reachOut, upClear: Infinity };
+    if (upClear === Infinity) return { up: true, lift: 0, dir: null, dirs: [], reach: reachOut, upClear };
     for (let L = minLift; L <= Math.min(WAY_MOST * stack.height, upClear) + 1e-9; L += step) {
       const bodies = slices.map((s) => sliceAt(s.z + L).body);
       const dirs = [];
@@ -927,8 +941,9 @@ export function floorOf(stack, c) {
  * A base that twists off from underneath: under the model's middle a floor (the first run of levels, in its lowest
  * third, that are solid there) with the inside opening over it; the ring the body keeps round it is the floor's
  * least outside radius; and the widest circle (from that ring inwards) whose wall crosses nothing standing on the
- * floor – a cup on it goes with the base, a post or a wall it would cut rules the radius out – and comes near
- * nothing else just over it. A ragged floor top (a scan's or a generated mesh's) counts as the joint, not as things
+ * floor – a cup on it goes with the base, a post or a wall it would cut rules the radius out, and so does taking
+ * more than `PLUG_MOST` of the model with it (the lantern on a plate wider than itself) – and comes near nothing
+ * else just over it. A ragged floor top (a scan's or a generated mesh's) counts as the joint, not as things
  * standing on it. `{ solid: true }` when the model is solid all through its middle; null with no floor there.
  */
 function plugCandidate(stack, c) {
@@ -947,6 +962,7 @@ function plugCandidate(stack, c) {
     const seen = new Set(starts.map((x) => x.id));
     const queue = [...starts];
     let top = floorTop;
+    let volume = 0;
     while (queue.length) {
       const x = queue.pop();
       for (const y of [...x.up, ...x.down]) {
@@ -962,6 +978,9 @@ function plugCandidate(stack, c) {
         seen.add(y.id);
         queue.push(y);
         top = Math.max(top, y.z);
+        volume += y.area * h;
+        // a circle round the walls of a lantern standing on a wider plate would take the lantern with its base
+        if (volume > PLUG_MOST * stack.volume) return null;
       }
     }
     // nothing else may come near the circle just over the floor: a post on the floor's edge, joined to it only lower
@@ -1033,10 +1052,11 @@ const BELOW_STEP = 0.25;
  * @param {number} z0 the face
  * @param {object} S `sizes()`
  * @param {number} zmin the model's bottom
- * @returns {object} `collarFor`'s with `slope`, `reach`, `shelf` and the profiles the solids are clipped to, in the
- *   lock's frame (`above` the lid's outside up to the socket ring's top, `below` the body's down to the collar's
- *   reach, `[[r, z], …]`); or `{ r0, why }`, `why` also 'collar' when no wall goes round the axis as deep as the
- *   collar's own depth twice, so nothing would carry it
+ * @returns {object} `collarFor`'s with `slope`, `reach`, `hang` (`collarReach`) and the profiles the solids are
+ *   clipped to, in the lock's frame (`above` the lid's outside up to the socket ring's top, `[[r, z], …]`; `below` the
+ *   body's wall down to where the collar lands on it or it ends, `[[r, z, rin], …]`); or `{ r0, why }`, `why` also
+ *   'collar' when no wall goes round the axis as deep as the collar's own depth twice, so nothing would carry it, or
+ *   the collar would run on out of the model's bottom (`zmin`) before it lands
  */
 export function collarAt(fine, c, z0, S, zmin) {
   const half = S.hl / 2;
@@ -1057,19 +1077,34 @@ export function collarAt(fine, c, z0, S, zmin) {
     if (!wall) break;
     below.push([wall.r, -j * BELOW_STEP, wall.rin]);
     slope ??= collarSlope(below, S);
-    if (slope != null && collarReach(below, lock.rn, S, slope)?.shelf === 0) break;
+    if (slope != null && collarReach(below, lock.rn, S, slope)?.hang === 0) break;
   }
   const down = slope == null ? null : collarReach(below, lock.rn, S, slope);
-  if (!down) return { r0: lock.r0, why: 'collar' };
-  return { ...lock, slope: round(slope, 6), reach: down.depth, shelf: round(down.shelf, 4), above, below: below.map(([r, z]) => [r, z]) };
+  // a collar that runs on under the wall's end stays inside the model (or its piece)
+  if (!down || z0 - down.depth <= zmin + 1e-9) return { r0: lock.r0, why: 'collar' };
+  return { ...lock, slope: round(slope, 6), reach: down.depth, hang: down.hang, above, below };
+}
+
+/**
+ * Whether the wall under a lid's face round the axis carries a collar from a bore of radius rn at q times the size
+ * now, by `collarAt`'s rule: `walls` the wall read off the levels under the face at the size now (`[[r, z, rin], …]`
+ * by falling z), grown q times, `depth` how far the model reaches under the face. Where the levels are coarse the
+ * least scales it finds are checked on the finder's own reading at that size.
+ */
+function carried(walls, rn, depth, S, q) {
+  const below = walls.map(([r, z, rin]) => [q * r, q * z, q * rin]);
+  const slope = collarSlope(below, S);
+  const down = slope == null ? null : collarReach(below, rn, S, slope);
+  return !!down && down.depth < q * depth - 1e-9;
 }
 
 // ---------- the open top ----------
 
 /**
  * Whether the model is open at the top already: down its axis from the top, air until a ring goes round it (its
- * hole Ø d), then air on down at least as far as an opening that size leads. A mug is; a lantern with a finial or a
- * crown over its middle is not.
+ * hole Ø d, at least `OPEN_SHARE` of the model's width), then air on down at least as far as an opening that size
+ * leads. A mug is; a lantern with a finial or a crown over its middle is not, nor one with a hanging hole through
+ * its crown or a vent down its finial: that ring covers the middle but for a hole nothing goes through.
  */
 function openTop(stack, c) {
   const { levels } = stack;
@@ -1083,6 +1118,7 @@ function openTop(stack, c) {
   }
   if (!rim) return null;
   const d = 2 * rim.hole.near;
+  if (d < OPEN_SHARE * stack.width) return null;
   let depth = 0;
   for (; j >= 0 && !levels[j].islands.some((x) => reach(x, c).dmin === 0); j--) depth += stack.h;
   return depth >= Math.min(d, LEADS * stack.height) ? { d } : null;
@@ -1099,16 +1135,32 @@ function lidEntry(solid, stack, fam, fine, S, { zBed, handles, cover, scale }) {
   const { face, at, half } = placed;
   const c = fam.c;
   const R = (face.lo + face.hi) / 2;
-  const now = lidLockOn(placed, S);
-  // a lock (and a tea light through it) at q times the size now: read quickly, and checked at that size
-  const fits = (lock, tea) => !!lock && (!tea || takesTeaLight(lock.opening, S.c));
+  // the lock at this size as the engine builds it: sized on the lid's outside, and carried by a wall under the face
+  // round the axis (`collarAt`) – a dome on a band too thin for the collar gets none
+  let now = lidLockOn(placed, S);
+  if (now.lock) {
+    const built = collarAt(fine, c, face.z, S, stack.zmin);
+    if (built.why) now = { lock: null, why: built.why };
+  }
+  // the wall under the face round the axis, read off the levels for the collar at other sizes
+  const walls = [];
+  for (let k = stack.levels.length - 1; k >= 0; k--) {
+    const lv = stack.levels[k];
+    if (lv.z >= face.z) continue;
+    const wall = ringWall(lv.islands, c);
+    if (!wall) break;
+    walls.push([wall.r, lv.z - face.z, wall.rin]);
+  }
+  // a lock (and a tea light through it) at q times the size now, its collar carried: read quickly, and checked at
+  // that size
+  const fits = (lock, tea, q) => !!lock && (!tea || takesTeaLight(lock.opening, S.c)) && carried(walls, lock.rn, face.z - stack.zmin, S, q);
   const exact = (tea) => (q) => {
     const there = placeLid(stack, fam, fine, S, zBed, q);
-    return !!there && fits(lidLockOn(there, S).lock, tea);
+    return !!there && fits(lidLockOn(there, S).lock, tea, q);
   };
   const least = {
-    lock: now.lock ? null : leastOf((q) => fits(lidLockNear(placed, S, q)?.lock, false), exact(false), scale),
-    tea: fits(now.lock, true) ? null : leastOf((q) => fits(lidLockNear(placed, S, q)?.lock, true), exact(true), scale),
+    lock: now.lock ? null : leastOf((q) => fits(lidLockNear(placed, S, q)?.lock, false, q), exact(false), scale),
+    tea: now.lock && takesTeaLight(now.lock.opening, S.c) ? null : leastOf((q) => fits(lidLockNear(placed, S, q)?.lock, true, q), exact(true), scale),
   };
   const ends = capOf(stack, fam, fine, c, R);
   // the coarse level of the face, for the handle's trace and the pick mode
@@ -1219,7 +1271,8 @@ export function findParts(solid, { n = 0.4, hl = 0.2, c = 0.15, stack = null, sc
       const cover = coverOf(stack, fam.items[0]);
       if (cover > COVER_MOST) continue;
       const lid = lidEntry(solid, stack, fam, fine, S, { zBed, handles, cover, scale });
-      if (lid) parts.push(lid);
+      // a lid that can't come out, lifted and slid however, is no part to offer
+      if (lid && (lid.way.up || lid.way.lift != null)) parts.push(lid);
     }
     t = lap('lids', t);
     if (base && !base.solid) parts.push(plugEntry(stack, base, fine, S, zBed));

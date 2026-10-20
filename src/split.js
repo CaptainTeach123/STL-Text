@@ -2343,6 +2343,8 @@ const COS45 = Math.SQRT1_2;
 const FLAT = 0.999;
 /** Less than this much on the bed (mm²) and a piece stands on a point or an edge: it needs supports. */
 const STEADY = 25;
+/** A model's flat end more than this many times its cut face's area would hang past the face, the piece upside down. */
+const SOCKET_END = 1.05;
 /** How many slices of a piece along each axis `orientationStats` measures its spread in. */
 const BANDS = 16;
 
@@ -3789,19 +3791,18 @@ export function endsAsWell(beds, face, { lengths = null, spans = [0, 0], faceSpa
 /**
  * Whether each piece either side of a cut would print about as well lying
  * on its cut face – where a twist-lock's socket is cut into it – as it does
- * anyway, guessed before the model is cut from the model's ends, as
- * `endsAsWell` guesses: only where the model ends on that side in nothing
- * flat of 25 mm² or more and half the face's area, so the cut face is the
- * flat it has (a lantern's top under its finial). A piece with such a flat
- * end would rather stand on it: on its cut face a slender tower would stand
- * on its small roof, and a closed tube would hang its end over its inside.
- * `apartMales` judges the pieces themselves.
+ * anyway, guessed before the model is cut from the model's ends: unless the
+ * model ends on that side in something flat larger than the face itself
+ * (and 25 mm² or more), which would rather be its bed – upside down on its
+ * cut face, a closed tube's end would hang over its inside. An open tube's
+ * rim, a solid cylinder's end, no larger than the face, lie as well either
+ * way, as `apartMales`, judging the pieces themselves, finds.
  * @param {number[]} beds the flat area the model ends in on each side, [towards −axis, towards +axis] (mm²)
  * @param {number} face the cut face's area (mm²)
  * @returns {boolean[]} [the piece below, the one above]
  */
 export function socketsAsWell(beds, face) {
-  return [0, 1].map((k) => !((beds[k] ?? 0) >= Math.max(STEADY, 0.5 * face)));
+  return [0, 1].map((k) => !((beds[k] ?? 0) >= STEADY && beds[k] > SOCKET_END * face));
 }
 
 /**

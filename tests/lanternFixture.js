@@ -129,17 +129,53 @@ export function stlCheck(solid) {
 }
 
 /**
+ * A binary STL file as a slicer reads it, its float32 corners matched exactly: as `stlCheck`, of the file itself.
+ * @param {ArrayBuffer} buf
+ */
+export function stlFileCheck(buf) {
+  const dv = new DataView(buf);
+  const n = dv.getUint32(80, true);
+  const edges = new Map();
+  let degenerate = 0;
+  for (let t = 0; t < n; t++) {
+    const k = [0, 1, 2].map((j) => [0, 1, 2].map((a) => dv.getFloat32(84 + t * 50 + 12 + (j * 3 + a) * 4, true)).join(','));
+    if (k[0] === k[1] || k[1] === k[2] || k[0] === k[2]) degenerate++;
+    for (let i = 0; i < 3; i++) edges.set(`${k[i]}|${k[(i + 1) % 3]}`, (edges.get(`${k[i]}|${k[(i + 1) % 3]}`) ?? 0) + 1);
+  }
+  let open = 0;
+  for (const [e, c] of edges) if (c !== 1 || edges.get(e.split('|').reverse().join('|')) !== 1) open++;
+  return { degenerate, open };
+}
+
+/**
  * Overhangs as a slicer sees them, the solid printed with +z up: sliced every `step` from z0 to z1, what of each
  * slice lies further than `step + tol` out from the slice below, as parts with their area, narrowest width
- * (twice the deepest inset), length and height. Parts under 0.01 mm² are left out.
+ * (twice the deepest inset), length and height. Parts under 0.01 mm² are left out. With `besides` (another solid,
+ * the same piece without what was added to it), what overhangs there at the same layer is left out too: only the
+ * overhangs the addition makes.
  */
-export function overhangs(solid, z0, z1, step = 0.2, tol = 0.02) {
+export function overhangs(solid, z0, z1, step = 0.2, tol = 0.02, besides = null) {
   const out = [];
-  let below = solid.slice(z0);
-  for (let z = z0 + step; z <= z1 + 1e-9; z += step) {
-    const cur = solid.slice(z);
+  const overAt = (m, below, z) => {
+    const cur = m.slice(z);
     const grown = below.offset(step + tol, 'Round', 2, 32);
     const over = cur.subtract(grown);
+    grown.delete();
+    return { cur, over };
+  };
+  let below = solid.slice(z0);
+  let other = besides?.slice(z0) ?? null;
+  for (let z = z0 + step; z <= z1 + 1e-9; z += step) {
+    const { cur, over: own } = overAt(solid, below, z);
+    let over = own;
+    if (besides) {
+      const theirs = overAt(besides, other, z);
+      over = own.subtract(theirs.over);
+      own.delete();
+      theirs.over.delete();
+      other.delete();
+      other = theirs.cur;
+    }
     for (const part of over.decompose()) {
       const area = part.area();
       if (area >= 0.01) {
@@ -157,12 +193,12 @@ export function overhangs(solid, z0, z1, step = 0.2, tol = 0.02) {
       }
       part.delete();
     }
-    grown.delete();
     over.delete();
     below.delete();
     below = cur;
   }
   below.delete();
+  other?.delete();
   return out;
 }
 

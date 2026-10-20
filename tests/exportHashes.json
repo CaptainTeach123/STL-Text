@@ -1,5 +1,5 @@
 {
- "commit": "c97a1b5 with changes to src",
+ "commit": "f031319 with changes to src",
  "cases": {
   "lantern/lock-190": {
    "files": {
@@ -197,21 +197,21 @@
   },
   "round/lock-150": {
    "files": {
-    "round-piece-1-of-2.stl": "0cb8ffc7cb7b8e97",
-    "round-piece-2-of-2.stl": "b35686ebc49965d0",
+    "round-piece-1-of-2.stl": "3e1ad28cbc6b1ba8",
+    "round-piece-2-of-2.stl": "8d85afb7ab6550e0",
     "round-how-to-glue.txt": "2b28630277a848e4"
    },
    "notes": "a6b67efa9d72dbbe",
-   "fit": "- dadeb3d8f82a4c00"
+   "fit": "8da9b41f8729feab e449d8a5b20b8f1e"
   },
   "round/snap-150": {
    "files": {
-    "round-piece-1-of-2.stl": "0cb8ffc7cb7b8e97",
-    "round-piece-2-of-2.stl": "b35686ebc49965d0",
+    "round-piece-1-of-2.stl": "3e1ad28cbc6b1ba8",
+    "round-piece-2-of-2.stl": "8d85afb7ab6550e0",
     "round-how-to-glue.txt": "2b28630277a848e4"
    },
    "notes": "a6b67efa9d72dbbe",
-   "fit": "- dadeb3d8f82a4c00"
+   "fit": "8da9b41f8729feab e449d8a5b20b8f1e"
   },
   "round/lift-150": {
    "files": {
@@ -224,21 +224,21 @@
   },
   "round/lock-146.5": {
    "files": {
-    "round-piece-1-of-2.stl": "eb84fa84f35f53a3",
-    "round-piece-2-of-2.stl": "ee2a73958aeb54ab",
+    "round-piece-1-of-2.stl": "251326a94b35e351",
+    "round-piece-2-of-2.stl": "063aad4908100c5d",
     "round-how-to-glue.txt": "c02440c7b2085024"
    },
    "notes": "354cb35a9594d684",
-   "fit": "- dadeb3d8f82a4c00"
+   "fit": "3054fcd6a1be5376 7116d322f131e10a"
   },
   "round/lock-142.5": {
    "files": {
-    "round-piece-1-of-2.stl": "bbbab090e7039d25",
-    "round-piece-2-of-2.stl": "e3dafe0a6ff0f3f6",
+    "round-piece-1-of-2.stl": "e75b91527509be60",
+    "round-piece-2-of-2.stl": "1405d7224bfd6205",
     "round-how-to-glue.txt": "9ec8f8d0b744673d"
    },
    "notes": "354cb35a9594d684",
-   "fit": "1beeae452c3d0306 1c9b9802ddcbcaa1"
+   "fit": "3054fcd6a1be5376 7116d322f131e10a"
   },
   "plate/dovetail-x0": {
    "files": {

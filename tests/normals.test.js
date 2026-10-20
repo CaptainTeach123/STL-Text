@@ -1,6 +1,8 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
 import { cornerNormals, normalsTopology } from '../src/normals.js';
+import { displayBuffers } from '../src/mesh.js';
+import { batLanternSolid } from './lanternFixture.js';
 import { setup } from './helpers.js';
 
 let wasm;
@@ -249,6 +251,34 @@ describe('cornerNormals reproduces Manifold.calculateNormals(0, 36)', () => {
     expect(ref.shadedVertices).toBeLessThan(mesh.index.length * 0.9);
   });
 
+  it("the fixture modelled on the user's lantern: every corner of a face with area, seeing through the slivers between faces", () => {
+    // its handle's legs fuse into the dome through triangles of no area, between faces at right angles: those stay
+    // sharp, as Manifold sees them
+    const solid = batLanternSolid();
+    const mesh = meshOf(solid);
+    const ref = manifoldNormals(solid, mesh);
+    solid.delete();
+    const ours = cornerNormals(mesh.positions, mesh.index, 36);
+    const fn = faceNormals(mesh.positions, mesh.index);
+    let degenerate = 0;
+    let worst = 0;
+    for (let c = 0; c < mesh.index.length; c++) {
+      const t = tri(c);
+      const { positions: P, index: I } = mesh;
+      const [a, b, d] = [I[3 * t] * 3, I[3 * t + 1] * 3, I[3 * t + 2] * 3];
+      const u = [P[b] - P[a], P[b + 1] - P[a + 1], P[b + 2] - P[a + 2]];
+      const v = [P[d] - P[a], P[d + 1] - P[a + 1], P[d + 2] - P[a + 2]];
+      if (!(Math.hypot(u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]) > 1e-9)) {
+        degenerate++;
+        continue;
+      }
+      worst = Math.max(worst, angleBetween(ours, c, ref.normals, c));
+    }
+    expect(degenerate).toBeGreaterThan(0);
+    expect(fn.length).toBe(mesh.index.length);
+    expect(worst).toBeLessThan(0.1);
+  });
+
   it('edges exactly at the crease angle are a coin toss on both sides (logged)', () => {
     // A 10-sided prism has dihedral angles of exactly 36° between its sides. Manifold
     // decides each one from its double-precision positions, we from float32 ones, so a
@@ -406,5 +436,57 @@ describe('cornerNormals on its own', () => {
     }
     console.log(`sphere(40, 700): ${index.length / 3} triangles – topology ${topologyMs.toFixed(0)} ms, cornerNormals with prebuilt topology ${best.toFixed(0)} ms (best of 3; target ≤ 200 ms)`);
     expect(out.length).toBe(index.length * 3);
+  });
+});
+
+describe('the display buffers', () => {
+  it('shade a solid as Manifold does, a vertex for each smooth group: the same normal at every corner of a face with area', () => {
+    for (const make of [cube, cylinder, chamfered, () => batLanternSolid()]) {
+      const solid = make();
+      const b = displayBuffers(solid);
+      const shaded = solid.calculateNormals(0, 36);
+      const m = shaded.getMesh();
+      shaded.delete();
+      const mesh = meshOf(solid);
+      solid.delete();
+      expect(b.index.length).toBe(mesh.index.length);
+      const ref = new Float32Array(mesh.index.length * 3);
+      const ours = new Float32Array(mesh.index.length * 3);
+      for (let c = 0; c < mesh.index.length; c++) {
+        for (let a = 0; a < 3; a++) {
+          // the same corner of the same triangle, at the same point
+          expect(b.positions[3 * b.index[c] + a]).toBe(mesh.positions[3 * mesh.index[c] + a]);
+          ref[3 * c + a] = m.vertProperties[6 * m.triVerts[c] + 3 + a];
+          ours[3 * c + a] = b.normals[3 * b.index[c] + a];
+        }
+      }
+      const { within } = compare(ours, ref);
+      expect(within).toBeGreaterThanOrEqual(0.999);
+      // shared where the normal is shared: as many shaded vertices as Manifold's, give or take its slivers' corners
+      expect(Math.abs(b.positions.length / 3 - m.vertProperties.length / 6)).toBeLessThanOrEqual(0.01 * m.vertProperties.length / 6);
+    }
+  });
+
+  it("shade a rough model in a fraction of a second, where Manifold's own shading takes seconds with every sharp edge", () => {
+    // a ball of 100k triangles with its vertices moved in and out by up to 1 %, as a scan or a generated model is
+    // rough: tens of thousands of sharp edges (the user's lantern's view, 667k triangles, took 41 s to shade)
+    const ball = wasm.Manifold.sphere(10, 448);
+    const g = ball.getMesh();
+    ball.delete();
+    let seed = 1;
+    const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    const P = g.vertProperties.slice();
+    for (let i = 0; i < P.length; i += 3) {
+      const k = 1 + 0.02 * (rnd() - 0.5);
+      for (let a = 0; a < 3; a++) P[i + a] *= k;
+    }
+    const rough = new wasm.Manifold(new wasm.Mesh({ numProp: 3, vertProperties: P, triVerts: g.triVerts }));
+    const t0 = performance.now();
+    const b = displayBuffers(rough);
+    const ms = performance.now() - t0;
+    rough.delete();
+    console.log(`rough ball: ${b.index.length / 3} triangles shaded in ${ms.toFixed(0)} ms`);
+    expect(b.index.length / 3).toBeGreaterThan(100000);
+    expect(ms).toBeLessThan(1500);
   });
 });

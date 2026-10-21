@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   MATERIALS, PLUG, STEEP, TEA_LIGHT, arcBeam, camOut, click, collarFor, collarReach, collarSlope, ddOf, domeRoom, gminOf, layout, leastScale,
   lugHold, offerPercent, plugAt, plugDims, plugFor, plugHold, plugLayoutOk, rAt, ringCompliance, roundAngle, roundForce, roundLift, roundOpening,
-  roundZ, scalePercent, sizes, skinAt, slideWords, takesTeaLight, twistFor, wayWords,
+  roundZ, SEAT_WORD, TEA_SEAT, scalePercent, seatFloor, seatFloorAt, seatFor, seatSizes, sizes, skinAt, slideWords, takesTeaLight, twistFor, wayWords,
 } from '../src/locks.js';
 
 const two = (v) => +v.toFixed(2);
@@ -358,6 +358,77 @@ describe('the plug twist-lock', () => {
         expect(L.lugs[k].phi - a0).toBeCloseTo(theta + L.lugs[k].half + (S.c / R) * (180 / Math.PI), 9);
       });
     }
+  });
+});
+
+describe('the tea-light seat on a base', () => {
+  it('takes every common tea light, 38 to 39 mm, holds it within a millimetre of the middle and grows with the clearance', () => {
+    // room over it for the tallest LED tea light with its flame, the light the notes say to use
+    expect(TEA_SEAT).toEqual({ light: 39, tall: 45, depth: 3, lead: 0.6, band: 2 });
+    // 39 mm and the clearance and a typical printer's wall error either side: a 38 mm light 0.75 drawn each side, about
+    // 0.65 as printed; three whole layers deep, a wall of two lines round it, as uneven round it as it is deep
+    expect(seatSizes(sizes())).toEqual({ d: 39.5, r: 19.75, depth: 3, lead: 0.6, wall: 0.8, rough: 3, band: 2, tall: 45 });
+    expect(seatSizes(sizes(0.4, 0.2, 0.3))).toMatchObject({ d: 39.8, r: 19.9 });
+    // whole layers of any height, and two lines of any nozzle
+    expect(seatSizes(sizes(0.6, 0.28, 0.15))).toMatchObject({ depth: 3.08, rough: 3.08, wall: 1.2 });
+    // its floor a millimetre over the base's lock, whole layers (the lock's top is 5.26 at the default clearance), or 2
+    // mm over the bed with no lock; and a depth under the top's lowest point, on a layer
+    expect(seatFloor(sizes(), 5.262132)).toBe(6.4);
+    expect(seatFloor(sizes())).toBe(2);
+    expect(seatFloorAt(sizes(), 26.4)).toBe(23.4);
+    expect(seatFloorAt(sizes(), 26.401367)).toBe(23.4);
+    expect(seatFloorAt(sizes(), 26.39)).toBe(23.2);
+    expect(SEAT_WORD).toBe('tea-light seat');
+  });
+
+  it('cuts a seat into a level top over a solid base, with room over it for a light', () => {
+    const S = sizes();
+    const lock = plugDims(S, 28.7).top;
+    // the lantern's base at 400 % with nothing on its floor: the seat 3 mm under its top, on a layer
+    expect(seatFor(S, 28.7, { low: 26.4013, solid: true, room: 86 }, lock)).toEqual({ d: 39.5, r: 19.75, depth: 3.0013, lead: 0.6, zf: 23.4, mouth: 26.4013 });
+    // a ribbed top (a generated model's), ribs 1.6 mm proud round and in it: they are the top, and the seat cuts them
+    expect(seatFor(S, 28.7, { low: 25.95, inside: { top: 27.45, d: 40 }, rim: 27.55, solid: true, room: 90 }, lock)).toMatchObject({ zf: 22.8, depth: 3.15, mouth: 25.95 });
+    // a base 42.6 mm across keeps two lines round the seat's mouth; with no lock under it, its floor 2 mm over the bed
+    expect(seatFor(S, 21.3, { low: 19.8 }, lock)).toMatchObject({ zf: 16.8 });
+    expect(seatFor(S, 21.3, { low: 5 })).toMatchObject({ zf: 2, depth: 3 });
+  });
+
+  it('refuses what it should, and says why: in the order a user reads it', () => {
+    const S = sizes();
+    const lock = plugDims(S, 28.7).top;
+    const level = { low: 26.4, solid: true, room: 86 };
+    // no 38 mm tea light goes through a 30 mm opening; through 42.4 mm one goes, but no wall round the seat fits
+    expect(seatFor(S, 15, level)).toEqual({ why: 'narrow', opening: 30, need: 38.3 });
+    expect(seatFor(sizes(0.4, 0.2, 0.25), 19.2, level)).toEqual({ why: 'narrow', opening: 38.4, need: 38.5 });
+    expect(seatFor(S, 21.2, level)).toEqual({ why: 'room', opening: 42.4, need: 42.6 });
+    // the user's base at 400 %: its own cup stands 7.6 mm over the floor, 37 mm across, where the light would sit – the
+    // seat takes its place, cut a millimetre past where the cup ends
+    const cup = { low: 25.95, inside: { top: 33.585, d: 36.66, clear: 33.835 }, rim: 27.55, solid: true, room: 86 };
+    expect(seatFor(S, 28.7, cup, lock)).toEqual({ d: 39.5, r: 19.75, depth: 3.15, lead: 0.6, zf: 22.8, mouth: 25.95, clears: { h: 7.635, across: 36.66, top: 34.835 } });
+    // one only a little prouder than the seat is deep is the model's too; a tall one is cut no higher than the model
+    // over it
+    expect(seatFor(S, 28.7, { ...cup, inside: { top: 29.2, d: 20, clear: 29.45 } }, lock).clears).toEqual({ h: 3.25, across: 20, top: 30.45 });
+    expect(seatFor(S, 28.7, { ...cup, inside: { top: 70, d: 20, clear: 70.25 }, room: 47.5 }, lock).clears).toEqual({ h: 44.05, across: 20, top: 70.3 });
+    // wider than the seat, cutting it would leave its edge standing; running on up into the model, the rest of it
+    expect(seatFor(S, 28.7, { ...cup, inside: { top: 33.585, d: 39.6, clear: 33.835 } }, lock)).toEqual({ why: 'detail', h: 7.635, across: 39.6, rough: 3, d: 39.5 });
+    expect(seatFor(S, 28.7, { ...cup, inside: { top: 33.585, d: 36.66, clear: null } }, lock)).toEqual({ why: 'detail', h: 7.635, across: 36.66, rough: 3, d: 39.5, open: true });
+    // it takes the room over it from its own floor, as it does with nothing there
+    expect(seatFor(S, 28.7, { ...cup, room: 44 }, lock)).toEqual({ why: 'low', room: 44, tall: 45 });
+    // a top that slopes or steps more than the seat is deep round where it would go
+    expect(seatFor(S, 28.7, { ...level, rim: 30 }, lock)).toEqual({ why: 'level', h: 3.6, rough: 3 });
+    expect(seatFor(S, 28.7, { ...level, rim: 29.4 }, lock)).not.toHaveProperty('why');
+    // a floor too near the lock under it, or too thin with no lock
+    expect(seatFor(S, 28.7, { ...level, low: 9.3 }, lock)).toEqual({ why: 'thin', t: 4.037868, need: 4.137868, lock: true });
+    expect(seatFor(S, 28.7, { ...level, low: 9.4 }, lock)).toMatchObject({ zf: 6.4 });
+    expect(seatFor(S, 28.7, { ...level, low: 4.9 })).toEqual({ why: 'thin', t: 4.9, need: 5, lock: false });
+    // nothing round the mouth to read, or a hollow under the seat
+    expect(seatFor(S, 28.7, { low: null }, lock)).toEqual({ why: 'hollow' });
+    expect(seatFor(S, 28.7, { ...level, solid: false }, lock)).toEqual({ why: 'hollow' });
+    // the model closing over it lower than an LED tea light stands with its flame, the light the notes say to use: room
+    // for a 16 mm wax one is not enough
+    expect(seatFor(S, 28.7, { ...level, room: 22 }, lock)).toEqual({ why: 'low', room: 22, tall: 45 });
+    expect(seatFor(S, 28.7, { ...level, room: 44.9 }, lock)).toEqual({ why: 'low', room: 44.9, tall: 45 });
+    expect(seatFor(S, 28.7, { ...level, room: 45 }, lock)).not.toHaveProperty('why');
   });
 });
 

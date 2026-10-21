@@ -778,7 +778,8 @@ describe('a split that takes parts out', () => {
     expect(notes).toEqual([
       "SPLIT: Cut into 3 pieces. Cuts A and B come apart – don't glue them.",
       'PART_LOCK: Cut A: the dome and cap (piece 2) twist-lock onto piece 1 and the handle stays on piece 1. To fit it: set it on turned 27° to the left so the wide lug finds its wide slot, push down and turn it right until it clicks. To open it: turn it left until it clicks again, lift it 4.5 mm and slide it out under the handle, square to it.',
-      'PART_PLUG: Cut B: the base (piece 3) twists off underneath. Turn the lantern over, set the base in turned 23° to the left, push it in and turn it right until it clicks – a coin in its slot helps. To open it: turn it left until it clicks and lift it out. Its Ø 43 mm opening takes a 38 mm tea light.',
+      // a tea light goes in through the base: it goes in from underneath with the light standing on it
+      "PART_PLUG: Cut B: the base (piece 3) twists off underneath, and its Ø 43 mm opening takes a 38 mm tea light. To fit it: stand the light on the middle of the base, hold the lantern up and, looking at the base's bottom, set the base in turned 23° to the left, push it in and turn it right until it clicks – a coin in its slot helps. To open it: turn it left until it clicks and lower it out. Use an LED tea light: a flame's heat softens the plastic over it.",
       // how each prints: the lid's slit bridges as built (9 mm tabs round a Ø 32 mm socket: 10.41 mm along their middle), the
       // collar as steep as the dome; the base adds no overhang
       'PART_PRINT: Print piece 2 on its cut face, as saved. The lock needs no support: its slots and click tabs are bridged (10.5 mm or less) – if your slicer puts support inside them, turn on "don\'t support bridges". The collar under the joint inside piece 1 slopes like the dome (60°), so it needs whatever support the dome needs.',
@@ -791,7 +792,7 @@ describe('a split that takes parts out', () => {
     const coupon = await client.fitTest([], version, { printing, split: { clearance: 0.15, cuts: cuts('lock') }, name: 'bat' });
     expect(ex.notes.find((n) => n.code === 'PART_FIT')).toMatchObject({ d: coupon.twist.d, grams: coupon.twist.grams });
     expect(ex.assembly).toEqual([
-      'Do not glue cut B: it comes apart. Base: turn piece 1 over, set the base in turned 23° to the left, push in and turn it right until it clicks (a coin in the slot helps). To open: turn it left and lift it out.',
+      "Do not glue cut B: it comes apart. Base: its Ø 43 mm opening takes a 38 mm tea light – stand the light on the middle of the base, hold piece 1 up and, looking at the base's bottom, set the base in turned 23° to the left, push in and turn it right until it clicks (a coin in the slot helps). To open: turn it left and lower it out.",
       'Do not glue cut A: it comes apart. Dome and cap: set it on turned 27° to the left so the wide lug finds its wide slot, push down and turn it right until it clicks. To open: turn it left until it clicks again, lift it 4.5 mm and slide it out under the handle, square to it.',
     ]);
     const glue = ex.files.find((f) => f.kind === 'text').text;
@@ -1118,6 +1119,186 @@ describe('a split that takes parts out', () => {
       expect([name, ex.notes.map((n) => n.code).slice(0, 2)]).toEqual([name, ['SPLIT', 'PART_PLUG']]);
       expect(ex.seams[0].apart).toMatchObject({ mech: 'plug', R: base.r });
     }
+  });
+
+  it("cuts a tea-light seat into the base's top where it has room: one clean piece, its lock untouched, a light standing in it clear of the lantern", async () => {
+    const { Manifold } = wasm;
+    const kept = [];
+    const own = (m) => {
+      kept.push(m);
+      return m;
+    };
+    // the fixture with nothing on its floor at 400 %: its base's top is a flat floor 26.4 mm over the bed
+    await load(batLanternSolid({ cup: false }).scale([4, 4, 4]));
+    const table = await client.parts([], version, { printing, split: {} });
+    const base = table.parts.find((e) => e.kind === 'plug');
+    expect(base).toMatchObject({ r: 28.8, lock: { mech: 'plug', teaLight: true }, seat: { d: 39.5, r: 19.75, lead: 0.6, zf: 23.4 } });
+    const cut = (seat, hold = 'lock') => {
+      const c = partCut('c1', base.centre, base.face, base.r, { hold });
+      return { ...c, part: { ...c.part, ...(seat == null ? {} : { seat }) } };
+    };
+    const files = async (seat, hold) => {
+      const ex = await exportFiles({ cuts: [cut(seat, hold)] });
+      const placed = ex.files.filter((f) => f.stl).map((f) => {
+        const m = solidOf(f);
+        const w = m.transform(f.matrix);
+        m.delete();
+        return w;
+      });
+      return { ex, placed };
+    };
+    const seated = await files(true);
+    const plain = await files(false);
+    const unasked = await files(null);
+    try {
+      const [body, plug] = seated.placed;
+      const [body0, plug0] = plain.placed;
+      // one piece each, clean for a slicer
+      expect([body, plug].map((m) => m.decompose().map((x) => (x.delete(), 1)).length)).toEqual([1, 1]);
+      for (const f of seated.ex.files.filter((x) => x.stl)) expect([f.file, stlFileCheck(f.stl)]).toEqual([f.file, { degenerate: 0, open: 0 }]);
+      // the seat: what the base lost, round its axis from its floor 23.4 up to its top, 40.7 mm across at its lead-in;
+      // nothing added, and a part saved without a seat, or with it off, gets none
+      const took = plug0.subtract(plug);
+      const b = took.boundingBox();
+      expect(b.min[2]).toBeCloseTo(23.4, 4);
+      expect(b.max[2]).toBeCloseTo(26.4, 4);
+      for (const k of [0, 1]) {
+        expect(b.min[k]).toBeCloseTo(base.centre[k] - 20.35, 2);
+        expect(b.max[k]).toBeCloseTo(base.centre[k] + 20.35, 2);
+      }
+      const pocket = Math.PI * 19.75 ** 2 * 3;
+      expect(took.volume()).toBeGreaterThan(pocket);
+      expect(took.volume()).toBeLessThan(pocket + Math.PI * 2 * 20.05 * 0.18 + 1);
+      expect(own(plug.subtract(plug0)).volume()).toBe(0);
+      took.delete();
+      expect(unasked.placed[1].volume()).toBe(plug0.volume());
+      // the lock and the coin slot under it as they were, on the base and in the lantern
+      const under = own(Manifold.cube([200, 200, 24.4]).translate([-100, -100, -1]));
+      expect(own(plug0.intersect(under)).volume()).toBeCloseTo(own(plug.intersect(under)).volume(), 2);
+      expect(own(own(plug0.intersect(under)).subtract(plug)).volume()).toBeLessThan(0.01);
+      expect(body.volume()).toBe(body0.volume());
+      // a light standing in it, wax or LED, 38 or 39 mm across, meets neither the base nor the lantern over it
+      for (const [d, h] of [[38, 16], [39, 16], [38, 45]]) {
+        const light = own(Manifold.cylinder(h, d / 2, d / 2, 128).translate([base.centre[0], base.centre[1], 23.4 + 1e-3]));
+        expect([d, h, own(plug.intersect(light)).volume(), own(body.intersect(light)).volume()]).toEqual([d, h, 0, 0]);
+      }
+      // and it is held there: a 38 mm light moved 0.8 mm off the middle runs into the seat's wall
+      const off = own(Manifold.cylinder(2, 19, 19, 128).translate([base.centre[0] + 0.8, base.centre[1], 23.5]));
+      expect(own(plug.intersect(off)).volume()).toBeGreaterThan(0);
+    } finally {
+      [...seated.placed, ...plain.placed, ...unasked.placed, ...kept].forEach((m) => m.delete());
+    }
+    // what the seam, the notes, the pieces and the glue sheet say of it
+    const { ex } = seated;
+    expect(ex.seams[0].apart.seat).toEqual({ d: 39.5, depth: expect.closeTo(3, 2) });
+    expect(ex.seams[0].part).toMatchObject({ seat: { d: 39.5, zf: 23.4 }, wantsSeat: true });
+    expect(plain.ex.seams[0].apart).not.toHaveProperty('seat');
+    expect(ex.notes.find((n) => n.code === 'PART_PLUG').text).toBe(
+      "Cut A: the base (piece 2) twists off underneath, and a 38 mm tea light sits in the seat on top of it (Ø 39.5 mm, 3 mm deep). To fit it: stand the light in the seat, hold piece 1 up and, looking at the base's bottom, set the base in turned 17° to the left, push it in and turn it right until it clicks – a coin in its slot helps. To open it: turn it left until it clicks and lower it out. Use an LED tea light: a flame's heat softens the plastic over it.",
+    );
+    expect(ex.assembly[0]).toContain('Base: a 38 mm tea light sits in the seat on top of the base (Ø 39.5 mm, 3 mm deep) – stand the light in it, hold piece 1 up');
+    const glue = ex.files.find((f) => f.kind === 'text').text;
+    expect(glue).toMatch(/piece 2 of 2 .*comes off at cut A \(the base\), tea-light seat Ø 39\.5 mm on top\n/);
+    expect(glue).toContain('  A 38 mm tea light should drop into the seat on top of the base (cut A) and lift out with two fingers.');
+    // the pieces view paints the seat apart from the lock, and puts its word on it, on the base
+    const shown = await client.result([], version, { printing, split: { clearance: 0.15, cuts: [cut(true)] } });
+    expect(shown.display.marks.map((m) => m.kind)).toEqual(['lock', 'carry', 'lug', 'seat']);
+    const seatMark = shown.display.marks.findIndex((m) => m.kind === 'seat');
+    const painted = shown.display.markRanges.filter(([, , m]) => m === seatMark).reduce((n, [, count]) => n + count, 0);
+    expect(painted).toBeGreaterThan(100);
+    expect(shown.display.lockLabels.filter((x) => x.name === 'tea-light seat')).toEqual([{ cutId: 'c1', name: 'tea-light seat', piece: 2, at: [expect.closeTo(base.centre[0], 6), expect.closeTo(base.centre[1], 6), expect.closeTo(26.4, 2)] }]);
+    // a base that lifts out has its seat too, and says so; the view paints it and names it, with no lock round it
+    const lifting = await exportFiles({ cuts: [cut(true, 'lift')] });
+    expect(lifting.seams[0].apart).toMatchObject({ mech: null, seat: { d: 39.5 } });
+    expect(lifting.notes.map((n) => n.code)).toEqual(['SPLIT', 'PART_LIFTS', 'PART_SEAT']);
+    const lifted = await client.result([], version, { printing, split: { clearance: 0.15, cuts: [cut(true, 'lift')] } });
+    expect(lifted.display.marks.map((m) => m.kind)).toEqual(['seat']);
+    expect(lifted.display.markRanges.length).toBeGreaterThan(0);
+    expect(lifted.display.lockLabels.map((x) => [x.name, x.piece])).toEqual([['tea-light seat', 2]]);
+
+    // the switch is cheap: the base is carved once, and only drilled again
+    progress.length = 0;
+    await exportFiles({ cuts: [cut(false)] });
+    expect(progress).not.toContain('Cutting the base…');
+  });
+
+  it("cuts the seat in place of the base's own cup where that stands in the middle of its top, and says so; where none fits, says why in a note to read, not a warning", async () => {
+    const { Manifold } = wasm;
+    const kept = [];
+    const own = (m) => {
+      kept.push(m);
+      return m;
+    };
+    // the fixture as the user's lantern is, a cup 34 mm across standing 7.8 mm on its floor at 400 %
+    await load(batLanternSolid().scale([4, 4, 4]));
+    const base = (await client.parts([], version, { printing, split: {} })).parts.find((e) => e.kind === 'plug');
+    expect(base.seat).toMatchObject({ d: 39.5, zf: 23.4, clears: { across: expect.closeTo(34.4, 4) } });
+    expect(base.seat.clears.top).toBeGreaterThan(34 + 1);
+    const c = partCut('c1', base.centre, base.face, base.r);
+    const asked = await exportFiles({ cuts: [{ ...c, part: { ...c.part, seat: true } }] });
+    const kept0 = await exportFiles({ cuts: [{ ...c, part: { ...c.part, seat: false } }] });
+    const placed = (ex) => {
+      const f = ex.files.find((x) => x.index === 2);
+      const m = solidOf(f);
+      const w = m.transform(f.matrix);
+      m.delete();
+      return own(w);
+    };
+    try {
+      const [plug, plug0] = [placed(asked), placed(kept0)];
+      // one clean piece, its cup gone and the pocket in its place: nothing over the floor inside the seat
+      expect(plug.decompose().map((x) => (x.delete(), 1)).length).toBe(1);
+      expect(stlFileCheck(asked.files.find((x) => x.index === 2).stl)).toEqual({ degenerate: 0, open: 0 });
+      const inside = (m, z0, z1) => own(m.intersect(own(Manifold.cylinder(z1 - z0, 19.7, 19.7, 128).translate([base.centre[0], base.centre[1], z0])))).volume();
+      expect(inside(plug0, 26.5, 34)).toBeGreaterThan(400);
+      expect(inside(plug, 23.45, 40)).toBe(0);
+      // the lock under it as it was
+      const under = own(Manifold.cube([200, 200, 23.4]).translate([-100, -100, -1]));
+      expect(own(plug.intersect(under)).volume()).toBeCloseTo(own(plug0.intersect(under)).volume(), 2);
+      // the LED tea light the notes say to use stands in it clear of the base and the lantern
+      const light = own(Manifold.cylinder(45, 19, 19, 128).translate([base.centre[0], base.centre[1], 23.4 + 1e-3]));
+      expect(own(plug.intersect(light)).volume()).toBe(0);
+      // the base comes out lower than it was cut, its cup gone: the pieces and the file say so; with the cup kept, as
+      // tall as it was
+      const height = (m) => m.boundingBox().max[2] - m.boundingBox().min[2];
+      expect(height(plug)).toBeLessThan(27);
+      expect(height(plug0)).toBeGreaterThan(33.9);
+      expect(asked.pieces[1].size[2]).toBeCloseTo(height(plug), 6);
+      expect(asked.files.find((x) => x.index === 2).size[2]).toBeCloseTo(height(plug), 6);
+      expect(kept0.pieces[1].size[2]).toBeCloseTo(height(plug0), 3);
+    } finally {
+      kept.forEach((m) => m.delete());
+      kept.length = 0;
+    }
+    expect(asked.seams[0].apart.seat).toEqual({ d: 39.5, depth: expect.closeTo(3, 2), clears: { h: expect.closeTo(7.6, 0), across: expect.closeTo(34.4, 4) } });
+    expect(kept0.seams[0].apart).not.toHaveProperty('seat');
+    const note = asked.notes.find((n) => n.code === 'PART_PLUG');
+    expect(note.text).toMatch(/^Cut A: the base \(piece 2\) twists off underneath, and a 38 mm tea light sits in the seat on top of it \(Ø 39\.5 mm, 3 mm deep\), in place of the model's own detail there \(7\.\d mm proud, Ø 34 mm across\)\. To fit it: stand the light in the seat, /);
+    expect(note.text).toMatch(/ To keep that detail instead, untick Tea-light seat\.$/);
+    expect(asked.notes.some((n) => n.level === 'warn' || n.code === 'PART_NO_SEAT')).toBe(false);
+    // the seat's wall is two of the nozzle's lines: at 300 % a 0.4 mm nozzle's fit round it, a 0.6 mm one's do not –
+    // read again when only the nozzle changes, on a base that lifts out as on one that locks
+    await load(batLanternSolid({ cup: false }).scale([3, 3, 3]));
+    const b3 = (await client.parts([], version, { printing, split: {} })).parts.find((e) => e.kind === 'plug');
+    const lift3 = partCut('c1', b3.centre, b3.face, b3.r, { hold: 'lift' });
+    const seat3 = { ...lift3, part: { ...lift3.part, seat: true } };
+    expect((await exportFiles({ cuts: [seat3] })).seams[0].apart.seat).toMatchObject({ d: 39.5 });
+    const wide = await exportFiles({ cuts: [seat3] }, { nozzle: 0.6, layerHeight: 0.2 });
+    expect(wide.seams[0].part.seat).toEqual({ why: 'room', opening: 42.8, need: 43.4 });
+    expect(wide.seams[0].apart).not.toHaveProperty('seat');
+    // the seat is asked for wherever one fits, so none fitting is a note to read, not a warning to act on (the app makes
+    // a warning its red status line)
+    expect(wide.notes.find((n) => n.code === 'PART_NO_SEAT')).toMatchObject({
+      level: 'info', why: 'room', text: 'Cut A: no tea-light seat on the base (piece 2) – it is too narrow to keep a wall round one – that takes a Ø 43.4 mm opening.',
+    });
+    expect(wide.notes.some((n) => n.level === 'warn')).toBe(false);
+    // at 100 % no tea light goes into the base at all: its note says from what size one does, and nothing more is said
+    await load(batLanternSolid({ cup: false }));
+    const small = (await client.parts([], version, { printing, split: {} })).parts.find((e) => e.kind === 'plug');
+    expect(small.seat).toMatchObject({ why: 'narrow' });
+    const s = partCut('c1', small.centre, small.face, small.r);
+    const tiny = await exportFiles({ cuts: [{ ...s, part: { ...s.part, seat: true } }] });
+    expect(tiny.notes.map((n) => n.code)).toEqual(['SPLIT', 'PART_SMALL']);
   });
 
   it('takes a dome out from under a bail on side pivots: lifted the lock\'s own lift, it slides out under the arch', async () => {

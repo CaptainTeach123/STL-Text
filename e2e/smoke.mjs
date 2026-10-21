@@ -3519,6 +3519,11 @@ try {
           zShown: li.querySelector('[data-part-z]') ? !li.querySelector('[data-part-z]').closest('label').hidden : null,
           d: li.querySelector('[data-part-d]')?.value ?? null,
           holds: [...li.querySelectorAll('[data-cut-hold]')].map((r) => ({ value: r.value, checked: r.checked, disabled: r.disabled, title: r.parentElement.title })),
+          seat: (() => {
+            const box = li.querySelector('[data-part-seat]');
+            const label = box?.closest('label');
+            return box && !label.hidden ? { checked: box.checked, disabled: box.disabled, text: label.textContent, title: label.title } : null;
+          })(),
           meta: li.querySelector('.meta').textContent,
         })),
       );
@@ -3710,9 +3715,9 @@ try {
     check(
       big.parts[0].title === 'Dome and cap – twist-lock · Ø 29 mm opening · the handle stays · a 38 mm tea light fits through the base, not the lid' &&
         big.parts[0].badge === "the lantern's collar needs the dome's support" &&
-        big.parts[1].title === 'Base – twists off underneath · twist-lock · Ø 43 mm opening, takes a 38 mm tea light' && big.parts[1].badge === 'no extra support' &&
-        JSON.stringify(big.parts[1].buttons) === JSON.stringify(['Use']),
-      'at 300 % the card lists the dome and cap with its twist-lock and the base with its own, each with its print badge',
+        big.parts[1].title === "Base – twists off underneath · twist-lock · Ø 43 mm opening, takes a 38 mm tea light · a seat for it on top, in place of the model's own detail there" &&
+        big.parts[1].badge === 'no extra support' && JSON.stringify(big.parts[1].buttons) === JSON.stringify(['Use']),
+      "at 300 % the card lists the dome and cap with its twist-lock and the base with its own and a tea-light seat in place of its cup, each with its print badge",
       JSON.stringify(big),
     );
     await b.click('#undoBtn');
@@ -3731,9 +3736,19 @@ try {
     await settle();
     const withBase = await partRows();
     check(
-      withBase.length === 2 && withBase[1].name === 'Base' && withBase[1].zShown === false && withBase[1].meta === 'twist-lock, 3 lugs – turn 23° · coin slot' &&
+      withBase.length === 2 && withBase[1].name === 'Base' && withBase[1].zShown === false && withBase[1].meta.startsWith('twist-lock, 3 lugs – turn 23° · coin slot · ') &&
         (await b.locator('#downloadBtn').innerText()) === 'Download 3 pieces (.zip)',
       "Use on the base adds its row – no Z, its twist-lock with its coin slot – and a third piece",
+      JSON.stringify(withBase),
+    );
+    // its own cup stands in the middle of its top, where the light is to go: the tea-light seat takes its place, and the
+    // row says so, and how to keep the cup
+    check(
+      withBase[1].meta === "twist-lock, 3 lugs – turn 23° · coin slot · tea-light seat Ø 39.5 mm in place of the model's own detail" && !withBase[1].seat?.disabled &&
+        withBase[1].seat.checked && withBase[1].seat.text === 'Tea-light seat Ø 39.5 mm' &&
+        /, in place of the model's own detail there \(5\.\d mm proud, Ø 26 mm across\) – untick it to keep that$/.test(withBase[1].seat.title) &&
+        withBase[0].seat === null,
+      "the base's row has its Tea-light seat on in place of its own cup, saying so and how to keep the cup; the lid's has none",
       JSON.stringify(withBase),
     );
     await b.click('#undoBtn');
@@ -4418,6 +4433,284 @@ try {
     );
     check(batProblems.length === 0, 'no page errors with parts that come off', batProblems.join(' | '));
     await batContext.close();
+  }
+
+  console.log("\na base's tea-light seat");
+  {
+    // the bat lantern with nothing on its floor: at 400 % a 38 mm tea light stands in a seat on its base
+    const seatFile = writeFixture('bat-seat.stl', soupOf(batLanternSolid({ cup: false })));
+    const seatContext = await browser.newContext({ viewport: { width: 1400, height: 850 }, acceptDownloads: true });
+    // let the test read the view's WebGL pixels back, for the seat's colour in it
+    await seatContext.addInitScript(() => {
+      const getContext = HTMLCanvasElement.prototype.getContext;
+      HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+        if (type === 'webgl' || type === 'webgl2') attrs = { ...attrs, preserveDrawingBuffer: true };
+        return getContext.call(this, type, attrs);
+      };
+    });
+    const s = await seatContext.newPage();
+    const seatProblems = [];
+    s.on('pageerror', (e) => seatProblems.push(`pageerror: ${e.message}`));
+    s.on('console', (m) => m.type() === 'error' && seatProblems.push(`console: ${m.text()}`));
+    const settle = async () => {
+      await s.waitForTimeout(80);
+      await s.waitForSelector('body[data-engine="idle"]', { timeout: 120000 });
+      await s.waitForTimeout(80);
+      await s.waitForSelector('body[data-engine="idle"]', { timeout: 120000 });
+    };
+    const row = () =>
+      s.evaluate(() => {
+        const li = document.querySelector('#cutList > li.part');
+        const box = li?.querySelector('[data-part-seat]');
+        const label = box?.closest('label');
+        return (
+          li && {
+            seat: { checked: box.checked, disabled: box.disabled, text: label.textContent, title: label.title, struck: label.classList.contains('struck'), aria: box.getAttribute('aria-label') },
+            meta: li.querySelector('.meta').textContent,
+          }
+        );
+      });
+    const piecesText = async () => (await s.locator('#pieceList').innerText()).split('\n').filter(Boolean);
+    await s.goto(url);
+    await s.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    await s.setInputFiles('#stlFile', seatFile);
+    await s.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('bat-seat:'), null, { timeout: 60000 });
+    await settle();
+    await s.evaluate(() => (document.querySelector('#toast').hidden = true));
+    await s.click('#itemList li:first-child');
+    await s.keyboard.press('Delete');
+    await settle();
+    const listedParts = () => s.waitForFunction(() => !document.querySelector('#partsCard').hidden && !document.querySelector('#partsNote').classList.contains('busy') && document.querySelectorAll('#partList li').length > 0, null, { timeout: 120000 });
+    await s.click('#addApartBtn');
+    await listedParts();
+    await settle();
+    await s.keyboard.press('Escape');
+    await settle();
+    await s.locator('#partList li').first().locator('button', { hasText: 'Make it 400 %' }).click();
+    await settle();
+    await listedParts();
+    await settle();
+    const baseTitle = await s.locator('#partList li', { hasText: /^Base/ }).locator('.part-title').innerText();
+    check(
+      baseTitle.replace(/\u00a0/g, ' ') === 'Base – twists off underneath · twist-lock · Ø 58 mm opening, takes a 38 mm tea light · a seat for it on top',
+      "at 400 % the card's base takes a 38 mm tea light in a seat on its top",
+      baseTitle,
+    );
+    // Use: the base's row has its tea-light seat on, with its size, and says so under it
+    await s.locator('#partList li', { hasText: /^Base/ }).locator('button', { hasText: /^Use$/ }).click();
+    await settle();
+    const used = await row();
+    check(
+      used?.seat.checked && !used.seat.disabled && used.seat.text === 'Tea-light seat Ø 39.5 mm' && used.meta === 'twist-lock, 3 lugs – turn 17° · coin slot · tea-light seat Ø 39.5 mm',
+      "Use on a base with room for one gives it a tea-light seat, on by default: the row's box with its size, and its words",
+      JSON.stringify(used),
+    );
+    // its pieces: the seat on the base, the notes saying where the light goes and how the base goes in with it
+    await s.check('#resultToggle');
+    await settle();
+    await s.waitForTimeout(500);
+    await settle();
+    const withSeat = { pieces: await piecesText(), notes: await s.locator('#splitNotes').innerText(), legend: await s.evaluate(() => [...document.querySelectorAll('.legend > span')].filter((x) => !x.hidden).map((x) => x.textContent.trim())) };
+    check(
+      withSeat.pieces.length === 2 && /^2 · Base · .* · twist-lock, 3 lugs, coin slot · tea-light seat Ø 39\.5 mm$/.test(withSeat.pieces[1]) &&
+        withSeat.notes.includes("the base (piece 2) twists off underneath, and a 38 mm tea light sits in the seat on top of it (Ø 39.5 mm, 3 mm deep). To fit it: stand the light in the seat") &&
+        withSeat.notes.includes('Use an LED tea light') && withSeat.legend.includes('tea-light seat'),
+      'Show pieces lists the seat on the base, the notes say a 38 mm tea light sits in it and how the base goes in with it, and the legend keys it',
+      JSON.stringify(withSeat),
+    );
+    // the view: Look at the lock, then the seat from over the base, its word on it; the base's own ▶ brings the base
+    // back into view from wherever the camera is, the seat showing through the pieces faded round it
+    const violet = () =>
+      s.evaluate(() => {
+        const c = document.querySelector('#stage canvas');
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        let n = 0;
+        for (let i = 0; i < d.length; i += 4) if (d[i + 2] > 150 && d[i + 1] < 0.75 * d[i + 2] && d[i + 2] > d[i] - 10 && d[i] > 0.45 * d[i + 2]) n++;
+        return n;
+      });
+    // the view's pixels by hue, as shares of the canvas: the base's tan, the seat's violet as the legend keys it, and the
+    // pink a violet turns lit orange
+    const hues = () =>
+      s.evaluate(() => {
+        const c = document.querySelector('#stage canvas');
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        const n = { tan: 0, violet: 0, pink: 0 };
+        for (let i = 0; i < d.length; i += 4) {
+          const [r, g, b] = [d[i], d[i + 1], d[i + 2]];
+          const max = Math.max(r, g, b);
+          const min = Math.min(r, g, b);
+          if (max - min < 30) continue;
+          const h = max === r ? (60 * ((g - b) / (max - min)) + 360) % 360 : max === g ? 60 * ((b - r) / (max - min)) + 120 : 60 * ((r - g) / (max - min)) + 240;
+          if (h >= 38 && h < 70) n.tan++;
+          else if (h >= 245 && h < 275) n.violet++;
+          else if (h >= 275 && h < 335) n.pink++;
+        }
+        const all = d.length / 4;
+        return { tan: +((100 * n.tan) / all).toFixed(2), violet: +((100 * n.violet) / all).toFixed(2), pink: +((100 * n.pink) / all).toFixed(2) };
+      });
+    const lookWords = () => s.evaluate(() => [...document.querySelectorAll('#stage .lock-word')].filter((x) => !x.hidden).map((x) => x.textContent).sort().join('|'));
+    const looks = [];
+    for (let k = 0; k < 3; k++) {
+      const label = await s.locator('#lookLockBtn').innerText();
+      await s.click('#lookLockBtn');
+      await s.waitForTimeout(300);
+      looks.push({ label, words: await lookWords(), violet: await violet(), hues: await hues() });
+    }
+    check(
+      looks[0].label === 'Look at the lock' && looks[0].words === 'click tab|lug|slot' && looks[1].label === 'Look at the seat' && looks[1].words === 'tea-light seat' &&
+        looks[1].violet > 20000 && looks[1].violet > 50 * Math.max(looks[0].violet, 100) && looks[2].label === 'Look at the lock' && looks[2].words === 'click tab|lug|slot',
+      "after the base's lock, Look at the seat shows the seat from over the base, named, filling the view; then the lock again",
+      JSON.stringify(looks),
+    );
+    // looked at, the seat is the violet the legend keys it, not lit pink as the lock is lit orange
+    check(
+      looks[1].hues.violet > 2 && looks[1].hues.pink < 0.1 * looks[1].hues.violet,
+      'Look at the seat shows it violet, as the legend keys it, not pink',
+      JSON.stringify(looks[1].hues),
+    );
+    await s.hover('#cutList li.part .part-name');
+    await s.locator('#cutList li.part [data-part-play]').click();
+    await s.waitForTimeout(3000);
+    const played = await violet();
+    await s.mouse.move(700, 840);
+    await s.waitForTimeout(200);
+    check(played > 1500, "the base's own ▶, from close on its lock, frames the base dropping out, its seat showing", JSON.stringify({ played, lock: looks[2].violet }));
+    // off while it is looked at, and back with undo and redo, one step each: the view stays on the base, its top bare,
+    // then its seat again
+    for (let k = 0; k < 3 && (await lookWords()) !== 'tea-light seat'; k++) {
+      await s.click('#lookLockBtn');
+      await s.waitForTimeout(300);
+    }
+    const looking = { words: await lookWords(), hues: await hues() };
+    await s.locator('[data-part-seat]').uncheck();
+    await settle();
+    await s.waitForTimeout(400);
+    await settle();
+    const off = { row: await row(), pieces: await piecesText(), words: await lookWords(), label: await s.locator('#lookLockBtn').innerText(), hues: await hues() };
+    await s.click('#undoBtn');
+    await settle();
+    await s.waitForTimeout(400);
+    await settle();
+    const undone = { row: await row(), pieces: await piecesText(), words: await lookWords(), hues: await hues() };
+    check(
+      looking.words === 'tea-light seat' && off.hues.tan > 0.8 * looking.hues.tan && off.hues.violet < 0.05 * looking.hues.violet && off.words === '' &&
+        off.label === 'Look at the lock' && undone.words === 'tea-light seat' && undone.hues.violet > 0.8 * looking.hues.violet,
+      'unticking the seat while it is looked at leaves the view on the base, its top bare; undo shows the seat there again',
+      JSON.stringify({ looking, off: { words: off.words, label: off.label, hues: off.hues }, undone: { words: undone.words, hues: undone.hues } }),
+    );
+    await s.click('#redoBtn');
+    await settle();
+    const redone = await row();
+    await s.click('#undoBtn');
+    await settle();
+    await s.waitForTimeout(400);
+    await settle();
+    check(
+      !off.row.seat.checked && !off.row.seat.disabled && off.row.meta === 'twist-lock, 3 lugs – turn 17° · coin slot' && !/tea-light/.test(off.pieces[1]) &&
+        undone.row.seat.checked && /tea-light seat Ø 39\.5 mm$/.test(undone.pieces[1]) && !redone.seat.checked && (await row()).seat.checked,
+      "unticking the seat takes it off the base in one step, and undo and redo put it back and take it off again",
+      JSON.stringify({ off, undone, redone }),
+    );
+    // the download: the base has its seat, a round pocket 39.5 mm across and 3 mm deep in the middle of its top; the
+    // glue sheet says where the light goes
+    const [dl] = await Promise.all([s.waitForEvent('download', { timeout: 120000 }), s.click('#downloadBtn')]);
+    const zipFile = path.join(out, 'bat-seat.zip');
+    await dl.saveAs(zipFile);
+    await settle();
+    const zip = unzipSync(new Uint8Array(fs.readFileSync(zipFile)));
+    const baseEntry = Object.keys(zip).find((n) => /piece-2-of-2\.stl$/.test(n));
+    const pocket = (() => {
+      const bytes = zip[baseEntry];
+      const m = geometryToManifold(parseSTL(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)));
+      const bb = m.boundingBox();
+      const at = (z) => {
+        const cs = m.slice(bb.min[2] + z);
+        const hole = cs.toPolygons().filter((p) => {
+          let a = 0;
+          for (let i = 0; i < p.length; i++) a += p[i][0] * p[(i + 1) % p.length][1] - p[(i + 1) % p.length][0] * p[i][1];
+          return a < 0;
+        });
+        const xs = hole.flat().map((p) => p[0]);
+        cs.delete();
+        return { holes: hole.length, across: xs.length ? Math.max(...xs) - Math.min(...xs) : 0 };
+      };
+      const out = { shells: m.decompose().map((x) => (x.delete(), 1)).length, height: bb.max[2] - bb.min[2], floor: at(23.3), seat: at(24.9) };
+      m.delete();
+      return out;
+    })();
+    const glue = strFromU8(zip[Object.keys(zip).find((n) => n.endsWith('.txt'))]);
+    check(
+      pocket.shells === 1 && Math.abs(pocket.height - 26.4) < 0.01 && pocket.floor.holes === 0 && pocket.seat.holes === 1 && Math.abs(pocket.seat.across - 39.5) < 0.05 &&
+        glue.includes('a 38 mm tea light sits in the seat on top of the base') && glue.includes('tea-light seat Ø 39.5 mm on top'),
+      "the downloaded base has its seat: a round pocket Ø 39.5 mm down to 3 mm under its top, solid under it, and the glue sheet says the light sits in it",
+      JSON.stringify({ baseEntry, pocket }),
+    );
+    // at 280 % a 38 mm tea light still goes in through the base, but there is no room for a seat's wall round it: the
+    // card and the row say why, the box stays there to untick, the note says why and is no warning – the status line
+    // stays grey – and Look at the lock goes on to the base's top, where the light stands
+    await s.evaluate(() => {
+      document.querySelector('#scalePercent').value = '70';
+      document.querySelector('#scaleBtn').click();
+    });
+    await settle();
+    await listedParts();
+    await settle();
+    await s.check('#resultToggle');
+    await settle();
+    await s.waitForTimeout(500);
+    await settle();
+    const small = {
+      size: await s.evaluate(() => document.querySelector('#modelInfo').textContent.match(/: ([\d.]+ × [\d.]+ × [\d.]+) mm/)?.[1] ?? null),
+      card: (await s.locator('#partList li', { hasText: /^Base/ }).locator('.part-title').innerText()).replace(/\u00a0/g, ' '),
+      row: await row(),
+      status: await s.evaluate(() => ({ text: document.querySelector('#status').textContent, error: document.querySelector('#status').classList.contains('error') })),
+      notes: await s.locator('#splitNotes').innerText(),
+      words: await lookWords(),
+      label: await s.locator('#lookLockBtn').innerText(),
+    };
+    check(
+      small.size === '70.0 × 70.0 × 140.0' && small.card === 'Base – twists off underneath · twist-lock · Ø 40 mm opening, takes a 38 mm tea light · no seat for it on top: too narrow for one' &&
+        small.row.seat.checked && !small.row.seat.disabled && small.row.seat.struck && small.row.seat.text === 'Tea-light seat' &&
+        small.row.seat.title === 'No tea-light seat fits: it is too narrow to keep a wall round one – that takes a Ø 42.6 mm opening' &&
+        small.row.seat.aria === "A tea-light seat on top of cut A's base – none fits: it is too narrow to keep a wall round one – that takes a Ø 42.6 mm opening" &&
+        small.row.meta === 'twist-lock, 3 lugs – turn 24° · coin slot · no tea-light seat: too narrow for one' && !small.status.error && !/tea-light/.test(small.status.text) &&
+        small.notes.includes('Cut A: no tea-light seat on the base (piece 2) – it is too narrow to keep a wall round one – that takes a Ø 42.6 mm opening.') &&
+        small.notes.includes("its Ø 40 mm opening takes a 38 mm tea light. To fit it: stand the light on the middle of the base, hold") &&
+        small.words === '' && small.label === 'Look at the lock',
+      'at 280 % the card, the row and a note say why no seat fits – no warning, and the box still there to untick',
+      JSON.stringify(small),
+    );
+    const tops = [];
+    for (let k = 0; k < 2; k++) {
+      const label = await s.locator('#lookLockBtn').innerText();
+      await s.click('#lookLockBtn');
+      await s.waitForTimeout(300);
+      tops.push({ label, words: await lookWords(), hues: await hues() });
+    }
+    await s.locator('[data-part-seat]').uncheck();
+    await settle();
+    await s.waitForTimeout(400);
+    await settle();
+    const unasked = { row: await row(), notes: await s.locator('#splitNotes').innerText() };
+    check(
+      tops[0].label === 'Look at the lock' && tops[0].words === 'click tab|lug|slot' && tops[1].label === "Look at the base's top" && tops[1].words === '' && tops[1].hues.tan > 5 &&
+        tops[1].hues.violet < 0.2 &&
+        !unasked.row.seat.checked && !unasked.row.seat.disabled && unasked.row.meta === 'twist-lock, 3 lugs – turn 24° · coin slot' && !/no tea-light seat/.test(unasked.notes),
+      "Look at the lock goes on to the base's top where no seat fits; unticking the seat there asks for none, and the note goes",
+      JSON.stringify({ tops, unasked }),
+    );
+    check(seatProblems.length === 0, "no page errors with a base's tea-light seat", seatProblems.join(' | '));
+    await seatContext.close();
   }
 
   console.log('\na cut row on the narrowest phone');

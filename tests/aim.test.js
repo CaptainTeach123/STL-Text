@@ -3,7 +3,7 @@ import { BoxGeometry, BufferGeometry, Float32BufferAttribute, Uint32BufferAttrib
 import { MeshBVH } from 'three-mesh-bvh';
 import {
   HANDLE_PLANE, MIXED_PART, SNAP_MAX, aimLine, aimTargets, bandOf, handlePlaneWords, lipLine, lipVerdict, lipWords, noFitTestWords, noLockOf, noLockTitle, offWords,
-  partCard, partFace, partMeta, partOffered, partReadout, partWidth, partsNote, percentOf, pickPart, placedAt, snapTolerance, snappedWords, spotLabel, stuckWords, takesHandle,
+  partCard, partFace, partMeta, partOffered, partReadout, partWidth, partsNote, percentOf, pickPart, placedAt, seatMeta, snapTolerance, snappedWords, spotLabel, stuckWords, takesHandle,
   throughWords, wayCaption, widthWords,
 } from '../src/aim.js';
 import { snapTarget, wayStep } from '../src/split.js';
@@ -229,6 +229,18 @@ describe('parts that come off', () => {
     expect(partCard({ ...lid400, lock: { ...lid400.lock, slope: 1 } }, bat400).badge).toBe('no extra support');
     expect(partCard({ ...lid400, lock: { ...lid400.lock, slope: 1 }, underSlope: 7.5 }, bat400).badge).toBe('no extra support');
     expect(partCard({ ...lid400, name: 'Top', handle: null }, bat400).badge).toBe("the collar under it needs the model's support");
+    // a base whose top has room for a tea-light seat says it gets one – in place of its own cup, where the seat cuts that
+    // away; one with no room for one says why, and one no tea light goes into says nothing of it
+    expect(partCard({ ...base400, seat: { d: 39.5, zf: 23.4 } }, bat400).title).toBe('Base – twists off underneath · twist-lock · Ø 57 mm opening, takes a 38 mm tea light · a seat for it on top');
+    expect(partCard({ ...base400, seat: { d: 39.5, zf: 23.4, clears: { h: 7.6, across: 36.7, top: 35.3 } } }, bat400).title).toBe(
+      "Base – twists off underneath · twist-lock · Ø 57 mm opening, takes a 38 mm tea light · a seat for it on top, in place of the model's own detail there",
+    );
+    expect(partCard({ ...base400, seat: { why: 'room', opening: 39, need: 42.6 } }, bat400).title).toBe(
+      'Base – twists off underneath · twist-lock · Ø 57 mm opening, takes a 38 mm tea light · no seat for it on top: too narrow for one',
+    );
+    expect(partCard({ ...base400, seat: { why: 'detail', h: 7.6, across: 45 } }, bat400).title).toMatch(/takes a 38 mm tea light · no seat for it on top: the model's own detail is in the way$/);
+    expect(partCard({ ...base400, lock: { ...base400.lock, teaLight: false }, seat: { why: 'narrow', opening: 37.6 } }, bat400).title).toBe('Base – twists off underneath · twist-lock · Ø 57 mm opening');
+    expect(partCard(base400, bat400).title).toBe('Base – twists off underneath · twist-lock · Ø 57 mm opening, takes a 38 mm tea light');
     // a top with no handle over it, or one that takes the handle
     expect(partCard({ ...lid400, name: 'Top', handle: null }, bat400).title).toBe('Top – twist-lock · Ø 42 mm opening, takes a 38 mm tea light');
     expect(partCard({ ...lid400, takesHandle: true }, bat400).title).toBe('Dome and cap – twist-lock · Ø 42 mm opening, takes a 38 mm tea light · takes the handle with it');
@@ -315,6 +327,24 @@ describe('parts that come off', () => {
     expect(partMeta({ hold: 'lock', note: { ...gap, movedTo: 115.6 } })).toBe("the circle runs too close to the handle's feet at Z 115.4 – moved to Z 115.6");
     expect(partMeta({ hold: 'lock', note: gap })).toBe("the circle runs too close to the handle's feet at Z 115.4 – no face here leaves 0.9 mm");
     expect(partMeta({ hold: 'lock', note: { code: 'PART_MIXED' } })).toBe('left out – see the note');
+    // a base's tea-light seat after what holds it: the one it has, or why none where it asked for one – nothing where no
+    // tea light goes into it at all, and nothing on a lid
+    const plug = { hold: 'lock', kind: 'plug', lock: { mech: 'plug', theta: 17 } };
+    expect(partMeta({ ...plug, seat: { d: 39.5, depth: 3 } })).toBe('twist-lock, 3 lugs – turn 17° · coin slot · tea-light seat Ø 39.5 mm');
+    expect(partMeta({ ...plug, seat: { d: 39.5, depth: 3, clears: { h: 7.6, across: 36.7 } } })).toBe(
+      "twist-lock, 3 lugs – turn 17° · coin slot · tea-light seat Ø 39.5 mm in place of the model's own detail",
+    );
+    expect(partMeta({ ...plug, seat: { why: 'detail', h: 7.6 } })).toBe("twist-lock, 3 lugs – turn 17° · coin slot · no tea-light seat: the model's own detail is in the way");
+    expect(partMeta({ hold: 'lift', kind: 'plug', seat: { d: 39.5 } })).toBe('lifts out – nothing holds it · tea-light seat Ø 39.5 mm');
+    expect(partMeta({ ...plug, seat: { why: 'narrow', opening: 30 } })).toBe('twist-lock, 3 lugs – turn 17° · coin slot');
+    expect(partMeta({ hold: 'lock', lock: lid400.lock, seat: { d: 39.5 } })).toBe('twist-lock, 3 lugs, 6 clicks – turn 19°');
+    expect(partMeta({ ...plug, note: { code: 'PART_MIXED' }, seat: { d: 39.5 } })).toBe('left out – see the note');
+    expect(['room', 'level', 'thin', 'hollow', 'low'].map((why) => seatMeta({ why }))).toEqual([
+      'no tea-light seat: too narrow for one', "no tea-light seat: its top isn't level", 'no tea-light seat: too thin for one', 'no tea-light seat: not solid under it',
+      'no tea-light seat: no room over it for a light',
+    ]);
+    expect(seatMeta({ why: 'thin', lock: true })).toBe('no tea-light seat: too near its lock');
+    expect(seatMeta(null)).toBe('');
   });
 
   it('says what a part is doing as it comes out along its way: each step, its number, and how far', () => {
@@ -333,7 +363,8 @@ describe('parts that come off', () => {
     // the base, as it is fitted: seen from underneath
     const base = { name: 'Base', kind: 'plug', way: { turn: 17, up: true, lift: 0, dir: null, out: [0, 0, -1], reach: 0 } };
     expect(at(base, 0.25)).toBe('Base: 1 of 2 · Turn it 17° to the left, seen from underneath – it clicks free');
-    expect(at(base, 0.75)).toBe('Base: 2 of 2 · Lift it out');
+    // a base drops out of the model's end, the lantern standing as it is
+    expect(at(base, 0.75)).toBe('Base: 2 of 2 · Lower it out');
   });
 
   it('says what a part is doing as it goes on again (Shift+▶): the steps the other way round, counted as they are done', () => {

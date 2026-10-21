@@ -63,6 +63,94 @@ export const TEA_LIGHT = 38;
 /** Whether a tea light goes through an opening of diameter d with the clearance c either side. */
 export const takesTeaLight = (d, c = 0.15) => d >= TEA_LIGHT + 2 * c - 1e-9;
 
+/**
+ * The tea-light seat a base gets on its top (mm): a round pocket a tea light stands in, centred, so it can't slide
+ * about while the lantern is carried. `light` the widest common tea light – a wax one in its aluminium cup is 38–39
+ * across, an LED one 38 – and `tall` the tallest it makes room for over it: an LED one is 35–45 with its flame, and
+ * the notes say to use one, as a flame's heat softens the plastic over it (a wax one is 16). `depth`: a light knocked
+ * about has to lift this far to get out, three times its cup's rolled rim, and a wax one still stands 13 mm proud to
+ * be taken out with two fingers. `lead` the 45° lead-in round the mouth, so a light set down a little off the middle
+ * slides in; `band` how far round the mouth the top is read to be level.
+ */
+export const TEA_SEAT = Object.freeze({ light: 39, tall: 45, depth: 3, lead: 0.6, band: 2 });
+
+/** What the view calls a base's seat where it puts the word on it. */
+export const SEAT_WORD = 'tea-light seat';
+
+/**
+ * The seat's sizes on a printer (mm): its diameter `d` the widest light with the clearance either side and the wall
+ * error a typical printer prints a hole smaller by (39.5 at the default clearance, so a 39 mm light drops in and a 38
+ * mm one sits within 0.65 of the middle), its `depth` whole layers, the `wall` of two lines it keeps from the base's
+ * side, and how uneven (`rough`) the top round it may be: within the seat's own depth, as a scan's or a generated
+ * model's ribbing is – anything standing higher inside it is the model's own, which the seat cuts away to take its
+ * place.
+ */
+export function seatSizes(S) {
+  const d = r6(TEA_SEAT.light + 2 * (S.c + PRINTERS.typical.delta));
+  const depth = up(TEA_SEAT.depth, S.hl);
+  return { d, r: r6(d / 2), depth, lead: TEA_SEAT.lead, wall: S.skin, rough: depth, band: TEA_SEAT.band, tall: TEA_SEAT.tall };
+}
+
+/**
+ * The least height of the seat's floor over the bed: solid a millimetre over the base's lock (`lockTop`, the plug's
+ * `top`), as the base is anyway, or 2 mm over the bed with no lock under it – whole layers.
+ */
+export const seatFloor = (S, lockTop = null) => up(lockTop == null ? 2 : lockTop + 1, S.hl);
+
+/** The seat's floor for a top whose lowest point round the mouth is `low` over the bed: its depth under that, on a layer. */
+export const seatFloorAt = (S, low) => r6(Math.floor((low - seatSizes(S).depth) / S.hl + 1e-9) * S.hl);
+
+/**
+ * The tea-light seat a base with a bore of radius R gets, from what its top is (`seatOf` reads it off the model's
+ * slices, heights over the bed): or why none – 'narrow' when a 38 mm tea light doesn't go through the bore at all,
+ * 'room' when the base is too narrow to keep a wall round the seat, 'level' when the top round the seat rises more
+ * than the seat is deep (a sloping or stepped top), 'detail' when something of the model stands that high inside it
+ * that the seat can't take the place of (wider than the seat, or running on up into the model), 'thin' when its floor
+ * would come too near the lock under it, 'hollow' when the base is not solid under it and 'low' when an LED tea light
+ * would not stand up in the model over it. The model's own detail standing in the seat's mouth – a candle cup on the
+ * floor, where the light is to go – is cut away with the seat (`clears`).
+ * @param {object} S `sizes()`
+ * @param {number} R the base's bore
+ * @param {{ low: number|null, inside?: { top: number, d: number, clear?: number|null }|null, rim?: number|null,
+ *   solid?: boolean, room?: number }} m `low` the top's lowest point round the mouth (null with nothing there); `rim`
+ *   the highest point round the mouth, where the top round it rises past the seat's depth; `inside` the highest thing
+ *   inside the mouth, how wide it spans and the first height clear over it (null when it runs on up into the model);
+ *   `solid` whether the base is solid under the seat's floor down to the least floor (`seatFloor`); `room` the free
+ *   height over the floor inside the model, over what the seat clears
+ * @param {number|null} lockTop the plug lock's `top`, or null when it has none
+ * @returns {{ d: number, r: number, depth: number, lead: number, zf: number, mouth: number, clears?: { h: number,
+ *   across: number, top: number } }|{ why: string, … }} `zf` the floor and `mouth` the top's lowest point, where the
+ *   lead-in ends; `clears` the model's own detail the seat takes the place of, `h` proud and `across` wide, cut up to
+ *   `top`; a refusal carries what its words need
+ */
+export function seatFor(S, R, m, lockTop = null) {
+  const z = seatSizes(S);
+  const opening = r6(2 * R);
+  if (!takesTeaLight(opening, S.c)) return { why: 'narrow', opening, need: r6(TEA_LIGHT + 2 * S.c) };
+  // the base's side is its plug's, the clearance in from the bore
+  if (R - S.c - (z.r + z.lead) < z.wall - 1e-9) return { why: 'room', opening, need: r6(2 * (z.r + z.lead + z.wall + S.c)) };
+  const { low, inside = null, rim = null, solid = true, room = Infinity } = m;
+  if (low == null) return { why: 'hollow' };
+  if (rim != null && rim - low > z.rough + 1e-9) return { why: 'level', h: r6(rim - low), rough: z.rough };
+  // the model's own detail standing higher than the seat is deep inside its mouth is where the light is to go: the
+  // seat takes its place where all of it lies inside the seat and it ends under the model over it – wider, or running
+  // on up into the model, cutting it would leave the rest of it standing
+  const proud = !!inside && inside.top - low > z.rough + 1e-9;
+  if (proud && !(inside.d <= z.d + 1e-9 && inside.clear != null)) {
+    return { why: 'detail', h: r6(inside.top - low), across: r6(inside.d), rough: z.rough, d: z.d, ...(inside.clear == null ? { open: true } : {}) };
+  }
+  const zf = seatFloorAt(S, low);
+  const least = seatFloor(S, lockTop);
+  if (zf < least - 1e-9) return { why: 'thin', t: r6(low - (lockTop ?? 0)), need: r6(least + z.depth - (lockTop ?? 0)), lock: lockTop != null };
+  if (!solid) return { why: 'hollow' };
+  if (room < z.tall - 1e-9) return { why: 'low', room: r6(room), tall: z.tall };
+  const seat = { d: z.d, r: z.r, depth: r6(low - zf), lead: z.lead, zf, mouth: r6(low) };
+  if (!proud) return seat;
+  // cut a millimetre past where the detail ends, and never into the model over it
+  const top = r6(Math.min(inside.clear + 1, zf + room));
+  return { ...seat, clears: { h: r6(inside.top - low), across: r6(inside.d), top } };
+}
+
 // ---------- sizes ----------
 
 /**

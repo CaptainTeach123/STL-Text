@@ -340,13 +340,14 @@ export function slenderTowerSolid() {
 
 /**
  * A small bat lantern like the user's, at its 100 % size (25 × 25 × 50 mm): a solid base disc with a recessed band
- * (r 10, 9.35 from z 1 to 4.5, 10.3 from 4.5 to 6.6) on 8 feet, a floor cup, 8 posts to z 26, a 1.5 mm ring band, a
+ * (r 10, 9.35 from z 1 to 4.5, 10.3 from 4.5 to 6.6) on 8 feet, a floor cup (r 3.3–4.3, to z 8.5; none with `cup`
+ * false, a floor a tea light can stand on), 8 posts to z 26, a 1.5 mm ring band, a
  * conical dome shell 30° from horizontal (0.6 mm thick square to it) from the band to a flange, a cupola of 12 columns
  * with a spire to z 38.7, 8 spires on the band and a handle in the XZ plane: two legs whose feet bend in and fuse into
  * the dome's outside at r 7.75–9.3, z 27.9–28.9, a boss on each and an arch over the cap to its crown at z 50. One
  * shell, genus 26, 8,004 triangles. The lid that leaves the handle on is the dome and cap over z ≈ 29 inside r ≈ 7.9.
  */
-export function batLanternSolid({ seg = 96 } = {}) {
+export function batLanternSolid({ seg = 96, cup = true } = {}) {
   const { Manifold, CrossSection } = manifold();
   const temps = [];
   const t = (m) => {
@@ -368,7 +369,7 @@ export function batLanternSolid({ seg = 96 } = {}) {
       const a = (k * Math.PI) / 4;
       parts.push(t(b([-1.2, -1.2, 0], [1.2, 1.2, 6.6]).translate([11.3 * Math.cos(a), 11.3 * Math.sin(a), 0])));
     }
-    parts.push(tube(1.95, 3.3, 4.3, 6.55));
+    if (cup) parts.push(tube(1.95, 3.3, 4.3, 6.55));
     // the posts, every other one wider
     for (let k = 0; k < 8; k++) {
       const a = (k * Math.PI) / 4;

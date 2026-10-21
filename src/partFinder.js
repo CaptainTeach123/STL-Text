@@ -25,7 +25,7 @@
  * least scale is a factor on the model as it is now.
  */
 import { manifold } from './manifold.js';
-import { collarFor, collarReach, collarSlope, leastScale, plugAt, plugDims, plugFor, scalePercent, sizes, takesTeaLight } from './locks.js';
+import { collarFor, collarReach, collarSlope, leastScale, plugAt, plugDims, plugFor, scalePercent, seatFloor, seatFloorAt, seatFor, seatSizes, sizes, takesTeaLight } from './locks.js';
 
 /** The levels the model is sliced at across its height, at the middle of each step. */
 export const PART_LEVELS = 240;
@@ -1043,6 +1043,154 @@ export function plugLockOf(stack, fine, c, R, S, zBed) {
   return plugAt(S, R, { solidTop: floor.floorTop - zBed, ringOutAt: ringOutOf(ringRows(fine, c, zBed, S), S, 1) });
 }
 
+// ---------- the tea-light seat ----------
+
+/** Segments of the circles the seat's rings are read with: 0.004 mm inside the circle at r 20. */
+const SEAT_SEGMENTS = 256;
+/** A ring this much covered is solid: a slice's own outline is a little off the circle's polygon. */
+const SEAT_SOLID = 0.999;
+/** A ring this little covered holds nothing: what is left of a speck the slices dropped. */
+const SEAT_NONE = 1e-5;
+/** How finely the top's lowest point round the seat is found (mm): the floor goes on the layer under it. */
+const SEAT_TOL = 0.002;
+
+/**
+ * A flat ring clipped to the box [x0, y0, x1, y1] (Sutherland–Hodgman), as points: a floor's outline far round the
+ * seat becomes the box's own corners, so the cross-section made of it is small. Null when nothing of it is left.
+ */
+function clippedRing(a, [x0, y0, x1, y1]) {
+  let pts = ringPoints(a);
+  const edges = [[0, x0, 1], [0, x1, -1], [1, y0, 1], [1, y1, -1]];
+  for (const [k, v, sign] of edges) {
+    if (!pts.length) break;
+    const inside = (p) => sign * (p[k] - v) >= 0;
+    const out = [];
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      const q = pts[(i + 1) % pts.length];
+      if (inside(p)) out.push(p);
+      if (inside(p) !== inside(q)) {
+        const t = (v - p[k]) / (q[k] - p[k]);
+        out.push([p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1])]);
+      }
+    }
+    pts = out;
+  }
+  return pts.length >= 3 ? pts : null;
+}
+
+/** How much of the ring round a centre from radius r0 to r1 (0: the disc) the islands of a slice cover, 0 to 1. */
+function ringCover(islands, c, r0, r1) {
+  const { CrossSection } = manifold();
+  const temps = scope();
+  try {
+    const box = [c[0] - r1 - 1, c[1] - r1 - 1, c[0] + r1 + 1, c[1] + r1 + 1];
+    const rings = islands
+      .filter((x) => {
+        const r = reach(x, c);
+        return r.dmin < r1 && r.dmax > r0;
+      })
+      .flatMap((x) => x.rings.map((a) => clippedRing(a, box)).filter(Boolean));
+    if (!rings.length) return 0;
+    const disc = temps.add(temps.add(CrossSection.circle(r1, SEAT_SEGMENTS)).translate(c));
+    const ring = r0 > 0 ? temps.add(disc.subtract(temps.add(temps.add(CrossSection.circle(r0, SEAT_SEGMENTS)).translate(c)))) : disc;
+    // the islands' outlines and holes as one cross-section: they never cross, so their windings add up to the fill
+    const solid = temps.add(new CrossSection(rings, 'Positive'));
+    return temps.add(solid.intersect(ring)).area() / ring.area();
+  } finally {
+    temps.dispose();
+  }
+}
+
+/**
+ * The tea-light seat a base with its circle of radius R round centre c gets on its top (`seatFor`), read off the
+ * model's slices as the finder and the engine both have them, so the card offers the seat the download cuts. The top's
+ * lowest point round the seat's mouth is where the ring there stops being solid, found on the slice stack and then to
+ * `SEAT_TOL` on fine slices; one slice the seat's depth over it says whether anything stands round the mouth (a top
+ * that isn't level) or inside it (the model's own detail) higher than the seat may cut; the stack says how high and
+ * wide that is and where it ends, whether the base is solid under the seat's floor, and how much room a light has
+ * over it before the model closes over it. Heights are over the model's bottom, `zBed`.
+ * @param {object} stack the model's `sliceStack`
+ * @param {(z: number) => object[]} fine its islands at a height (`fineSlices`)
+ * @param {number[]} c the circle's centre
+ * @param {number} R its radius, the base's bore
+ * @param {object} S `sizes()`
+ * @param {number} zBed the model's bottom, the base's face
+ * @param {{ lockTop?: number|null }} options the plug lock's `top` (null when the base has none)
+ * @returns {object} `seatFor`'s
+ */
+export function seatOf(stack, fine, c, R, S, zBed, { lockTop = null } = {}) {
+  const first = seatFor(S, R, { low: null }, lockTop);
+  if (first.why !== 'hollow') return first;
+  const z = seatSizes(S);
+  const rIn = z.r + z.lead;
+  const rOut = Math.min(rIn + z.band, R - S.c);
+  const at = (h) => fine(zBed + h);
+  const solidRing = (islands, r0, r1) => ringCover(islands, c, r0, r1) >= SEAT_SOLID;
+  const floor = seatFloor(S, lockTop);
+  // the ring round the mouth is solid over the seat's least floor, and stops being so at the top's lowest point there
+  let lo = floor;
+  if (!solidRing(at(lo + OVER), rIn, rOut)) return seatFor(S, R, { low: null }, lockTop);
+  let hi = null;
+  for (const lv of stack.levels) {
+    const h = lv.z - zBed;
+    if (h <= lo) continue;
+    if (solidRing(lv.islands, rIn, rOut)) lo = h;
+    else {
+      hi = h;
+      break;
+    }
+  }
+  if (hi == null) hi = stack.zmax - zBed;
+  while (hi - lo > SEAT_TOL) {
+    const mid = (lo + hi) / 2;
+    if (solidRing(at(mid), rIn, rOut)) lo = mid;
+    else hi = mid;
+  }
+  // the first height read as not solid: on a flat top a hair over it, so the floor goes a whole depth under the top
+  const low = hi;
+  // what stands higher than the seat may cut, read at that height: round its mouth, the top itself rising (a slope,
+  // a step); else inside it, the model's own detail standing on the top
+  const over = low + z.rough;
+  const there = at(over);
+  const round = ringCover(there, c, rIn, rOut) > SEAT_NONE;
+  const inside = !round && ringCover(there, c, 0, rIn) > SEAT_NONE;
+  // how high and wide that is, up the levels to where it ends (`clear`, the first level with nothing there: none when
+  // it runs on up the model); then the first thing over the seat a light would stand under
+  let top = inside || round ? over + OVER : null;
+  let across = inside ? 2 * Math.max(...there.filter((x) => reach(x, c).dmin < rIn).map((x) => reach(x, c).dmax)) : 0;
+  let clear = null;
+  let room = Infinity;
+  let rising = inside || round;
+  const zf = seatFloorAt(S, low);
+  for (const lv of stack.levels) {
+    const h = lv.z - zBed;
+    if (h <= over) continue;
+    const near = lv.islands.map((x) => reach(x, c));
+    if (rising) {
+      const standing = near.filter((r) => r.dmin < (inside ? rIn : rOut));
+      if (standing.length) {
+        top = h;
+        if (inside) across = Math.max(across, ...standing.map((r) => 2 * r.dmax));
+        continue;
+      }
+      rising = false;
+      clear = h;
+    }
+    if (near.some((r) => r.dmin < z.r)) {
+      room = h - zf;
+      break;
+    }
+  }
+  // solid under the floor: on every level from the least floor up to it, and just over it
+  let solid = ringCover(at(zf + OVER), c, 0, z.r) >= SEAT_SOLID;
+  for (const lv of stack.levels) {
+    const h = lv.z - zBed;
+    if (solid && h >= floor && h <= zf) solid = ringCover(lv.islands, c, 0, z.r) >= SEAT_SOLID;
+  }
+  return seatFor(S, R, { low, inside: inside ? { top, d: across, clear } : null, rim: round ? top : null, solid, room }, lockTop);
+}
+
 /** How far apart (mm) the body's outside is read under a lid's face, for its collar. */
 const BELOW_STEP = 0.25;
 
@@ -1237,10 +1385,13 @@ function plugEntry(stack, cand, fine, S, zBed, scale) {
     mech: 'plug', R: now.R, opening: now.opening, theta: now.theta, wall: now.wall, camOutN: now.camOutN, ringOut: now.ringOut, tabs: now.tabs,
     tabR: now.tabR, coin: now.coin, teaLight: takesTeaLight(now.opening, S.c),
   };
+  // the tea-light seat on its top, over the lock it gets at this size (the engine cuts the same one), or why none
+  const R = now ? now.R : cand.R;
+  const seat = seatOf(stack, fine, cand.c, R, S, zBed, { lockTop: now ? now.top : null });
   return {
-    kind: 'plug', name: 'Base', centre: cand.c.map((v) => round(v, 6)), face: round(zBed), side: 1, r: round(now ? now.R : cand.R),
+    kind: 'plug', name: 'Base', centre: cand.c.map((v) => round(v, 6)), face: round(zBed), side: 1, r: round(R),
     window: [0, round(cand.R)], ringOut: round(cand.rOut), solidTop: round(cand.floorTop), top: round(cand.top), reach: round(cand.reach),
-    takesHandle: false, handle: null, lock, why: now ? null : 'room', least, way: { up: true, lift: 0, dir: null, dirs: [], reach: 0 },
+    takesHandle: false, handle: null, lock, why: now ? null : 'room', least, seat, way: { up: true, lift: 0, dir: null, dirs: [], reach: 0 },
   };
 }
 

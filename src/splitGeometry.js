@@ -16,8 +16,8 @@
 import { manifold } from './manifold.js';
 import { displayBuffers } from './mesh.js';
 import { lockSolids } from './lockGeometry.js';
-import { COVER_MOST, FINE_REACH, FINE_SPECK, OVER, SPECK, collarAt, coverOf, fineSlices, freeWindows, plugLockOf, reach, traceOver, wayOut } from './partFinder.js';
-import { sizes } from './locks.js';
+import { COVER_MOST, FINE_REACH, FINE_SPECK, OVER, SPECK, collarAt, coverOf, fineSlices, freeWindows, plugLockOf, reach, seatOf, traceOver, wayOut } from './partFinder.js';
+import { plugDims, sizes } from './locks.js';
 import { buildCrossSectionInfo, printLimits, thinStrokeReport } from './textGeometry.js';
 import {
   AUTO_DIAMETERS,
@@ -2788,19 +2788,20 @@ export function shellCounts(solid) {
  * is called, in its frame: 'Base' for a plug; 'Dome and cap' when something stands over it inside its circle covering
  * at most a third of it (a lantern's handle), 'Top' when nothing does; `Part B` when more does (a cup under a roof).
  * With `S` (the sizes of a part that locks), its twist-lock is sized at the face as placed (`partLock`): a lid's way
- * out then starts at the lock's own lift, the neck's height and the play over it.
+ * out then starts at the lock's own lift, the neck's height and the play over it. With `seat` (the printer's sizes),
+ * a base's tea-light seat is read off the slices too (`seatOf`), its floor kept clear of the lock it gets.
  * @param {Manifold} solid the model in the part's frame (borrowed)
  * @param {object} stack its `sliceStack`
  * @param {(z: number) => object[]} fine its islands at a height (`fineSlices`)
  * @param {{ c: number[], z0: number, R: number }} part in its frame (`partInFrame`)
- * @param {{ hl: number, gmin: number, grid?: object|null, letter: string, minLift: number, S?: object|null }} options
- *   `minLift` the least lift tried on the way out without a lock
+ * @param {{ hl: number, gmin: number, grid?: object|null, letter: string, minLift: number, S?: object|null,
+ *   seat?: object|null }} options `minLift` the least lift tried on the way out without a lock
  * @returns {object} plain: `placePart`'s, with `cap`, `next`, `top`, `name`, `handle` (a handle stands over it),
- *   `covered`, `span` (the handle's, in plan, or null), `lock` (`partLock`'s, null without `S`) and `way` `{ up,
- *   lift, dir, dirs, reach }` in the frame (null when refused before it is looked for; `lift` null when it can't come
- *   out)
+ *   `covered`, `span` (the handle's, in plan, or null), `lock` (`partLock`'s, null without `S`), for a base `seat`
+ *   (`seatFor`'s, heights over its face; null without `seat`) and `way` `{ up, lift, dir, dirs, reach }` in the frame
+ *   (null when refused before it is looked for; `lift` null when it can't come out)
  */
-export function checkPart(solid, stack, fine, part, { hl, gmin, grid = null, letter, minLift, S = null }) {
+export function checkPart(solid, stack, fine, part, { hl, gmin, grid = null, letter, minLift, S = null, seat = null }) {
   const { c, R } = part;
   const placed = placePart(stack, fine, part, { hl, gmin, grid });
   const plug = placed.kind === 'plug';
@@ -2818,7 +2819,12 @@ export function checkPart(solid, stack, fine, part, { hl, gmin, grid = null, let
   const out = { ...placed, ...ends, name, handle, covered: +covered.toFixed(3), legs: trace?.legs ?? 0, span: handle ? trace.span : null, lock: null, way: null };
   if (!placed.ok) return out;
   const lock = S ? partLock(stack, fine, { c, R }, placed, S) : null;
-  if (plug) return { ...out, lock, way: { up: true, lift: 0, dir: null, dirs: [], reach: 0 } };
+  if (plug) {
+    // the tea-light seat its top has room for, over the lock it gets (its floor clear of it), or why none
+    const top = lock?.mech === 'plug' ? plugDims(S, R).top : null;
+    const seated = seat ? seatOf(stack, fine, c, R, seat, placed.z0, { lockTop: top }) : null;
+    return { ...out, lock, seat: seated, way: { up: true, lift: 0, dir: null, dirs: [], reach: 0 } };
+  }
   const way = wayOut(solid, stack, { c, r: R, face: placed.z0, cap: ends.cap }, lock?.mech ? S.H + S.cz : minLift);
   return { ...out, lock, way: { up: way.up, lift: way.lift, dir: way.dir, dirs: way.dirs, reach: way.reach } };
 }
@@ -4648,7 +4654,7 @@ function boxThrough(M, { min, max }) {
 /** What a lock's solids are built from, as a key: the same lock in the same place builds the same solids. */
 const lockKey = (lock) => JSON.stringify([
   lock.mech, lock.frame, lock.c, lock.z0, lock.S, lock.r0 ?? null, lock.theta ?? null, lock.slope ?? null, lock.above ?? null,
-  lock.below ?? null, lock.socket ?? null, lock.R ?? null, lock.top ?? null,
+  lock.below ?? null, lock.socket ?? null, lock.R ?? null, lock.top ?? null, lock.seat ?? null,
 ]);
 
 /**
@@ -4673,6 +4679,7 @@ function cachedLock(lock) {
       carry: s.carry,
       bare: s.bare,
       lugs: s.lugs,
+      seat: s.seat,
       points: s.points.map((x) => ({ ...x, at: applyMat4(M, x.at) })),
     };
   });
@@ -4687,15 +4694,17 @@ export const lockIds = (lock) => [...cachedLock(lock).ids];
 /**
  * A lock's faces for the view, as the pieces drilled with it now have them: `lock` the ids of what is the lock (neck,
  * grooves, slots, click tabs, coin slot), `lug` its lugs', painted apart so they stand out of the neck, `carry` of what
- * carries it (the collar, the socket ring), which is painted lighter; a plug's wall, its own outside turned down to the
- * bore's clearance, is none of them. Taken when the pieces are drilled, as a lock built again has new ids.
+ * carries it (the collar, the socket ring), which is painted lighter, and `seat` a base's tea-light seat, which is no
+ * lock and is painted as what it is; a plug's wall, its own outside turned down to the bore's clearance, is none of
+ * them. Taken when the pieces are drilled, as a lock built again has new ids.
  */
 export function lockFaces(lock) {
   const L = cachedLock(lock);
   const carry = new Set(L.carry);
   const bare = new Set(L.bare);
   const lugs = new Set(L.lugs);
-  return { lock: L.ids.filter((id) => !carry.has(id) && !bare.has(id) && !lugs.has(id)), carry: [...carry], lug: [...lugs] };
+  const seat = new Set(L.seat);
+  return { lock: L.ids.filter((id) => !carry.has(id) && !bare.has(id) && !lugs.has(id) && !seat.has(id)), carry: [...carry], lug: [...lugs], seat: [...seat] };
 }
 
 /**

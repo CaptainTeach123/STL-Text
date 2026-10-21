@@ -177,15 +177,16 @@ function apartOf(cut) {
 /**
  * The part a cut takes out, stored (`part` on a cut that comes apart, its
  * side read along the normal) or normalised (`centre`, `r` and `side` read
- * along the axis), as `{ r, side, auto, hold }`; null for a cut across the
- * whole model, or a circle with no size. A part twist-locks or lifts off, as
- * the document keeps it.
+ * along the axis), as `{ r, side, auto, hold, seat? }`; null for a cut across
+ * the whole model, or a circle with no size. A part twist-locks or lifts off,
+ * as the document keeps it; `seat` when a base is to have a tea-light seat
+ * on its top wherever one fits (a part stored without it has none).
  */
 function partOf(cut) {
   const p = Array.isArray(cut?.centre) ? cut : cut?.joint === 'apart' ? cut.part : null;
   const r = Number(p?.r);
   if (!(r > 0 && Number.isFinite(r))) return null;
-  return { r, side: Number(p.side) < 0 ? -1 : 1, auto: p.auto === true, hold: cut.hold === 'lift' ? 'lift' : 'lock' };
+  return { r, side: Number(p.side) < 0 ? -1 : 1, auto: p.auto === true, hold: cut.hold === 'lift' ? 'lift' : 'lock', ...(p.seat === true ? { seat: true } : {}) };
 }
 
 /**
@@ -221,8 +222,9 @@ function partMisses({ axis, at, centre, r, side }, bounds) {
  * @param {{ min: number[], max: number[] }|null} bounds the solid's bounds with the unrepaired triangles; null skips the miss test
  * @returns {{ spec: object, cuts: { id: string, letter: string, axis: number, at: number, apart?: { hold: string } }[],
  *   parts: { id: string, letter: string, axis: number, at: number, centre: number[], r: number, side: number, hold: string,
- *   auto: boolean }[], notes: object[], grid: number[] }} `spec` holds the clamped settings (no cuts), `grid` the number
- *   of cuts on each axis; `apart` only on a cut that comes apart. No cuts left means: export unsplit, with the notes.
+ *   auto: boolean, seat?: true }[], notes: object[], grid: number[] }} `spec` holds the clamped settings (no cuts), `grid`
+ *   the number of cuts on each axis; `apart` only on a cut that comes apart; `seat` only on a part whose base is to have
+ *   a tea-light seat. No cuts left means: export unsplit, with the notes.
  * @throws {SplitError} `SPLIT_INVALID` for more than 12 cuts and parts or 64 pieces
  */
 export function normaliseSplit(split, bounds = null) {
@@ -254,12 +256,12 @@ export function normaliseSplit(split, bounds = null) {
     const { axis, at } = plane;
     const part = partOf(cut);
     if (part) {
-      const { r, auto, hold } = part;
+      const { r, auto, hold, seat } = part;
       const normalised = Array.isArray(cut.centre);
       // a stored part's side is along its normal, which may point either way along the axis
       const side = !normalised && Number(cut.normal?.[axis]) < 0 ? -part.side : part.side;
       const centre = normalised ? [Number(cut.centre[0]), Number(cut.centre[1])] : [1, 2].map((i) => Number(cut.position?.[(axis + i) % 3]));
-      const found = { id, letter, axis, at, centre, r, side, hold, auto };
+      const found = { id, letter, axis, at, centre, r, side, hold, auto, ...(seat ? { seat } : {}) };
       if (!Number.isFinite(at) || !centre.every(Number.isFinite) || (bounds && partMisses(found, bounds))) notes.push(splitNote('CUT_MISSES', { cutId: id, letter }));
       else parts.push(found);
       return;
@@ -4192,6 +4194,8 @@ const pieceName = (index) => (index ? `Piece ${index}` : 'A piece');
 const quoted = (name) => (/^“/.test(name ?? '') ? name : `“${name ?? ''}”`);
 /** A length that is needed, to a tenth of a millimetre and never less: 9.35 → "9.4". */
 const need1 = (v) => String(Math.ceil(v * 10 - 1e-6) / 10);
+/** A length that falls short, to a tenth of a millimetre and never more: 38.29 → "38.2". */
+const short1 = (v) => String(Math.floor(v * 10 + 1e-6) / 10);
 /** "piece 2", "pieces 3 and 4". */
 const piecesOf = (list, fallback) => {
   const all = [list ?? fallback].flat().filter((x) => x != null);
@@ -4215,6 +4219,48 @@ const partPiece = (n, otherwise) => (Number.isFinite(n) ? `piece ${n}` : otherwi
 const partNumber = (n) => (Number.isFinite(n) ? ` (piece ${n})` : '');
 /** How a part's collar twist-lock goes on: set on turned θ to the left, the wide lug in its wide slot, turned right. */
 const twistOn = (turn) => `set it on turned ${roundAngle(turn)}° to the left so the wide lug finds its wide slot, push down and turn it right until it clicks.`;
+
+/**
+ * A base's tea-light seat in a few words: "a 38 mm tea light sits in the seat on top of the base (Ø 39.5 mm, 3 mm
+ * deep)", and where it takes the place of the model's own detail (`clears`), that it does.
+ */
+const seatWords = ({ d = 0, depth = 0, clears = null }, base = 'the base') => {
+  const instead = clears ? `, in place of the model's own detail there (${mm1(clears.h)} mm proud, Ø ${roundOpening(clears.across)} mm across)` : '';
+  return `a ${TEA_LIGHT} mm tea light sits in the seat on top of ${base} (Ø ${mm1(d)} mm, ${mm1(depth)} mm deep)${instead}`;
+};
+
+/** How to keep the model's own detail a seat takes the place of, in the app: the row's switch. */
+const keepDetail = (seat) => (seat?.clears ? ' To keep that detail instead, untick Tea-light seat.' : '');
+
+/** What to light a lantern with: the plastic over a flame softens. */
+const FLAME = "Use an LED tea light: a flame's heat softens the plastic over it.";
+
+/**
+ * Why a base gets no tea-light seat (`seatFor`'s refusal), as its note and its row's toggle say it: "the model's own
+ * detail in the middle of its top, 7.6 mm proud, is Ø 45.3 mm across – wider than the seat, which would leave the rest
+ * of it standing". An opening is said to a tenth short and what it takes to a tenth over, so the two never read alike.
+ */
+export function noSeatWords(fit) {
+  switch (fit?.why) {
+    case 'narrow':
+      return `a ${TEA_LIGHT} mm tea light doesn't go through its Ø ${short1(fit.opening)} mm opening${fit.need ? ` – that takes Ø ${need1(fit.need)} mm` : ''}`;
+    case 'room':
+      return `it is too narrow to keep a wall round one – that takes a Ø ${need1(fit.need)} mm opening`;
+    case 'detail':
+      if (fit.open) return `the model's own detail in the middle of its top runs on up into the model, where the light would sit`;
+      return `the model's own detail in the middle of its top, ${mm1(fit.h)} mm proud, is Ø ${need1(fit.across)} mm across – wider than the seat, which would leave the rest of it standing`;
+    case 'level':
+      return `its top rises ${mm1(fit.h)} mm round where the seat would go – a seat needs it level to within ${mm(fit.rough)} mm`;
+    case 'thin':
+      return fit.lock ? `its top is only ${mm1(fit.t)} mm over its lock – a seat needs ${need1(fit.need)} mm` : `it is only ${mm1(fit.t)} mm thick – a seat needs ${need1(fit.need)} mm`;
+    case 'hollow':
+      return "it isn't solid under where the seat would go";
+    case 'low':
+      return `there are only ${mm1(fit.room)} mm over it inside the model – a seat needs ${mm(fit.tall)} mm, room for the tallest tea light`;
+    default:
+      return 'no seat fits it';
+  }
+}
 
 const NOTE_LEVELS = Object.freeze({
   SPLIT: 'ok',
@@ -4255,6 +4301,9 @@ const NOTE_LEVELS = Object.freeze({
   PART_LIFTS: 'info',
   PART_LOCK: 'info',
   PART_PLUG: 'info',
+  PART_SEAT: 'info',
+  // the seat is asked for wherever one fits, so a base with none is nothing to act on: the note says why
+  PART_NO_SEAT: 'info',
   PART_SMALL: 'warn',
   PART_PRINT: 'info',
   PART_FIT: 'info',
@@ -4461,11 +4510,23 @@ const NOTE_TEXT = {
     const stays = handle ? ` and the handle stays on ${onto}` : '';
     return `Cut ${letter}: the ${partCalled(name)}${partNumber(piece)} ${verb} onto ${onto}${stays}. To fit it: ${twistOn(turn)} To open it: turn it left until it clicks again, ${wayWords({ lift, dir }, span)}.`;
   },
-  PART_PLUG: ({ letter, name, piece = null, home = null, turn = 0, opening = 0, teaLight = false, model = null }) => {
+  PART_PLUG: ({ letter, name, piece = null, home = null, turn = 0, opening = 0, teaLight = false, model = null, seat = null }) => {
     const called = partCalled(name);
-    const light = teaLight ? ` Its Ø ${roundOpening(opening)} mm opening takes a ${TEA_LIGHT} mm tea light.` : '';
-    return `Cut ${letter}: the ${called}${partNumber(piece)} twists off underneath. Turn ${model ?? partPiece(home, 'the model')} over, set the ${called} in turned ${roundAngle(turn)}° to the left, push it in and turn it right until it clicks – a coin in its slot helps. To open it: turn it left until it clicks and lift it out.${light}`;
+    const lantern = model ?? partPiece(home, 'the model');
+    const turnIn = `set the ${called} in turned ${roundAngle(turn)}° to the left, push it in and turn it right until it clicks – a coin in its slot helps`;
+    // with a light standing on it – in its seat, or on a base with none – the base goes in from underneath, the model
+    // held up: turned over, the light would fall out. Seen from under it, the turns are the same as turned over
+    const fit = `hold ${lantern} up and, looking at the ${called}'s bottom, ${turnIn}. To open it: turn it left until it clicks and lower it out.`;
+    if (seat) {
+      return `Cut ${letter}: the ${called}${partNumber(piece)} twists off underneath, and ${seatWords(seat, 'it')}. To fit it: stand the light in the seat, ${fit} ${FLAME}${keepDetail(seat)}`;
+    }
+    if (teaLight) {
+      return `Cut ${letter}: the ${called}${partNumber(piece)} twists off underneath, and its Ø ${roundOpening(opening)} mm opening takes a ${TEA_LIGHT} mm tea light. To fit it: stand the light on the middle of the ${called}, ${fit} ${FLAME}`;
+    }
+    return `Cut ${letter}: the ${called}${partNumber(piece)} twists off underneath. Turn ${lantern} over, ${turnIn}. To open it: turn it left until it clicks and lift it out.`;
   },
+  PART_SEAT: ({ letter, name, seat = null }) => `Cut ${letter}: ${seatWords(seat ?? {}, `the ${partCalled(name)}`)}. ${FLAME}${keepDetail(seat)}`,
+  PART_NO_SEAT: ({ letter, name, piece = null, ...fit }) => `Cut ${letter}: no tea-light seat on the ${partCalled(name)}${partNumber(piece)} – ${noSeatWords(fit)}.`,
   PART_LIFTS: ({ letter, name }) => {
     const many = partMany(name);
     return `Cut ${letter}: the ${partCalled(name)} ${many ? 'lift' : 'lifts'} off – nothing holds ${many ? 'them' : 'it'}.`;
@@ -4576,9 +4637,13 @@ const NOTE_TEXT = {
  * A cut that takes out a part (`name` the part's, "Dome and cap", "Top", "Base" or "Part B"): PART_LOCK `{ letter, cutId,
  * name, piece, home, handle, turn, lift, dir, span }` (part `piece` twist-locks onto piece `home` turning `turn`°, and
  * comes out lifted `lift` mm and slid along `dir`, under a handle spanning `span` – vectors in any frame, the two
- * alike); PART_PLUG `{ letter, cutId, name, piece, home, turn, opening, teaLight, model }` (a base that twists off
- * underneath, its opening Ø `opening`, said to take a tea light when `teaLight`; `model` what is turned over to fit
- * it, "the lantern", else piece `home`); PART_LIFTS `{ letter, cutId, name }` (it comes off and nothing holds it);
+ * alike); PART_PLUG `{ letter, cutId, name, piece, home, turn, opening, teaLight, model, seat }` (a base that twists off
+ * underneath, its opening Ø `opening`; `model` what is turned over to fit it, "the lantern", else piece `home` – or,
+ * when a tea light goes through it (`teaLight`), held up to fit it from underneath with the light standing on it, in
+ * its tea-light seat with `seat` `{ d, depth, clears? }`, which may take the place of the model's own detail);
+ * PART_SEAT `{ letter, cutId, name, piece, seat }` (a base with no lock and a tea-light seat); PART_NO_SEAT `{ letter,
+ * cutId, name, piece, why, … }` (a base asked for a seat where none fits, `seatFor`'s refusal: `noSeatWords`);
+ * PART_LIFTS `{ letter, cutId, name }` (it comes off and nothing holds it);
  * PART_SMALL `{ letter, cutId, name, why, now, wall, lock, opening, tea, most, base }` (asked to lock, but no twist-lock
  * fits at this size – `why` a lid's 'room', 'tabs' or 'collar', or a base's 'floor', 'wall' or 'cam' (no room for one),
  * `now` the size as a share of the model as loaded (%), `wall`
@@ -4635,13 +4700,15 @@ const pegCount = (seam) => (Array.isArray(seam.pegs) ? seam.pegs.length : Number
  * else is set, each step saying so first.
  * @param {{ pieces: { index: number, cell: number[] }[], seams: { letter: string, axis: number, at: number, pieces: number[],
  *   joint: 'dowels'|'pegs'|'dovetail'|'lip'|'part'|'none', dowels: number|object[], pegs?: number|object[], male?: number|null,
- *   labels: string[]|null, apart?: { hold: string, lip: boolean, clips: number, mech?: 'twist'|'plug'|null, theta?: number }|null,
+ *   labels: string[]|null, apart?: { hold: string, lip: boolean, clips: number, mech?: 'twist'|'plug'|null, theta?: number,
+ *   opening?: number, teaLight?: boolean, seat?: { d: number, depth: number, clears?: object } }|null,
  *   part?: { name: string, way?: { lift: number, dir: number[]|null }, span?: number[]|null }|null }[] }} plan
  *   piece numbers are 1-based; `labels` are the two faces' labels in the order of `pieces`; `male` the piece that carries
  *   a seam's built-in pegs, its lip, or the neck of the twist-lock it takes instead (`apart.mech` 'twist' on a cut with
  *   no part); `apart` on a seam of a cut that comes apart, and `part` on one that takes out a
  *   part (its pieces the one it comes out of, then the part; `apart.mech` the twist-lock it has, if any, turning
- *   `theta`°, and `part.way` how it comes out once turned free)
+ *   `theta`°, and `part.way` how it comes out once turned free; a base whose opening Ø `apart.opening` takes a tea
+ *   light (`apart.teaLight`) is fitted with a light standing on it, in its tea-light seat `apart.seat` when it has one)
  * @returns {{ letter: string, axis: number, pieces: number[], joins: number[], pins: number, pegs: number, text: string,
  *   apart?: true }[]} `pieces` already in place, `joins` the ones put on in this step; `apart` on a cut that comes apart
  */
@@ -4682,6 +4749,9 @@ export function assemblySteps({ pieces = [], seams = [] } = {}) {
 
 const pieceList = (list) => `${list.length > 1 ? 'pieces' : 'piece'} ${listOf(list)}`;
 
+/** A sentence's first letter made a capital. */
+const capital = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+
 /**
  * The step for a cut that comes apart, starting with what matters most:
  * that it is not glued. The top of a Z cut is pressed on until it clicks, or
@@ -4697,9 +4767,16 @@ function apartStepText(letter, group, lower, upper, axis) {
     if (apart?.mech === 'twist') return `${lead} ${part.name}: ${twistOn(apart.theta)} To open: turn it left until it clicks again, ${wayWords(part.way, part.span)}.`;
     if (apart?.mech === 'plug') {
       const called = partCalled(part.name);
-      return `${lead} ${part.name}: turn ${pieceList(lower)} over, set the ${called} in turned ${roundAngle(apart.theta)}° to the left, push in and turn it right until it clicks (a coin in the slot helps). To open: turn it left and lift it out.`;
+      const turnIn = `set the ${called} in turned ${roundAngle(apart.theta)}° to the left, push in and turn it right until it clicks (a coin in the slot helps)`;
+      // a light standing on it, in its seat or not: the base goes in from underneath, the model held up, so the light
+      // stays on it
+      const fit = `hold ${pieceList(lower)} up and, looking at the ${called}'s bottom, ${turnIn}. To open: turn it left and lower it out.`;
+      if (apart.seat) return `${lead} ${part.name}: ${seatWords(apart.seat, `the ${called}`)} – stand the light in it, ${fit}`;
+      if (apart.teaLight) return `${lead} ${part.name}: its Ø ${roundOpening(apart.opening)} mm opening takes a ${TEA_LIGHT} mm tea light – stand the light on the middle of the ${called}, ${fit}`;
+      return `${lead} ${part.name}: turn ${pieceList(lower)} over, ${turnIn}. To open: turn it left and lift it out.`;
     }
-    return `${lead} Set the ${partCalled(part.name)} in place on ${pieceList(lower)} – nothing holds ${partMany(part.name) ? 'them' : 'it'}.`;
+    const seated = apart?.seat ? ` ${capital(seatWords(apart.seat, `the ${partCalled(part.name)}`))}.` : '';
+    return `${lead} Set the ${partCalled(part.name)} in place on ${pieceList(lower)} – nothing holds ${partMany(part.name) ? 'them' : 'it'}.${seated}`;
   }
   const z = axis === 2;
   const top = upper.length > 1 ? `the top (${pieceList(upper)})` : 'the top';
@@ -4814,6 +4891,8 @@ export function howToGlueText(plan) {
   const anyClips = [...lips.values()].some((l) => l.clicks);
   // the parts that twist-lock in their own place: a lid's collar twist-lock, or a base's from underneath
   const locked = seams.filter((s) => s.joint === 'part' && s.apart?.mech && s.part);
+  // the bases with a tea-light seat on their top, whatever holds them
+  const seated = seams.filter((s) => s.joint === 'part' && s.apart?.seat && s.part);
   const anyTwist = [...lips.values()].some((l) => l.twist) || locked.length > 0;
   const plainLips = [...lips.values()].some((l) => !l.twist);
   const where = printer?.size
@@ -4835,6 +4914,7 @@ export function howToGlueText(plan) {
     }
     for (const x of locked) if (x.pieces[0] === p.index) extra.push(`${x.apart.mech === 'plug' ? 'twist-lock slots' : 'twist-lock neck'} for cut ${x.letter}`);
     if (p.part) extra.push(`comes off at cut ${listOf(p.lids ?? [])} (the ${partCalled(p.name)})`);
+    for (const x of seated) if (x.pieces[1] === p.index) extra.push(`tea-light seat Ø ${mm1(x.apart.seat.d)} mm on top`);
     out.push(`  ${pad(`piece ${p.index} of ${n}`, 12)}${pad(size1(p.size), width)}${pad(`lies ${p.lies}`, 0)}${extra.join(', ')}`);
   });
   // a lid's collar slopes out under the joint as steeply as the model beside it: support the dome, support the collar
@@ -4895,6 +4975,7 @@ export function howToGlueText(plan) {
       out.push(`  ${who} should twist on with a click and twist off again by hand. Try the fit test first: if it's too stiff to turn, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.`);
     }
   }
+  for (const x of seated) out.push(`  A ${TEA_LIGHT} mm tea light should drop into the seat on top of the ${partCalled(x.part.name)} (cut ${x.letter}) and lift out with two fingers.`);
   if (!anyPins && !anyPegs && !anyTabs && !anyLip && !locked.length) out.push('  Hold the pieces together and check that the faces meet all round.');
   out.push('');
 

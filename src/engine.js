@@ -27,7 +27,7 @@ import {
   partRows, pinAt, pinSheet, pinSpares, pinsPerSheet, placePart, planDovetails, probeLip, shellCounts, tabsAcross, wayOverlaps,
 } from './splitGeometry.js';
 import { FINE_SPECK, LEAST_MOST, WAY_START, WAY_STEP, findParts, fineSlices, freeWindows, sliceStack } from './partFinder.js';
-import { scalePercent, sizes, slitBridge, takesTeaLight } from './locks.js';
+import { scalePercent, seatSizes, sizes, slitBridge, takesTeaLight } from './locks.js';
 import { twistCoupon } from './lockGeometry.js';
 
 /**
@@ -406,6 +406,13 @@ function boxOf(m) {
   const { min, max } = m.boundingBox();
   return { min: [min[0], min[1], min[2]], max: [max[0], max[1], max[2]] };
 }
+
+/**
+ * How a piece lies (`chooseOrientation`'s), its height `h` as drilled where that is less than it was cut: a base whose
+ * tea-light seat takes the place of the model's own detail on its top, lying on its bottom. Whether it fits stays as
+ * the taller piece's.
+ */
+const lowered = (o, h) => (h != null && o.down === '-z' && h < o.size[2] - 1e-3 ? { ...o, size: [o.size[0], o.size[1], h] } : o);
 
 /** A cut id's number ('c3' → 3; 0 for any other id). */
 const cutNumber = (id) => Number(/^c(\d+)$/.exec(String(id))?.[1] ?? 0);
@@ -2469,7 +2476,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const laid = layPieces(cut.pieces, U, spec.orient, { flat, soups: cut.fragments });
     const hl = printing?.layerHeight ?? 0.2;
     const drill = drillStage(work, cut, laid, { cuts, spec, joints: plan.joints, nozzle, hl, U, flat, parted: parted.carved ? parted : null }, progress);
-    const lying = layGrown(laid, drill.layout, U, spec.orient, { flat });
+    const lying = layGrown(laid, drill.layout, U, spec.orient, { flat }).map((o, i) => lowered(o, drill.heights?.get(laid[i].index)));
     return summarise({ final: work, spec, cuts, U, given, plan, cut, laid, lying, drill, parted: parted.carved ? parted : null });
   }
 
@@ -2608,15 +2615,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         // a part across Z prints on the layers of the piece it comes out of: from the model's bottom, or the cut under it
         const under = zCuts.filter((t) => (part.side > 0 ? t < part.at - CUT_TOLERANCE : t <= part.at + CUT_TOLERANCE));
         const grid = part.axis === 2 ? { from: part.side * Math.max(zmin, ...under), step: hl } : null;
-        // a part that locks has its lock sized with it, on the printer's nozzle too
+        // a part that locks has its lock sized with it, on the printer's nozzle too, and a base its tea-light seat over
+        // that lock (its wall two lines of the nozzle)
         const locks = part.hold === 'lock';
-        const key = stableKey({ frame, c, z0, R, hl, gmin: S.gmin, grid, letter: part.letter, ...(locks ? { n: S.n } : {}) });
+        const key = stableKey({ frame, c, z0, R, hl, gmin: S.gmin, grid, letter: part.letter, n: S.n, ...(locks ? { locks } : {}) });
         let got = ps.checks.get(key);
         if (got) ps.checks.delete(key);
         else {
           progress?.('Placing the parts that come off…');
           const { solid, stack, fine } = inFrame(frame);
-          got = checkPart(solid, stack, fine, { c, z0, R }, { hl, gmin: S.gmin, grid, letter: part.letter, minLift: WAY_START * stack.height, S: locks ? S : null });
+          got = checkPart(solid, stack, fine, { c, z0, R }, { hl, gmin: S.gmin, grid, letter: part.letter, minLift: WAY_START * stack.height, S: locks ? S : null, seat: S });
         }
         ps.checks.set(key, got);
         while (ps.checks.size > PART_CHECKS) ps.checks.delete(ps.checks.keys().next().value);
@@ -2754,6 +2762,12 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const out = fromFrame(frame, [0, 0, 1]).map((v) => v * (plug ? -1 : 1) + 0);
       const inPlane = (v) => (v ? fromFrame(frame, [...v, 0]).map((x) => +x.toFixed(6) + 0) : null);
       const mech = got.lock?.mech ?? null;
+      // a base's tea-light seat, where one fits and the part asks for it: cut down to its floor and a millimetre past
+      // the most of the top it may clear – or past the model's own detail it takes the place of
+      const seat = plug ? got.seat ?? null : null;
+      const seated = part.seat && seat && !seat.why
+        ? { r: seat.r, zf: seat.zf, mouth: seat.mouth, lead: seat.lead, top: seat.clears?.top ?? +(seat.mouth + seatSizes(S).rough + 1).toFixed(6) }
+        : null;
       return {
         id: part.id, letter: part.letter, axis: part.axis, side: part.side, at: part.side * got.z0, centre: [...part.centre], r: k.R, hold: part.hold,
         kind: got.kind, name: k.name, handle: k.handle, span: inPlane(got.span), plug, solid, cap: part.side * got.cap, top: part.side * got.top, box: k.holds,
@@ -2761,13 +2775,13 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         down: `${part.side > 0 ? '-' : '+'}${AXES[part.axis]}`, inside: fromFrame(frame, [c[0], c[1], got.z0 + (plug ? PART_INSIDE : -PART_INSIDE)]),
         // a locked part is turned free first (anticlockwise about its way out), then lifted, slid or dropped out
         way: { turn: mech ? got.lock.theta : 0, up: got.way.up, lift: k.lift ?? got.way.lift, dir: inPlane(got.way.dir), out, reach: got.way.reach },
-        lock: got.lock, why: got.lock?.why ?? null, small: null,
+        lock: got.lock, why: got.lock?.why ?? null, small: null, seat, wantsSeat: !!part.seat, seated: !!seated,
         // what the drill stage builds the lock from: in the part's frame, its face at z0 (a base's plug turned down to
         // its wall's gap even when nothing holds it)
         build: mech || plug ? {
           mech, kind: plug ? 'plug' : 'lid', frame, c, z0: got.z0, S,
           ...(mech === 'twist' ? { r0: got.lock.r0, theta: got.lock.theta, slope: got.lock.slope, above: got.lock.above, below: got.lock.below, socket: 'ring' } : {}),
-          ...(plug ? { R: k.R, top: got.top - got.z0 } : {}),
+          ...(plug ? { R: k.R, top: got.top - got.z0, ...(seated ? { seat: seated } : {}) } : {}),
         } : null,
       };
     });
@@ -2960,7 +2974,17 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     if (layout.locks?.some((l) => l.mech)) progress?.('Building the twist-lock…');
     const drilled = drillAll(final, cut, laid, layout, font?.font ?? null, progress);
     const keep = drilled.reduce((n, m) => n + m.numTri(), 0) <= splitKeepTriangles;
-    state.drill = { key, layout, display: null, solids: keep ? drilled : null, transient: keep ? null : drilled };
+    // a base with a tea-light seat may come out lower than it was cut, where the seat takes the place of the model's
+    // own detail standing on its top: its height as drilled, for the size the pieces and the files say it is
+    const heights = new Map();
+    for (const l of layout.locks ?? []) {
+      const piece = l.seat ? l.sides.find((x) => x.role === 'part')?.piece : null;
+      const k = laid.findIndex((p) => p.index === piece);
+      if (k < 0) continue;
+      const b = drilled[k].boundingBox();
+      heights.set(piece, b.max[2] - b.min[2]);
+    }
+    state.drill = { key, layout, display: null, solids: keep ? drilled : null, transient: keep ? null : drilled, heights };
     return state.drill;
   }
 
@@ -3024,7 +3048,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       // the locks' own faces as these pieces have them, for the view to paint: a lock built again has new ids; and
       // where its lugs, slots and click tabs are, for the view's words on them
       for (const lock of layout.locks ?? []) {
-        if (!lock.mech) continue;
+        if (!lock.mech && !lock.seat) continue;
         lock.faces = lockFaces(lock);
         lock.points = lockPoints(lock);
       }
@@ -3204,15 +3228,18 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const lock = mech === 'twist'
         ? { r0: L.r0, opening: L.opening, theta: L.theta, tabs: L.tabs, teaLight, socket: built.socket, slope: L.slope, hang: L.hang }
         : mech === 'plug' ? { R: L.R, opening: L.opening, theta: L.theta, tabs: L.tabs, teaLight, coin: L.coin } : {};
+      // a base's tea-light seat as cut (`apart.seat`), and as its top has room for one or not (`part.seat`, whether it
+      // was asked for or not: the row offers it)
+      const seated = built?.seat ? { d: lid.seat.d, depth: lid.seat.depth, ...(lid.seat.clears ? { clears: { h: lid.seat.clears.h, across: lid.seat.clears.across } } : {}) } : null;
       return {
         cutId: lid.id, letter: lid.letter, axis: lid.axis, at: lid.at, pieces: [home, piece], joint: 'part', labels: null, dowels: [], pegs: [], male: null,
         apart: {
           hold: lid.hold, lip: false, clips: 0, mech, ...lock, ...(lid.hold === 'lock' && !mech ? { why: lid.why ?? 'pieces' } : {}),
-          ...(lid.small && !mech ? { small: lid.small } : {}),
+          ...(lid.small && !mech ? { small: lid.small } : {}), ...(seated ? { seat: seated } : {}),
         },
         part: {
           kind: lid.kind, name: lid.name, centre: lid.centre, r: lid.r, side: lid.side, cap: lid.cap, top: lid.top, handle: lid.handle, span: lid.span,
-          way: mech ? lid.way : { ...lid.way, turn: 0 },
+          way: mech ? lid.way : { ...lid.way, turn: 0 }, ...(lid.seat ? { seat: lid.seat, wantsSeat: lid.wantsSeat } : {}),
         },
       };
     });
@@ -3276,10 +3303,19 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       if (mech === 'twist') {
         return splitNote('PART_LOCK', { ...ids, piece, home, handle: x.part.handle, turn: theta, lift: x.part.way.lift, dir: x.part.way.dir, span: x.part.span });
       }
-      if (mech === 'plug') return splitNote('PART_PLUG', { ...ids, piece, home, turn: theta, opening, teaLight, model: bodyName ? 'the lantern' : null });
+      if (mech === 'plug') return splitNote('PART_PLUG', { ...ids, piece, home, turn: theta, opening, teaLight, model: bodyName ? 'the lantern' : null, seat: x.apart.seat ?? null });
       if (x.apart.small) return splitNote('PART_SMALL', { ...ids, why: x.apart.why, ...x.apart.small });
       return splitNote('PART_LIFTS', ids);
     });
+    // a base's tea-light seat: one with no lock round it says it has it, and one asked for where none fits says why –
+    // unless no tea light goes into the base at this size at all, which its lock's note says
+    for (const x of partSeams) {
+      const fit = x.part.seat;
+      if (x.apart.seat && x.apart.mech !== 'plug') lockNotes.push(splitNote('PART_SEAT', { letter: x.letter, cutId: x.cutId, name: x.part.name, piece: x.pieces[1], seat: x.apart.seat }));
+      else if (!x.apart.seat && x.part.wantsSeat && fit?.why && fit.why !== 'narrow') {
+        lockNotes.push(splitNote('PART_NO_SEAT', { letter: x.letter, cutId: x.cutId, name: x.part.name, piece: x.pieces[1], ...fit }));
+      }
+    }
     for (const x of partSeams.filter((s) => s.apart.mech)) {
       const [home, piece] = x.pieces;
       const built = layout.locks.find((l) => l.cutId === x.cutId);
@@ -3344,7 +3380,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
             const M = lockMatrix(lock);
             const at = applyMat4(M, [0, 0, 0]);
             const axis = applyMat4(M, [0, 0, 1]).map((v, a) => +(v - at[a]).toFixed(9) + 0);
-            for (const kind of ['lock', 'carry', 'lug']) {
+            // a base's tea-light seat is painted as what it is, with or without a lock round it
+            for (const kind of [...(lock.mech ? ['lock', 'carry', 'lug'] : []), ...(lock.faces.seat?.length ? ['seat'] : [])]) {
               let m = marks.findIndex((x) => x.cutId === lock.cutId && x.kind === kind);
               if (m < 0) m = marks.push({ cutId: lock.cutId, kind, at, axis }) - 1;
               for (const id of lock.faces[kind]) ids.set(id, m);

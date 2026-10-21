@@ -1174,6 +1174,25 @@ ul.plan li select {
 #cutList .part-play[hidden] {
   display: none;
 }
+/* a base's tea-light seat, beside how it holds: struck through where none fits, saying why */
+#cutList .part-seat {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+#cutList .part-seat[hidden] {
+  display: none;
+}
+#cutList .part-seat input {
+  margin: 0;
+  accent-color: var(--apart);
+}
+#cutList .part-seat.struck span {
+  text-decoration: line-through;
+  opacity: 0.6;
+}
 /* no twist-lock fits at this size: Twist-lock is struck through, and says from what size one does */
 #cutList .cut-hold label.struck span {
   text-decoration: line-through;
@@ -1262,6 +1281,9 @@ ul.plan li select {
 }
 .dot.lug {
   background: #ffd60a;
+}
+.dot.seat {
+  background: #8b5cf6;
 }
 .dot.over {
   background: #e11d48;

@@ -259,7 +259,9 @@ export function partCard(entry, table) {
   const { name, lock } = entry;
   const offers = [...new Set([entry.least?.lock, entry.kind === 'lid' ? entry.least?.tea : null].filter((q) => q != null).map((q) => offerPercent(q * scale)))];
   if (entry.kind === 'plug') {
-    if (lock) return { kind: 'plug', name, lock: true, title: `${name} – twists off underneath · twist-lock · ${openingWords(lock)}`, detail: '', badge: 'no extra support', offers: [], use: 'lock' };
+    // a tea light stands in a seat on its top where one fits, [Use] giving it one; where none does, the card says why
+    const seat = lock?.teaLight ? cardSeatWords(entry.seat) : '';
+    if (lock) return { kind: 'plug', name, lock: true, title: `${name} – twists off underneath · twist-lock · ${openingWords(lock)}${seat}`, detail: '', badge: 'no extra support', offers: [], use: 'lock' };
     const from = percentOf(entry.least?.lock, scale);
     const tea = percentOf(entry.least?.tea, scale);
     const title = from == null
@@ -468,16 +470,58 @@ export const MIXED_PART = 'The circle crosses the model above and around its pla
 /** The readout's words for a part that can't come out, and what holds it in. */
 export const stuckWords = (name, over, beside) => `${name} can't come out: ${over} is over it and ${beside} is beside it`;
 
+/** Why a base has no tea-light seat, in a few words: what its row and the card say after "no tea-light seat: ". */
+const SEAT_SHORT = Object.freeze({
+  room: 'too narrow for one',
+  detail: "the model's own detail is in the way",
+  level: "its top isn't level",
+  thin: 'too near its lock',
+  hollow: 'not solid under it',
+  low: 'no room over it for a light',
+});
+
+/** Why no seat fits a base (`seatFor`'s refusal), in a few words. */
+const seatShort = (seat) => (seat.why === 'thin' && !seat.lock ? 'too thin for one' : SEAT_SHORT[seat.why] ?? 'none fits');
+
+/**
+ * How a base's row words its tea-light seat (`seat`: `{ d, clears? }` the one it has, and the model's own detail it
+ * takes the place of; `{ why }` why none fits where it was asked for; null when it has none and none was asked for):
+ * nothing where no tea light goes into the base at all.
+ */
+export function seatMeta(seat) {
+  if (!seat) return '';
+  if (seat.d) return `tea-light seat Ø ${mm(seat.d)} mm${seat.clears ? " in place of the model's own detail" : ''}`;
+  if (seat.why === 'narrow') return '';
+  return `no tea-light seat: ${seatShort(seat)}`;
+}
+
+/**
+ * What the card says of a base's tea-light seat after the tea light it takes: " · a seat for it on top" (", in place of
+ * the model's own detail there" where the seat cuts that away), or why none fits; nothing before the finder has read it.
+ */
+function cardSeatWords(seat) {
+  if (!seat) return '';
+  if (seat.d) return ` · a seat for it on top${seat.clears ? ", in place of the model's own detail there" : ''}`;
+  return seat.why === 'narrow' ? '' : ` · no seat for it on top: ${seatShort(seat)}`;
+}
+
 /**
  * What a part's row says under its name: its twist-lock and turn, the handle it leaves on; that it lifts off, chosen
  * or too small for a lock (and from what size one fits); or what the split said of it – moved up the layers, refused,
  * stuck. `lock` is what it gets – the built seam's when the pieces are worked out, else the parts table's while the
  * part's face is the finder's – with `least` the least scale (%) a lock needs; null until either is known.
- * `known` that no lock fits it at this size (or, with `why` 'pieces', that one would leave it in pieces).
+ * `known` that no lock fits it at this size (or, with `why` 'pieces', that one would leave it in pieces). A base's
+ * tea-light seat (`seat`, `seatMeta`) follows what holds it.
  * @param {{ hold: string, kind?: 'lid'|'plug', lock?: object|null, least?: number|null, handle?: boolean, note?: object|null,
- *   known?: boolean, why?: string|null }} part
+ *   known?: boolean, why?: string|null, seat?: object|null }} part
  */
-export function partMeta({ hold, kind = 'lid', lock = null, least = null, handle = false, note = null, known = false, why = null }) {
+export function partMeta(part) {
+  const said = holdMeta(part);
+  const seat = part.kind === 'plug' && !part.note ? seatMeta(part.seat) : '';
+  return seat ? `${said} · ${seat}` : said;
+}
+
+function holdMeta({ hold, kind = 'lid', lock = null, least = null, handle = false, note = null, known = false, why = null }) {
   if (note?.code === 'PART_STUCK') return "can't come out – see the note";
   if (note?.code === 'PART_GAP') {
     // its face in several pieces (through a ring of columns), or its edge too near what stands beside it
@@ -519,7 +563,7 @@ export function wayCaption({ name, kind = 'lid', way, span = null }, at, { on = 
     }[at.step]
     : {
       turn: `Turn it ${roundAngle(way.turn)}° to the left${under} – it clicks free`,
-      lift: plug ? 'Lift it out' : at.of > at.n ? `Lift it ${roundLift(way.lift)} mm` : 'Lift it off',
+      lift: plug ? 'Lower it out' : at.of > at.n ? `Lift it ${roundLift(way.lift)} mm` : 'Lift it off',
       slide: `Slide it out ${slideWords(way.dir ?? [1, 0], span)}`,
     }[at.step];
   // counted in the order they are done

@@ -48,6 +48,7 @@ import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
 import { INTERSECTED, MeshBVH, NOT_INTERSECTED, acceleratedRaycast } from 'three-mesh-bvh';
 import { placedAt, snapTolerance } from './aim.js';
+import { SEAT_WORD } from './locks.js';
 import { geometryFromBuffers } from './mesh.js';
 import { clickRadius, surfaceNormalAt } from './surfaceNormal.js';
 import {
@@ -84,9 +85,9 @@ const TICK_COLORS = { seam: 0x64748b, spot: APART_COLOR, lip: 0xf59e0b, snapped:
  * A twist-lock in the pieces view: its own faces orange (the neck and grooves; the socket, slots and click tabs), its
  * lugs yellow so they stand out of the neck they are on, what carries it lighter (the collar, the socket ring), glowing
  * while its part is pointed at. As printed, a face of it that overhangs more than 45° is red, and its bridged ceilings
- * are outlined.
+ * are outlined. A base's tea-light seat, cut with its lock but no part of it, is violet.
  */
-export const LOCK_COLORS = Object.freeze({ lock: 0xff6a00, carry: 0xffb27a, lug: 0xffd60a, glow: 0xb84c00, over: 0xe11d48, bridge: 0xfacc15 });
+export const LOCK_COLORS = Object.freeze({ lock: 0xff6a00, carry: 0xffb27a, lug: 0xffd60a, glow: 0xb84c00, over: 0xe11d48, bridge: 0xfacc15, seat: 0x8b5cf6 });
 
 /** A part's circle in the model view: teal when its lock fits, amber when it only lifts off, red when it can't come out. */
 const PART_STATE_COLORS = { lock: APART_COLOR, lift: 0xf59e0b, stuck: COLORS.tooBig };
@@ -734,6 +735,8 @@ export class Viewer {
     this.asPrinted = false; // the pieces as they lie on the bed, not exploded
     this.wayPlay = null; // { frame, resolve } while ▶ plays a part coming apart
     this.lookAside = null; // the piece of a part set down beside its lock while the lock is looked at
+    this.lookSeat = false; // what is looked at there is a base's tea-light seat, from over it, not its lock
+    this.lookPose = null; // where the camera was put to look at it (`#pose`)
     this.lockLabels = []; // { cutId, name, piece, at } where a lock's lugs, slots and click tabs are (the engine's)
     this.lockWords = null; // { el, items: [{ el, name, points }] } the words on the lock looked at, in the page over the view
     this.insets = null; // () => ({ top, bottom }) CSS pixels of the view under the page's own controls: framing keeps clear of them
@@ -1924,7 +1927,8 @@ export class Viewer {
    *           ranges: number[][], markRanges?: number[][], marks?: object[], parts?: object[] }|null} display
    *   `ranges[r] = [triStart, triCount, vertStart, vertCount]`, each self-contained; `parts[r]` is
    *   `{ kind: 'piece', index }`, `{ kind: 'pin', cell }` (a half-cell, between its two pieces) or `{ kind: 'part', id, cell }`;
-   *   `markRanges[k] = [triStart, triCount, m]`, the triangles of lock `marks[m]` (`{ cutId, kind: 'lock'|'carry' }`)
+   *   `markRanges[k] = [triStart, triCount, m]`, the triangles of lock `marks[m]` (`{ cutId, kind: 'lock'|'carry'|'lug'|'seat' }`,
+   *   'seat' a base's tea-light seat)
    * @param {{ index: number, cell: number[], fits?: boolean, down?: string, yaw?: number }[]} [pieces] the result's
    *   pieces; `fits: false` tints a piece red; `down` and `yaw` how it lies as printed
    * @param {number[]|null} [grid] the number of cuts on each axis (from the pieces' cells without it)
@@ -1933,11 +1937,39 @@ export class Viewer {
    *   seam's `part.way`), what it is ('lid', 'plug') and its circle's radius
    */
   setPieces(display, pieces = [], grid = null, ways = []) {
+    // a part looked at is looked at again once its pieces are worked out anew – a seat switched off or a size changed
+    // meanwhile: set down afresh, and the camera on it, not on where it was – unless the camera has been moved since,
+    // which is left where it is. Pieces shown again after the model was, start afresh
+    const shown = this.lookAside != null && this.viewMode === 'pieces';
+    const looked = shown ? { cutId: this.lookingAt, seat: this.lookSeat, still: this.#pose() === this.lookPose } : null;
     this.#disposeMesh(this.resultMesh);
     this.resultMesh = null;
     this.#clearPieces();
     if (display?.index?.length && display.ranges?.length) this.#buildPieces(display, pieces ?? [], grid, ways ?? []);
+    if (looked?.cutId != null && !this.asPrinted) this.#lookAgain(looked);
     this.showResult(this.resultShown);
+  }
+
+  /** Where the camera is and looks, as a key: the same while nobody moves it. */
+  #pose() {
+    return [...this.camera.position.toArray(), ...this.controls.target.toArray()].map((v) => v.toFixed(6)).join(' ');
+  }
+
+  /** Cut `cutId`'s part set down again to be looked at (`seat`: its top), the camera on it while it was `still`. */
+  #lookAgain({ cutId, seat, still }) {
+    if (still) {
+      this.lookAtLock(cutId, { seat });
+      return;
+    }
+    const entry = [...this.pieceWays.entries()].find(([, x]) => x.cutId === cutId);
+    if (!entry) return;
+    this.spread = 1;
+    this.lookAside = entry[0];
+    this.lookSeat = seat && entry[1].kind === 'plug';
+    this.#layoutPieces();
+    this.#layoutCuts();
+    this.#showLockWords(cutId, { seat: this.lookSeat });
+    this.#stylePieces();
   }
 
   #buildPieces(display, pieces, grid, ways) {
@@ -2299,7 +2331,8 @@ export class Viewer {
         m.opacity = o;
       }
       materials[0].emissive.setHex(!e.fits ? TOO_BIG_COLOR : focus != null && shown ? 0x262626 : 0);
-      for (const s of e.slots) s.material.emissive.setHex(this.#lit(s.cutId) ? LOCK_COLORS.glow : 0);
+      // a base's seat keeps its own violet, as the legend keys it: the lock's orange glow would turn it pink
+      for (const s of e.slots) s.material.emissive.setHex(this.#lit(s.cutId) && s.kind !== 'seat' ? LOCK_COLORS.glow : 0);
     }
     for (const l of this.pieceLabels) {
       l.sprite.material.opacity = focus == null || l.index === focus ? stale : 0.35;
@@ -2345,6 +2378,7 @@ export class Viewer {
   #leaveLook() {
     if (this.lookAside == null) return;
     this.lookAside = null;
+    this.lookSeat = false;
     this.#hideLockWords();
     this.#stylePieces();
   }
@@ -2352,11 +2386,11 @@ export class Viewer {
   /**
    * The words on a lock looked at, in the page over the view: "lug" on the lantern's neck, "slot" and "click tab" in
    * its part (or on a base, the other way round) – each on the one of its kind nearest the camera, following the
-   * piece it is on.
+   * piece it is on; or, looking at a base's tea-light seat (`seat`), that word alone, on it.
    */
-  #showLockWords(cutId) {
+  #showLockWords(cutId, { seat = false } = {}) {
     this.#hideLockWords();
-    const points = this.lockLabels.filter((x) => x.cutId === cutId);
+    const points = this.lockLabels.filter((x) => x.cutId === cutId && (x.name === SEAT_WORD) === seat);
     if (!points.length) return;
     const el = document.createElement('div');
     el.className = 'lock-words';
@@ -2412,7 +2446,12 @@ export class Viewer {
 
   /** The cuts whose twist-lock is painted on the pieces shown, in the order they first appear. */
   get lockCuts() {
-    return [...new Set(this.pieceEntries.flatMap((e) => e.slots.map((s) => s.cutId)))].filter(Boolean);
+    return [...new Set(this.pieceEntries.flatMap((e) => e.slots.filter((s) => s.kind !== 'seat').map((s) => s.cutId)))].filter(Boolean);
+  }
+
+  /** The cuts whose base has a tea-light seat painted on the pieces shown: a seat is no lock, but is shown as one is. */
+  get seatCuts() {
+    return [...new Set(this.pieceEntries.flatMap((e) => e.slots.filter((s) => s.kind === 'seat').map((s) => s.cutId)))].filter(Boolean);
   }
 
   /** The cuts whose part moves along a way out of its own, and each one's way. */
@@ -2422,14 +2461,14 @@ export class Viewer {
 
   /**
    * ▶: the pieces come apart over 2.5 s, each part along its way out – turned free, lifted, slid out – and stay
-   * apart; backwards (`back`), they go together again. Seen across the slide (`#frameWay`). Spread follows
-   * (`onSpread`). Resolves once it has played, or been stopped.
+   * apart; backwards (`back`), they go together again. Seen across the slide (`#frameWay`) – that of the part `cutId`
+   * when it is a part's own ▶. Spread follows (`onSpread`). Resolves once it has played, or been stopped.
    */
-  playWay({ back = false } = {}) {
+  playWay({ back = false, cutId = null } = {}) {
     this.stopWay();
     if (this.asPrinted) this.setAsPrinted(false);
     this.#leaveLook();
-    this.#frameWay();
+    this.#frameWay(cutId);
     const [from, to] = back ? [1, 0] : [0, 1];
     return new Promise((resolve) => {
       const start = performance.now();
@@ -2464,13 +2503,20 @@ export class Viewer {
     return this.lookAside != null ? this.pieceWays.get(this.lookAside)?.cutId ?? null : null;
   }
 
+  /** Whether what is looked at, set down beside the model, is a base's tea-light seat rather than its lock. */
+  get lookingAtSeat() {
+    return this.lookAside != null && this.lookSeat;
+  }
+
   /**
    * Look at a part's lock: the camera close on it from 35° over its joint (under it, for a base), from the side away
    * from where the part goes out, and the lock glowing. The part is set down just beyond it, a lid turned over, so
    * both halves show: the neck and its lugs on the body and the socket, slots and click tabs in the lid; the slots in
-   * the body's bore and the base's lugs, click tabs and coin slot. False when the cut has no part shown.
+   * the body's bore and the base's lugs, click tabs and coin slot. With `seat`, a base set down there is looked at
+   * from 50° over its top instead, where a tea light stands – in its tea-light seat, where it has one. False when the
+   * cut has no part shown.
    */
-  lookAtLock(cutId) {
+  lookAtLock(cutId, { seat = false } = {}) {
     const entry = [...this.pieceWays.entries()].find(([, x]) => x.cutId === cutId);
     if (!entry) return false;
     const [piece, w] = entry;
@@ -2479,12 +2525,20 @@ export class Viewer {
     const lid = w.kind !== 'plug';
     this.spread = 1;
     this.lookAside = piece;
+    this.lookSeat = seat && !lid;
     this.#layoutPieces();
     this.#layoutCuts();
     this.onSpread?.(1, false);
     const r = w.r ?? w.half;
     const dir = this.#wayDir(w);
     const home = new Vector3(...explodeOffset(w.homeCell, this.pieceGrid, this.#explodeGap()));
+    if (this.lookSeat) {
+      this.#lookAtSeat(w, home, dir);
+      this.lookPose = this.#pose();
+      this.#showLockWords(cutId, { seat: true });
+      this.#stylePieces();
+      return true;
+    }
     // the lock's middle: a lid's neck stands out of the body's face into it, a base's slots run up into the body
     const lock = w.point.clone().add(home).addScaledVector(w.out, (lid ? 1 : -1) * Math.min(2, 0.08 * r));
     // with the part set down beyond it, the view takes in both
@@ -2505,9 +2559,32 @@ export class Viewer {
     this.controls.target.copy(target);
     this.controls.update();
     this.#keepClear();
+    this.lookPose = this.#pose();
     this.#showLockWords(cutId);
     this.#stylePieces();
     return true;
+  }
+
+  /**
+   * The camera on a base set down beside the model's end, from 50° over its top, from the side away from where it
+   * was set down: its tea-light seat in the middle of the view, the base whole round it.
+   */
+  #lookAtSeat(w, home, dir) {
+    // the base stands as it does in the model, beside it: its top is its own length up from the model's end
+    const top = w.point.clone().add(home).addScaledVector(dir, this.#parkAt(w)).addScaledVector(w.out, -w.drop);
+    const [cos, sin] = [Math.cos((50 * Math.PI) / 180), Math.sin((50 * Math.PI) / 180)];
+    const look = dir.clone().multiplyScalar(-cos).addScaledVector(w.out, -sin).normalize();
+    const radius = 1.25 * w.half + 0.15 * w.drop;
+    const vFov = (this.camera.fov * Math.PI) / 180;
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * this.camera.aspect);
+    const dist = radius / Math.sin(Math.min(vFov, hFov) / 2);
+    this.camera.position.copy(top).addScaledVector(look, dist);
+    this.camera.near = Math.max(dist / 500, 0.01);
+    this.camera.far = dist * 400;
+    this.camera.updateProjectionMatrix();
+    this.controls.target.copy(top);
+    this.controls.update();
+    this.#keepClear();
   }
 
   /**
@@ -2520,6 +2597,7 @@ export class Viewer {
     if (on) this.stopWay();
     this.asPrinted = on;
     this.lookAside = null;
+    this.lookSeat = false;
     this.#hideLockWords();
     if (on) this.#classifyPrinted();
     else {
@@ -2631,8 +2709,11 @@ export class Viewer {
    * until it looks square to the slide, from a little above, drawn back to take in the whole way, so the part is seen
    * passing under the handle. Where the slide already runs across the view, the view is left as the user has it.
    */
-  #frameWay() {
-    const w = [...this.pieceWays.values()].find((x) => x.way?.dir && x.kind !== 'plug');
+  #frameWay(cutId = null) {
+    const ways = [...this.pieceWays.entries()];
+    const own = cutId != null ? ways.find(([, x]) => x.cutId === cutId) : null;
+    if (own?.[1].kind === 'plug') return this.#frameBase(...own);
+    const w = (own?.[1].way?.dir ? own[1] : null) ?? ways.map(([, x]) => x).find((x) => x.way?.dir && x.kind !== 'plug');
     if (!w) return;
     const dir = this.#wayDir(w);
     const up = w.out.clone();
@@ -2657,6 +2738,32 @@ export class Viewer {
     this.#layoutPieces();
     const above = (20 * Math.PI) / 180;
     this.#fitBox(box, side.multiplyScalar(Math.cos(above)).addScaledVector(up, Math.sin(above)).normalize(), { clear: true });
+  }
+
+  /**
+   * A base's own ▶ seen from a little over the model's end, the way the camera looked round the upright: the base
+   * where it starts and where it ends, the model's foot round it, so it shows dropping out – and, the pieces round
+   * its lock faded while its row is pointed at, its tea-light seat on its top.
+   */
+  #frameBase(piece, w) {
+    const box = new Box3();
+    const was = this.spread;
+    for (const f of [0, 1]) {
+      this.spread = f;
+      this.#layoutPieces();
+      for (const e of this.pieceEntries) if (e.index === piece && e.mesh.visible) box.expandByObject(e.mesh);
+    }
+    this.spread = was;
+    this.#layoutPieces();
+    if (box.isEmpty()) return;
+    box.expandByScalar(0.25 * box.getSize(new Vector3()).length());
+    const up = w.out.clone().negate();
+    const offset = this.camera.position.clone().sub(this.controls.target);
+    const flat = offset.addScaledVector(up, -offset.dot(up));
+    // looking along the upright: from the front, as the view starts
+    if (flat.lengthSq() < 1e-9) flat.set(0.55, -0.95, 0).addScaledVector(up, -new Vector3(0.55, -0.95, 0).dot(up));
+    const above = (25 * Math.PI) / 180;
+    this.#fitBox(box, flat.normalize().multiplyScalar(Math.cos(above)).addScaledVector(up, Math.sin(above)).normalize(), { clear: true });
   }
 
   #shownBounds() {

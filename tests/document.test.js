@@ -728,6 +728,55 @@ describe('parts that come off', () => {
     expect(doc.split.cuts[0]).toMatchObject({ hold: 'lift', part: { r: 7.895, side: 1, auto: true } }); // the hold is no change to where it is
   });
 
+  it("a base's tea-light seat is kept on its part: switched in one step, undone and redone, the finder's pick still its own", () => {
+    const doc = lantern();
+    const base = () => ({ position: [-0.0168, 0.0448, 0], normal: [...Z], joint: 'apart', part: { r: 28.7, side: 1, auto: true, seat: true } });
+    const id = doc.addCut(base());
+    expect(doc.split.cuts[0].part).toEqual({ r: 28.7, side: 1, auto: true, seat: true });
+    const steps = doc.history.length;
+    doc.setPartSeat(id, false);
+    expect(doc.history).toHaveLength(steps + 1);
+    // the seat is no change to where the part is: it stays the finder's pick, so a Scale places it again
+    expect(doc.split.cuts[0].part).toEqual({ r: 28.7, side: 1, auto: true, seat: false });
+    doc.setPartSeat(id, false); // off already
+    doc.setPartSeat('c9', true); // no such cut
+    expect(doc.history).toHaveLength(steps + 1);
+    doc.undo();
+    expect(doc.split.cuts[0].part.seat).toBe(true);
+    doc.redo();
+    expect(doc.split.cuts[0].part.seat).toBe(false);
+    // it goes with the part through every edit: a wider circle, a Scale, the finder placing it again
+    doc.updateCut(id, { part: { r: 29 } });
+    doc.transformBase(new Matrix4().makeScale(2, 2, 2));
+    doc.refitParts([{ id, position: [0, 0, 0], part: { r: 57.4, side: 1 } }]);
+    expect(doc.split.cuts[0].part).toEqual({ r: 58, side: 1, auto: false, seat: false });
+    // a cut with no part has no seat to switch
+    const full = doc.addCut({ position: [0, 0, 40], normal: Z, joint: 'apart' });
+    const now = doc.history.length;
+    doc.setPartSeat(full, true);
+    expect(doc.history).toHaveLength(now);
+    expect(doc.split.cuts.find((c) => c.id === full)).not.toHaveProperty('part');
+  });
+
+  it('a part saved without a tea-light seat is kept without one: only a yes or a no is kept', () => {
+    const doc = lantern();
+    const at = (z) => ({ position: [0, 0, z], normal: [...Z], joint: 'apart' });
+    doc.setSplit({
+      cuts: [
+        { id: 'c1', ...at(0), part: { r: 28.7, side: 1, auto: true } },
+        { id: 'c2', ...at(0), part: { r: 28.7, side: 1, auto: true, seat: false } },
+        { id: 'c3', ...at(0), part: { r: 28.7, side: 1, auto: true, seat: 'yes' } },
+        { id: 'c4', ...at(0), part: { r: 28.7, side: 1, auto: true, seat: true } },
+      ],
+    });
+    expect(doc.split.cuts.map((c) => c.part)).toEqual([
+      { r: 28.7, side: 1, auto: true },
+      { r: 28.7, side: 1, auto: true, seat: false },
+      { r: 28.7, side: 1, auto: true },
+      { r: 28.7, side: 1, auto: true, seat: true },
+    ]);
+  });
+
   it('unticking Comes apart drops the part in the same step, and undo brings it back', () => {
     const doc = lantern();
     const id = doc.addCut(dome());

@@ -9,12 +9,12 @@ import {
   aimLine, aimTargets, bandOf, handlePlaneWords, lipLine, lipVerdict, noFitTestWords, partCard, partFace, partMeta, partOffered, partReadout, partWidth, partsNote,
   percentOf, pickPart, noLockOf, noLockTitle, snapTolerance, snappedWords, spotLabel, throughWords, wayCaption, widthWords,
 } from './aim.js';
-import { gminOf, offerPercent, roundZ } from './locks.js';
+import { TEA_LIGHT, gminOf, offerPercent, roundZ } from './locks.js';
 import { SIDES, placementMatrix, snapPartTo } from './placement.js';
 import { BUNDLED_FONTS, canQueryLocalFonts, fetchBundledFont, listLocalFonts, localFontBytes } from './fontCatalog.js';
 import {
   BED_DEFAULTS, BED_PRESETS, FILAMENT, PIECE_COLORS, SPLIT_LIMITS, SPLIT_NOTE_CODES, axisCuts, bedSize, cellFits, cellSizes, cutPlane, fitPieces, formatSize,
-  letterFor, nextCut, pegSizeOf, pieceColorIndex, splitActive, splitNote, usableBed, wayStep,
+  letterFor, nextCut, noSeatWords, pegSizeOf, pieceColorIndex, splitActive, splitNote, usableBed, wayStep,
 } from './split.js';
 
 const $ = (id) => document.getElementById(id);
@@ -1683,8 +1683,9 @@ function lockFocus() {
 
 /**
  * The lock's tools under the pieces: ▶ Show how it comes apart where a part moves along its way out, Look at the lock
- * where it has a lock, As printed; the legend's chips for the lock (and, as printed, its overhang and bridges); and
- * what the part is doing while it moves.
+ * where it has a lock (Look at the seat once a base's lock with a tea-light seat is looked at), As printed; the
+ * legend's chips for the lock (and, as printed, its overhang and bridges) and for a base's seat; and what the part is
+ * doing while it moves.
  */
 function syncLockTools() {
   const pieces = viewer.viewMode === 'pieces';
@@ -1698,9 +1699,19 @@ function syncLockTools() {
   $('lockPanel').hidden = !ways.length && !locks.length;
   $('playWayBtn').hidden = !ways.length;
   $('lookLockBtn').hidden = !ways.some((w) => locks.includes(w.cutId));
+  // after a base's lock, its tea-light seat – or its top, where a light stands on a base with none
+  const next = nextLockStop();
+  const [label, tip] = !next?.seat
+    ? ['Look at the lock', 'Put the part aside and look at its twist-lock close up']
+    : next.cut
+      ? ['Look at the seat', "Look at the base's tea-light seat from over it"]
+      : ["Look at the base's top", `Look at the top of the base from over it, where a ${TEA_LIGHT} mm tea light stands`];
+  relabel($('lookLockBtn'), label);
+  $('lookLockBtn').title = tip;
   $('asPrintedToggle').checked = viewer.asPrinted;
   $('legendLock').hidden = !locks.length;
   $('legendLugs').hidden = !locks.length || !viewer.lugsShown;
+  $('legendSeat').hidden = !pieces || !viewer.seatCuts.length;
   $('legendOver').hidden = !(locks.length && viewer.asPrinted);
   $('legendBridge').hidden = !(locks.length && viewer.asPrinted);
   syncWayCaption();
@@ -1741,22 +1752,43 @@ async function playWays({ back = false, cutId = null } = {}) {
   if (viewer.asPrinted) viewer.setAsPrinted(false);
   syncSpread();
   wayOn = back;
-  await viewer.playWay({ back });
+  await viewer.playWay({ back, cutId });
   wayOn = false;
   syncSpread();
 }
 
 /**
+ * What Look at the lock looks at, in turn: each part's lock, and after the lock of a base a tea light goes into, its
+ * top from over it – its tea-light seat (`cut`), or where the light stands on it with none.
+ */
+function lockStops() {
+  const seats = viewer.seatCuts;
+  const tops = (lastPieces?.seams ?? []).filter((s) => s.joint === 'part' && s.apart?.mech === 'plug' && s.apart.teaLight).map((s) => s.cutId);
+  return viewer.partWays
+    .map((w) => w.cutId)
+    .filter((id) => viewer.lockCuts.includes(id))
+    .flatMap((id) => [{ id, seat: false }, ...(seats.includes(id) || tops.includes(id) ? [{ id, seat: true, cut: seats.includes(id) }] : [])]);
+}
+
+/** The stop Look at the lock goes to next: after the one looked at, else the lock the tools work on. */
+function nextLockStop() {
+  const stops = lockStops();
+  if (!stops.length) return null;
+  const looking = viewer.lookingAt;
+  const at = looking ? stops.findIndex((x) => x.id === looking && x.seat === viewer.lookingAtSeat) : -1;
+  if (at >= 0 && stops.length > 1) return stops[(at + 1) % stops.length];
+  return stops.find((x) => x.id === lockFocus() && !x.seat) ?? stops[0];
+}
+
+/**
  * Look at the lock: the camera close on it, glowing, its part set down beside it – the part the lock's tools work on;
- * pressed again while looking, the next part's.
+ * pressed again while looking, a base's top from over it (its tea-light seat), then the next part's lock. The button
+ * says which comes next.
  */
 function lookAtLock() {
-  const ids = viewer.partWays.map((w) => w.cutId).filter((id) => viewer.lockCuts.includes(id));
-  if (!ids.length) return;
-  const looking = viewer.lookingAt;
-  const id = looking && ids.length > 1 ? ids[(ids.indexOf(looking) + 1) % ids.length] : ids.includes(lockFocus()) ? lockFocus() : ids[0];
-  if (!viewer.lookAtLock(id)) return;
-  wayFocus = id;
+  const next = nextLockStop();
+  if (!next || !viewer.lookAtLock(next.id, { seat: next.seat })) return;
+  wayFocus = next.id;
   syncSpread();
 }
 
@@ -2102,7 +2134,18 @@ function partRow(id) {
     option.append(radio, span);
     holds.append(option);
   }
-  place.append(z, d, holds);
+  // a base's tea-light seat: a round pocket on its top a tea light stands in, on by default where one fits
+  const seat = document.createElement('label');
+  seat.className = 'part-seat';
+  seat.hidden = true;
+  const seatBox = document.createElement('input');
+  seatBox.type = 'checkbox';
+  seatBox.dataset.partSeat = id;
+  seatBox.addEventListener('change', () => doc.setPartSeat(id, seatBox.checked));
+  keepKeysForCut(seatBox);
+  const seatText = document.createElement('span');
+  seat.append(seatBox, seatText);
+  place.append(z, d, holds, seat);
   const meta = document.createElement('span');
   meta.className = 'meta';
   // ▶ the part coming out along its way, in the pieces view; Shift: going on
@@ -2157,7 +2200,29 @@ function fillPartRow(li, cut, i) {
     r.parentElement.title = none ? `No twist-lock fits at this size${info.least != null ? ` – from ${info.least} %` : ''}` : PART_HOLD_CHOICES.find(([v]) => v === r.value)[2];
     r.parentElement.classList.toggle('struck', none);
   });
-  li.querySelector('.meta').textContent = partMeta({ hold: cut.hold, kind: info.kind, lock: info.lock, least: info.least, handle: info.handle, note: info.note, known: info.known, why: info.why });
+  // a base's tea-light seat: ticked while the part asks for one, which it is given wherever one fits – its size, or
+  // struck through saying why where none does; a bigger print gets it with no other click, and unticking it is always
+  // there to ask for none
+  const seatBox = li.querySelector('[data-part-seat]');
+  const seat = seatBox.closest('label');
+  seat.hidden = info.kind !== 'plug';
+  const fit = info.seatFit;
+  const none = !!fit?.why;
+  seatBox.checked = cut.part.seat === true;
+  seatBox.disabled = !usable;
+  const size = fit?.d ? ` Ø ${round(fit.d, 1)} mm` : '';
+  seatBox.setAttribute('aria-label', `A tea-light seat on top of cut ${letter}'s base${size}${none ? ` – none fits: ${noSeatWords(fit)}` : ''}`);
+  relabel(seat.querySelector('span'), `Tea-light seat${size}`);
+  const instead = fit?.clears
+    ? `, in place of the model's own detail there (${round(fit.clears.h, 1)} mm proud, Ø ${Math.round(fit.clears.across)} mm across) – untick it to keep that`
+    : '';
+  seat.title = none
+    ? `No tea-light seat fits: ${noSeatWords(fit)}`
+    : `A round pocket on top of the base that a ${TEA_LIGHT} mm tea light stands in, centred, so it can't slide about${instead}`;
+  seat.classList.toggle('struck', none);
+  li.querySelector('.meta').textContent = partMeta({
+    hold: cut.hold, kind: info.kind, lock: info.lock, least: info.least, handle: info.handle, note: info.note, known: info.known, why: info.why, seat: info.seat,
+  });
   const pick = li.querySelector('[data-part-pick]');
   pick.disabled = !usable || !modelInfo?.hasModel || plane?.axis !== 2;
   pick.setAttribute('aria-pressed', String(aiming?.cutId === cut.id));
@@ -2356,19 +2421,21 @@ function renderPieces() {
   let rows = [];
   if (computed) {
     // what each piece of a part's twist-lock carries: the lantern its neck (a base's slots), the part its socket and
-    // click tabs (a base its lugs and coin slot)
+    // click tabs (a base its lugs and coin slot); and a base its tea-light seat
     const locks = new Map();
     const lockOn = (index, words) => locks.set(index, [...(locks.get(index) ?? []), words]);
     for (const s of computed.seams ?? []) {
-      if (s.joint !== 'part' || !s.apart?.mech) continue;
+      if (s.joint !== 'part') continue;
       const [home, piece] = s.pieces;
-      if (s.apart.mech === 'plug') {
+      if (s.apart?.mech === 'plug') {
         lockOn(home, 'twist-lock slots');
         lockOn(piece, 'twist-lock, 3 lugs, coin slot');
-      } else {
+      } else if (s.apart?.mech) {
         lockOn(home, 'twist-lock neck, 3 lugs');
         lockOn(piece, `twist-lock socket, ${s.apart.tabs} ${s.apart.tabs === 1 ? 'click' : 'clicks'}`);
       }
+      // a base's tea-light seat, with or without a lock round it
+      if (s.apart?.seat) lockOn(piece, `tea-light seat Ø ${round(s.apart.seat.d, 1)} mm`);
     }
     rows = computed.pieces.map((p) => ({
       index: p.index,
@@ -3072,8 +3139,14 @@ function refreshAim() {
 
 viewer.onAimPick = ({ at, shift, point, free }) => placeAimed(at, { keep: shift, point, free });
 
-/** A part as the finder places it: its circle round the centre, on its face, the finder's own pick. */
-const partPlaced = (entry) => ({ position: [entry.centre[0], entry.centre[1], entry.face], part: { r: entry.r, side: entry.side, auto: true } });
+/**
+ * A part as the finder places it: its circle round the centre, on its face, the finder's own pick. A base gets a
+ * tea-light seat on its top where one fits, unless the part it replaces had one switched off (`was`).
+ */
+const partPlaced = (entry, was = null) => {
+  const seat = entry.kind === 'plug' ? (typeof was?.seat === 'boolean' ? was.seat : true) : null;
+  return { position: [entry.centre[0], entry.centre[1], entry.face], part: { r: entry.r, side: entry.side, auto: true, ...(seat != null ? { seat } : {}) } };
+};
 
 /**
  * A part clicked while placing: taken out as the finder places it, as one undo step, and selected – a new cut, or the
@@ -3093,7 +3166,7 @@ function takePart(pick, { keep = false } = {}) {
   }
   if (!keep) endAim();
   if (a.cutId) {
-    doc.updateCut(a.cutId, partPlaced(entry));
+    doc.updateCut(a.cutId, partPlaced(entry, doc.split?.cuts.find((c) => c.id === a.cutId)?.part));
     selectCut(a.cutId);
     return;
   }
@@ -3341,6 +3414,11 @@ function partInfo(cut, letter) {
   // At this size none fits – unless the lock was left off because it would have left the part in pieces
   const lockless = seam ? !seam.apart.mech && seam.apart.hold === 'lock' : !!entry && !entry.lock;
   const pieces = lockless && seam?.apart.why === 'pieces';
+  // a base's tea-light seat: whether its top has room for one (`seatFit`), and what the row says of it – the seat its
+  // pieces have, or why none where it was asked for; from the table while the base is the finder's, before the pieces
+  const seatFit = seam ? seam.part.seat ?? null : exact && entry.kind === 'plug' ? entry.seat ?? null : null;
+  const asked = cut.part.seat === true;
+  const seat = seam ? seam.apart.seat ?? (asked && seatFit?.why ? seatFit : null) : asked ? seatFit : null;
   return {
     name: seam?.part.name ?? entry?.name ?? `Part ${letter}`,
     kind: seam?.part.kind ?? entry?.kind ?? 'lid',
@@ -3351,6 +3429,8 @@ function partInfo(cut, letter) {
     note,
     known: lockless,
     why: seam?.apart.why ?? null,
+    seat,
+    seatFit,
   };
 }
 

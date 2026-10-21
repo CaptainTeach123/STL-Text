@@ -5,7 +5,7 @@ import {
   SPLIT_NOTE_CODES, SplitError, TO_PLANE, TO_WORLD, YAW90, applyMat4, applyToSoup, assemblySteps, axisCuts, bedSize, cellOf,
   cellFits, cellOfPoint, cellSizes, chooseCentres, chooseOffsets, chooseOrientation, clipSoupByPlane, clippedArea, cutPlane, dirAxis, dirOf,
   dovetailSize, evenCell, explodeOffset, fitsBed, footprintYaw, formatSize, glueFileName, gridCandidates, gridCounts, gridPoints,
-  howToGlueText, invertRigid, isSymmetric, letterFor, localFrame, maxCellLength, mulMat4, nextCut, normaliseSplit, offsetAlongRay,
+  howToGlueText, invertRigid, isSymmetric, letterFor, localFrame, maxCellLength, mulMat4, nextCut, noSeatWords, normaliseSplit, offsetAlongRay,
   oppositeDir, orientationStats, partFileName, pieceColorIndex, pieceFileName, pinsFileName, planAllowance, planCost, planGrid,
   planSamples, plateAxis, polygonsArea, polygonsCentroid, printTransform, safeFileName, cellSupport, fitPieces, flatProbes, liesFlat, statsWithSoup,
   sizesFor, sizesForRoom, soupCells, splitActive, splitNote, teardropApex, usableBed, yawMat4, zipFileName, triangleInBox, baseAxis,
@@ -168,6 +168,11 @@ describe('normaliseSplit with parts that come off', () => {
     ]);
     expect(r.notes).toEqual([]);
     expect(r.grid).toEqual([0, 0, 2]);
+    // a base asked for a tea-light seat says so; a seat switched off, or never asked for, is no seat
+    const seated = (seat) => normaliseSplit({ cuts: [{ ...split.cuts[3], part: { ...split.cuts[3].part, seat } }] }, lantern).parts[0];
+    expect(seated(true)).toEqual({ id: 'c4', letter: 'A', axis: 2, at: 0, centre: [0, 0], r: 28.7, side: 1, hold: 'lift', auto: false, seat: true });
+    expect(seated(false)).not.toHaveProperty('seat');
+    expect(seated('yes')).not.toHaveProperty('seat');
     // the cuts, the grid and the settings are what they are with no parts at all (listed last, so no letter changes)
     const listed = [split.cuts[0], split.cuts[2], split.cuts[1], split.cuts[3]];
     const without = normaliseSplit({ cuts: listed.slice(0, 2) }, lantern);
@@ -1482,14 +1487,60 @@ describe('notes', () => {
     );
     expect(splitNote('PART_LOCK', { ...lock, dir: [1, 0, 0] }).text).toContain('lift it 5 mm and slide it out sideways.');
     const plug = { letter: 'C', cutId: 'c3', name: 'Base', piece: 3, home: 1, turn: 17, opening: 57.4, teaLight: true, model: 'the lantern' };
+    // a tea light goes in through it: with the light standing on it, the base goes in from underneath, the lantern held
+    // up – turned over, the light would fall out
     expect(splitNote('PART_PLUG', plug)).toMatchObject({
       level: 'info',
-      text: 'Cut C: the base (piece 3) twists off underneath. Turn the lantern over, set the base in turned 17° to the left, push it in and turn it right until it clicks – a coin in its slot helps. To open it: turn it left until it clicks and lift it out. Its Ø 57 mm opening takes a 38 mm tea light.',
+      text: "Cut C: the base (piece 3) twists off underneath, and its Ø 57 mm opening takes a 38 mm tea light. To fit it: stand the light on the middle of the base, hold the lantern up and, looking at the base's bottom, set the base in turned 17° to the left, push it in and turn it right until it clicks – a coin in its slot helps. To open it: turn it left until it clicks and lower it out. Use an LED tea light: a flame's heat softens the plastic over it.",
     });
     // not a lantern, and an opening a tea light does not go through
     expect(splitNote('PART_PLUG', { ...plug, model: null, teaLight: false, opening: 35.2 }).text).toBe(
       'Cut C: the base (piece 3) twists off underneath. Turn piece 1 over, set the base in turned 17° to the left, push it in and turn it right until it clicks – a coin in its slot helps. To open it: turn it left until it clicks and lift it out.',
     );
+    // with a tea-light seat on its top, it goes in from underneath with the light standing in the seat: turned over, the
+    // light would fall out. And an LED light, not a flame
+    expect(splitNote('PART_PLUG', { ...plug, seat: { d: 39.5, depth: 3.0014 } }).text).toBe(
+      "Cut C: the base (piece 3) twists off underneath, and a 38 mm tea light sits in the seat on top of it (Ø 39.5 mm, 3 mm deep). To fit it: stand the light in the seat, hold the lantern up and, looking at the base's bottom, set the base in turned 17° to the left, push it in and turn it right until it clicks – a coin in its slot helps. To open it: turn it left until it clicks and lower it out. Use an LED tea light: a flame's heat softens the plastic over it.",
+    );
+    // the user's base at 400 %: the seat takes the place of its own cup, and the note says so, and how to keep the cup
+    expect(splitNote('PART_PLUG', { ...plug, seat: { d: 39.5, depth: 3.0014, clears: { h: 7.635, across: 36.66 } } }).text).toBe(
+      "Cut C: the base (piece 3) twists off underneath, and a 38 mm tea light sits in the seat on top of it (Ø 39.5 mm, 3 mm deep), in place of the model's own detail there (7.6 mm proud, Ø 37 mm across). To fit it: stand the light in the seat, hold the lantern up and, looking at the base's bottom, set the base in turned 17° to the left, push it in and turn it right until it clicks – a coin in its slot helps. To open it: turn it left until it clicks and lower it out. Use an LED tea light: a flame's heat softens the plastic over it. To keep that detail instead, untick Tea-light seat.",
+    );
+  });
+
+  it("says a base has a tea-light seat on its top, or why it has none where one was asked for", () => {
+    expect(splitNote('PART_SEAT', { letter: 'B', cutId: 'c2', name: 'Base', piece: 3, seat: { d: 39.8, depth: 3.15 } })).toMatchObject({
+      level: 'info',
+      text: "Cut B: a 38 mm tea light sits in the seat on top of the base (Ø 39.8 mm, 3.2 mm deep). Use an LED tea light: a flame's heat softens the plastic over it.",
+    });
+    expect(splitNote('PART_SEAT', { letter: 'B', cutId: 'c2', name: 'Base', piece: 3, seat: { d: 39.5, depth: 3, clears: { h: 5.87, across: 27.5 } } }).text).toBe(
+      "Cut B: a 38 mm tea light sits in the seat on top of the base (Ø 39.5 mm, 3 mm deep), in place of the model's own detail there (5.9 mm proud, Ø 28 mm across). Use an LED tea light: a flame's heat softens the plastic over it. To keep that detail instead, untick Tea-light seat.",
+    );
+    const none = (fit) => splitNote('PART_NO_SEAT', { letter: 'B', cutId: 'c2', name: 'Base', piece: 2, ...fit });
+    // the seat is asked for wherever one fits: a base with none is told why, nothing to act on – never a warning
+    expect(none({ why: 'room', opening: 39, need: 42.6 })).toMatchObject({
+      level: 'info', why: 'room',
+      text: 'Cut B: no tea-light seat on the base (piece 2) – it is too narrow to keep a wall round one – that takes a Ø 42.6 mm opening.',
+    });
+    // the model's own detail in the middle of its top that the seat can't take the place of: wider than it, or running on
+    // up into the model
+    expect(none({ why: 'detail', h: 7.635, across: 45.21, rough: 3, d: 39.5 }).text).toBe(
+      "Cut B: no tea-light seat on the base (piece 2) – the model's own detail in the middle of its top, 7.6 mm proud, is Ø 45.3 mm across – wider than the seat, which would leave the rest of it standing.",
+    );
+    expect(none({ why: 'detail', h: 60, across: 20, rough: 3, d: 39.5, open: true }).text).toBe(
+      "Cut B: no tea-light seat on the base (piece 2) – the model's own detail in the middle of its top runs on up into the model, where the light would sit.",
+    );
+    expect(none({ why: 'level', h: 4.45, rough: 3 }).text).toBe('Cut B: no tea-light seat on the base (piece 2) – its top rises 4.5 mm round where the seat would go – a seat needs it level to within 3 mm.');
+    expect(none({ why: 'room', opening: 42.4, need: 42.6 }).text).toBe('Cut B: no tea-light seat on the base (piece 2) – it is too narrow to keep a wall round one – that takes a Ø 42.6 mm opening.');
+    expect(none({ why: 'thin', t: 3.74, need: 4.137868, lock: true }).text).toBe('Cut B: no tea-light seat on the base (piece 2) – its top is only 3.7 mm over its lock – a seat needs 4.2 mm.');
+    expect(none({ why: 'thin', t: 4.5, need: 5, lock: false }).text).toBe('Cut B: no tea-light seat on the base (piece 2) – it is only 4.5 mm thick – a seat needs 5 mm.');
+    expect(none({ why: 'hollow' }).text).toBe("Cut B: no tea-light seat on the base (piece 2) – it isn't solid under where the seat would go.");
+    expect(none({ why: 'low', room: 40, tall: 45 }).text).toBe('Cut B: no tea-light seat on the base (piece 2) – there are only 40 mm over it inside the model – a seat needs 45 mm, room for the tallest tea light.');
+    expect(noSeatWords({ why: 'narrow', opening: 30, need: 38.3 })).toBe("a 38 mm tea light doesn't go through its Ø 30 mm opening – that takes Ø 38.3 mm");
+    // an opening just short of what a tea light takes is said short of it, never as wide: 37.6 and 38.29 are not "38"
+    expect(noSeatWords({ why: 'narrow', opening: 37.6, need: 38.3 })).toBe("a 38 mm tea light doesn't go through its Ø 37.6 mm opening – that takes Ø 38.3 mm");
+    expect(noSeatWords({ why: 'narrow', opening: 38.29, need: 38.3 })).toBe("a 38 mm tea light doesn't go through its Ø 38.2 mm opening – that takes Ø 38.3 mm");
+    expect(noSeatWords({ why: 'narrow', opening: 38.45, need: 38.5 })).toBe("a 38 mm tea light doesn't go through its Ø 38.4 mm opening – that takes Ø 38.5 mm");
   });
 
   it("says a part is too small for a twist-lock at this size, why, and from what size one fits, as the design words it at 100 %", () => {
@@ -1566,6 +1617,30 @@ describe('notes', () => {
     const plain = howToGlueText({ name: 'bat', pieces, seams: loose });
     expect(plain).not.toContain('twist');
     expect(plain).toContain('Hold the pieces together');
+    // a base with a tea-light seat goes in from underneath, the light standing in the seat; whatever holds it, the sheet
+    // says where the light goes, on the base's line and in the dry fit
+    const seat = { d: 39.5, depth: 3 };
+    const lit = seams.map((x) => (x.letter === 'B' ? { ...x, apart: { ...x.apart, seat } } : x));
+    expect(assemblySteps({ pieces, seams: lit })[0].text).toBe(
+      "Do not glue cut B: it comes apart. Base: a 38 mm tea light sits in the seat on top of the base (Ø 39.5 mm, 3 mm deep) – stand the light in it, hold piece 1 up and, looking at the base's bottom, set the base in turned 17° to the left, push in and turn it right until it clicks (a coin in the slot helps). To open: turn it left and lower it out.",
+    );
+    const litSheet = howToGlueText({ name: 'bat', pieces, seams: lit });
+    expect(litSheet).toMatch(/piece 3 of 3 .*fits, comes off at cut B \(the base\), tea-light seat Ø 39\.5 mm on top\n/);
+    expect(litSheet).toContain('  A 38 mm tea light should drop into the seat on top of the base (cut B) and lift out with two fingers.\n');
+    expect(sheet).not.toContain('tea-light seat');
+    // a base a tea light goes through goes in from underneath with the light standing on it, seat or none
+    const through = seams.map((x) => (x.letter === 'B' ? { ...x, apart: { ...x.apart, opening: 57.4, teaLight: true } } : x));
+    expect(assemblySteps({ pieces, seams: through })[0].text).toBe(
+      "Do not glue cut B: it comes apart. Base: its Ø 57 mm opening takes a 38 mm tea light – stand the light on the middle of the base, hold piece 1 up and, looking at the base's bottom, set the base in turned 17° to the left, push in and turn it right until it clicks (a coin in the slot helps). To open: turn it left and lower it out.",
+    );
+    const cleared = seams.map((x) => (x.letter === 'B' ? { ...x, apart: { ...x.apart, opening: 57.4, teaLight: true, seat: { ...seat, clears: { h: 7.6, across: 36.7 } } } } : x));
+    expect(assemblySteps({ pieces, seams: cleared })[0].text).toContain(
+      "Base: a 38 mm tea light sits in the seat on top of the base (Ø 39.5 mm, 3 mm deep), in place of the model's own detail there (7.6 mm proud, Ø 37 mm across) – stand the light in it",
+    );
+    const lifting = loose.map((x) => (x.letter === 'B' ? { ...x, apart: { ...x.apart, seat } } : x));
+    expect(assemblySteps({ pieces, seams: lifting })[0].text).toBe(
+      'Do not glue cut B: it comes apart. Set the base in place on piece 1 – nothing holds it. A 38 mm tea light sits in the seat on top of the base (Ø 39.5 mm, 3 mm deep).',
+    );
   });
 
   it("the glue sheet puts a part back in its place, and says it isn't glued", () => {

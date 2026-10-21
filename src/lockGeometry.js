@@ -23,7 +23,7 @@
  * returned is the caller's.
  */
 import { manifold } from './manifold.js';
-import { collarReach, layout, plugDims, plugLayoutOk, twistFor } from './locks.js';
+import { SEAT_WORD, collarReach, layout, plugDims, plugLayoutOk, twistFor } from './locks.js';
 
 /** Segments for a full turn of every revolve: 0.008 mm inside the circle at r 40, far under any clearance. */
 export const LOCK_SEGMENTS = 160;
@@ -437,6 +437,24 @@ export function plugWall(S, R, top, lugs = null) {
 }
 
 /**
+ * A base's tea-light seat, in its frame (z = 0 its bed): the cutter of a round pocket of radius `r` down to its floor
+ * `zf`, its wall straight up to the lead-in, which widens it 45° by `lead` to where the top round it is lowest
+ * (`mouth`), then straight on up past what the seat clears (`top`). It opens upwards, so the base prints it on its
+ * bottom with no overhang. A primitive of its own, so its faces keep their id for the view to show the seat by.
+ * @param {{ r: number, zf: number, mouth: number, lead: number, top: number }} seat
+ * @returns {{ solid: Manifold, ids: number[] }} the caller's
+ */
+export function seatSolid({ r, zf, mouth, lead, top }) {
+  const k = kit();
+  try {
+    const cut = revolve(k, [[0, zf], [r, zf], [r, mouth - lead], [r + lead, mouth], [r + lead, top], [0, top]]);
+    return { solid: cut.translate([0, 0, 0]), ids: [...k.ids] };
+  } finally {
+    k.dispose();
+  }
+}
+
+/**
  * The twist-lock's fit test: the lock exactly as the pieces get it – the same neck, lugs, slots, click tabs, mouths
  * and layer heights – on two small rings, so a print of a few grams tries the clearance before the model. The body's
  * half is the neck and its lugs on a flat ring 12 layers thick, standing on the bed; the lid's half is the socket in
@@ -475,14 +493,16 @@ export function twistCoupon(S, r0, { theta = twistFor(S, r0) } = {}) {
  * the neck and the lugs less the grooves; the lid the socket ring, the socket (the ring, or the full disc where the
  * lock says so) and slots and slits, then the ridges. A plug lock: the body loses the slots, grooves and mouths; the
  * plug gets its lugs, loses its wall's gap, slits, mouth and coin slot, then gets its ridges. A plug with no lock gets
- * its wall's gap only. `carry` names, among `ids`, what carries the lock rather than being it – the collar and the
- * socket ring – which the view paints lighter, and `bare` what is the piece's own outside, only turned down to its
- * clearance – the plug's wall – which the view leaves the piece's colour; `lugs` the lugs', which it paints apart, and
- * `points` where a lug, a slot and a click tab are, in the lock's frame, for the words it puts on them.
+ * its wall's gap only. A plug with a tea-light seat (`seat`, `seatSolid`) loses its pocket too, with or without a
+ * lock. `carry` names, among `ids`, what carries the lock rather than being it – the collar and the socket ring –
+ * which the view paints lighter, and `bare` what is the piece's own outside, only turned down to its clearance – the
+ * plug's wall – which the view leaves the piece's colour; `lugs` the lugs', which it paints apart; `seat` the seat's,
+ * which it paints as a seat, not a lock; and `points` where a lug, a slot and a click tab are (and the seat, with
+ * one), in the lock's frame, for the words it puts on them.
  * @param {{ mech: 'twist'|'plug'|null, kind: string, S: object, r0?: number, theta?: number, slope?: number,
- *   below?: number[][], above?: number[][], socket?: 'ring'|'disc', R?: number, top?: number }} lock
+ *   below?: number[][], above?: number[][], socket?: 'ring'|'disc', R?: number, top?: number, seat?: object }} lock
  * @returns {{ body: { add: Manifold|null, cut: Manifold|null, after: null }, part: { add: Manifold|null, cut: Manifold|null,
- *   after: Manifold|null }, fill: boolean, ids: number[], carry: number[], bare: number[], lugs: number[],
+ *   after: Manifold|null }, fill: boolean, ids: number[], carry: number[], bare: number[], lugs: number[], seat: number[],
  *   points: object[] }} the caller's
  */
 export function lockSolids(lock) {
@@ -506,9 +526,16 @@ export function lockSolids(lock) {
         carry: [...collar.ids, ...ring.ids],
         bare: [],
         lugs: [...L.lugIds],
+        seat: [],
         points: L.points,
       };
     }
+    // a base's tea-light seat is cut with its wall's gap, whatever holds it
+    const seat = lock.seat ? seatSolid(lock.seat) : null;
+    if (seat) k.add(seat.solid);
+    const seated = seat ? [seat.solid] : [];
+    // the word on the seat, in the middle of its mouth, where the view looks at it from over the base
+    const seatPoint = seat ? [{ name: SEAT_WORD, on: 'part', at: [0, 0, lock.seat.mouth] }] : [];
     if (lock.mech === 'plug') {
       const P = plugLockSolids(S, lock.R);
       [P.lugs, P.bodyCut, P.plugCut, P.ridges].forEach((m) => k.add(m));
@@ -516,17 +543,22 @@ export function lockSolids(lock) {
       k.add(wall.solid);
       return {
         body: { add: null, cut: P.bodyCut.translate([0, 0, 0]), after: null },
-        part: { add: P.lugs.translate([0, 0, 0]), cut: Manifold.union([wall.solid, P.plugCut]), after: P.ridges.translate([0, 0, 0]) },
+        part: { add: P.lugs.translate([0, 0, 0]), cut: Manifold.union([wall.solid, P.plugCut, ...seated]), after: P.ridges.translate([0, 0, 0]) },
         fill: false,
-        ids: [...P.ids, ...wall.ids],
+        ids: [...P.ids, ...wall.ids, ...(seat?.ids ?? [])],
         carry: [],
         bare: [...wall.ids],
         lugs: [...P.lugIds],
-        points: P.points,
+        seat: seat?.ids ?? [],
+        points: [...P.points, ...seatPoint],
       };
     }
     const wall = plugWall(S, lock.R, lock.top);
-    return { body: { add: null, cut: null, after: null }, part: { add: null, cut: wall.solid, after: null }, fill: false, ids: wall.ids, carry: [], bare: wall.ids, lugs: [], points: [] };
+    k.add(wall.solid);
+    return {
+      body: { add: null, cut: null, after: null }, part: { add: null, cut: seat ? Manifold.union([wall.solid, ...seated]) : wall.solid.translate([0, 0, 0]), after: null },
+      fill: false, ids: [...wall.ids, ...(seat?.ids ?? [])], carry: [], bare: wall.ids, lugs: [], seat: seat?.ids ?? [], points: seatPoint,
+    };
   } finally {
     k.dispose();
   }

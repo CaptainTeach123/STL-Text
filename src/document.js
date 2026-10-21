@@ -68,7 +68,7 @@ export const ITEM_DEFAULTS = Object.freeze({
  * handle that stays on the lantern.
  */
 export const SPLIT_DEFAULTS = Object.freeze({
-  // [{ id: 'c1', position: [x, y, z], normal: [1, 0, 0], joint?: 'apart', hold?: 'lock', part?: { r, side, auto } }], model mm
+  // [{ id: 'c1', position: [x, y, z], normal: [1, 0, 0], joint?: 'apart', hold?: 'lock', part?: { r, side, auto, seat? } }], model mm
   cuts: Object.freeze([]),
   joint: 'auto', // 'auto' | 'dowels' | 'dovetail' | 'none'
   diameter: 0, // mm: 0 = automatic | 1.75 (filament) | 3 | 4 | 5 | 6 | 8 | 10
@@ -240,13 +240,16 @@ const NEW_HOLD = 'lock';
 /**
  * A cut's part, kept as the document keeps it: a circle of radius `r` on the
  * plane (world mm, round `position`), the side of the plane the part lies on
- * (`side` +1 along the normal, −1 the other way) and whether it is still where
- * the finder put it (`auto`). Null when there is no circle to take out.
+ * (`side` +1 along the normal, −1 the other way), whether it is still where
+ * the finder put it (`auto`) and, once it is known to be a base, whether it
+ * has a tea-light seat on its top where one fits (`seat`). A part saved
+ * without `seat` stays without it, and gets no seat. Null when there is no
+ * circle to take out.
  */
 const copyPart = (part) => {
   const r = Number(part?.r);
   if (!(r > 0 && Number.isFinite(r))) return null;
-  return { r, side: Number(part.side) < 0 ? -1 : 1, auto: part.auto === true };
+  return { r, side: Number(part.side) < 0 ? -1 : 1, auto: part.auto === true, ...(typeof part.seat === 'boolean' ? { seat: part.seat } : {}) };
 };
 
 /**
@@ -575,6 +578,19 @@ export class Document {
       },
       { coalesce: step },
     );
+  }
+
+  /**
+   * A base's tea-light seat on or off (`seat`): one undo step, nothing when it
+   * is that already. It is no change to where the part is, so the part stays
+   * the finder's pick, and a Scale places it again.
+   */
+  setPartSeat(id, seat) {
+    const cut = this.state.split?.cuts.find((c) => c.id === id);
+    if (!cut?.part || cut.part.seat === !!seat) return;
+    this.commit((s) => {
+      s.split.cuts = s.split.cuts.map((c) => (c.id === id ? copyCut({ ...c, part: { ...c.part, seat: !!seat } }) : c));
+    });
   }
 
   /**

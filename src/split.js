@@ -4700,8 +4700,23 @@ export const partFileName = (name, k, partName) => `${safeFileName(name)}-part-$
 /** "bar-text-2-pieces.zip". */
 export const zipFileName = (name, n) => `${safeFileName(name)}-${n}-pieces.zip`;
 
-/** "bar-text-how-to-glue.txt". */
-export const glueFileName = (name) => `${safeFileName(name)}-how-to-glue.txt`;
+/** The sheets that come with the pieces, by their own names: the model's name goes in front of them. */
+const SHEETS = { glue: 'how-to-glue.txt', fit: 'how-to-print-and-fit.txt' };
+
+/**
+ * The sheet that comes with the pieces: "bar-text-how-to-glue.txt" – or, for a split that takes out parts that come
+ * off (`parts`) and glues nothing (`glued` false), "batlantern-how-to-print-and-fit.txt": it has only the pieces to
+ * print and the parts to fit. A split with no such part keeps the name whatever it glues: its downloads are kept as
+ * they were before parts came off, name and bytes, and are known by it.
+ */
+export const glueFileName = (name, { parts = false, glued = true } = {}) => `${safeFileName(name)}-${parts && !glued ? SHEETS.fit : SHEETS.glue}`;
+
+/**
+ * A split's sheet by its own name, as the status line lists it beside the pieces: "how-to-glue.txt" or
+ * "how-to-print-and-fit.txt" – the model's name in front of it left off, whatever that name is (a model called
+ * "how-to-box" too).
+ */
+export const sheetName = (file) => Object.values(SHEETS).find((sheet) => file === sheet || file.endsWith(`-${sheet}`)) ?? file;
 
 const dowelCount = (seam) => (Array.isArray(seam.dowels) ? seam.dowels.length : Number(seam.dowels) || 0);
 const pegCount = (seam) => (Array.isArray(seam.pegs) ? seam.pegs.length : Number(seam.pegs) || 0);

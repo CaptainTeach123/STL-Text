@@ -280,9 +280,8 @@ function plugLeastWords(from, tea, offer) {
 /**
  * One part in the card "Parts that come off", from the engine's parts table (`split.plan` mode 'parts'): what it is
  * and the lock it gets at this size, or why none fits and from what size one does; the print badge; the sizes its
- * [Make it N %] buttons offer (the least scale of a lock, and of a tea light through it, each up to a whole 100 % of
- * the model as loaded); and how [Use] puts it on – 'lock' (it twist-locks), 'lift' ("Use – it just lifts off", a lid
- * too small for a lock) or null (a base too small for one, which would just drop out).
+ * [Make it N %] buttons offer (`sizeOffers`); and how [Use] puts it on – 'lock' (it twist-locks), 'lift' ("Use – it
+ * just lifts off", a lid too small for a lock) or null (a base too small for one, which would just drop out).
  * @param {object} entry one of the table's `parts`
  * @param {{ scale?: number, most?: number, parts?: object[] }} table the table it is from
  * @returns {{ kind: string, name: string, lock: boolean, title: string, detail: string, badge: string, offers: number[], use: 'lock'|'lift'|null }}
@@ -290,11 +289,11 @@ function plugLeastWords(from, tea, offer) {
 export function partCard(entry, table) {
   const scale = table.scale ?? 1;
   const { name, lock } = entry;
-  const offers = [...new Set([entry.least?.lock, entry.kind === 'lid' ? entry.least?.tea : null].filter((q) => q != null).map((q) => offerPercent(q * scale)))];
+  const offers = sizeOffers(entry, table);
   if (entry.kind === 'plug') {
     // a tea light stands in a seat on its top where one fits, [Use] giving it one; where none does, the card says why
     const seat = lock?.teaLight ? cardSeatWords(entry.seat) : '';
-    if (lock) return { kind: 'plug', name, lock: true, title: `${name} – twists off underneath · twist-lock · ${openingWords(lock)}${seat}`, detail: '', badge: 'no extra support', offers: [], use: 'lock' };
+    if (lock) return { kind: 'plug', name, lock: true, title: `${name} – twists off underneath · twist-lock · ${openingWords(lock)}${seat}`, detail: '', badge: 'no extra support', offers, use: 'lock' };
     // too small for its lock at this size: it would just drop out, so it has no [Use] – but it is offered all the same,
     // as what it gets once the model is big enough, why not now, and the size that gives it its lock (and a tea light)
     const from = percentOf(entry.least?.lock, scale);
@@ -304,18 +303,58 @@ export function partCard(entry, table) {
       ? `${name} – no twist-lock fits it underneath while something stands under its bottom.`
       : from == null ? `${name} – no twist-lock fits it underneath${most}.` : `${name} – twists off underneath once the model is ${from} % or bigger.`;
     const detail = [plugSmallWords(entry), from == null ? '' : plugLeastWords(from, tea, offers[0])].filter(Boolean).join(' ');
-    return { kind: 'plug', name, lock: false, title, detail, badge: '', offers: offers.slice(0, 1), use: null };
+    return { kind: 'plug', name, lock: false, title, detail, badge: '', offers, use: null };
   }
   if (lock) {
     // a lid whose opening is too small for a tea light, on a lantern whose base takes one
     const base = (table.parts ?? []).find((e) => e.kind === 'plug' && e.lock?.teaLight);
     const elsewhere = !lock.teaLight && base ? `a ${TEA_LIGHT} mm tea light fits through the base, not the lid` : '';
     const title = `${name} – ${['twist-lock', openingWords(lock), handleWords(entry), elsewhere].filter(Boolean).join(' · ')}`;
-    return { kind: 'lid', name, lock: true, title, detail: '', badge: collarBadge(name, lock.slope), offers: [], use: 'lock' };
+    return { kind: 'lid', name, lock: true, title, detail: '', badge: collarBadge(name, lock.slope), offers, use: 'lock' };
   }
   const where = entry.takesHandle ? 'comes off, and takes the handle with it.' : entry.handle ? 'comes off inside the handle; the handle stays on the lantern.' : 'comes off.';
   const detail = [`Too small for a lock at this size: ${smallWords(entry)}.`, leastWords(entry, table)].filter(Boolean).join(' ');
   return { kind: 'lid', name, lock: false, title: `${name} – ${where}`, detail, badge: '', offers, use: 'lift' };
+}
+
+/**
+ * The sizes a part's row offers, as [Make it N %] (% of the model as loaded): each size at which a twist-lock, or a
+ * 38 mm tea light through one, first fits one of the table's parts – up to a whole 100 % – that is bigger than the
+ * size now; for a part too small for its own lock, none smaller than the size that fits it. Every part's row offers
+ * them all, and goes on offering the bigger ones once its own part fits: the size a print is wanted at – a bigger
+ * lantern whose dome takes a tea light too, say, with only its base coming off – is then a click away on the row of the
+ * part being taken out, and the biggest offered is the biggest any part asks for. None for a part no lock fits at any
+ * size the finder looks at: no size helps it.
+ * @param {object} entry one of the table's `parts`
+ * @param {{ scale?: number, parts?: object[] }} table the table it is from
+ * @returns {number[]} the sizes, smallest first
+ */
+export function sizeOffers(entry, table) {
+  const scale = table.scale ?? 1;
+  if (!entry.lock && entry.least?.lock == null) return [];
+  const from = entry.lock ? 0 : offerPercent(entry.least.lock * scale);
+  const sizes = [entry, ...(table.parts ?? [])].flatMap((e) => [e.least?.lock, e.least?.tea]).filter((q) => q != null).map((q) => offerPercent(q * scale));
+  return [...new Set(sizes)].filter((n) => n >= from && n > scale * 100 + 1e-6).sort((a, b) => a - b);
+}
+
+/**
+ * What a size the card offers (`n` % of the model as loaded) gives the table's parts, for its button's tooltip: the
+ * parts whose twist-lock, or a 38 mm tea light through it, first fits at that size – "the base twists off with its
+ * twist-lock", "a 38 mm tea light fits through the dome and cap".
+ * @param {number} n the size offered, % of the model as loaded
+ * @param {{ scale?: number, parts?: object[] }} table
+ * @returns {string[]}
+ */
+export function sizeGains(n, table) {
+  const scale = table.scale ?? 1;
+  const at = (q) => q != null && offerPercent(q * scale) === n;
+  const gains = [];
+  for (const e of table.parts ?? []) {
+    const called = calledOf(e.name);
+    if (at(e.least?.lock)) gains.push(e.kind === 'plug' ? `the ${called} twists off with its twist-lock` : `the ${called} ${manyOf(e.name) ? 'twist-lock' : 'twist-locks'} on`);
+    if (at(e.least?.tea)) gains.push(`a ${TEA_LIGHT} mm tea light fits through the ${called}`);
+  }
+  return gains;
 }
 
 /**
@@ -336,6 +375,31 @@ export const partOffered = (entry, table) => {
   const w = partCard(entry, table);
   return !!w.use || w.offers.length > 0;
 };
+
+/** How the box and lid of a fit test hold, as its lip does: the cut's hold. */
+const BOX_HELD = Object.freeze({ lock: 'that locks onto it', snap: 'that clicks onto it', light: 'that clicks onto it lightly', lift: 'that lifts off it' });
+
+/**
+ * What Download fit test's tooltip says the fit test holds, for the split as it stands (the engine makes it of what the
+ * pieces have): holes and a pin of the size they use, a built-in peg and its socket, a dovetail tab and its socket, a
+ * small box and its lid on the lip of a cut that comes apart, held as that lip is, two rings with a twist-lock (a lid's,
+ * or a round wall's in place of a lip), a ring and a plug with a base's. Where the split has none of them – only parts
+ * that lift off – that there is nothing to try, as a click then says.
+ * @param {{ pins?: boolean, own?: boolean, pegs?: boolean, dovetail?: boolean, lip?: string|null, twist?: boolean, plug?: boolean }} holds
+ */
+export function fitTestTitle({ pins = false, own = false, pegs = false, dovetail = false, lip = null, twist = false, plug = false } = {}) {
+  const list = [
+    pins && (own ? 'holes for your own dowels' : 'holes and a pin of the size the pieces use'),
+    pegs && 'a built-in peg and its socket',
+    dovetail && 'a dovetail tab and its socket',
+    lip && `a small box and a lid ${BOX_HELD[lip] ?? BOX_HELD.snap}, on the same lip`,
+    twist && 'two rings with the twist-lock',
+    plug && "a ring and a plug with the base's twist-lock",
+  ].filter(Boolean);
+  if (!list.length) return 'Nothing holds these cuts, so there is nothing to try – a click says why';
+  const last = list.length > 1 ? `${list.slice(0, -1).join('; ')}; and ${list[list.length - 1]}` : list[0];
+  return `A small print to try before printing the pieces, at the size and clearance they have: ${last}`;
+}
 
 /**
  * What Download fit test says when there is nothing to try because the split's only cuts take out parts that come off
@@ -397,8 +461,8 @@ export function partReadout({ part, on }, table) {
 
 /**
  * How low on the model, as a share of its height, a cut across would take most of it off as its "top": there, on a
- * model whose handle such a cut would take with it, a click that picks a part takes out the base – where its lock fits
- * – rather than placing such a cut.
+ * model whose handle such a cut would take with it, a click that picks a part picks the base – taken out where its lock
+ * fits, offered at the size it fits from where it is too small for it now – rather than placing such a cut.
  */
 export const BASE_LOW = 0.2;
 
@@ -406,10 +470,12 @@ export const BASE_LOW = 0.2;
  * Which part a point on the model picks, from the table alone (each pointer move, so no slicing): a lid when the
  * point is on it; the lid under a handle when it is on the handle the lid leaves on the body; the lid when it is
  * just under its face, on the shell it sits in; the base when it is on the model's solid bottom, on what stands on it
- * inside its circle (a cup on a lantern's floor, seen through a window), or – where its lock fits, on a model with a
- * handle – anywhere on its lowest `BASE_LOW` round it: the walls over its bottom, where a cut across would take the
- * rest of the model off as its top, handle and all. A model with no handle, or a base too small to lock, keeps the
- * low cuts across there (a band below the openings). `on` says which.
+ * inside its circle (a cup on a lantern's floor, seen through a window), or – on a model with a handle – anywhere on
+ * its lowest `BASE_LOW` round it: the walls over its bottom, where a cut across would take the rest of the model off as
+ * its top, handle and all. That is so whether its lock fits at this size or only at a bigger one – too small, the base
+ * is picked all the same, so a click there says from what size it twists off rather than take the top off at its
+ * walls. A model with no handle, or a base no lock fits at any size the finder looks at, keeps the low cuts across
+ * there (a band below the openings, the only way in). `on` says which, and `band` that only the low band picked it.
  * @returns {{ part: object|null, index: number, on: 'lid'|'handle'|'under'|'base'|null }}
  */
 export function pickPart(table, p) {
@@ -422,15 +488,14 @@ export function pickPart(table, p) {
     ['lid', (e) => e.kind === 'lid' && p[2] >= e.face - 1e-6 && p[2] <= e.cap + 1e-6 && dist(e) <= e.r],
     ['handle', (e) => e.kind === 'lid' && !!e.handle && onTrace(e.handle, p, 1.5 * h)],
     ['under', (e) => e.kind === 'lid' && p[2] < e.face && p[2] >= e.from - 2 * h && dist(e) <= e.window[1] + 2 * h],
-    ['base', (e) => e.kind === 'plug' && (
-      (p[2] <= e.solidTop + 1e-6 && dist(e) <= e.reach + 1e-6)
-      || (p[2] <= (e.top ?? -Infinity) + 1e-6 && dist(e) <= e.r)
-      || (!!e.lock && p[2] <= low && dist(e) <= (e.reach ?? e.r) + round)
-    )],
+    ['base', (e) => e.kind === 'plug' && ((p[2] <= e.solidTop + 1e-6 && dist(e) <= e.reach + 1e-6) || (p[2] <= (e.top ?? -Infinity) + 1e-6 && dist(e) <= e.r))],
+    // the low band round it, said so (`band`): where the base is too small for its lock, a spot suggested for a cut
+    // across there wins over it (see the page's `partPicked`)
+    ['base', (e) => e.kind === 'plug' && (!!e.lock || e.least?.lock != null) && p[2] <= low && dist(e) <= (e.reach ?? e.r) + round, true],
   ];
-  for (const [on, test] of rules) {
+  for (const [on, test, band = false] of rules) {
     const index = table.parts.findIndex(test);
-    if (index >= 0) return { part: table.parts[index], index, on };
+    if (index >= 0) return { part: table.parts[index], index, on, ...(band ? { band } : {}) };
   }
   return { part: null, index: -1, on: null };
 }

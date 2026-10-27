@@ -6,7 +6,7 @@ import {
   cellFits, cellOfPoint, cellSizes, chooseCentres, chooseOffsets, chooseOrientation, clipSoupByPlane, clippedArea, cutPlane, dirAxis, dirOf,
   dovetailSize, evenCell, explodeOffset, fitsBed, footprintYaw, formatSize, glueFileName, gridCandidates, gridCounts, gridPoints,
   howToGlueText, invertRigid, isSymmetric, letterFor, localFrame, maxCellLength, mulMat4, nextCut, noSeatWords, normaliseSplit, offsetAlongRay,
-  oppositeDir, orientationStats, partFileName, pieceColorIndex, pieceFileName, pinsFileName, planAllowance, planCost, planGrid,
+  oppositeDir, orientationStats, partFileName, pieceColorIndex, pieceFileName, pinsFileName, planAllowance, planCost, planGrid, sheetName,
   planSamples, plateAxis, polygonsArea, polygonsCentroid, printTransform, safeFileName, cellSupport, fitPieces, flatProbes, liesFlat, statsWithSoup,
   sizesFor, sizesForRoom, soupCells, splitActive, splitNote, teardropApex, usableBed, yawMat4, zipFileName, triangleInBox, baseAxis,
   outlineColumns, pieceHolding, textNotes, AUTO_PEGS, SMALLEST_PEG, layPegged, pegAllowance, pegMales, pegSides, pegSizeOf, pegSizesFor,
@@ -1382,6 +1382,18 @@ describe('files and the glue sheet', () => {
     expect(partFileName('bar', 1, 'Big logo!')).toBe('bar-part-1-Big_logo_');
     expect(zipFileName('long-bar-text', 2)).toBe('long-bar-text-2-pieces.zip');
     expect(glueFileName('box')).toBe('box-how-to-glue.txt');
+    // a split that takes out parts and glues nothing has a sheet to print the pieces and fit the parts by; one that
+    // glues as well, or that takes out no part, keeps the glue sheet's name
+    expect(glueFileName('batlantern', { parts: true, glued: false })).toBe('batlantern-how-to-print-and-fit.txt');
+    expect(glueFileName('batlantern', { parts: true, glued: true })).toBe('batlantern-how-to-glue.txt');
+    expect(glueFileName('lantern', { parts: false, glued: false })).toBe('lantern-how-to-glue.txt');
+    // the status line names the sheet by its own name, whatever the model is called – one called "how-to-box" too
+    expect(sheetName('box-text-how-to-glue.txt')).toBe('how-to-glue.txt');
+    expect(sheetName('batlantern-how-to-print-and-fit.txt')).toBe('how-to-print-and-fit.txt');
+    expect(sheetName(glueFileName('how-to-box-text'))).toBe('how-to-glue.txt');
+    expect(sheetName(glueFileName('my-how-to-box-text'))).toBe('how-to-glue.txt');
+    expect(sheetName(glueFileName('how-to-glue', { parts: true, glued: false }))).toBe('how-to-print-and-fit.txt');
+    expect(sheetName('notes.txt')).toBe('notes.txt');
     expect(safeFileName('my model (2).stl')).toBe('my_model_2_.stl');
   });
 

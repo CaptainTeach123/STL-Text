@@ -59,8 +59,8 @@
                 <button type="button" class="btn small" data-fix="rotZ">Z</button>
               </div>
               <div class="row">
-                <label class="field inline grow"><span>Scale</span><input type="number" id="scalePercent" value="100" min="1" max="10000" step="1" /><span class="unit">%</span></label>
-                <button type="button" class="btn small" id="scaleBtn">Apply</button>
+                <label class="field inline grow" title="The model's size as a share of it as loaded – 100 % is as downloaded"><span>Scale</span><input type="number" id="scalePercent" value="100" min="1" max="100000" step="any" /><span class="unit">%</span></label>
+                <button type="button" class="btn small" id="scaleBtn" title="Make the model the size in the box: a share of it as loaded">Apply</button>
               </div>
               <div class="row">
                 <label class="field inline grow" title="Merge triangles that are within this distance of a flat surface. Speeds up huge models."><span>Simplify</span><input type="number" id="simplifyTol" value="0.02" min="0.001" max="0.05" step="0.005" /><span class="unit">mm</span></label>
@@ -512,7 +512,7 @@
             </details>
             <div class="row spread">
               <span class="hint">Not sure of the fit?</span>
-              <button type="button" id="splitFitTestBtn" class="btn small" title="A small print of the joints these cuts get – holes and a pin of the size the pieces use, a peg and its socket with built-in pegs, a dovetail where a cut has one, a small box and its lid where a cut comes apart – to try before printing the pieces">Download fit test</button>
+              <button type="button" id="splitFitTestBtn" class="btn small" title="A small print to try before printing the pieces, of what holds them together: the pins, pegs, dovetails, lips or twist-locks these cuts get">Download fit test</button>
             </div>
           </div>
           <ul class="plan" id="pieceList" aria-label="Pieces"></ul>

@@ -385,10 +385,12 @@ input[type='range'] {
   white-space: pre-line;
 }
 /* in the bar that stays at the foot of the panel, under its buttons: what the page says is never scrolled away (the
-   placing hint, a download's name, the fit test's instructions); a long one scrolls in its own few lines */
+   placing hint, a download's name, the fit test's instructions). It is as tall as what it says, up to over a quarter of
+   the window – the fit test's eight lines of how to try it read whole, their last sentence (what to change when it is
+   too tight or too loose) with them – and only something longer scrolls in it */
 .actions .status {
   grid-column: 1 / -1;
-  max-height: 7.5em;
+  max-height: max(7.5em, 28vh);
   overflow-y: auto;
 }
 /* on a short screen (a laptop zoomed in) three lines: the bar must leave the panel room for the cards over it */
@@ -698,8 +700,10 @@ input[type='range'] {
   flex: 1;
   gap: 6px;
 }
+/* the box takes the room its row has, down to 60px – never its own natural width, which a number box works out from
+   its max and step (Scale's step="any" makes it wider) and which would push the panel past a 320 px phone's edge */
 .field.inline.grow input {
-  width: auto;
+  width: 0;
   flex: 1;
   min-width: 60px;
 }

@@ -142,6 +142,31 @@ describe('Document', () => {
     void a;
   });
 
+  it("Inches → mm's share of the transforms is kept as the base's units: undone with it, and gone with a reset", () => {
+    const doc = new Document();
+    doc.setBase('stl', 'inch');
+    const mm = new Matrix4().makeScale(25.4, 25.4, 25.4);
+    doc.transformBase(mm, { units: 25.4 });
+    expect(doc.base.units).toBe(25.4);
+    // a size made after it is the model's own, not a unit's
+    doc.transformBase(new Matrix4().makeScale(2, 2, 2));
+    expect(doc.base.units).toBe(25.4);
+    expect(doc.base.transforms).toHaveLength(2);
+    doc.undo();
+    doc.undo();
+    expect(doc.base.units).toBeUndefined();
+    doc.redo();
+    expect(doc.base.units).toBe(25.4);
+    doc.resetBase();
+    expect(doc.base.units).toBeUndefined();
+    doc.undo();
+    expect(doc.base.units).toBe(25.4);
+    // a Scale of the same factor is no unit: the base has none
+    doc.setBase('stl', 'other');
+    doc.transformBase(mm);
+    expect(doc.base.units).toBeUndefined();
+  });
+
   it('resetBase undoes non-commuting transforms exactly', () => {
     const doc = new Document();
     doc.setBase('stl', 'box');

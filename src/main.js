@@ -7,15 +7,15 @@ import { ENHANCE_DEFAULTS, isEnhanceActive } from './enhance.js';
 import { Viewer } from './viewer.js';
 import { applyTheme, browserStorage, storeTheme, storedTheme } from './theme.js';
 import {
-  aimLine, aimTargets, bandOf, handlePlaneWords, lipLine, lipVerdict, noFitTestWords, partCard, partFace, partMeta, partOffered, partReadout, partWidth, partsNote,
-  percentOf, pickPart, noLockOf, noLockTitle, snapTolerance, snappedWords, spotLabel, throughWords, wayCaption, widthWords,
+  aimLine, aimTargets, bandOf, fitTestTitle, handlePlaneWords, lipLine, lipVerdict, noFitTestWords, partCard, partFace, partMeta, partOffered, partReadout, partWidth, partsNote,
+  percentOf, pickPart, noLockOf, noLockTitle, sizeGains, snapTolerance, snappedWords, spotLabel, throughWords, wayCaption, widthWords,
 } from './aim.js';
 import { TEA_LIGHT, gminOf, offerPercent, roundZ } from './locks.js';
 import { SIDES, placementMatrix, snapPartTo } from './placement.js';
 import { BUNDLED_FONTS, canQueryLocalFonts, fetchBundledFont, listLocalFonts, localFontBytes } from './fontCatalog.js';
 import {
   BED_DEFAULTS, BED_PRESETS, FILAMENT, PIECE_COLORS, SPLIT_LIMITS, SPLIT_NOTE_CODES, axisCuts, bedSize, cellFits, cellSizes, cutPlane, fitPieces, formatSize,
-  letterFor, nextCut, noSeatWords, pegSizeOf, pieceColorIndex, splitActive, splitNote, usableBed, wayStep,
+  letterFor, nextCut, noSeatWords, pegSizeOf, pieceColorIndex, sheetName, splitActive, splitNote, usableBed, wayStep,
 } from './split.js';
 
 const $ = (id) => document.getElementById(id);
@@ -490,7 +490,10 @@ async function syncBase() {
     const v = version();
     sentVersion = v;
     const pending = doc.base
-      ? client.updateBase({ version: v, transforms: doc.base.transforms, simplify: doc.base.simplify, enhance: compareOriginal ? null : doc.base.enhance, spots: spotsOf(doc.items), covers: coversOf(doc.items) })
+      ? client.updateBase({
+        version: v, transforms: doc.base.transforms, units: doc.base.units ?? 1, simplify: doc.base.simplify, enhance: compareOriginal ? null : doc.base.enhance,
+        spots: spotsOf(doc.items), covers: coversOf(doc.items),
+      })
       : client.loadBase({ kind: 'none', version: v });
     basePending = pending;
     setDeriving(true);
@@ -541,16 +544,21 @@ function applyFix(kind) {
   if (!doc.base || !modelInfo?.bounds) return;
   const bounds = modelInfo.bounds;
   let matrix = null;
+  let units = 1;
   switch (kind) {
     case 'inches':
+      // the file's numbers put in mm: the model is no bigger for it, and is still 100 % as downloaded (`modelScale`)
       matrix = new Matrix4().makeScale(25.4, 25.4, 25.4);
+      units = 25.4;
       break;
     case 'scale': {
-      const f = Number.parseFloat($('scalePercent').value) / 100;
-      if (!(f > 0)) return;
-      matrix = new Matrix4().makeScale(f, f, f);
-      $('scalePercent').value = 100;
-      break;
+      // the size typed is a share of the model as loaded (100 % as downloaded), as the card's sizes are – never of the
+      // size now, which would make 400 at 300 % twelve times as big – and is made as [Make it N %] makes it: the view
+      // framed on the model at its new size, its parts placed again for it and the card shown, as one undo step
+      const percent = Number.parseFloat($('scalePercent').value);
+      if (!(percent > 0)) return;
+      makeIt(percent, modelScale());
+      return;
     }
     case 'rotX':
     case 'rotY':
@@ -578,11 +586,30 @@ function applyFix(kind) {
       return;
   }
   if (matrix) {
-    const step = doc.transformBase(matrix);
+    const step = doc.transformBase(matrix, { units });
     // a new size: the parts the finder placed are placed again for it, in the same undo step
     if (kind === 'scale' || kind === 'inches') refitParts(step);
   }
   setStatus('');
+}
+
+/**
+ * The Scale box: the model's size now as a share of it as loaded (100 % as downloaded), as the card's [Make it N %]
+ * gives sizes – an undo, a redo or a size made from the card shows in it – left alone while it is typed in; its
+ * tooltip, how tall the model is at the size in it.
+ */
+function fillScale() {
+  const box = $('scalePercent');
+  if (box !== document.activeElement) box.value = doc.base ? +(modelScale() * 100).toFixed(2) : 100;
+  scaleTip();
+}
+
+/** The Scale box's tooltip: how tall the model is at the size typed in it, from its height now (once the engine has the model as it is). */
+function scaleTip() {
+  const percent = Number.parseFloat($('scalePercent').value);
+  const b = engineVersion === version() ? modelInfo?.bounds : null;
+  const tall = b && percent > 0 && modelScale() > 0 ? Math.round(((b.max[2] - b.min[2]) * percent) / 100 / modelScale()) : null;
+  $('scalePercent').closest('label').title = `The model's size as a share of it as loaded – 100 % is as downloaded${tall != null ? `; at ${+percent.toFixed(2)} % it is ${tall} mm tall` : ''}`;
 }
 
 /* ----------------------------------------------------------------- enhance */
@@ -1175,11 +1202,23 @@ function exportName() {
   return modelInfo?.hasModel ? `${modelInfo.name}-text` : items.map((i) => itemLabel(i, '')).filter(Boolean).join('-').slice(0, 40) || 'text';
 }
 
+/**
+ * The name a split's files start with – the zip, its pieces and its sheet, and the fit test. Where the split takes out
+ * a part that comes off they are the model's pieces, so the model's name ("batlantern-2-pieces.zip"), with "-text"
+ * only where there is text on it. A split with no such part keeps the name its downloads always had – their names and
+ * bytes (an STL's header carries its file's name) are kept as they were before parts came off.
+ */
+function splitName() {
+  const texts = doc.items.some((i) => hasText(i) && !isSpot(i));
+  const parts = (doc.split?.cuts ?? []).some((c) => c.part);
+  return modelInfo?.hasModel && parts && !texts ? modelInfo.name : exportName();
+}
+
 async function download() {
   const items = doc.items.filter((i) => hasText(i) && !isSpot(i)); // spots change the model, they are not exported geometry
   if (!items.length && !modelInfo?.hasModel) return setStatus('Type some text or open a model first.', 'error');
-  const name = exportName();
   const split = activeSplit();
+  const name = split ? splitName() : exportName();
   const splitFor = lastSplitKey;
   const requestedFor = lastContentKey;
   if (split) setSplitPending(true);
@@ -1227,7 +1266,10 @@ async function download() {
   }
 }
 
-/** "2 pieces, 3 pins (Ø6 × 19 mm, 1 spare), 1 part and how-to-glue.txt" from a split download's files. */
+/**
+ * "2 pieces, 3 pins (Ø6 × 19 mm, 1 spare), 1 part and how-to-glue.txt" from a split download's files – the sheet by
+ * its own name: "how-to-print-and-fit.txt" where nothing is glued and parts come off.
+ */
 function zipContents(files) {
   const n = (v) => String(Math.round(v * 100) / 100);
   const count = (k, one, many = `${one}s`) => `${k} ${k === 1 ? one : many}`;
@@ -1247,7 +1289,8 @@ function zipContents(files) {
   }
   const parts = files.filter((f) => f.kind === 'part').length;
   if (parts) list.push(count(parts, 'part'));
-  if (files.some((f) => f.kind === 'text')) list.push('how-to-glue.txt');
+  const sheet = files.find((f) => f.kind === 'text');
+  if (sheet) list.push(sheetName(sheet.file));
   return list.length > 1 ? `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}` : list[0];
 }
 
@@ -1954,6 +1997,7 @@ function fillSplit() {
   const bounds = cutBounds();
   $('splitFitBtn').disabled = !usable;
   $('splitFitTestBtn').disabled = !usable || (glueOnly && !apart.length); // nothing to try the fit of, but a lip's
+  $('splitFitTestBtn').title = fitTestTitle(fitTestHolds(settings));
   $('addCutBtn').disabled = !usable || !roomForAnyCut() || (!!bounds && !nextCut(bounds, planeCuts()));
   // a removable part is picked on the model: the button stays pressed while it is
   const picking = !!aiming && !aiming.cutId;
@@ -2029,13 +2073,12 @@ function renderCuts() {
     }
     li.querySelector('.meta').textContent = [cutMeta(cut, plane), missing ? 'no lock fits here' : ''].filter(Boolean).join(' · ');
   });
-  // a part just taken out: its row, which opens at the foot of the cuts' own box, shown whole – taken from the card,
-  // with the card where the two fit, its other parts' offers what may be pressed next
-  const shown = revealCutId ? list.querySelector(`:scope > li[data-id="${CSS.escape(revealCutId.id)}"]`) : null;
+  // a part just taken out: its row, which opens at the foot of the cuts' own box, shown whole – with the card where the
+  // two fit, its other parts' offers what may be pressed next, taken from the card or picked on the model
+  const shown = revealCutId ? list.querySelector(`:scope > li[data-id="${CSS.escape(revealCutId)}"]`) : null;
   if (shown) {
-    const fromCard = revealCutId.card;
     revealCutId = null;
-    requestAnimationFrame(() => revealRow(shown, fromCard ? $('partsCard') : null));
+    requestAnimationFrame(() => revealRow(shown, $('partsCard')));
   }
 }
 
@@ -3046,13 +3089,17 @@ const takesOut = (entry) => entry.kind !== 'plug' || !!entry.lock;
 /**
  * The part a point on the model picks while placing (`pickPart` on the parts table: no engine round trip, so at once
  * on a dense model), with the table; null where it picks none, the table is not in yet, or Alt places a cut freely.
- * Only a new cut that comes apart, or a part's own cut picked again, takes a part.
+ * Only a new cut that comes apart, or a part's own cut picked again, takes a part. On the low band round a base too
+ * small for its lock, a plane snapped onto a spot suggested for a cut across (`target`) is placed instead: the base
+ * can't twist off at this size, and a good place low down – a full lip with clips below the openings – is the other
+ * way in; anywhere else there the base says from what size it twists off.
  */
-function partPicked(point, free = false) {
+function partPicked(point, free = false, target = null) {
   if (!aiming || (aiming.cutId && !partAim()) || free || !point) return null;
   const table = currentTable();
   if (!table?.parts.length) return null;
   const pick = pickPart(table, point);
+  if (pick.band && !pick.part.lock && target?.kind === 'spot') return null;
   return pick.part ? { ...pick, table } : null;
 }
 
@@ -3136,16 +3183,16 @@ function dropLipTarget() {
  * across the axis already is – a click near one snaps onto it – nothing is
  * placed, and the page says so.
  */
-function placeAimed(at, { keep = false, point = null, free = false } = {}) {
+function placeAimed(at, { keep = false, point = null, free = false, target = null } = {}) {
   const a = aiming;
   if (!a || !Number.isFinite(at)) return;
   // the parts that come off still being found: a click waits for them, and takes what it landed on once they are in
   if (!a.cutId && !free && partsCard?.busy && partsCard.key === partsKey() && partsCard.loads === loads) {
-    heldPick = { at, keep, point: point ?? aimAt?.point ?? null, free };
+    heldPick = { at, keep, point: point ?? aimAt?.point ?? null, free, target: target ?? aimAt?.target ?? null };
     return setStatus('Finding the parts that come off – your click takes what it landed on once they are in.');
   }
   // on a part that comes off: that part (a finger's pinned plane has no point of its own: the one it showed)
-  const pick = point ? partPicked(point, free) : aimAt?.pick ?? aimAt?.small ?? null;
+  const pick = point ? partPicked(point, free, target) : aimAt?.pick ?? aimAt?.small ?? null;
   if (pick && takesOut(pick.part)) return takePart(pick, { keep });
   // on a base too small for its lock: nothing cut – a cut across there takes the rest of the model off it – but the
   // sizes it twists off at, in its row
@@ -3177,7 +3224,7 @@ viewer.onAim = (h) => {
     return;
   }
   // over a part that comes off, the part lights up and the readout says what it gets; elsewhere the plane is tried
-  const found = partPicked(h.point, h.free);
+  const found = partPicked(h.point, h.free, h.target);
   const pick = found && takesOut(found.part) ? found : null;
   // a base too small for its lock lights up too, and says from what size it twists off: a click there cuts nothing
   const small = found && !pick && found.part.kind === 'plug' ? found : null;
@@ -3212,7 +3259,7 @@ function refreshAim() {
   showAimReadout();
 }
 
-viewer.onAimPick = ({ at, shift, point, free }) => placeAimed(at, { keep: shift, point, free });
+viewer.onAimPick = ({ at, target, shift, point, free }) => placeAimed(at, { keep: shift, point, free, target });
 
 /**
  * A part as the finder places it: its circle round the centre, on its face, the finder's own pick. A base gets a
@@ -3250,7 +3297,9 @@ function takePart(pick, { keep = false } = {}) {
     return setStatus(`A split can have up to ${SPLIT_LIMITS.cuts} cuts and ${SPLIT_LIMITS.cells} pieces.`, 'error');
   }
   const id = doc.addCut({ ...partPlaced(entry), normal: [0, 0, 1], joint: 'apart', hold: 'lock' }, { defaults: splitDefaults });
-  revealCutId = { id, card: false };
+  // its row opens over the card, pushing the card down under the bar of Undo and Download: shown with the card where
+  // the two fit, as [Use] shows it, the part's own row in it saying which cut takes it out
+  revealCutId = id;
   selectCut(id);
 }
 
@@ -3431,8 +3480,13 @@ let partsAsk = null; // { key, promise } the parts table being asked for: the ca
 let partsSignature = '';
 let frameAfter = null; // the model's version [Make it N %] made: the view is framed on it once it is in
 
-/** The model's size against the one loaded (the cube root of its transforms' scale), as the parts table's `scale`. */
-const modelScale = () => +Math.cbrt(Math.abs((doc.base?.transforms ?? []).reduce((acc, t) => new Matrix4().fromArray(t).multiply(acc), new Matrix4()).determinant())).toFixed(6);
+/**
+ * The model's size against the one loaded (the cube root of its transforms' scale), as the parts table's `scale` – less
+ * Inches → mm (`base.units`), which only puts the file's numbers in mm: the model as downloaded is 100 % after it too,
+ * so the Scale box reads 100 and 200 doubles the model on screen.
+ */
+const modelScale = () =>
+  +(Math.cbrt(Math.abs((doc.base?.transforms ?? []).reduce((acc, t) => new Matrix4().fromArray(t).multiply(acc), new Matrix4()).determinant())) / (doc.base?.units ?? 1)).toFixed(6);
 
 /** Whether the model's own up (as loaded) no longer points up: turned on its side by Rotate X or Y, or Y-up → Z-up. */
 const tippedSinceLoad = () => {
@@ -3518,7 +3572,7 @@ function partInfo(cut, letter) {
 }
 
 let revealParts = null; // { top } the card was asked for by a press, the panel then scrolled to `top`: shown in full once it lists (`revealInPanel`)
-let revealCutId = null; // { id, card } a part just taken out: its row shown once it is built – with the card, from it
+let revealCutId = null; // the id of the cut a part was just taken out by: its row shown once it is built – with the card where both fit
 
 /**
  * Scroll the panel – or the page, on a phone, where the panel runs on under the view – just so far that `el` shows
@@ -3582,6 +3636,10 @@ async function findPartsCard() {
   const card = { key, loads, version: version(), busy: true, table: null, failed: null };
   partsCard = card;
   renderPartsCard();
+  // found again for the model as it is now – scaled, an undo or a redo across sizes, the printer changed: what the page
+  // said while placing of the parts as they were ("the base is too small … then click it again") is old news, and what
+  // to do while they are found is said in its place
+  if (aiming && $('status').textContent === aimHintShown) showAimHint();
   try {
     card.table = await askPartsTable();
   } catch (err) {
@@ -3629,15 +3687,16 @@ function usePart(entry) {
   endAim();
   if (!roomForAnyCut()) return setStatus(`A split can have up to ${SPLIT_LIMITS.cuts} cuts and ${SPLIT_LIMITS.cells} pieces.`, 'error');
   const id = doc.addCut({ ...partPlaced(entry), normal: [0, 0, 1], joint: 'apart', hold: 'lock' }, { defaults: splitDefaults });
-  revealCutId = { id, card: true };
+  revealCutId = id;
   selectCut(id);
 }
 
 /**
- * [Make it N %]: the model scaled to N % of its size as loaded, and the parts still where the finder put them placed
- * again for the new size, as one undo step; the card lists the parts at that size. What was on screen stays: the
- * pieces are shown again at the new size once their parts are placed for it, and a part being picked on the model goes
- * on being picked, among the parts at that size.
+ * [Make it N %], and Fix model's Scale: the model scaled to N % of its size as loaded, and the parts still where the
+ * finder put them placed again for the new size, as one undo step; the view framed on it at that size, and the card,
+ * where it is listed, shown with the parts at that size. What was on screen stays: the pieces are shown again at the
+ * new size once their parts are placed for it, and a part being picked on the model goes on being picked, among the
+ * parts at that size.
  */
 async function makeIt(percent, scale = currentTable()?.scale) {
   if (!doc.base || !(scale > 0)) return;
@@ -3655,6 +3714,11 @@ async function makeIt(percent, scale = currentTable()?.scale) {
   frameAfter = made;
   // the card lists the parts at the new size: shown as it does, the [Use] it may now have with it
   if (partsCard) askReveal();
+  // what the page said was of the model at its old size – a fit test's ring and turn "at this size", a base too small
+  // for its lock to "make it 300 %, then click it again" – and is old news: while placing, what to do now (the parts
+  // being found again for the new size); else nothing, as after anything else Fix model does
+  if (aiming) showAimHint();
+  else setStatus('');
   undoToast(`Scaled the model to ${percent} %.`);
   await refitParts(step);
   if (pieces && version() === made && !$('resultToggle').checked && splitActive(doc.split)) {
@@ -3942,15 +4006,19 @@ function renderPartsCard() {
         actions.append(b);
       };
       const letter = taken[k];
-      // the sizes its lock (and a tea light through it) fits from, whether or not a cut takes it out already: made
-      // bigger, the part taken out is placed again for that size and locks
+      // the sizes still to come for the model's parts (`sizeOffers`), whether or not a cut takes this one out already:
+      // made bigger, the part taken out is placed again for that size and locks. Each says how tall the model is then
+      // and what that size gives
       const tall = (n) => Math.round(((table.zmax - table.zmin) * n) / 100 / table.scale);
-      // a base too small for its lock has only its size to offer: that is what to press
+      // a base too small for its lock has only sizes to offer: the first, which gives it its lock, is what to press
       const only = w.kind === 'plug' && !w.use && !letter;
-      for (const n of w.offers) {
-        const gets = only ? ` – the ${w.name.toLowerCase()} then twists off with its lock, and [Use] takes it out` : '';
-        button(`Make it ${n} %`, () => makeIt(n), { accent: only, title: `Scale the model to ${n} % of its size as loaded: ${tall(n)} mm tall${gets}` });
-      }
+      w.offers.forEach((n, i) => {
+        const says = [...sizeGains(n, table), ...(only && i === 0 ? [`then [Use] takes the ${w.name.toLowerCase()} out`] : [])];
+        button(`Make it ${n} %`, () => makeIt(n), {
+          accent: only && i === 0,
+          title: `Scale the model to ${n} % of its size as loaded: ${tall(n)} mm tall${says.length ? ` – ${says.join('; ')}` : ''}`,
+        });
+      });
       if (letter) button(`Cut ${letter} takes it out`, () => selectCut(partCutFor(entry, currentTable())?.id ?? null));
       else {
         if (w.use === 'lock') button('Use', () => usePart(entry), { accent: true, title: `Take the ${w.name.toLowerCase()} out with its twist-lock` });
@@ -3980,11 +4048,13 @@ function offerBase(pick) {
   }
   const from = percentOf(pick.part.least?.lock, pick.table.scale);
   const called = w.name.toLowerCase();
-  setStatus(
+  // said in place of what to do while placing, and gone as that is (`endAim`), or said again for the model at its new
+  // size (`makeIt`): "too small … then click it again" is true only while the base is too small and being picked
+  aimHintShown =
     from != null && w.offers.length
       ? `The ${called} is too small for its twist-lock at this size – it twists off underneath from ${from} %. Make it ${w.offers[0]} % (in Parts that come off), then click it again.`
-      : [w.title, w.detail].filter(Boolean).join(' '),
-  );
+      : [w.title, w.detail].filter(Boolean).join(' ');
+  setStatus(aimHintShown);
 }
 
 let offered = null; // the text of the toast that offers to split the model just loaded
@@ -3998,6 +4068,49 @@ function offerSplit() {
   const [x, y] = bedSize(bed);
   offered = `This model won't fit your ${x} × ${y} mm bed.`;
   toast(offered, note.pieces > 1 && canSplit() ? { label: 'Split it', run: autoSplit } : null);
+}
+
+/**
+ * What Download fit test holds for the split as it stands, for its tooltip (`fitTestTitle`): what the pieces have once
+ * they are worked out – what the engine makes the fit test of – else what the cuts are set to get: the glued ones'
+ * joints, the lip of each that comes apart (or the twist-lock a round wall got in its place, where a download or the
+ * pieces said so), the twist-lock of each part taken out that has one at this size.
+ */
+function fitTestHolds(settings) {
+  if (!splitActive(doc.split)) return {};
+  const own = settings.pins === 'own' || Number(settings.diameter) === FILAMENT;
+  if (piecesCurrent()) {
+    const seams = lastPieces.seams ?? [];
+    const lipped = seams.filter((s) => s.apart?.lip);
+    const clicking = lipped.find((s) => s.apart.clips > 0 && s.apart.hold !== 'lift');
+    return {
+      pins: seams.some((s) => s.dowels?.length > 0), own, pegs: seams.some((s) => s.pegs?.length > 0), dovetail: seams.some((s) => s.joint === 'dovetail' && !!s.tabs),
+      lip: clicking ? clicking.apart.hold : lipped.length ? 'lift' : null,
+      twist: seams.some((s) => s.apart?.mech === 'twist'), plug: seams.some((s) => s.apart?.mech === 'plug'),
+    };
+  }
+  const got = joined?.key === lastSplitKey && joined.content === lastContentKey ? joined.joints : null;
+  const holds = { own };
+  for (const c of doc.split.cuts) {
+    if (c.part) {
+      const info = partInfo(c, cutLetter(c.id));
+      if (info.lock) holds[info.kind === 'plug' ? 'plug' : 'twist'] = true;
+      continue;
+    }
+    const joint = got?.get(c.id) ?? null;
+    if (c.joint === 'apart') {
+      if (/^twist-lock/.test(joint ?? '')) holds.twist = true;
+      else if (joint === 'dovetail') holds.dovetail = true;
+      else if (joint !== 'none') holds.lip = joint === 'lifts off' ? 'lift' : holds.lip ?? c.hold ?? 'snap';
+      continue;
+    }
+    const m = measured?.cuts.get(c.id)?.joint;
+    if (settings.joint === 'none' || joint === 'none' || m === 'none' || m === 'miss') continue;
+    if (joint === 'dovetail' || m === 'dovetail') holds.dovetail = true;
+    else if (settings.joint === 'pegs') holds.pegs = true;
+    else holds.pins = true;
+  }
+  return holds;
 }
 
 /**
@@ -4015,7 +4128,7 @@ async function downloadFitTest() {
   setSplitPending(true);
   try {
     if (!(await syncBase())) return setStatus('The model is still being updated – try again in a moment.', '');
-    const r = await client.fitTest(doc.items, version(), { printing, split, bed: usableBed(bed), name: exportName() });
+    const r = await client.fitTest(doc.items, version(), { printing, split, bed: usableBed(bed), name: splitName() });
     if (!r) return;
     // it worked the split out and found no pins (or no pegs, or no lip) in it: the cuts planned to have them have none
     // (nor tabs, with no file)
@@ -4584,6 +4697,7 @@ function render() {
   $('duplicateBtn').disabled = !sel;
   $('clearBtn').disabled = !doc.base;
   document.querySelectorAll('[data-fix], #scaleBtn, #simplifyBtn').forEach((b) => (b.disabled = !doc.base));
+  fillScale();
   document.querySelectorAll('[data-side], [data-nudge], #snapBtn').forEach((b) => (b.disabled = !sel || !hasModel));
   document.querySelectorAll('[data-turn]').forEach((b) => (b.disabled = !sel));
   document.querySelector('input[name="mode"][value="engrave"]').disabled = !hasModel || !modelInfo?.watertight;
@@ -4769,6 +4883,7 @@ function bindControls() {
   bindEnhance();
   bindSplit();
   $('scaleBtn').addEventListener('click', () => applyFix('scale'));
+  $('scalePercent').addEventListener('input', scaleTip);
   $('simplifyBtn').addEventListener('click', () => applyFix('simplify'));
 
   $('addTextBtn').addEventListener('click', () => addItem());

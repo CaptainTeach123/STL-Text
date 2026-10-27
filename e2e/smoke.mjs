@@ -552,6 +552,22 @@ try {
   await idle();
   check(/50\.8 × 25\.4 × 12\.7 mm/.test(await page.locator('#modelInfo').innerText()), 'model converted to mm', await page.locator('#modelInfo').innerText());
   check((await page.locator('#modelSuggestions').innerText()) === '', 'suggestion disappears after applying it');
+  // the file's numbers put in mm, the model no bigger for it: the Scale box still reads 100 – as downloaded – and 200
+  // doubles the model on screen, not the inch-sized file
+  const unitsBox = await page.inputValue('#scalePercent');
+  await page.evaluate(() => (document.querySelector('#fixModel').open = true));
+  await page.fill('#scalePercent', '200');
+  await page.click('#scaleBtn');
+  await idle();
+  const doubled = await page.locator('#modelInfo').innerText();
+  await page.click('#undoBtn');
+  await idle();
+  check(
+    unitsBox === '100' && /101\.6 × 50\.8 × 25\.4 mm/.test(doubled) && /50\.8 × 25\.4 × 12\.7 mm/.test(await page.locator('#modelInfo').innerText()) &&
+      (await page.inputValue('#scalePercent')) === '100',
+    'after Inches → mm the Scale box reads 100, and Scale 200 doubles the model in mm; undo takes it back',
+    JSON.stringify({ unitsBox, doubled }),
+  );
   await page.click('[data-fix="rotX"]');
   await idle();
   check(/50\.8 × 12\.7 × 25\.4 mm/.test(await page.locator('#modelInfo').innerText()), 'rotate 90° about X swaps Y and Z');
@@ -2761,8 +2777,10 @@ try {
           await p.waitForTimeout(120);
         }
       } else {
+        // turned so the pointer ends on a wall low down, snapped onto the spot suggested below the openings – not on the
+        // floor seen through a window, which is the base's: there a click offers the base rather than cut across
         await p.mouse.down();
-        [cx, cy] = [x + 40, body + 60];
+        [cx, cy] = [x + 60, body + 30];
         await p.mouse.move(cx, cy, { steps: 8 });
         await p.mouse.up();
       }
@@ -3704,8 +3722,10 @@ try {
       'a click on the base while it is too small for its lock places no cut across – it would take the top off – but says why and lights its row, its size offered',
       JSON.stringify({ smallY, overSmall, smallClick }),
     );
+    // "then click it again" is about picking: placing stopped, it goes, as what to do while placing does
     await b.keyboard.press('Escape');
     await settle();
+    check((await b.locator('#status').innerText()) === '', 'Esc stops placing, and the base being too small to click goes from the status with it', await b.locator('#status').innerText());
     const small = await card();
     const [dome, base] = small.parts;
     check(
@@ -3715,9 +3735,22 @@ try {
         JSON.stringify(dome.buttons) === JSON.stringify(['Make it 300 %', 'Make it 400 %', 'Use – it just lifts off']) &&
         base.title === 'Base – twists off underneath once the model is 215 % or bigger.' &&
         base.detail === 'Too small for its twist-lock at this size: its bottom is Ø 19 mm across, and the lock needs Ø 39 mm. A 38 mm tea light fits through it from 275 %; at 300 % it twists off and takes a tea light.' &&
-        JSON.stringify(base.buttons) === JSON.stringify(['Make it 300 %']),
+        JSON.stringify(base.buttons) === JSON.stringify(['Make it 300 %', 'Make it 400 %']),
       '+ Removable part lists the dome and cap inside the handle and the base, each too small to lock at 100 % and from what size one fits',
       JSON.stringify(small),
+    );
+    // the base's row offers the lantern's bigger size too – where the dome takes a tea light – the first highlighted,
+    // each saying how tall the model is then and what that size gives
+    const baseSizes = await b.evaluate(() =>
+      [...document.querySelectorAll('#partList li[data-part-kind="plug"] button')].map((x) => ({ text: x.textContent, accent: x.classList.contains('accent'), title: x.title })),
+    );
+    check(
+      baseSizes.length === 2 && baseSizes[0].accent && !baseSizes[1].accent &&
+        baseSizes[0].title ===
+          'Scale the model to 300 % of its size as loaded: 150 mm tall – the dome and cap twist-lock on; the base twists off with its twist-lock; a 38 mm tea light fits through the base; then [Use] takes the base out' &&
+        baseSizes[1].title === 'Scale the model to 400 % of its size as loaded: 200 mm tall – a 38 mm tea light fits through the dome and cap',
+      "the base's row offers 300 % for its lock and 400 % for the lantern's bigger print, each saying how tall and what it gives",
+      JSON.stringify(baseSizes),
     );
     check(
       /^No good place for a cut across the whole model – use a part above, or pick a place on the model yourself:/.test(await b.locator('#spotsNote').innerText()),
@@ -3744,27 +3777,91 @@ try {
         return n;
       });
     const shown100 = await modelPixels();
-    // pressed while a part is being picked on the model: picking goes on, among the parts at the new size
+    // pressed while a part is being picked on the model: picking goes on, among the parts at the new size. The base
+    // clicked while too small said to make it 300 %, then click it again: once it is made, that is no longer so, and
+    // the page says what to do now instead – it never keeps saying the base is too small
     await b.click('#addApartBtn');
     await settle();
+    await b.mouse.move(st0.x + st0.width / 2, smallY + 1);
+    await b.mouse.move(st0.x + st0.width / 2, smallY);
+    await b.waitForTimeout(300);
+    await b.mouse.click(st0.x + st0.width / 2, smallY);
+    await settle();
+    const offeredAgain = await b.locator('#status').innerText();
     await b.locator('#partList li').nth(1).locator('button', { hasText: 'Make it 300 %' }).click();
+    const madeSaid = await b.locator('#status').innerText();
     await settle();
     await listed();
     await settle();
     const shown300 = await modelPixels();
-    const at300 = { size: await size(), first: (await card()).parts[0]?.title, picking: await b.getAttribute('#addApartBtn', 'aria-pressed') };
+    const at300 = {
+      size: await size(), first: (await card()).parts[0]?.title, picking: await b.getAttribute('#addApartBtn', 'aria-pressed'), said: await b.locator('#status').innerText(),
+      box: await b.inputValue('#scalePercent'), tip: await b.evaluate(() => document.querySelector('#scalePercent').closest('label').title),
+    };
     await b.keyboard.press('Escape');
     await settle();
     check(
       at300.size === '75.0 × 75.0 × 150.0' && /^Dome and cap – twist-lock/.test(at300.first ?? '') && shown300 > 0.5 * shown100 && shown300 < 2 * shown100 && at300.picking === 'true',
-      "the card's Make it 300 % scales the model, shows it whole at its new size, and lists the dome and cap's twist-lock; picking a part goes on",
+      "the card's Make it 300 %, pressed while a part is picked, scales the model, shows it whole at its new size, and lists the dome and cap's twist-lock; picking a part goes on",
       JSON.stringify({ at300, shown100, shown300 }),
+    );
+    check(
+      /^The base is too small for its twist-lock at this size/.test(offeredAgain) && /^Finding the parts that come off… Then click one that lights up/.test(madeSaid) &&
+        /^Click a part that lights up to take it out/.test(at300.said) && (await b.locator('#status').innerText()) === '',
+      'made 300 %, the page no longer says the base is too small: what to do while the parts are found, then while picking; placing stopped, nothing',
+      JSON.stringify({ offeredAgain, madeSaid, said: at300.said }),
+    );
+    check(
+      at300.box === '300' && /at 300 % it is 150 mm tall$/.test(at300.tip),
+      "Fix model's Scale box reads the size made, as a share of the model as loaded, and its tooltip how tall it is",
+      JSON.stringify({ box: at300.box, tip: at300.tip }),
     );
     await b.click('#undoBtn');
     await settle();
     await listed();
     await settle();
-    check((await size()) === '25.0 × 25.0 × 50.0' && (await card()).parts[0].title === dome.title, 'undo brings back 100 % and the card lists the parts at that size', await size());
+    check(
+      (await size()) === '25.0 × 25.0 × 50.0' && (await card()).parts[0].title === dome.title && (await b.inputValue('#scalePercent')) === '100',
+      'undo brings back 100 % and the card lists the parts at that size; the Scale box reads 100 again',
+      await size(),
+    );
+    // picking again at 100 %, the base clicked says it is too small: Redo makes it 300 % again, where it twists off, and
+    // the page says so at once – what to do while the parts are found for that size – not once they are in, seconds on
+    // a dense model. The view framed on the model at 100 % to find its base, and on it at 300 % again before the undo
+    await b.click('#frameBtn');
+    await b.click('#addApartBtn');
+    await settle();
+    let againY = null;
+    for (let y = st0.y + st0.height - 12; y > st0.y + st0.height / 2 && againY == null; y -= 4) {
+      await b.mouse.move(st0.x + st0.width / 2, y);
+      await b.waitForTimeout(40);
+      if ((await readoutLines())?.[0]?.startsWith('Base · too small')) againY = y - 8;
+    }
+    await b.mouse.move(st0.x + st0.width / 2, againY + 1);
+    await b.mouse.move(st0.x + st0.width / 2, againY);
+    await b.waitForTimeout(300);
+    await b.mouse.click(st0.x + st0.width / 2, againY);
+    await settle();
+    const tooSmall = await b.locator('#status').innerText();
+    await b.click('#redoBtn');
+    const redoSaid = await b.locator('#status').innerText();
+    await settle();
+    await listed();
+    await settle();
+    const redone = { size: await size(), said: await b.locator('#status').innerText() };
+    await b.keyboard.press('Escape');
+    await settle();
+    await b.click('#frameBtn');
+    await b.click('#undoBtn');
+    await settle();
+    await listed();
+    await settle();
+    check(
+      /^The base is too small for its twist-lock at this size/.test(tooSmall) && /^Finding the parts that come off… Then click one that lights up/.test(redoSaid) &&
+        redone.size === '75.0 × 75.0 × 150.0' && /^Click a part that lights up to take it out/.test(redone.said) && (await size()) === '25.0 × 25.0 × 50.0',
+      'Redo to 300 % while picking: at once the page no longer says the base is too small, but what to do while the parts are found, then while picking',
+      JSON.stringify({ againY, tooSmall, redoSaid, redone }),
+    );
 
     // Use – it just lifts off: a part row, its circle on the model; Twist-lock struck through and saying from what size
     const before = await teal();
@@ -3837,8 +3934,8 @@ try {
       big.parts[0].title === 'Dome and cap – twist-lock · Ø 29 mm opening · the handle stays · a 38 mm tea light fits through the base, not the lid' &&
         big.parts[0].badge === "the lantern's collar needs the dome's support" &&
         big.parts[1].title === "Base – twists off underneath · twist-lock · Ø 43 mm opening, takes a 38 mm tea light · a seat for it on top, in place of the model's own detail there" &&
-        big.parts[1].badge === 'no extra support' && JSON.stringify(big.parts[1].buttons) === JSON.stringify(['Use']),
-      "at 300 % the card lists the dome and cap with its twist-lock and the base with its own and a tea-light seat in place of its cup, each with its print badge",
+        big.parts[1].badge === 'no extra support' && JSON.stringify(big.parts[1].buttons) === JSON.stringify(['Make it 400 %', 'Use']),
+      "at 300 % the card lists the dome and cap with its twist-lock and the base with its own and a tea-light seat in place of its cup, each with its print badge – the base's row still offering 400 %",
       JSON.stringify(big),
     );
     await b.click('#undoBtn');
@@ -3850,6 +3947,72 @@ try {
       undone.size === '25.0 × 25.0 × 50.0' && undone.rows.length === 1 && undone.rows[0].z === '29' && (await size()) === '75.0 × 75.0 × 150.0' && (await partRows())[0].z === '86',
       'one undo takes back the Scale and the part placed again for it, one redo brings both',
       JSON.stringify(undone),
+    );
+    // Fix model's Scale takes the size as a share of the model as loaded, as the card's sizes are: 400 at 300 % makes
+    // 400 %, not 1200 %, its tooltip saying how tall that is. Like Make it N %, it frames the view on the model at its
+    // new size and, the card listed, brings it back into view from up at Fix model; one undo takes it back
+    await b.click('#frameBtn'); // the view framed on the model at 300 %, as a Scale frames it at its new size
+    await b.waitForTimeout(300);
+    await b.evaluate(() => (document.querySelector('#fixModel').open = true));
+    await b.locator('#scalePercent').scrollIntoViewIfNeeded();
+    const scaleAsked = { box: await b.inputValue('#scalePercent'), shown: await modelPixels() };
+    await b.fill('#scalePercent', '400');
+    scaleAsked.tip = await b.evaluate(() => document.querySelector('#scalePercent').closest('label').title);
+    scaleAsked.cardBefore = await b.evaluate(() => Math.round(document.querySelector('#partsCard').getBoundingClientRect().top - document.querySelector('.panel .actions').getBoundingClientRect().top));
+    await b.click('#scaleBtn');
+    await settle();
+    await listed();
+    await settle();
+    await b.waitForTimeout(300);
+    const scaled = {
+      size: await size(), box: await b.inputValue('#scalePercent'), shown: await modelPixels(), z: (await partRows())[0]?.z,
+      card: await b.evaluate(() => {
+        const base = document.querySelector('#partList li[data-part-kind="plug"]');
+        const r = base.getBoundingClientRect();
+        const panel = document.querySelector('.panel').getBoundingClientRect();
+        const bar = document.querySelector('.panel .actions').getBoundingClientRect();
+        const use = [...base.querySelectorAll('button')].find((x) => x.textContent === 'Use');
+        const ur = use?.getBoundingClientRect();
+        const hit = ur ? document.elementFromPoint(ur.left + ur.width / 2, ur.top + ur.height / 2) : null;
+        return { top: Math.round(r.top), bottom: Math.round(r.bottom), panel: Math.round(panel.top), bar: Math.round(bar.top), use: !!hit && hit === use };
+      }),
+    };
+    check(
+      scaleAsked.box === '300' && /at 400 % it is 200 mm tall$/.test(scaleAsked.tip) && scaleAsked.cardBefore > 0 &&
+        scaled.size === '100.0 × 100.0 × 200.0' && scaled.box === '400' && scaled.z !== '86' &&
+        scaled.shown > 0.8 * scaleAsked.shown && scaled.shown < 1.25 * scaleAsked.shown &&
+        scaled.card.top >= scaled.card.panel && scaled.card.bottom <= scaled.card.bar && scaled.card.use,
+      "Fix model's Scale 400 at 300 % makes 400 % of the model as loaded, frames the view on it and brings the card back into view, its base's Use there to click",
+      JSON.stringify({ scaleAsked, scaled }),
+    );
+    await b.click('#undoBtn');
+    await settle();
+    await listed();
+    await settle();
+    check(
+      (await size()) === '75.0 × 75.0 × 150.0' && (await b.inputValue('#scalePercent')) === '300' && (await partRows())[0].z === '86',
+      "one undo takes the Scale back, the part placed for it with it, and the Scale box reads 300 again",
+      JSON.stringify({ size: await size(), box: await b.inputValue('#scalePercent'), rows: await partRows() }),
+    );
+    // a fit test downloaded at 300 % says what to print "at this size": made 400 % from the base's row, the page says
+    // none of it any more – the rings, their weight and the turn are another size's – as after Fix model's Scale
+    const [fit300] = await Promise.all([b.waitForEvent('download', { timeout: 120000 }), b.click('#splitFitTestBtn')]);
+    await settle();
+    const fitSaid = await b.locator('#status').innerText();
+    await b.locator('#partList li[data-part-kind="plug"] button', { hasText: 'Make it 400 %' }).click();
+    await settle();
+    await listed();
+    await settle();
+    const made400 = { size: await size(), said: await b.locator('#status').innerText() };
+    await b.click('#undoBtn');
+    await settle();
+    await listed();
+    await settle();
+    check(
+      /-fit-test\.stl$/.test(fit300.suggestedFilename()) && /at this size/.test(fitSaid) && made400.size === '100.0 × 100.0 × 200.0' && made400.said === '' &&
+        (await size()) === '75.0 × 75.0 × 150.0',
+      "the base's Make it 400 % after a fit test downloaded at 300 %: the fit test's words, of that size, go from the status line",
+      JSON.stringify({ fitSaid, made400 }),
     );
 
     // the base as well: its row has no Z (its face is the model's bottom), and three pieces
@@ -4360,6 +4523,18 @@ try {
     await b.mouse.click(px, pickAt.dome);
     await settle();
     const picked = { rows: await partRows(), pressed: await b.getAttribute('#addApartBtn', 'aria-pressed'), view: await pickColours() };
+    // its row opens over the card, pushing it down under the bar of Undo and Download: the two are shown together where
+    // they fit, as Use shows them, the dome's row in the card saying cut A takes it out, where a click lands on it
+    picked.shown = await b.evaluate(() => {
+      const bar = document.querySelector('.panel .actions').getBoundingClientRect();
+      const panel = document.querySelector('.panel').getBoundingClientRect();
+      const row = document.querySelector('#cutList > li:last-child').getBoundingClientRect();
+      const card = document.querySelector('#partsCard').getBoundingClientRect();
+      const cut = [...document.querySelectorAll('#partList button')].find((x) => x.textContent === 'Cut A takes it out');
+      const r = cut?.getBoundingClientRect();
+      const hit = r ? document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) : null;
+      return { row: row.top >= panel.top - 0.5 && row.bottom <= bar.top + 0.5, card: card.bottom <= bar.top + 0.5, cut: !!hit && hit === cut, fits: card.bottom - row.top <= bar.top - panel.top - 16 };
+    });
     await b.click('#undoBtn');
     await settle();
     const unpicked = await partRows();
@@ -4371,6 +4546,11 @@ try {
         unpicked.length === 0 && (await partRows()).length === 1,
       'a click on the dome takes out the dome and cap where the finder puts it, twist-locking; placing stops, and one undo takes it back',
       JSON.stringify({ picked, unpicked }),
+    );
+    check(
+      picked.shown.row && picked.shown.fits && picked.shown.card && picked.shown.cut,
+      "the part's new row and the card are shown together, the card's Cut A takes it out not left under the bar",
+      JSON.stringify(picked.shown),
     );
     // Shift+click picks on: the base too; over the dome the readout says cut A takes it out already
     await b.click('#addApartBtn');
@@ -4697,6 +4877,13 @@ try {
       "Use on a base with room for one gives it a tea-light seat, on by default: the row's box with its size, and its words",
       JSON.stringify(used),
     );
+    // Download fit test says what this split's fit test holds: a ring and a plug, not pins or a box with a lid
+    const fitTip = await s.getAttribute('#splitFitTestBtn', 'title');
+    check(
+      fitTip === "A small print to try before printing the pieces, at the size and clearance they have: a ring and a plug with the base's twist-lock",
+      "with only the base taken out, Download fit test's tooltip says it holds a ring and a plug with the base's twist-lock",
+      fitTip,
+    );
     // its pieces: the seat on the base, the notes saying where the light goes and how the base goes in with it
     await s.check('#resultToggle');
     await settle();
@@ -4729,8 +4916,18 @@ try {
       }
       await settle();
       const said = await s.locator('#status').innerText();
+      // eight lines of how to try it, in the bar under the buttons: whole, its last sentence with it, nothing scrolled
+      const whole = await s.evaluate(() => {
+        const el = document.querySelector('#status');
+        return { scroll: el.scrollHeight, client: el.clientHeight };
+      });
       check(
-        !!dl && /^bat-seat.*-fit-test\.stl$/.test(dl.suggestedFilename()) && shells.length === 2 && shells.every(([, z]) => z === 0) &&
+        whole.scroll > 100 && whole.scroll <= whole.client + 1 && /Loose, or no click: lower it\.$/.test(said),
+        "the fit test's long status reads whole in the bar – its last sentence too – with nothing to scroll",
+        JSON.stringify(whole),
+      );
+      check(
+        !!dl && dl.suggestedFilename() === 'bat-seat-fit-test.stl' && shells.length === 2 && shells.every(([, z]) => z === 0) &&
           /A ring Ø 75 mm and a plug with the base's twist-lock at this size \(about \d+ g\): looking at the plug's coin slot, it should go into the ring's bottom \(the side it printed on\) turned 17° to the left, turn right until it clicks/.test(said) &&
           withSeat.notes.includes("a ring Ø 75 mm and a plug with the base's twist-lock"),
         "with only the base taken out, Download fit test saves a file: a ring and a plug with the base's twist-lock, which the status and the notes describe",
@@ -4847,6 +5044,16 @@ try {
     await dl.saveAs(zipFile);
     await settle();
     const zip = unzipSync(new Uint8Array(fs.readFileSync(zipFile)));
+    // named after what they are: the model's pieces, with no text on it – no "-text" – and, nothing glued, a sheet to
+    // print and fit them by; the status names it as the zip has it
+    const zipSaid = await s.locator('#status').innerText();
+    check(
+      dl.suggestedFilename() === 'bat-seat-2-pieces.zip' &&
+        Object.keys(zip).sort().join() === 'bat-seat-how-to-print-and-fit.txt,bat-seat-piece-1-of-2.stl,bat-seat-piece-2-of-2.stl' &&
+        /^Downloaded bat-seat-2-pieces\.zip .*: 2 pieces and how-to-print-and-fit\.txt\./.test(zipSaid),
+      'with only the base taken out and no text, the zip and its files are named after the model and its pieces, the sheet how-to-print-and-fit',
+      JSON.stringify({ zip: dl.suggestedFilename(), names: Object.keys(zip), zipSaid }),
+    );
     const baseEntry = Object.keys(zip).find((n) => /piece-2-of-2\.stl$/.test(n));
     const pocket = (() => {
       const bytes = zip[baseEntry];
@@ -4876,9 +5083,10 @@ try {
     );
     // at 280 % a 38 mm tea light still goes in through the base, but there is no room for a seat's wall round it: the
     // card and the row say why, the box stays there to untick, the note says why and is no warning – the status line
-    // stays grey – and Look at the lock goes on to the base's top, where the light stands
+    // stays grey – and Look at the lock goes on to the base's top, where the light stands. The Scale box takes the size
+    // as a share of the model as loaded: 280, whatever size it is now
     await s.evaluate(() => {
-      document.querySelector('#scalePercent').value = '70';
+      document.querySelector('#scalePercent').value = '280';
       document.querySelector('#scaleBtn').click();
     });
     await settle();
@@ -4985,6 +5193,22 @@ try {
         [...planeHolds, ...partHolds].every((h) => h.out <= 0 && h.clipped === 0),
       "on a 320 px phone how a cut holds fits its row: a plane's four holds and a part's two, none cut off",
       JSON.stringify({ planeHolds, partHolds }),
+    );
+    // Fix model open – it opens by itself on a dense model – its Scale box takes the room its row has: the page never
+    // scrolls sideways, the view's buttons and the Classic switch never cut off, in either look
+    const sideways = () =>
+      n.evaluate(() => {
+        document.querySelector('#fixModel').open = true;
+        return { scroll: document.scrollingElement.scrollWidth - document.scrollingElement.clientWidth, panel: Math.round(document.querySelector('.panel').getBoundingClientRect().width) };
+      });
+    const cyberFix = await sideways();
+    await n.evaluate(() => document.querySelector('#classicLook').click());
+    await n.waitForTimeout(200);
+    const classicFix = await sideways();
+    check(
+      cyberFix.scroll === 0 && classicFix.scroll === 0 && cyberFix.panel === 320 && classicFix.panel === 320,
+      'on a 320 px phone with Fix model open the page never scrolls sideways, in either look',
+      JSON.stringify({ cyberFix, classicFix }),
     );
     await narrow.close();
   }

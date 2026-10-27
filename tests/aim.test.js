@@ -2,8 +2,8 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { BoxGeometry, BufferGeometry, Float32BufferAttribute, Uint32BufferAttribute } from 'three';
 import { MeshBVH } from 'three-mesh-bvh';
 import {
-  HANDLE_PLANE, MIXED_PART, SNAP_MAX, aimLine, aimTargets, bandOf, handlePlaneWords, lipLine, lipVerdict, lipWords, noFitTestWords, noLockOf, noLockTitle, offWords,
-  partCard, partFace, partMeta, partOffered, partReadout, partWidth, partsNote, percentOf, pickPart, placedAt, seatMeta, snapTolerance, snappedWords, spotLabel, stuckWords, takesHandle,
+  HANDLE_PLANE, MIXED_PART, SNAP_MAX, aimLine, aimTargets, bandOf, fitTestTitle, handlePlaneWords, lipLine, lipVerdict, lipWords, noFitTestWords, noLockOf, noLockTitle, offWords,
+  partCard, partFace, partMeta, partOffered, partReadout, partWidth, partsNote, percentOf, pickPart, placedAt, seatMeta, sizeGains, sizeOffers, snapTolerance, snappedWords, spotLabel, stuckWords, takesHandle,
   throughWords, wayCaption, widthWords,
 } from '../src/aim.js';
 import { snapTarget, wayStep } from '../src/split.js';
@@ -252,13 +252,14 @@ describe('parts that come off', () => {
       detail: 'Too small for a lock at this size: its roof is 0.6 mm thick. A twist-lock fits from 280 % (a 23 mm opening); a 38 mm tea light fits through it from 380 %.',
       badge: '', offers: [300, 400], use: 'lift',
     });
-    // a base too small for a lock is offered the size only (lifting out, it would drop out of the lantern), and reads as
-    // an offer: what it gets from what size, why not at this one – its bottom against the lock's – and what the size
-    // offered gives it
+    // a base too small for a lock is offered sizes only (lifting out, it would drop out of the lantern), and reads as
+    // an offer: what it gets from what size, why not at this one – its bottom against the lock's – and what the first
+    // size offered gives it. It offers the lantern's bigger size too, where the dome takes a tea light: a base-only
+    // print wanted at 400 % is a click away on the base's own row
     expect(partCard(base100, bat100)).toEqual({
       kind: 'plug', name: 'Base', lock: false, title: 'Base – twists off underneath once the model is 205 % or bigger.',
       detail: 'Too small for its twist-lock at this size: its bottom is Ø 19 mm across, and the lock needs Ø 38 mm. A 38 mm tea light fits through it from 275 %; at 300 % it twists off and takes a tea light.',
-      badge: '', offers: [300], use: null,
+      badge: '', offers: [300, 400], use: null,
     });
     // at 200 % the bottom is nearly wide enough: tenths, so the two never read alike
     expect(partCard({ ...base100, ringOut: 18.64, least: { lock: 1.004, tea: 1.375, opening: 29.4 } }, { ...bat100, scale: 2 }).detail).toBe(
@@ -267,12 +268,13 @@ describe('parts that come off', () => {
     // a size that gives the lock but no tea light, and one that gives both at once
     expect(partCard({ ...base100, least: { lock: 2.04, tea: null, opening: 29.4 } }, bat100).detail).toMatch(/needs Ø 38 mm\. At 300 % it twists off\.$/);
     expect(partCard({ ...base100, least: { lock: 2.95, tea: 2.95, opening: 39 } }, bat100).detail).toMatch(/From 295 % a 38 mm tea light fits through it too; at 300 % it twists off and takes a tea light\.$/);
-    // least scales are factors on the size now: at 200 % the same lid needs 1.4 times it, still 280 % of the model as loaded
+    // least scales are factors on the size now: at 200 % the same lid needs 1.4 times it, still 280 % of the model as
+    // loaded (its table at 200 %: the row reads every part's sizes, so the table is the one the lid is from)
     const lid200 = { ...lid100, why: 'tabs', least: { lock: 1.4, tea: 1.9, opening: 23.06 } };
-    expect(partCard(lid200, { ...bat100, scale: 2 }).detail).toBe(
+    expect(partCard(lid200, { ...bat100, scale: 2, parts: [lid200] }).detail).toBe(
       'Too small for a lock at this size: there is no room round it for the click tabs. A twist-lock fits from 280 % (a 23 mm opening); a 38 mm tea light fits through it from 380 %.',
     );
-    expect(partCard(lid200, { ...bat100, scale: 2 }).offers).toEqual([300, 400]);
+    expect(partCard(lid200, { ...bat100, scale: 2, parts: [lid200] }).offers).toEqual([300, 400]);
     // one size for both, and none at all as far as the finder looks
     expect(partCard({ ...lid100, least: { lock: 3.8, tea: 3.8, opening: 41 } }, bat100)).toMatchObject({
       detail: 'Too small for a lock at this size: its roof is 0.6 mm thick. A twist-lock fits from 380 % (a 41 mm opening), and takes a 38 mm tea light.', offers: [400],
@@ -293,6 +295,39 @@ describe('parts that come off', () => {
     });
     expect(percentOf(2.04, 1)).toBe(205);
     expect(percentOf(null, 1)).toBeNull();
+  });
+
+  it("offers on every part's row the sizes up to the biggest any part asks for, the bigger ones still once its own fits", () => {
+    // the user's lantern at 100 %: the base's lock from 205 % and a tea light through it from 275 %, both 300 %; the
+    // dome's lock from 280 % (300 %) and a tea light through it from 380 % (400 %). Both rows offer 300 % and 400 %
+    expect(sizeOffers(base100, bat100)).toEqual([300, 400]);
+    expect(sizeOffers(lid100, bat100)).toEqual([300, 400]);
+    // at 300 % both lock, and the base takes a tea light: only the dome's tea light is still to come, at 400 % – offered
+    // beside [Use] on both rows, the base's included
+    const lid300 = { ...lid400, lock: { ...lid400.lock, opening: 26.04, teaLight: false }, least: { lock: null, tea: 3.8 / 3 } };
+    const bat300 = { ...bat400, scale: 3, parts: [lid300, base400] };
+    expect(sizeOffers(base400, bat300)).toEqual([400]);
+    expect(sizeOffers(lid300, bat300)).toEqual([400]);
+    expect(partCard(base400, bat300)).toMatchObject({ lock: true, offers: [400], use: 'lock' });
+    expect(partCard(lid300, bat300)).toMatchObject({ lock: true, offers: [400], use: 'lock' });
+    // at 400 % nothing is to come: no size offered
+    expect(sizeOffers(base400, bat400)).toEqual([]);
+    expect(sizeOffers(lid400, bat400)).toEqual([]);
+    // at 250 %, a size no part asks for: the base locks, and the sizes still to come are offered, none below the size now
+    const bat250 = { ...bat100, scale: 2.5, parts: [{ ...lid100, least: { lock: 2.8 / 2.5, tea: 3.8 / 2.5 } }, { ...base400, least: { lock: null, tea: 2.75 / 2.5 } }] };
+    expect(sizeOffers(bat250.parts[1], bat250)).toEqual([300, 400]);
+    // a part too small for its own lock is offered nothing smaller than the size that fits it, though another part
+    // asks for one
+    const late = { ...lid100, least: { lock: 3.8, tea: 3.8, opening: 41 } };
+    expect(sizeOffers(late, { ...bat100, parts: [late, base100] })).toEqual([400]);
+    // a part no lock fits at any size: no size helps it
+    expect(sizeOffers({ ...base100, least: { lock: null, tea: null } }, bat100)).toEqual([]);
+    // what each size gives, for its button's tooltip
+    expect(sizeGains(300, bat100)).toEqual(['the dome and cap twist-lock on', 'the base twists off with its twist-lock', 'a 38 mm tea light fits through the base']);
+    expect(sizeGains(400, bat100)).toEqual(['a 38 mm tea light fits through the dome and cap']);
+    expect(sizeGains(400, bat300)).toEqual(['a 38 mm tea light fits through the dome and cap']);
+    expect(sizeGains(500, bat100)).toEqual([]);
+    expect(sizeGains(300, { ...bat100, parts: [{ ...lid100, name: 'Top' }] })).toEqual(['the top twist-locks on']);
   });
 
   it('says why the card lists nothing: solid all through, already open, or no part – to click the model only while placing', () => {
@@ -321,6 +356,22 @@ describe('parts that come off', () => {
     expect(noFitTestWords([{ name: 'Top', hold: 'lock', least: null }, { name: 'Base', kind: 'plug', hold: 'lock', least: 215 }])).toBe(
       'Nothing to try: the top lifts off at this size – no twist-lock fits; the base lifts out at this size – a twist-lock fits from 215 %.',
     );
+  });
+
+  it("says in Download fit test's tooltip what this split's fit test holds, not every joint there is", () => {
+    // the user's lantern with only its base taken out: a ring and a plug, no pins and no box with a lid
+    expect(fitTestTitle({ plug: true })).toBe("A small print to try before printing the pieces, at the size and clearance they have: a ring and a plug with the base's twist-lock");
+    expect(fitTestTitle({ twist: true, plug: true })).toBe(
+      "A small print to try before printing the pieces, at the size and clearance they have: two rings with the twist-lock; and a ring and a plug with the base's twist-lock",
+    );
+    expect(fitTestTitle({ pins: true, lip: 'lock' })).toBe(
+      'A small print to try before printing the pieces, at the size and clearance they have: holes and a pin of the size the pieces use; and a small box and a lid that locks onto it, on the same lip',
+    );
+    expect(fitTestTitle({ pins: true, own: true })).toMatch(/: holes for your own dowels$/);
+    expect(fitTestTitle({ pegs: true, dovetail: true })).toMatch(/: a built-in peg and its socket; and a dovetail tab and its socket$/);
+    expect(fitTestTitle({ lip: 'lift' })).toMatch(/: a small box and a lid that lifts off it, on the same lip$/);
+    // only parts that lift off: nothing to try, as the click says
+    expect(fitTestTitle({})).toBe('Nothing holds these cuts, so there is nothing to try – a click says why');
   });
 
   it('reads out the part under the pointer: the lid and its lock, the handle it leaves on, the base', () => {
@@ -460,11 +511,23 @@ describe('picking a part on the model', () => {
     expect(pickPart(table, [36, 0, 40.5])).toEqual({ part: null, index: -1, on: null });
     expect(pickPart({ ...table, parts: [lid, { ...base, top: 50 }] }, [5, 0, 48])).toMatchObject({ part: { name: 'Base' }, on: 'base' });
     expect(pickPart({ ...table, parts: [lid, { ...base, top: 50 }] }, [36, 0, 48])).toEqual({ part: null, index: -1, on: null });
-    // with no handle a cut across low down takes no handle with it, and a base too small to lock is no better than one:
-    // the walls there place a cut across, as a band below the openings
+    // with no handle a cut across low down takes no handle with it, and a base no lock fits at any size is no better
+    // than none: the walls there place a cut across, as a band below the openings – the only way in
     expect(pickPart({ ...table, handles: [] }, [36, 0, 25])).toEqual({ part: null, index: -1, on: null });
     expect(pickPart({ ...table, parts: [lid, { ...base, lock: null }] }, [36, 0, 25])).toEqual({ part: null, index: -1, on: null });
     expect(pickPart({ ...table, parts: [lid, { ...base, lock: null }] }, [10, 0, 3])).toMatchObject({ on: 'base' });
+    // a base too small for its lock at this size, which locks at a bigger one, is picked on its low walls all the same
+    // (a cut across there would take the top off): the click says from what size it twists off, as one on its bottom
+    // does. The user's lantern at 100 %, 25 px over the bottom at the far left and right of the base
+    const small = { ...base, lock: null, why: 'room', least: { lock: 2.04, tea: 2.75, opening: 29.4 } };
+    expect(pickPart({ ...table, parts: [lid, small] }, [36, 0, 25])).toMatchObject({ part: small, on: 'base', band: true });
+    // said so where only the low band picks it – the page lets a spot suggested for a cut across there win over a base
+    // too small for its lock – and not on its bottom
+    expect(pickPart({ ...table, parts: [lid, small] }, [10, 0, 3])).toEqual({ part: small, index: 1, on: 'base' });
+    expect(pickPart(table, [36, 0, 25])).toMatchObject({ part: base, band: true });
+    expect(pickPart({ ...table, parts: [lid, small] }, [36, 0, 39.9])).toMatchObject({ part: small, on: 'base' });
+    expect(pickPart({ ...table, parts: [lid, small] }, [36, 0, 40.5])).toEqual({ part: null, index: -1, on: null });
+    expect(pickPart({ ...table, parts: [lid, small], handles: [] }, [36, 0, 25])).toEqual({ part: null, index: -1, on: null });
     // the band round the lantern's middle, a post and the air between the legs: none
     expect(pickPart(table, [45, 0, 60])).toEqual({ part: null, index: -1, on: null });
     expect(pickPart(table, [39, 0, 150])).toEqual({ part: null, index: -1, on: null });

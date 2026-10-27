@@ -608,6 +608,23 @@ describe('parts that come off', () => {
     }
   });
 
+  it('a model put in mm by Inches → mm is still 100 % as downloaded: the sizes the table gives are shares of it in mm', async () => {
+    const fx = batLanternSolid();
+    const inches = fx.scale([3 / 25.4, 3 / 25.4, 3 / 25.4]); // the lantern as a file in inches has it
+    await client.loadBase({ kind: 'stl', bytes: stlOf(inches), name: 'bat', version: ++version });
+    fx.delete();
+    inches.delete();
+    const mm = new Matrix4().makeScale(25.4, 25.4, 25.4).toArray();
+    const printing = { nozzle: 0.4, layerHeight: 0.2 };
+    await client.updateBase({ version: ++version, transforms: [mm], units: 25.4, simplify: null });
+    const converted = await client.parts([], version, { printing, split: {} });
+    expect(converted.scale).toBe(1);
+    expect(converted.parts.map((e) => e.kind)).toEqual(['lid', 'plug']);
+    // the same transforms with no units – a Scale of 2540 % – is that share of it, not the table read before
+    await client.updateBase({ version: ++version, transforms: [mm], simplify: null });
+    expect((await client.parts([], version, { printing, split: {} })).scale).toBe(25.4);
+  });
+
   it("mode 'part' tries a part's face where it is put, as the split places it: on the layers, moved up to print apart, with its bands", async () => {
     const fx = batLanternSolid();
     const big = fx.scale([3, 3, 3]);
@@ -938,6 +955,11 @@ describe('a split that takes parts out', () => {
       "Print the fit test first (Download fit test): a ring Ø 56 mm and a plug with the base's twist-lock, about 12 g. If the plug won't twist into the ring, raise the Clearance by 0.05 mm and print them again; if it rattles or doesn't click, lower it. Most printers need 0.15–0.25 mm, and PETG 0.25–0.3.",
     );
     const glue = ex.files.find((f) => f.kind === 'text').text;
+    // nothing is glued: the sheet is for printing the pieces and fitting the base, and is called so – glued as well
+    // (a cut across the middle), it is the glue sheet again
+    expect(ex.files.map((f) => f.file)).toEqual(['bat-piece-1-of-2.stl', 'bat-piece-2-of-2.stl', 'bat-how-to-print-and-fit.txt']);
+    const both = await exportFiles({ ...split('lock'), cuts: [...split('lock').cuts, { id: 'c2', position: [0, 0, 75], normal: [0, 0, 1] }], joint: 'none' });
+    expect(both.files.filter((f) => f.kind === 'text').map((f) => f.file)).toEqual(['bat-how-to-glue.txt']);
     expect(glue).toContain('  Not sure about the fit? Print the fit test first (Split card → Download fit test): a ring Ø 56 mm with a plug, about 12 g.');
     expect(glue).toContain("  The base (cut A) should twist in with a click and twist out again by hand. Try the fit test first: if its plug is too stiff to turn in its ring, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.");
     // a base that only lifts out has no lock to try: no file, and no note sends you to one

@@ -40,9 +40,12 @@ import { plugCoupon, twistCoupon } from './lockGeometry.js';
  * message, details } }`. Request types:
  *
  *   font.add    { fontId, bytes }                       -> { fontId, label }
- *   base.load   { kind:'stl'|'sample'|'none', bytes, name, version, transforms, simplify }
+ *   base.load   { kind:'stl'|'sample'|'none', bytes, name, version, transforms, units?, simplify }
  *                                                       -> { info, report, display }
- *   base.update { version, transforms, simplify }       -> { info, report, display }
+ *   base.update { version, transforms, units?, simplify }
+ *                                                       -> { info, report, display }
+ *                                                          (units: the share of the transforms that only puts
+ *                                                          the file's numbers in mm, left out of its size)
  *   preview     { item, baseVersion, printing }         -> { empty } | { geometry, bounds, stats, notes }
  *   result      { items, baseVersion, printing, split?, bed? }
  *                                                       -> { display, notes, info }
@@ -1254,7 +1257,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     };
   }
 
-  function loadBase({ kind, bytes, name = 'model', version, transforms = [], simplify = null, enhance = null, spots = [], covers = [] }, progress) {
+  function loadBase({ kind, bytes, name = 'model', version, transforms = [], units = 1, simplify = null, enhance = null, spots = [], covers = [] }, progress) {
     disposeBase();
     clearDerived();
     let original;
@@ -1291,14 +1294,15 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       fail('INTERNAL', `Unknown model kind "${kind}"`);
     }
     original.stage = makeStage({ manifold: original.manifold });
-    base = { version, kind, name, original, transforms, simplify, enhance, spots, covers };
+    base = { version, kind, name, original, transforms, units, simplify, enhance, spots, covers };
     return deriveCurrent(progress);
   }
 
-  function updateBase({ version, transforms = [], simplify = null, enhance = null, spots = [], covers = [] }, progress) {
+  function updateBase({ version, transforms = [], units = 1, simplify = null, enhance = null, spots = [], covers = [] }, progress) {
     if (!base?.original) fail('BASE_MISSING', 'The model is not loaded in the engine', { version });
     base.version = version;
     base.transforms = transforms;
+    base.units = units;
     base.simplify = simplify;
     base.enhance = enhance;
     base.spots = spots;
@@ -3512,7 +3516,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       clearance: spec.clearance, bed: U, printer, steps: assembly, ...(bridges.length ? { bridges } : {}),
       fit: split.notes.find((n) => n.code === 'PART_FIT') ?? null,
     });
-    const glue = glueFileName(name);
+    // a split that takes out parts and glues nothing has a sheet to print and fit the pieces by, and is called so
+    const glue = glueFileName(name, { parts: split.partSeams.length > 0, glued: assembly.some((s) => !s.apart) });
     files.push({ name: glue.replace(/\.txt$/, ''), file: glue, kind: 'text', text });
     const triangles = files.reduce((t, f) => t + (f.triangles ?? 0), 0);
     const message = {
@@ -4642,8 +4647,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     return { message: { ok, why, asked, z0, kind, lo, hi, gap, nearest, tried, windows, gmin: S.gmin, ...extra }, transfer: [] };
   }
 
-  /** The model's size against the one loaded (the cube root of its transforms' scale), for the texts' scales. */
-  const modelScale = () => +Math.cbrt(Math.abs(composeTransforms(base.transforms ?? []).determinant())).toFixed(6);
+  /**
+   * The model's size against the one loaded (the cube root of its transforms' scale), for the texts' scales – less
+   * Inches → mm (`units`), which only puts the file's numbers in mm: the model as downloaded is 100 % after it too.
+   */
+  const modelScale = () => +(Math.cbrt(Math.abs(composeTransforms(base.transforms ?? []).determinant())) / (base.units ?? 1)).toFixed(6);
 
   /**
    * The parts table for a result and the printer's nozzle, layer height and the clearance (`settings`: `n`, `hl`,
@@ -4651,13 +4659,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    */
   function partsTable(final, settings, progress) {
     const ps = partsState(final);
-    const key = stableKey(settings);
+    // the model's size as a share of it as downloaded is in the key: the same transforms are a different share where
+    // one of them only put the file's numbers in mm, and the least sizes are whole 5 % of it
+    const scale = modelScale();
+    const key = stableKey({ ...settings, scale });
     let table = ps.tables.get(key);
     if (table) ps.tables.delete(key);
     else {
       progress?.('Finding the parts that come off…');
       ps.stack ??= sliceStack(final.solid);
-      table = findParts(final.solid, { ...settings, stack: ps.stack, slices: ps.fine, scale: modelScale() });
+      table = findParts(final.solid, { ...settings, stack: ps.stack, slices: ps.fine, scale });
     }
     ps.tables.set(key, table);
     while (ps.tables.size > PARTS_TABLES) ps.tables.delete(ps.tables.keys().next().value);

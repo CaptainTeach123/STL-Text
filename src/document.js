@@ -416,14 +416,18 @@ export class Document {
   /**
    * Apply a 4x4 transform (16 numbers, column-major) to the model and carry
    * the items and cuts along. Returns the step it made, for `refitParts`.
+   * `units` is the share of it that only puts the file's numbers in mm
+   * (Inches → mm): kept in `base.units`, as the model is no bigger for it –
+   * its size as a share of it as downloaded leaves it out.
    */
-  transformBase(matrix) {
+  transformBase(matrix, { units = 1 } = {}) {
     if (!this.state.base) return null;
     const array = matrix instanceof Matrix4 ? matrix.toArray() : [...matrix];
     const step = `base:move:${++this.moves}`;
     this.commit(
       (s) => {
         s.base.transforms.push(array);
+        if (units !== 1) s.base.units = (s.base.units ?? 1) * units;
         s.baseVersion += 1;
         s.items = transformItems(s.items, array);
         if (s.split) s.split = { ...s.split, cuts: transformItems(s.split.cuts, array) };
@@ -474,6 +478,7 @@ export class Document {
     this.commit(
       (s) => {
         s.base.transforms = [];
+        delete s.base.units;
         s.base.simplify = null;
         s.base.enhance = null;
         s.baseVersion += 1;

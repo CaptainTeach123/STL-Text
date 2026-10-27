@@ -144,6 +144,10 @@ try {
     await page.waitForTimeout(60);
     await page.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
   };
+  /** The line editor moves the focus to a line in the next frame, which a busy machine can be slow to draw: wait for it
+   * (two seconds at most; the checks after it say whether it came) before typing on */
+  const lineFocused = (index) =>
+    page.waitForFunction((i) => document.activeElement === document.querySelectorAll('#lineList .line-text')[i], index, { timeout: 2000 }).catch(() => {});
   const download = async (name) => {
     const [dl] = await Promise.all([page.waitForEvent('download'), page.click('#downloadBtn')]);
     const file = path.join(out, name);
@@ -317,6 +321,7 @@ try {
   await page.focus('#lineList .line-text >> nth=1');
   await page.keyboard.press('Enter');
   await idle();
+  await lineFocused(2);
   check((await page.locator('#lineList .line').count()) === 3, 'Enter adds a line below');
   await page.keyboard.press('Backspace');
   await idle();
@@ -333,8 +338,10 @@ try {
   await page.keyboard.press('End');
   await page.keyboard.press('Enter');
   await idle();
+  await lineFocused(1);
   await page.keyboard.press('Backspace'); // remove the empty line again
   await idle();
+  await lineFocused(0);
   await page.keyboard.type(' world');
   await idle();
   check((await page.inputValue('#lineList .line-text >> nth=0')) === 'Hello world', 'Backspace on an empty line puts the caret at the end of the previous line', await page.inputValue('#lineList .line-text >> nth=0'));
@@ -347,9 +354,11 @@ try {
     input.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
   });
   await idle();
+  await lineFocused(1);
   check((await page.locator('#lineList .line').count()) === 2 && (await page.inputValue('#lineList .line-text >> nth=1')) === 'Birthday', 'pasting multi-line text makes lines', `${await page.locator('#lineList .line').count()} lines`);
   await page.click('#lineList .line-remove >> nth=1');
   await idle();
+  await lineFocused(0);
   check((await page.locator('#lineList .line').count()) === 1 && (await page.evaluate(() => document.activeElement?.className)) === 'line-text', 'removing a line with × keeps the keyboard focus in the editor');
   await setLines(['Hello', 'World']);
 
@@ -451,8 +460,21 @@ try {
   check(pegPart.volume > 360 && pegPart.sizeOk, 'pegs: the part downloads separately with its pegs', `${pegPart.volume?.toFixed(0)}`);
   check(Math.abs(pegPart.min[2]) < 0.01 && pegPart.max[2] > 3 + 5 && pegPart.max[2] < 3 + 7, 'pegs: the part file lies flat with the pegs pointing up', `z ${pegPart.min[2].toFixed(2)}…${pegPart.max[2].toFixed(2)}`);
   check((await page.locator('#textNotes').innerText()).includes('Pegs'), 'pegs: the notes explain the separate download');
+  /** The selected item's glyph in the list, and the legend's chips for raised and cut text: the key to the view. */
+  const glyphColours = () =>
+    page.evaluate(() => {
+      const bg = (sel) => getComputedStyle(document.querySelector(sel)).backgroundColor;
+      return { glyph: bg('#itemList li[aria-selected="true"] .glyph'), raised: bg('.legend .dot.emboss'), cut: bg('.legend .dot.engrave') };
+    });
+  const partRaised = await glyphColours();
   await page.check('input[name="mode"][value="engrave"]');
   await idle();
+  const partCutter = await glyphColours();
+  check(
+    partRaised.glyph === partRaised.raised && partCutter.glyph === partCutter.cut && partCutter.cut !== partCutter.raised,
+    "a part's glyph in the list is the colour the view draws it: the raised text's, and the cut text's as a cutter",
+    JSON.stringify({ partRaised, partCutter }),
+  );
   check(await page.locator('fieldset.join-only').isHidden(), 'a part used as a cutter has no connection options');
   check((await page.locator('#sinkLabel').innerText()).startsWith('Cut depth'), 'the sink field becomes the cut depth for a cutter');
   const cutterPart = await download('part-cutter.stl');
@@ -5049,6 +5071,265 @@ try {
       JSON.stringify({ looked, printedOn }),
     );
     await phone.close();
+  }
+
+  console.log('\nthe look: cyberpunk by default, Classic on the switch');
+  {
+    const lookProblems = [];
+    const preserve = () => {
+      const getContext = HTMLCanvasElement.prototype.getContext;
+      HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+        if (type === 'webgl' || type === 'webgl2') attrs = { ...attrs, preserveDrawingBuffer: true };
+        return getContext.call(this, type, attrs);
+      };
+    };
+    const lookContext = await browser.newContext({ viewport: { width: 1400, height: 850 } });
+    await lookContext.addInitScript(preserve);
+    const p = await lookContext.newPage();
+    p.on('pageerror', (e) => lookProblems.push(`pageerror: ${e.message}`));
+    p.on('console', (m) => m.type() === 'error' && lookProblems.push(`console: ${m.text()}`));
+    const ready = async () => {
+      await p.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+      await p.waitForTimeout(150);
+      await p.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    };
+    /** The page's look as the browser has it: the attribute, the switch, the font, tokens, the legend's chips, storage, focus. */
+    const look = () =>
+      p.evaluate(() => {
+        const root = getComputedStyle(document.documentElement);
+        // a token as the colour it computes to (the build writes #ffffff as #fff)
+        const colorOf = (token) => {
+          const probe = document.createElement('i');
+          probe.style.color = `var(${token})`;
+          document.body.append(probe);
+          const c = getComputedStyle(probe).color;
+          probe.remove();
+          return c;
+        };
+        const chip = (c) => getComputedStyle(document.querySelector(`.legend .dot.${c}`)).backgroundColor;
+        let stored;
+        try {
+          stored = localStorage.getItem('stltext.theme');
+        } catch {
+          stored = 'throws';
+        }
+        return {
+          theme: document.documentElement.dataset.theme ?? null,
+          checked: document.querySelector('#classicLook').checked,
+          font: getComputedStyle(document.body).fontFamily,
+          panel: colorOf('--panel'),
+          accent: colorOf('--accent'),
+          raised: chip('emboss'),
+          cutText: chip('engrave'),
+          meanings: ['cut', 'apart', 'lock', 'lug', 'seat', 'over'].map(chip).join(' ') + ` | ${getComputedStyle(document.querySelector('.legend .dot.bridge')).boxShadow}`,
+          themeColor: document.querySelector('meta[name="theme-color"]')?.content ?? null,
+          stored,
+          focus: document.activeElement?.id ?? null,
+        };
+      });
+    /**
+     * What a look does beyond its colours, as the browser has it: the scroll bars' thumb against the panel (and with more
+     * contrast asked for), the bar at the foot of the panel in forced colours, and the line editor's text box.
+     */
+    const details = async () => {
+      const read = () =>
+        p.evaluate(() => {
+          const rgb = (c) => c.match(/[\d.]+/g).slice(0, 3).map(Number);
+          const lum = (c) => {
+            const [r, g, b] = rgb(c).map((v) => (v / 255 <= 0.03928 ? v / 255 / 12.92 : ((v / 255 + 0.055) / 1.055) ** 2.4));
+            return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+          };
+          const ratio = (a, b) => {
+            const [x, y] = [lum(a), lum(b)].sort((m, n) => n - m);
+            return Math.round(((x + 0.05) / (y + 0.05)) * 100) / 100;
+          };
+          const thumb = getComputedStyle(document.documentElement).scrollbarColor;
+          const box = getComputedStyle(document.querySelector('#lineList .line-text'));
+          return {
+            thumb: thumb === 'auto' ? 'auto' : ratio(thumb.match(/rgba?\([^)]*\)/)[0], getComputedStyle(document.querySelector('.panel')).backgroundColor),
+            bar: getComputedStyle(document.querySelector('.actions')).backgroundColor,
+            box: `${box.borderTopWidth} ${box.borderTopStyle}, radius ${box.borderTopLeftRadius}, padding ${box.padding}`,
+          };
+        });
+      const plain = await read();
+      await p.emulateMedia({ contrast: 'more' });
+      const more = await read();
+      await p.emulateMedia({ contrast: 'no-preference', forcedColors: 'active' });
+      const forced = await read();
+      await p.emulateMedia({ forcedColors: 'none' });
+      return { thumb: plain.thumb, thumbMore: more.thumb, box: plain.box, barForced: forced.bar };
+    };
+    /** The text's pixels in the view, by its colour in each look: raised magenta or orange, cut acid green or pink-red. */
+    const textPixels = () =>
+      p.evaluate(async () => {
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        const c = document.querySelector('#stage canvas');
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        const n = { magenta: 0, orange: 0, acid: 0, pink: 0 };
+        for (let i = 0; i < d.length; i += 4) {
+          const [r, g, b] = [d[i], d[i + 1], d[i + 2]];
+          if (r > 200 && b > 170 && g < 90) n.magenta++;
+          else if (r > 200 && g > 0.35 * r && g < 0.65 * r && b < 80) n.orange++;
+          else if (g > 140 && r > 0.6 * g && r < 0.95 * g && b < 0.65 * g) n.acid++;
+          else if (r > 170 && g < 0.6 * r && b > 0.45 * r && b < 0.85 * r) n.pink++;
+        }
+        return n;
+      });
+    const toggle = async () => {
+      await p.focus('#classicLook');
+      await p.keyboard.press('Space');
+      await p.waitForTimeout(100);
+    };
+    await p.goto(url);
+    await ready();
+    const fresh = await look();
+    const freshPixels = await textPixels();
+    await p.emulateMedia({ colorScheme: 'dark' });
+    const freshDark = (await look()).panel;
+    await p.emulateMedia({ colorScheme: 'light' });
+    const freshLight = (await look()).panel;
+    check(
+      fresh.theme === 'cyber' && !fresh.checked && fresh.font.startsWith('Inter') && fresh.raised === 'rgb(255, 43, 214)' && fresh.cutText === 'rgb(198, 255, 61)' &&
+        fresh.themeColor === '#0e0b1a' && fresh.stored === null && freshDark === 'rgb(14, 11, 26)' && freshLight === 'rgb(14, 11, 26)',
+      'with nothing stored the page has the cyberpunk look, dark in either scheme, in Inter, its chips the colours the view draws text in',
+      JSON.stringify({ fresh, freshDark, freshLight }),
+    );
+    check(freshPixels.magenta > 300 && freshPixels.orange < 20, 'the raised text is drawn magenta in the view, not orange', JSON.stringify(freshPixels));
+    const freshDetails = await details();
+    check(
+      freshDetails.thumb >= 3 && freshDetails.thumbMore > freshDetails.thumb && freshDetails.box === '1px solid, radius 0px, padding 6px 8px' && freshDetails.barForced.startsWith('rgb('),
+      "in the cyberpunk look the scroll bars' thumb is 3:1 on the panel and firmer with more contrast, the line's box is a field, and the bar at the foot of the panel stays solid in forced colours",
+      JSON.stringify(freshDetails),
+    );
+
+    await toggle();
+    const classic = await look();
+    const classicPixels = await textPixels();
+    await p.emulateMedia({ colorScheme: 'dark' });
+    const classicDark = (await look()).panel;
+    await p.emulateMedia({ colorScheme: 'light' });
+    const classicLight = (await look()).panel;
+    check(
+      classic.theme === 'classic' && classic.checked && classic.accent === 'rgb(255, 122, 26)' && !classic.font.startsWith('Inter') && classic.raised === 'rgb(255, 138, 43)' &&
+        classic.cutText === 'rgb(255, 59, 107)' && classic.themeColor === null && classic.stored === 'classic' && classic.focus === 'classicLook' &&
+        classicLight === 'rgb(255, 255, 255)' && classicDark === 'rgb(23, 29, 43)',
+      'ticking Classic (Space on the switch) brings back the old tokens, light or dark as the system is, keeps the focus and is stored',
+      JSON.stringify({ classic, classicLight, classicDark }),
+    );
+    check(classicPixels.orange > 300 && classicPixels.magenta < 20, 'in Classic the view draws the raised text orange again, at once', JSON.stringify(classicPixels));
+    const classicDetails = await details();
+    check(
+      classicDetails.thumb === 'auto' && /^2px inset, radius 0px, padding 1px 2px$/.test(classicDetails.box) && classicDetails.barForced.startsWith('rgb('),
+      "Classic keeps the browser's own scroll bars and its own box for a line's text, as it always had, and the bar at the foot of the panel stays solid in forced colours",
+      JSON.stringify(classicDetails),
+    );
+    check(
+      classic.meanings === fresh.meanings && fresh.meanings === 'rgb(139, 92, 246) rgb(13, 148, 136) rgb(255, 106, 0) rgb(255, 214, 10) rgb(139, 92, 246) rgb(225, 29, 72) | rgb(250, 204, 21) 0px 0px 0px 2px inset',
+      "the chips for a cut, a cut that comes apart and the lock (its lugs, seat, overhang and bridges) are the view's colours in either look",
+      JSON.stringify({ cyber: fresh.meanings, classic: classic.meanings }),
+    );
+
+    // cut in: acid green in the cyberpunk look, the old pink-red in Classic
+    await p.click('input[name="mode"][value="engrave"]', { force: true });
+    await ready();
+    const cutClassic = await textPixels();
+    await toggle();
+    const cutCyber = await textPixels();
+    check(
+      cutClassic.pink > 300 && cutClassic.acid < 20 && cutCyber.acid > 300 && cutCyber.pink < 20,
+      'cut-in text is drawn pink-red in Classic and acid green in the cyberpunk look',
+      JSON.stringify({ cutClassic, cutCyber }),
+    );
+    await toggle();
+    await p.click('input[name="mode"][value="emboss"]', { force: true });
+    await ready();
+
+    // reloaded, Classic is there before the app's script runs: the head's own script set it, before the first paint
+    await p.reload();
+    await ready();
+    const reloaded = await look();
+    const reloadedPixels = await textPixels();
+    const early = await lookContext.newPage();
+    let held = 0;
+    await early.route(/\/assets\/index-[^/]*\.js$/, (route) => {
+      held++;
+      return route.abort();
+    });
+    await early.goto(url);
+    const before = await early.evaluate(() => ({
+      theme: document.documentElement.dataset.theme ?? null,
+      panel: getComputedStyle(document.querySelector('.panel')).backgroundColor,
+      engine: document.body.dataset.engine,
+      themeColor: document.querySelector('meta[name="theme-color"]')?.content ?? null,
+      orangeIcon: document.querySelector('link[rel="icon"]').href.includes('ff7a1a'),
+    }));
+    before.held = held;
+    await early.close();
+    check(
+      reloaded.theme === 'classic' && reloaded.checked && reloadedPixels.orange > 300 && before.held === 1 && before.theme === 'classic' && before.panel === 'rgb(255, 255, 255)' &&
+        before.engine === 'starting' && before.themeColor === null && before.orangeIcon,
+      "reloaded, the page is Classic, and already was with the app's script held back: no flash of the other look, in the page, the browser's bar or the tab's icon",
+      JSON.stringify({ reloaded, reloadedPixels, before }),
+    );
+
+    // the meanings on the model are the same in either look: a glued cut's handle is exactly the cut violet
+    await p.evaluate(() => document.querySelector('#addCutBtn').click());
+    await ready();
+    const violet = () =>
+      p.evaluate(async () => {
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        const c = document.querySelector('#stage canvas');
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        let n = 0;
+        for (let i = 0; i < d.length; i += 4) if (Math.abs(d[i] - 139) + Math.abs(d[i + 1] - 92) + Math.abs(d[i + 2] - 246) < 30) n++;
+        return n;
+      });
+    const violetClassic = await violet();
+    await toggle();
+    const back = await look();
+    const violetCyber = await violet();
+    check(
+      violetClassic > 50 && violetCyber > 50 && back.theme === 'cyber' && !back.checked && back.stored === null && back.raised === 'rgb(255, 43, 214)',
+      "a glued cut is the same violet in either look; unticking Classic brings the cyberpunk look back and forgets the choice",
+      JSON.stringify({ violetClassic, violetCyber, back }),
+    );
+    check(lookProblems.length === 0, 'no page errors switching the look', lookProblems.join(' | '));
+    await lookContext.close();
+
+    // where storage is blocked: the default look, no errors, and the switch still works for the visit
+    const blocked = await browser.newContext({ viewport: { width: 1400, height: 850 } });
+    await blocked.addInitScript(() => {
+      Object.defineProperty(window, 'localStorage', {
+        get() {
+          throw new DOMException('The operation is insecure.', 'SecurityError');
+        },
+      });
+    });
+    const q = await blocked.newPage();
+    const blockedProblems = [];
+    q.on('pageerror', (e) => blockedProblems.push(`pageerror: ${e.message}`));
+    await q.goto(url);
+    await q.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    const blockedStart = await q.evaluate(() => document.documentElement.dataset.theme);
+    await q.focus('#classicLook');
+    await q.keyboard.press('Space');
+    const blockedAfter = await q.evaluate(() => ({ theme: document.documentElement.dataset.theme, panel: getComputedStyle(document.querySelector('.panel')).backgroundColor }));
+    check(
+      blockedStart === 'cyber' && blockedAfter.theme === 'classic' && blockedAfter.panel === 'rgb(255, 255, 255)' && blockedProblems.length === 0,
+      'with storage blocked the page opens in the cyberpunk look without errors, and Classic still works for the visit',
+      JSON.stringify({ blockedStart, blockedAfter, blockedProblems }),
+    );
+    await blocked.close();
   }
 
   check(problems.length === 0, 'no console errors or exceptions (page or worker)', problems.join(' | '));

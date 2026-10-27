@@ -5,14 +5,30 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content="Add text in any font to an STL model: raised or cut in, following curved surfaces, with automatic mesh repair. Runs entirely in your browser." />
     <title>STL Text – custom fonts on STL models</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23ff7a1a'/%3E%3Ctext x='16' y='23' font-size='19' font-family='Arial Black,Arial' font-weight='900' text-anchor='middle' fill='white'%3EA%3C/text%3E%3C/svg%3E" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M0 0h24l8 8v24H8L0 24z' fill='%230e0b1a'/%3E%3Cpath d='M1 1h22.6L31 8.4V31H8.4L1 23.6z' fill='none' stroke='%23ff2bd6' stroke-width='2'/%3E%3Ctext x='16' y='23' font-size='18' font-family='Arial Black,Arial' font-weight='900' text-anchor='middle' fill='%2329e6ff'%3EA%3C/text%3E%3C/svg%3E" />
+    <meta name="theme-color" content="#0e0b1a" />
+    <script>
+      // The look is set before the first paint, so a Classic visitor never sees the other one flash by: not in the page,
+      // not in the browser's bar, which takes the colour above at the first paint (Classic has none), and not in the tab,
+      // whose icon would otherwise stay the one above until the app's script has loaded. It comes after both so it can
+      // change them; theme.js keeps all three in step from here (the icon below is its ICONS.classic)
+      try {
+        if (localStorage.getItem('stltext.theme') === 'classic') {
+          document.documentElement.dataset.theme = 'classic';
+          document.querySelector('meta[name="theme-color"]').remove();
+          document.querySelector('link[rel="icon"]').href = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23ff7a1a'/%3E%3Ctext x='16' y='23' font-size='19' font-family='Arial Black,Arial' font-weight='900' text-anchor='middle' fill='white'%3EA%3C/text%3E%3C/svg%3E";
+        }
+      } catch {}
+    </script>
     <link rel="stylesheet" href="/src/style.css" />
+    <link rel="stylesheet" href="/src/cyber.css" />
   </head>
   <body data-engine="starting">
     <div class="app">
       <aside class="panel" aria-label="Controls">
         <header class="brand">
           <h1>STL&nbsp;Text</h1>
+          <label class="look-switch" title="The plain look, light or dark as your system is set"><input type="checkbox" id="classicLook" role="switch" /> Classic</label>
           <p>Put any font on your 3D model. Everything runs in your browser – files never leave your computer.</p>
         </header>
 

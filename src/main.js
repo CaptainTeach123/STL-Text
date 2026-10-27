@@ -5,6 +5,7 @@ import { DECOR_KINDS, decorPartId, normaliseDecorSpec } from './decor.js';
 import { createEngineClient } from './engineClient.js';
 import { ENHANCE_DEFAULTS, isEnhanceActive } from './enhance.js';
 import { Viewer } from './viewer.js';
+import { applyTheme, browserStorage, storeTheme, storedTheme } from './theme.js';
 import {
   aimLine, aimTargets, bandOf, handlePlaneWords, lipLine, lipVerdict, noFitTestWords, partCard, partFace, partMeta, partOffered, partReadout, partWidth, partsNote,
   percentOf, pickPart, noLockOf, noLockTitle, snapTolerance, snappedWords, spotLabel, throughWords, wayCaption, widthWords,
@@ -24,6 +25,20 @@ const SETTINGS_KEY = 'stltext.settings.v2';
 
 const doc = new Document();
 const viewer = new Viewer($('stage'));
+// the page's look (index.html set it before the first paint), and the view's text in its colours
+{
+  const theme = storedTheme();
+  applyTheme(theme);
+  viewer.setTheme(theme);
+  $('classicLook').checked = theme === 'classic';
+  // not part of the document or its undo, and no engine work: the page and the view change colour, the focus stays
+  $('classicLook').addEventListener('change', (e) => {
+    const next = e.target.checked ? 'classic' : 'cyber';
+    applyTheme(next);
+    viewer.setTheme(next);
+    storeTheme(browserStorage(), next);
+  });
+}
 const fonts = new Map(); // fontId -> { label, group }
 const partAssets = new Map(); // partId -> { name, info }
 let partCount = 0;
@@ -4459,7 +4474,9 @@ function renderItems() {
       li.dataset.id = item.id;
       const glyph = document.createElement('span');
       const part = isPart(item);
-      glyph.className = `glyph ${part ? 'part' : item.mode}`;
+      // a part carries its mode too: one used as a cutter is drawn in the cut text's colour, and a look that keys its
+      // glyphs to the view's colours (cyber.css) needs to know
+      glyph.className = `glyph ${part ? 'part ' : ''}${item.mode}`;
       glyph.textContent = part ? 'P' : item.mode === 'engrave' ? 'C' : 'R';
       glyph.title = part ? 'Attached part' : item.mode === 'engrave' ? 'Cut in' : 'Raised';
       const name = document.createElement('span');

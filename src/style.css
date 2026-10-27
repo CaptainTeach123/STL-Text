@@ -18,6 +18,20 @@
   --stage-top: #eef2fa;
   --stage-bottom: #cfd8e8;
   --radius: 10px;
+  --font-ui: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --line: #d8dde6; /* the plan lists' edges and separators */
+  --warn: #c77700;
+  /* the view's own colours (viewer.js, split.js), so the legend's chips are what is drawn. The raised and cut text are
+     this look's; cyber.css gives its own */
+  --model: #8aa4c8;
+  --emboss: #ff8a2b;
+  --engrave: #ff3b6b;
+  --pass: #e0a93a;
+  --spot: #22d3a6;
+  --lug: #ffd60a;
+  --seat: #8b5cf6;
+  --over: #e11d48;
+  --bridge: #facc15;
   color-scheme: light;
 }
 
@@ -33,6 +47,7 @@
     --lock-text: #fb923c;
     --stage-top: #243049;
     --stage-bottom: #121827;
+    --line: var(--border); /* the light edge of the light scheme stood out on the dark panel */
     color-scheme: dark;
   }
 }
@@ -50,7 +65,7 @@ body {
 body {
   background: var(--bg);
   color: var(--text);
-  font: 14px/1.45 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font: 14px/1.45 var(--font-ui);
 }
 
 .app {
@@ -70,6 +85,10 @@ body {
   gap: 12px;
 }
 
+.brand {
+  /* the look's switch sits at the right of the heading, out of the flow: the block is as tall in either look */
+  position: relative;
+}
 .brand h1 {
   margin: 0;
   font-size: 22px;
@@ -78,6 +97,20 @@ body {
 .brand p {
   margin: 4px 0 0;
   color: var(--muted);
+}
+.look-switch {
+  position: absolute;
+  top: 7px;
+  right: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.look-switch input {
+  margin: 0;
 }
 
 .card {
@@ -431,13 +464,13 @@ input[type='range'] {
   margin-right: 4px;
 }
 .dot.model {
-  background: #8aa4c8;
+  background: var(--model);
 }
 .dot.emboss {
-  background: #ff8a2b;
+  background: var(--emboss);
 }
 .dot.engrave {
-  background: #ff3b6b;
+  background: var(--engrave);
 }
 
 
@@ -501,12 +534,6 @@ input[type='range'] {
   }
   .actions {
     bottom: 0;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .spinner {
-    animation-duration: 3s;
   }
 }
 
@@ -691,6 +718,15 @@ input[type='range'] {
   align-self: stretch;
   white-space: normal;
 }
+/* "scales all lines" under the text width stays beside its box: as a field's heading it spanned both columns, and on a
+   narrow phone ran into the box. It may use the gap before the box, so on a wide panel it is one line as it always was,
+   and wraps where it must */
+.field.num > #widthHint {
+  grid-column: 1;
+  margin-right: -8px;
+  white-space: normal;
+  line-height: 1.15;
+}
 .nudge {
   display: inline-flex;
   gap: 4px;
@@ -700,7 +736,7 @@ input[type='range'] {
   padding: 4px 0;
 }
 .dot.pass {
-  background: #e0a93a;
+  background: var(--pass);
 }
 
 /* ---------- progress pill & toast ---------- */
@@ -729,6 +765,12 @@ input[type='range'] {
   border-top-color: var(--accent);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
+}
+/* after the rule above: its shorthand would set the duration back */
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 3s;
+  }
 }
 @keyframes spin {
   to {
@@ -823,7 +865,7 @@ body[data-engine='busy'] .stage canvas {
 /* ---------- items that are not touching the model ---------- */
 .items li .meta.warn,
 .hint.warn {
-  color: var(--warn, #c77700);
+  color: var(--warn);
   font-weight: 600;
 }
 
@@ -859,7 +901,7 @@ ul.plan {
   padding: 0;
   max-height: 14rem;
   overflow: auto;
-  border: 1px solid var(--line, #d8dde6);
+  border: 1px solid var(--line);
   border-radius: 6px;
 }
 ul.plan:empty {
@@ -871,7 +913,7 @@ ul.plan li {
   gap: 0.4rem;
   align-items: center;
   padding: 0.3rem 0.5rem;
-  border-bottom: 1px solid var(--line, #d8dde6);
+  border-bottom: 1px solid var(--line);
   font-size: 0.85rem;
 }
 ul.plan li:last-child {
@@ -1309,17 +1351,17 @@ ul.plan#cutList {
   background: var(--lock);
 }
 .dot.lug {
-  background: #ffd60a;
+  background: var(--lug);
 }
 .dot.seat {
-  background: #8b5cf6;
+  background: var(--seat);
 }
 .dot.over {
-  background: #e11d48;
+  background: var(--over);
 }
 .dot.bridge {
   background: transparent;
-  box-shadow: inset 0 0 0 2px #eab308;
+  box-shadow: inset 0 0 0 2px var(--bridge);
 }
 /* the lock's tools, bottom left of the view: what the part is doing as it comes out, over the buttons */
 .lock-panel {
@@ -1439,5 +1481,29 @@ ul.plan#cutList {
   #cutList .cut-hold span {
     padding: 2px 4px;
     font-size: 0.74rem;
+  }
+}
+
+/* ---------- reduced motion: the busy notes hold still (their words say it) ---------- */
+@media (prefers-reduced-motion: reduce) {
+  body.deriving .deriving-note,
+  #splitCard.pending .deriving-note,
+  .spots-note.busy,
+  .parts-note.busy {
+    animation: none;
+  }
+}
+
+/* ---------- forced colours (in either look) ----------
+   The chips, glyphs and swatches are the key to what the view draws: left to the system's palette they all went the
+   one colour. And the bar at the foot of the panel stays solid, so the cards do not show through under its buttons */
+@media (forced-colors: active) {
+  .dot,
+  .items li .glyph,
+  #pieceList .swatch {
+    forced-color-adjust: none;
+  }
+  .actions {
+    background: Canvas;
   }
 }

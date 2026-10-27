@@ -59,10 +59,10 @@ import {
 Mesh.prototype.raycast = acceleratedRaycast;
 
 const COLORS = {
+  // the model keeps its blue in either look: the hover gold and the lifts-off amber are mixed into it in the shader,
+  // and the page's checks read those mixes off the canvas (a bluer model was tried for the cyberpunk look, and moved them)
   model: 0x8aa4c8,
   passthrough: 0xe0a93a,
-  emboss: 0xff8a2b,
-  engrave: 0xff3b6b,
   detached: 0xb8bcc8, // an item that is not touching the model
   spot: 0x22d3a6, // a clean-up spot's ring
   marker: 0x22d3a6,
@@ -70,6 +70,17 @@ const COLORS = {
   apartHover: 0x2dd4bf, // the same for a cut that comes apart
   tooBig: 0xd6294b, // the number of a piece too big for the printer (the page's --err)
 };
+
+/**
+ * The text in the model view, raised (and attached parts) and cut in, in each of the page's looks (theme.js). The
+ * cyberpunk look frees orange for the lock: its raised text is magenta and its cut text acid green, clear of the lock,
+ * the cuts and the red of a piece too big. Classic keeps the colours the view always had. Only these follow the look:
+ * every other colour here means something the page's legend and checks rely on.
+ */
+export const TEXT_COLORS = Object.freeze({
+  cyber: Object.freeze({ emboss: 0xff2bd6, engrave: 0xc6ff3d }),
+  classic: Object.freeze({ emboss: 0xff8a2b, engrave: 0xff3b6b }),
+});
 
 /**
  * The model's section under a cut being placed, by the lip the engine finds
@@ -576,6 +587,7 @@ function handleGeometry() {
 export class Viewer {
   constructor(container) {
     this.container = container;
+    this.textColors = TEXT_COLORS.cyber; // the page's look sets it (setTheme)
     this.renderer = new WebGLRenderer({ antialias: true, alpha: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     this.renderer.setClearColor(0x000000, 0);
@@ -918,10 +930,22 @@ export class Viewer {
 
   /* ---------------------------------------------------------- overlays */
 
+  /**
+   * Draw the text in a look's colours (`'cyber'` or `'classic'`): every overlay is restyled and the view drawn again
+   * once – nothing is rebuilt, and nothing else in the view depends on the look.
+   */
+  setTheme(theme) {
+    const colors = TEXT_COLORS[theme] ?? TEXT_COLORS.cyber;
+    if (colors === this.textColors) return;
+    this.textColors = colors;
+    for (const o of this.overlays.values()) this.#styleOverlay(o);
+    this.requestRender();
+  }
+
   #overlayMaterial(mode) {
-    if (mode === 'engrave') return new MeshStandardMaterial({ color: COLORS.engrave, roughness: 0.6, flatShading: true, transparent: true, opacity: 0.6, depthTest: false });
+    if (mode === 'engrave') return new MeshStandardMaterial({ color: this.textColors.engrave, roughness: 0.6, flatShading: true, transparent: true, opacity: 0.6, depthTest: false });
     if (mode === 'spot') return new MeshStandardMaterial({ color: COLORS.spot, roughness: 0.5, flatShading: true, transparent: true, opacity: 0.7 });
-    return new MeshStandardMaterial({ color: COLORS.emboss, roughness: 0.45, flatShading: true, transparent: true, opacity: 1 });
+    return new MeshStandardMaterial({ color: this.textColors.emboss, roughness: 0.45, flatShading: true, transparent: true, opacity: 1 });
   }
 
   #styleOverlay(o) {
@@ -930,7 +954,7 @@ export class Viewer {
     const stale = o.stale ? 0.7 : 1;
     const loose = o.detached ? 0.55 : 1;
     o.mesh.material.opacity = base * fade * stale * loose;
-    o.mesh.material.color.set(o.detached ? COLORS.detached : o.mode === 'engrave' ? COLORS.engrave : o.mode === 'spot' ? COLORS.spot : COLORS.emboss);
+    o.mesh.material.color.set(o.detached ? COLORS.detached : o.mode === 'engrave' ? this.textColors.engrave : o.mode === 'spot' ? COLORS.spot : this.textColors.emboss);
     o.mesh.material.wireframe = !!o.detached;
     o.mesh.material.transparent = true;
     o.mesh.renderOrder = o.mode === 'engrave' ? 5 : 0;
@@ -3109,6 +3133,8 @@ export class Viewer {
     }
     const extent = Math.max(this.bounds.getSize(new Vector3()).length() * 1.6, 100);
     const size = Math.ceil(extent / 10) * 10;
+    // the same grey in either look: where its faint lines cross the pieces the blend is what the page's checks count, and
+    // a lighter or tinted grid (tried for the cyberpunk look) landed in the tea-light seat's violet
     this.grid = new GridHelper(size, size / 10, 0x7a869c, 0x7a869c);
     this.grid.material.transparent = true;
     this.grid.material.opacity = 0.25;

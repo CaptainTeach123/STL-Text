@@ -39,6 +39,8 @@ Everything runs in your browser. Your models and fonts are never uploaded anywhe
 
 The final model is always *model + everything raised or fused − everything cut*, whatever order you added them in, so cut-in text always cuts through raised text. Parts connected with pegs are not merged: they are downloaded as separate files.
 
+The page has a dark cyberpunk look, in which raised text is drawn magenta and cut-in text acid green. Tick *Classic* at the top of the panel for the plain look, light or dark as your system is set (raised text orange, cut-in text pink-red); your browser remembers the choice. Every other colour in the 3D view means the same in both.
+
 ### Connecting parts well
 
 - **Fused** is right for one-piece prints: the part sinks a little into the surface (default 0.4 mm) so the two bodies share material.
@@ -144,6 +146,7 @@ npm run bench:lantern -- model.stl --scale 400   # times the removable parts of 
 | `src/lockGeometry.js` | The twist-lock's solids: the collar, neck and lugs, the socket ring with its L-slots and click tabs, the plug build with its coin slot, a base's tea-light seat, and the fit tests: a lid's two rings, a base's ring and plug |
 | `src/fontParse.js`, `src/fontCatalog.js` | Font parsing (worker) and the bundled / installed font sources (browser) |
 | `src/main.js` | UI wiring |
+| `src/style.css`, `src/cyber.css`, `src/theme.js` | The page's two looks: `style.css` is the plain Classic one, `cyber.css` the cyberpunk one laid over it (every rule scoped to `html:not([data-theme='classic'])`), and `theme.js` the switch – what the browser remembers (`stltext.theme`), and the icon and browser colour of each look. The 3D view's text colours follow it (`Viewer.setTheme`, `TEXT_COLORS`) |
 
 Built with [three.js](https://threejs.org), [three-mesh-bvh](https://github.com/gkjohnson/three-mesh-bvh), [opentype.js](https://opentype.js.org), [Manifold](https://github.com/elalish/manifold) and [Vite](https://vite.dev). Needs a browser with module Web Workers and WebGL (current Chrome, Edge, Firefox, Safari).
 

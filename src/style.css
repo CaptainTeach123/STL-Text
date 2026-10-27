@@ -520,7 +520,8 @@ input[type='range'] {
     height: auto;
   }
   .app {
-    grid-template-columns: 1fr;
+    /* never wider than the screen: a wide system font or a long word wraps in the panel rather than scroll the page */
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: 52vh auto;
     height: auto;
   }

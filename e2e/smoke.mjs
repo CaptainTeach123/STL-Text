@@ -5205,10 +5205,14 @@ try {
     await n.evaluate(() => document.querySelector('#classicLook').click());
     await n.waitForTimeout(200);
     const classicFix = await sideways();
+    // Classic's system font is a wider face on some machines (DejaVu Sans on Linux): the page must not grow with it
+    await n.addStyleTag({ content: 'html, body, button, input, select, textarea { font-family: "DejaVu Sans", Verdana, sans-serif !important; }' });
+    await n.waitForTimeout(200);
+    const wideFix = await sideways();
     check(
-      cyberFix.scroll === 0 && classicFix.scroll === 0 && cyberFix.panel === 320 && classicFix.panel === 320,
-      'on a 320 px phone with Fix model open the page never scrolls sideways, in either look',
-      JSON.stringify({ cyberFix, classicFix }),
+      [cyberFix, classicFix, wideFix].every((f) => f.scroll === 0 && f.panel === 320),
+      'on a 320 px phone with Fix model open the page never scrolls sideways, in either look, nor with a wide system font',
+      JSON.stringify({ cyberFix, classicFix, wideFix }),
     );
     await narrow.close();
   }

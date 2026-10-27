@@ -9,8 +9,8 @@ import { FINE_SPECK, SPECK, WAY_START, findParts, fineSlices, plugLockOf, sliceS
 import { bandFor, buildSplitDisplay, carveParts, checkPart, cutTwist, drillPiece, lockFaces, lockIds, lockMatrix, lockPieces, lockPoints, wayOverlaps } from '../src/splitGeometry.js';
 import { displayBuffers } from '../src/mesh.js';
 import { unmarkJoint } from '../src/viewer.js';
-import { LOCK_SEGMENTS, lockSolids, plugLockSolids, twistCoupon, twistLockSolids } from '../src/lockGeometry.js';
-import { layout, plugLayoutOk, sizes, slitBridge } from '../src/locks.js';
+import { LOCK_SEGMENTS, lockSolids, plugCoupon, plugLockSolids, twistCoupon, twistLockSolids } from '../src/lockGeometry.js';
+import { camOut, layout, plugDims, plugHold, plugLayoutOk, plugRing, sizes, slitBridge } from '../src/locks.js';
 import { setup } from './helpers.js';
 import { batLanternSolid, overhangs, roundLanternSolid, stlCheck } from './lanternFixture.js';
 
@@ -379,6 +379,66 @@ describe('the twist-lock\'s fit test', () => {
     expect(fitAt(neck, rigid, 0, S.cz + 0.1)).toBeGreaterThan(0.3);
     expect(fitAt(neck, lid, 9, 0)).toBeGreaterThan(0.1);
     for (let dz = 0; dz <= S.H + 1; dz += 0.5) expect(fitAt(neck, lid, 18, dz)).toBe(0);
+  });
+});
+
+describe("the base's fit test", () => {
+  it('is the plug lock on a ring and a short plug: one piece each, seated, held pulled down, turned free, clicked, out at the entry – as the real lock is', () => {
+    // the real lock's own numbers at 300 % and 400 % (the base's plug twist-lock, below): the coupon is the same lock
+    const want = {
+      21.4: { theta: 23, pulled: 1.4108, click: 0.519, wrong: 28.7382, d: 56.2 },
+      28.8: { theta: 17, pulled: 1.4031, click: 0.5233, wrong: 28.585, d: 74.8 },
+    };
+    const S = sizes();
+    for (const [R, w] of Object.entries(want).map(([r, x]) => [+r, x])) {
+      const { body, plug, d } = plugCoupon(S, R);
+      own(body);
+      own(plug);
+      expect(d).toBe(w.d);
+      expect([body, plug].map((x) => x.decompose().map((y) => (y.delete(), 1)).length)).toEqual([1, 1]);
+      // clean as a slicer reads it
+      expect([stlCheck(body), stlCheck(plug)]).toEqual([{ degenerate: 0, open: 0 }, { degenerate: 0, open: 0 }]);
+      // each stands on its bottom on the bed, as the lantern and its base print, as tall as the lock and a millimetre over
+      const h = Math.ceil((plugDims(S, R).top + 1) / S.hl - 1e-9) * S.hl;
+      for (const x of [body, plug]) expect([x.boundingBox().min[2], x.boundingBox().max[2]]).toEqual([0, expect.closeTo(h, 6)]);
+      // the plug before its click's ridges go on: the lock's own fit
+      const L = lockSolids({ mech: 'plug', S, R, top: h });
+      for (const x of [L.body.cut, L.part.add, L.part.cut, L.part.after]) own(x);
+      const rigid = own(plug.subtract(L.part.after));
+      expect(overlap(body, plug)).toBeLessThan(1e-9);
+      expect(r4(fitAt(body, rigid, 0, -0.3))).toBeCloseTo(w.pulled, 3);
+      for (let phi = 0; phi <= w.theta; phi += 1) expect(fitAt(body, rigid, -phi, 0)).toBeLessThan(1e-9);
+      expect(fitAt(body, plug, -w.theta, 0)).toBeLessThan(1e-9);
+      expect(r4(fitAt(body, plug, -w.theta / 2, 0))).toBeCloseTo(w.click, 3);
+      for (let dz = -0.25; dz >= -(h + 1); dz -= 0.25) expect(fitAt(body, rigid, -w.theta, dz)).toBeLessThan(1e-9);
+      expect(r4(fitAt(body, rigid, w.theta, 0))).toBeCloseTo(w.wrong, 2);
+      // printed on their bottoms, nothing hangs out more than a layer's slope: no support
+      for (const x of [body, plug]) for (const o of overhangs(x, 0.1, h)) expect(o.width).toBeLessThanOrEqual(0.25);
+      // the coin slot across the plug's bottom: 2.4 wide, along X, a millimetre inside the tabs' slits
+      const strip = (z, x0, x1, wd) => own(own(plug.slice(z)).intersect(own(wasm.CrossSection.square([x1 - x0, wd]).translate([x0, -wd / 2])))).area();
+      const half = plugDims(S, R).coin / 2;
+      expect(strip(0.6, -half + 0.1, half - 0.1, 2.3)).toBe(0);
+      expect(strip(0.6, -half + 0.1, half - 0.1, 3)).toBeGreaterThan(1);
+      // the ring as thin as the plug rule lets a body be round this bore: a tenth of a millimetre less spreads before
+      // three times the plug's hold
+      const out = d / 2;
+      expect(out).toBe(plugRing(S, R));
+      expect(camOut(S, R, plugDims(S, R), out - 0.1)).toBeLessThan(3 * Math.round(plugHold(S)));
+    }
+  });
+
+  it('is light: a few grams more than its ring, the plug a band inside its tabs with a bar across for the coin', () => {
+    const S = sizes();
+    const { body, plug } = plugCoupon(S, 21.4);
+    own(body);
+    own(plug);
+    const solidDisc = rev([[0, 0], [21.25, 0], [21.25, 6.4], [0, 6.4]]);
+    expect(plug.volume()).toBeLessThan(0.5 * solidDisc.volume());
+    expect(Math.round((body.volume() + plug.volume()) * 1.24e-3)).toBe(12);
+    // the middle is open: nothing at the axis but the bar, nothing over the bar
+    expect(solidAt(plug, [0, 8], 1)).toBe(false);
+    expect(solidAt(plug, [8, 0], 4)).toBe(false);
+    expect(solidAt(plug, [8, 2], 1)).toBe(true);
   });
 });
 

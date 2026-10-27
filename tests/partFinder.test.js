@@ -358,6 +358,18 @@ describe('what is no lid, and what is', () => {
     expect(baseOf(findParts(footed, { n: 0.25, hl: 0.12 })).lock).toMatchObject({ R: 28.8 });
   });
 
+  it("a generated model's soft bottom edge, which grows with it, does not count against the base's ring at any size", () => {
+    // the fixture standing on a Ø 2 mm disc for its lowest 0.04 mm, as a generated lantern's bottom edge is rounded off:
+    // 0.64 mm of it at 1600 %, 1 mm made 25.4 times bigger (Inches → mm) – past the bed layer and the bore's mouth
+    const soft = minus(own(batLanternSolid()), minus(cyl(20, -1, 0.04), cyl(1, -2, 1)));
+    for (const s of [16, 25.4]) {
+      const base = baseOf(findParts(scaled(soft, s), {}));
+      expect(base.lock).toMatchObject({ mech: 'plug', teaLight: true });
+      // the lock it would get on the flat-bottomed fixture, but for the edge's few layers
+      expect(base.lock.R / s).toBeGreaterThan(6.5);
+    }
+  });
+
   it('a hanging hole through the handle\'s crown, or a vent down the finial, is no open top: the dome and the base are still found', () => {
     // the fixture's crown is solid over its axis from z 49.31 to its top at 50: a Ø 0.5 mm hole through it (Ø 2 mm
     // at 400 %) leaves the air under it leading 6 mm down, more than the hole is wide

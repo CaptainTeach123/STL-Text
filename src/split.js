@@ -4533,6 +4533,11 @@ const NOTE_TEXT = {
   },
   PART_SMALL: ({ letter, name, why = 'room', now = 100, wall = null, lock = null, opening = null, tea = null, most = null, base = null }) => {
     const called = partCalled(name);
+    // something standing under a base's bottom – raised text, a foot – is where its slots and the floor that holds its
+    // lugs go, at any size
+    if (why === 'under') {
+      return `Cut ${letter}: something stands under the ${called}'s bottom where its twist-lock goes – raised text, or a foot – so it has none. Engrave the text there or move it off the bottom for one; until then the ${called} just lifts out.`;
+    }
     // the dome and cap's roof is the dome: that is what is too thin
     const roof = name === 'Dome and cap' ? 'dome' : called;
     let s;
@@ -4561,7 +4566,15 @@ const NOTE_TEXT = {
     const like = name === 'Dome and cap' ? 'the dome' : 'the model round it';
     return `${s} The collar under the joint inside ${inside} slopes like ${like} (${roundAngle((Math.atan(slope) * 180) / Math.PI)}°), so it needs whatever support ${like} needs.`;
   },
-  PART_FIT: ({ d = 0, grams = 0 }) => `Print the fit test first (Download fit test): two rings Ø ${roundOpening(d)} mm, about ${grams} g. If they won't twist together, raise the Clearance by 0.05 mm and print them again; if they rattle or don't click, lower it. Most printers need 0.15–0.25 mm, and PETG 0.25–0.3.`,
+  PART_FIT: ({ d = 0, grams = 0, lid = null, plug = null }) => {
+    const most = 'Most printers need 0.15–0.25 mm, and PETG 0.25–0.3.';
+    if (!plug) return `Print the fit test first (Download fit test): two rings Ø ${roundOpening(d)} mm, about ${grams} g. If they won't twist together, raise the Clearance by 0.05 mm and print them again; if they rattle or don't click, lower it. ${most}`;
+    // a base's lock is tried on a ring of its bore and a short plug, which goes into it from underneath as the base does
+    const base = `a ring Ø ${roundOpening(plug.d)} mm and a plug with the ${partCalled(plug.name ?? 'Base')}'s twist-lock`;
+    if (!(d > 0)) return `Print the fit test first (Download fit test): ${base}, about ${plug.grams} g. If the plug won't twist into the ring, raise the Clearance by 0.05 mm and print them again; if it rattles or doesn't click, lower it. ${most}`;
+    const rings = `two rings Ø ${roundOpening(d)} mm with the ${lid ? `${partCalled(lid)}'s` : 'lid\'s'} twist-lock`;
+    return `Print the fit test first (Download fit test): ${rings}, and ${base}, about ${grams + plug.grams} g in all. If a pair won't twist together, raise the Clearance by 0.05 mm and print them again; if one rattles or doesn't click, lower it. ${most}`;
+  },
   PART_GAP: ({ letter, name, axis = 2, z = 0, gap = 0, need = 0.9, by = 'the model beside it', islands = 0, movedTo = null, nearest = null }) => {
     const where = `Cut ${letter}: at ${partAt(axis, z)} the ${partCalled(name)}'s`;
     // the face in pieces, or its edge too near what stands beside it (or running into it) to print apart
@@ -4645,13 +4658,15 @@ const NOTE_TEXT = {
  * cutId, name, piece, why, … }` (a base asked for a seat where none fits, `seatFor`'s refusal: `noSeatWords`);
  * PART_LIFTS `{ letter, cutId, name }` (it comes off and nothing holds it);
  * PART_SMALL `{ letter, cutId, name, why, now, wall, lock, opening, tea, most, base }` (asked to lock, but no twist-lock
- * fits at this size – `why` a lid's 'room', 'tabs' or 'collar', or a base's 'floor', 'wall' or 'cam' (no room for one),
+ * fits at this size – `why` a lid's 'room', 'tabs' or 'collar', or a base's 'floor', 'wall' or 'cam' (no room for one)
+ * or 'under' (raised text or a foot under its bottom, where its lock goes),
  * `now` the size as a share of the model as loaded (%), `wall`
  * its roof's `{ t, slope }` – so it lifts off: a twist-lock fits from `lock` % with an opening Ø `opening`, a tea light
  * from `tea` %, none up to `most` %; `base` the least scale (%) the base's own lock needs, or 'now');
  * PART_PRINT `{ letter, cutId, name, piece, home, mech, bridge, slope }` (how a locked part prints: a collar
  * twist-lock's longest bridge `bridge` mm, its collar's slope `slope` in r per z; a base prints on its bottom);
- * PART_FIT `{ d, grams }` (the fit test's two rings, Ø `d`, about `grams` g);
+ * PART_FIT `{ d, grams, lid, plug }` (the fit test: a lid's twist-lock on two rings, Ø `d`, about `grams` g – none when
+ * `d` is 0 – the part `lid`; and a base's, `plug` `{ d, grams, name }`, on a ring Ø `d` and a plug);
  * PART_GAP `{ letter, cutId, name, axis, z, gap, need, by,
  * islands, movedTo, nearest }` (at `z` its edge is `gap` mm from what stands beside it, `by` – 0 when it runs into it
  * – where it needs `need` to print apart, or its face is in `islands` pieces: moved to `movedTo`, or refused, with
@@ -4848,6 +4863,17 @@ const pad = (s, n) => (s.length >= n ? `${s}   ` : s + ' '.repeat(n - s.length +
 const size1 = (dims) => `${dims.map((v) => v.toFixed(1)).join(' × ')} mm`;
 
 /**
+ * What the glue sheet says the fit test holds for the parts' twist-locks (the PART_FIT note's fields): ": two rings
+ * Ø 40 mm and a ring Ø 56 mm with a plug, about 17 g" – nothing without one.
+ */
+function fitWords(fit) {
+  if (!fit) return '';
+  const what = [fit.d > 0 && `two rings Ø ${roundOpening(fit.d)} mm`, fit.plug && `a ring Ø ${roundOpening(fit.plug.d)} mm with a plug`].filter(Boolean);
+  const grams = (fit.d > 0 ? fit.grams ?? 0 : 0) + (fit.plug?.grams ?? 0);
+  return what.length ? `: ${listOf(what)}, about ${grams} g` : '';
+}
+
+/**
  * The glue sheet that goes in the zip: what to print, a dry fit, and the
  * glue steps in an order that never locks – or, when no two pieces touch
  * (cuts only between letters), that there is nothing to glue. The cuts that
@@ -4857,15 +4883,15 @@ const size1 = (dims) => `${dims.map((v) => v.toFixed(1)).join(' × ')} mm`;
  *   part?: string, name?: string, lids?: string[] }[],
  *   seams: object[], pins?: { d: number, length: number, count: number, spares?: number, own?: boolean }[],
  *   parts?: { name: string }[], clearance?: number, bed?: number[], printer?: { size: number[], margin: number }|null, steps?: object[],
- *   bridges?: number[] }} plan
+ *   bridges?: number[], fit?: object|null }} plan
  *   `seams` as for `assemblySteps`; a piece that is a part taken out has its cut's id (`part`), its `name` and the
  *   cut's letter (`lids`); `pins` one group per pin size (count without spares); `bed` the usable bed;
  *   `printer` the printer itself, when known, for the heading; `bridges` the clips' bridges' lengths as built (each
- *   hold's own on a 1.6 mm tongue when not given)
+ *   hold's own on a 1.6 mm tongue when not given); `fit` the PART_FIT note's fields, for what the fit test holds
  * @returns {string}
  */
 export function howToGlueText(plan) {
-  const { name = 'model', pieces = [], seams = [], parts = [], clearance = SPLIT_DEFAULTS.clearance, bed = null, printer = null } = plan;
+  const { name = 'model', pieces = [], seams = [], parts = [], clearance = SPLIT_DEFAULTS.clearance, bed = null, printer = null, fit = null } = plan;
   const pins = (Array.isArray(plan.pins) ? plan.pins : plan.pins ? [plan.pins] : []).filter((g) => g.count > 0);
   const steps = plan.steps ?? assemblySteps({ pieces, seams });
   const n = pieces.length;
@@ -4939,7 +4965,7 @@ export function howToGlueText(plan) {
     const spans = [...new Set(plan.bridges ?? [...lips.values()].filter((l) => l.clicks).map((l) => clipShape(l.hold)?.span ?? CLIP.span))].sort((a, b) => a - b);
     out.push(`  Clips are ${listOf(spans.map(mm))} mm bridges over a slot: print with bridging on (the default) and no supports.`);
   }
-  if (anyPins || anyPegs || anyTabs || anyLip || locked.length) out.push('  Not sure about the fit? Print the fit test first (Split card → Download fit test).');
+  if (anyPins || anyPegs || anyTabs || anyLip || locked.length) out.push(`  Not sure about the fit? Print the fit test first (Split card → Download fit test)${fitWords(fit)}.`);
   out.push('');
 
   if (!steps.length) {
@@ -4970,7 +4996,7 @@ export function howToGlueText(plan) {
   for (const x of locked) {
     const who = `The ${partCalled(x.part.name)} (cut ${x.letter})`;
     if (x.apart.mech === 'plug') {
-      out.push(`  ${who} should twist in with a click and twist out again by hand. Too stiff to turn: raise Clearance by 0.05 mm; loose, or no click: lower it by 0.05 mm, and download again.`);
+      out.push(`  ${who} should twist in with a click and twist out again by hand. Try the fit test first: if its plug is too stiff to turn in its ring, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.`);
     } else {
       out.push(`  ${who} should twist on with a click and twist off again by hand. Try the fit test first: if it's too stiff to turn, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.`);
     }

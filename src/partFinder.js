@@ -25,7 +25,7 @@
  * least scale is a factor on the model as it is now.
  */
 import { manifold } from './manifold.js';
-import { collarFor, collarReach, collarSlope, leastScale, plugAt, plugDims, plugFor, scalePercent, seatFloor, seatFloorAt, seatFor, seatSizes, sizes, takesTeaLight } from './locks.js';
+import { collarFor, collarReach, collarSlope, leastScale, plugAt, plugDims, plugFor, plugWhy, scalePercent, seatFloor, seatFloorAt, seatFor, seatSizes, sizes, takesTeaLight } from './locks.js';
 
 /** The levels the model is sliced at across its height, at the middle of each step. */
 export const PART_LEVELS = 240;
@@ -76,6 +76,10 @@ export const FINE_REACH = 1;
 export const OVER = 1e-4;
 /** Fine slices keep islands of this share of a speck and more: a sliver at the face would close a window. */
 export const FINE_SPECK = 0.01;
+/** A base's ring this share of the widest over the bottom is past the bottom's rounded or ragged edge (`bottomEdge`). */
+const EDGE_SHARE = 0.9;
+/** A soft or ragged bottom edge is at most this share of the model's height; anything taller stands under it. */
+export const EDGE_MOST = 0.004;
 /** The least scale is looked for up to this many times the model's size now, and checked this many 5 % steps up. */
 export const LEAST_MOST = 6;
 /** A lid's roof is read this far (mm) over its face for its slope. */
@@ -1013,12 +1017,30 @@ export function ringRows(fine, c, zBed, S) {
 }
 
 /**
- * The base's ring's least outside radius from over the bed layer and the bore's mouth (cut anyway, and where a
- * model's bottom edge is rounded or ragged) up to zMax, from its slices (`ringRows`), at q times the model's size now:
- * zMax is a height of the model at that size.
+ * How far up its slices (`ringRows`) a base's ring is narrower than over it: the lowest row whose ring is within a
+ * tenth of the widest in reach (a chamfer leaves it at the bed), never more than a third of the rows' reach. A
+ * generated mesh's soft or ragged bottom edge grows with the model, a thousandth of its height or so; anything taller
+ * than `EDGE_MOST` of it standing under the bottom – raised text, a foot – is where the lock's slots and the floor
+ * that holds its lugs would go (`standsUnder`).
  */
-function ringOutOf(rings, S, q) {
-  const from = Math.max(S.hl, S.mouth) / q;
+export function bottomEdge(rings) {
+  const most = Math.max(0, ...rings.map(({ r }) => r ?? 0));
+  if (!(most > 0)) return 0;
+  const first = rings.find(({ r }) => (r ?? 0) >= EDGE_SHARE * most);
+  return Math.min(first ? first.dz - rings[0].dz : 0, rings.at(-1).dz / 3);
+}
+
+/** Whether something stands under a base's bottom where its lock would go: taller than a soft edge (`bottomEdge`). */
+const standsUnder = (rings, height) => bottomEdge(rings) > EDGE_MOST * height + 1e-9;
+
+/**
+ * The base's ring's least outside radius from over the bed layer and the bore's mouth (cut anyway) and over the model's
+ * own soft or ragged bottom edge (`bottomEdge`, which grows with the model where the bed layer does not) up to zMax,
+ * from its slices (`ringRows`), at q times the model's size now: zMax is a height of the model at that size. Something
+ * taller under the bottom counts against the ring.
+ */
+function ringOutOf(rings, S, q, height) {
+  const from = Math.max(Math.max(S.hl, S.mouth) / q, standsUnder(rings, height) ? 0 : bottomEdge(rings));
   return (zMax) => {
     let least = Infinity;
     for (const { dz, r } of rings) if (dz > from + 1e-9 && dz <= zMax / q + 1e-9) least = Math.min(least, r ?? 0);
@@ -1027,8 +1049,8 @@ function ringOutOf(rings, S, q) {
 }
 
 /** The base's plug twist-lock at q times the model's size now (`plugFor`), from its ring's slices (`ringRows`). */
-function plugLockAt(cand, rings, S, zBed, q) {
-  return plugFor(S, { Rwindow: q * cand.R, solidTop: q * (cand.floorTop - zBed), ringOutAt: ringOutOf(rings, S, q) });
+function plugLockAt(cand, rings, S, zBed, q, height) {
+  return plugFor(S, { Rwindow: q * cand.R, solidTop: q * (cand.floorTop - zBed), ringOutAt: ringOutOf(rings, S, q, height) });
 }
 
 /**
@@ -1040,7 +1062,10 @@ function plugLockAt(cand, rings, S, zBed, q) {
 export function plugLockOf(stack, fine, c, R, S, zBed) {
   const floor = floorOf(stack, c);
   if (!floor || floor.solid) return { R, why: 'floor' };
-  return plugAt(S, R, { solidTop: floor.floorTop - zBed, ringOutAt: ringOutOf(ringRows(fine, c, zBed, S), S, 1) });
+  const rings = ringRows(fine, c, zBed, S);
+  const P = plugAt(S, R, { solidTop: floor.floorTop - zBed, ringOutAt: ringOutOf(rings, S, 1, stack.height) });
+  // none where something stands under the bottom: that is what to say, not that the wall is thin
+  return P.why && standsUnder(rings, stack.height) ? { R, why: 'under' } : P;
 }
 
 // ---------- the tea-light seat ----------
@@ -1369,18 +1394,24 @@ function lockWords(lock, S) {
 /** The base's entry: its window, ring and lock, and the least scales. */
 function plugEntry(stack, cand, fine, S, zBed, scale) {
   const rings = ringRows(fine, cand.c, zBed, S);
-  const now = plugLockAt(cand, rings, S, zBed, 1);
+  const now = plugLockAt(cand, rings, S, zBed, 1, stack.height);
   // the base's window, floor and ring grow with the model, so its lock at another scale is read straight off them
   const fits = (tea) => (q) => {
-    const P = plugLockAt(cand, rings, S, zBed, q);
+    const P = plugLockAt(cand, rings, S, zBed, q, stack.height);
     return !!P && (!tea || takesTeaLight(P.opening, S.c));
   };
   const least = {
     lock: now ? null : leastScale(fits(false), { from: 1, to: LEAST_MOST }),
     tea: fits(true)(1) ? null : leastScale(fits(true), { from: 1, to: LEAST_MOST }),
   };
-  // the opening the lock has at the scale the texts give for it: its least, up to a whole 5 % of the model as loaded
-  if (least.lock != null) least.opening = round(plugLockAt(cand, rings, S, zBed, scalePercent(least.lock * scale) / 100 / scale)?.opening ?? null, 2);
+  // the opening the lock has at the scale the texts give for it: its least, up to a whole 5 % of the model as loaded;
+  // where none fits as far as the finder looks, what stops it there
+  if (least.lock != null) least.opening = round(plugLockAt(cand, rings, S, zBed, scalePercent(least.lock * scale) / 100 / scale, stack.height)?.opening ?? null, 2);
+  const limit = now || least.lock != null
+    ? null
+    : standsUnder(rings, stack.height)
+      ? 'under'
+      : plugWhy(S, { Rwindow: LEAST_MOST * cand.R, solidTop: LEAST_MOST * (cand.floorTop - zBed), ringOutAt: ringOutOf(rings, S, LEAST_MOST, stack.height) });
   const lock = now && {
     mech: 'plug', R: now.R, opening: now.opening, theta: now.theta, wall: now.wall, camOutN: now.camOutN, ringOut: now.ringOut, tabs: now.tabs,
     tabR: now.tabR, coin: now.coin, teaLight: takesTeaLight(now.opening, S.c),
@@ -1391,7 +1422,7 @@ function plugEntry(stack, cand, fine, S, zBed, scale) {
   return {
     kind: 'plug', name: 'Base', centre: cand.c.map((v) => round(v, 6)), face: round(zBed), side: 1, r: round(R),
     window: [0, round(cand.R)], ringOut: round(cand.rOut), solidTop: round(cand.floorTop), top: round(cand.top), reach: round(cand.reach),
-    takesHandle: false, handle: null, lock, why: now ? null : 'room', least, seat, way: { up: true, lift: 0, dir: null, dirs: [], reach: 0 },
+    takesHandle: false, handle: null, lock, why: now ? null : 'room', least, ...(limit ? { limit } : {}), seat, way: { up: true, lift: 0, dir: null, dirs: [], reach: 0 },
   };
 }
 

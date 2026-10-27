@@ -1562,6 +1562,10 @@ describe('notes', () => {
       'Cut B: the base has no room for a twist-lock at 100 %. A twist-lock fits from 205 % (a 29 mm opening); a 38 mm tea light needs 275 %. At this size the base just lifts out.',
     );
     expect(text({ name: 'Top', wall: null })).toMatch(/^Cut B: the top has no room for a twist-lock at 100 %\..* At this size the top just lifts off\.$/);
+    // raised text or a foot under a base's bottom: what stops its lock at any size, and what to do
+    expect(text({ name: 'Base', why: 'under', wall: null, lock: null, tea: null, most: 600, base: null })).toBe(
+      "Cut B: something stands under the base's bottom where its twist-lock goes – raised text, or a foot – so it has none. Engrave the text there or move it off the bottom for one; until then the base just lifts out.",
+    );
   });
 
   it('says how a locked part prints, with the longest bridge its lock really has, and the fit test that tries it first', () => {
@@ -1581,6 +1585,13 @@ describe('notes', () => {
       level: 'info',
       text: "Print the fit test first (Download fit test): two rings Ø 53 mm, about 7 g. If they won't twist together, raise the Clearance by 0.05 mm and print them again; if they rattle or don't click, lower it. Most printers need 0.15–0.25 mm, and PETG 0.25–0.3.",
     });
+    // a base's lock alone is tried on a ring of its bore and a short plug; with a lid's too, both in one print
+    expect(splitNote('PART_FIT', { plug: { d: 74.8, grams: 19, name: 'Base' } }).text).toBe(
+      "Print the fit test first (Download fit test): a ring Ø 75 mm and a plug with the base's twist-lock, about 19 g. If the plug won't twist into the ring, raise the Clearance by 0.05 mm and print them again; if it rattles or doesn't click, lower it. Most printers need 0.15–0.25 mm, and PETG 0.25–0.3.",
+    );
+    expect(splitNote('PART_FIT', { d: 53.08, grams: 7, lid: 'Dome and cap', plug: { d: 74.8, grams: 19, name: 'Base' } }).text).toBe(
+      "Print the fit test first (Download fit test): two rings Ø 53 mm with the dome and cap's twist-lock, and a ring Ø 75 mm and a plug with the base's twist-lock, about 26 g in all. If a pair won't twist together, raise the Clearance by 0.05 mm and print them again; if one rattles or doesn't click, lower it. Most printers need 0.15–0.25 mm, and PETG 0.25–0.3.",
+    );
   });
 
   it('the glue sheet says how to put a twist-locked part on and take it off, never to glue it', () => {
@@ -1606,7 +1617,8 @@ describe('notes', () => {
     expect(sheet).toMatch(/piece 1 of 3 .*fits, twist-lock neck for cut A, twist-lock slots for cut B\n/);
     expect(sheet).toContain('  Not sure about the fit? Print the fit test first (Split card → Download fit test).');
     expect(sheet).toContain("DRY-FIT FIRST\n  The dome and cap (cut A) should twist on with a click and twist off again by hand. Try the fit test first: if it's too stiff to turn, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.\n");
-    expect(sheet).toContain('  The base (cut B) should twist in with a click and twist out again by hand. Too stiff to turn: raise Clearance by 0.05 mm; loose, or no click: lower it by 0.05 mm, and download again.\n');
+    // a base's lock has its own fit test now, a ring and a plug: tried first, as the lid's is
+    expect(sheet).toContain("  The base (cut B) should twist in with a click and twist out again by hand. Try the fit test first: if its plug is too stiff to turn in its ring, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.\n");
     expect(sheet).not.toContain('Hold the pieces together');
     // a collar steeper than 45° under the joint takes the dome's support
     expect(sheet).not.toContain('The collar');

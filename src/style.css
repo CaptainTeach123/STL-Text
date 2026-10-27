@@ -358,6 +358,12 @@ input[type='range'] {
   max-height: 7.5em;
   overflow-y: auto;
 }
+/* on a short screen (a laptop zoomed in) three lines: the bar must leave the panel room for the cards over it */
+@media (max-height: 520px) {
+  .actions .status {
+    max-height: 4.4em;
+  }
+}
 .actions .status:empty {
   min-height: 0;
 }
@@ -946,6 +952,10 @@ ul.plan li select {
   font-weight: 700;
 }
 
+/* the cuts' own box holds a lid's row and a base's whole, with its tea-light seat, before it scrolls */
+ul.plan#cutList {
+  max-height: 22rem;
+}
 /* one row per cut: its letter, the axis it is across, where it is, remove; what it cuts on a line below */
 #cutList li {
   grid-template-columns: auto auto 1fr auto auto;
@@ -1116,6 +1126,25 @@ ul.plan li select {
 /* too small for a lock at this size: amber, as a place where only a lip without clips fits */
 .part-offer.small {
   border-left-color: var(--amber);
+}
+/* the row a click on the model points to (a base too small for its lock at this size): lit for a moment */
+.part-offer.flash {
+  animation: part-flash 1.6s ease-out;
+}
+@keyframes part-flash {
+  0%,
+  40% {
+    background: color-mix(in srgb, var(--amber) 28%, var(--panel));
+  }
+  100% {
+    background: var(--panel);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .part-offer.flash {
+    animation: none;
+    outline: 2px solid var(--amber);
+  }
 }
 .part-detail {
   color: var(--muted);

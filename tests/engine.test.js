@@ -784,13 +784,27 @@ describe('a split that takes parts out', () => {
       // collar as steep as the dome; the base adds no overhang
       'PART_PRINT: Print piece 2 on its cut face, as saved. The lock needs no support: its slots and click tabs are bridged (10.5 mm or less) – if your slicer puts support inside them, turn on "don\'t support bridges". The collar under the joint inside piece 1 slopes like the dome (60°), so it needs whatever support the dome needs.',
       'PART_PRINT: Print piece 3 on its bottom, as saved. Its lock needs no support: every face it adds slopes at 45° or less, with no bridge.',
-      // the fit test the download makes: its rings as the fit test's own words give them
-      'PART_FIT: Print the fit test first (Download fit test): two rings Ø 40 mm, about 5 g. If they won\'t twist together, raise the Clearance by 0.05 mm and print them again; if they rattle or don\'t click, lower it. Most printers need 0.15–0.25 mm, and PETG 0.25–0.3.',
+      // the fit test the download makes: the lid's rings and the base's ring and plug, as the fit test's own words give them
+      "PART_FIT: Print the fit test first (Download fit test): two rings Ø 40 mm with the dome and cap's twist-lock, and a ring Ø 56 mm and a plug with the base's twist-lock, about 17 g in all. If a pair won't twist together, raise the Clearance by 0.05 mm and print them again; if one rattles or doesn't click, lower it. Most printers need 0.15–0.25 mm, and PETG 0.25–0.3.",
     ]);
     expect(ex.notes.slice(1).map((n) => n.level)).toEqual(['info', 'info', 'info', 'info', 'info']);
     expect(ex.notes.find((n) => n.code === 'PART_PRINT')).toMatchObject({ cutId: 'c1', piece: 2, home: 1, mech: 'twist', bridge: expect.closeTo(10.41, 2), slope: 1.72 });
     const coupon = await client.fitTest([], version, { printing, split: { clearance: 0.15, cuts: cuts('lock') }, name: 'bat' });
-    expect(ex.notes.find((n) => n.code === 'PART_FIT')).toMatchObject({ d: coupon.twist.d, grams: coupon.twist.grams });
+    expect(ex.notes.find((n) => n.code === 'PART_FIT')).toMatchObject({
+      d: coupon.twist.d, grams: coupon.twist.grams, lid: 'Dome and cap', plug: { d: coupon.plug.d, grams: coupon.plug.grams, name: 'Base' },
+    });
+    // with a lid and a base, both coupons in a row in one file: the lid's two rings, the base's ring and plug
+    expect(coupon.plug).toEqual({ R: 21.4, opening: 42.8, theta: 23, d: 56.2, grams: 12 });
+    const both = solidOf(coupon);
+    try {
+      const bodies = both.decompose();
+      const boxes = bodies.map((x) => x.boundingBox());
+      bodies.forEach((x) => x.delete());
+      expect(boxes.map((b) => [+(b.max[0] - b.min[0]).toFixed(1), b.min[2]])).toEqual([[40.1, 0], [40.1, 0], [56.2, 0], [42.7, 0]]);
+      expect(boxes.every((b, i) => i === 0 || b.min[0] > boxes[i - 1].max[0])).toBe(true);
+    } finally {
+      both.delete();
+    }
     expect(ex.assembly).toEqual([
       "Do not glue cut B: it comes apart. Base: its Ø 43 mm opening takes a 38 mm tea light – stand the light on the middle of the base, hold piece 1 up and, looking at the base's bottom, set the base in turned 23° to the left, push in and turn it right until it clicks (a coin in the slot helps). To open: turn it left and lower it out.",
       'Do not glue cut A: it comes apart. Dome and cap: set it on turned 27° to the left so the wide lug finds its wide slot, push down and turn it right until it clicks. To open: turn it left until it clicks again, lift it 4.5 mm and slide it out under the handle, square to it.',
@@ -804,7 +818,8 @@ describe('a split that takes parts out', () => {
     expect(glue).toMatch(/piece 1 of 3 .* fits, twist-lock neck for cut A, twist-lock slots for cut B\n/);
     expect(glue).toContain("  The collar under cut A's neck slopes like the dome (60°): it takes whatever support the dome takes.");
     expect(glue).toContain("  The dome and cap (cut A) should twist on with a click and twist off again by hand. Try the fit test first: if it's too stiff to turn, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.");
-    expect(glue).toContain('  The base (cut B) should twist in with a click and twist out again by hand.');
+    expect(glue).toContain("  The base (cut B) should twist in with a click and twist out again by hand. Try the fit test first: if its plug is too stiff to turn in its ring, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.");
+    expect(glue).toContain('  Not sure about the fit? Print the fit test first (Split card → Download fit test): two rings Ø 40 mm and a ring Ø 56 mm with a plug, about 17 g.');
     // the same parts lifting off, for what the locks add and take
     const plain = await exportFiles({ cuts: cuts('lift') });
     expect(plain.seams.map((x) => x.apart.mech)).toEqual([null, null]);
@@ -889,6 +904,64 @@ describe('a split that takes parts out', () => {
     await client.result([], version, { printing, split: { cuts: [{ id: 'c1', position: [0, 0, 100], normal: [0, 0, 1] }] } });
     expect((await client.call('ping', {})).caches.carved).toBe(0);
   });
+
+  it("takes only the base out, the top left on: its fit test is a ring and a plug with its lock, and the notes and the glue sheet say so", async () => {
+    await load(batLanternSolid().scale([3, 3, 3]));
+    const table = await client.parts([], version, { printing, split: {} });
+    const base = table.parts.find((e) => e.kind === 'plug');
+    const split = (hold) => ({ clearance: 0.15, cuts: [partCut('c1', base.centre, base.face, base.r, { hold })] });
+    // the base alone: no twist-lock rings, but its own coupon, the ring of its bore and a short plug
+    const fit = await client.fitTest([], version, { printing, split: split('lock'), name: 'bat' });
+    expect(fit.stl).not.toBeNull();
+    expect(fit.name).toBe('bat-fit-test');
+    expect(fit.twist).toBeUndefined();
+    expect(fit).toMatchObject({ pins: false, pegs: false, dovetail: false, apart: null, plug: { R: 21.4, opening: 42.8, theta: 23, d: 56.2, grams: 12 } });
+    expect(stlFileCheck(fit.stl)).toEqual({ degenerate: 0, open: 0 });
+    const coupon = solidOf(fit);
+    try {
+      const bodies = coupon.decompose();
+      const boxes = bodies.map((x) => x.boundingBox());
+      const volumes = bodies.map((x) => x.volume());
+      bodies.forEach((x) => x.delete());
+      // the ring as wide as the plug rule's least ring round a 21.4 mm bore, the plug its lugs past its face; each on
+      // the bed as it prints, as tall as the lock and a millimetre over it; together 12 g of PLA
+      expect(boxes.map((b) => [+(b.max[0] - b.min[0]).toFixed(1), b.min[2], +b.max[2].toFixed(2)])).toEqual([[56.2, 0, 6.4], [42.7, 0, 6.4]]);
+      expect(Math.round((volumes[0] + volumes[1]) * 1.24e-3)).toBe(12);
+    } finally {
+      coupon.delete();
+    }
+    const ex = await exportFiles(split('lock'));
+    expect(ex.pieces.map((p) => [p.name, p.part ?? null])).toEqual([['piece 1 of 2', null], ['Base', 'c1']]);
+    const note = ex.notes.find((n) => n.code === 'PART_FIT');
+    expect(note).toMatchObject({ plug: { d: 56.2, grams: 12, name: 'Base' } });
+    expect(note.text).toBe(
+      "Print the fit test first (Download fit test): a ring Ø 56 mm and a plug with the base's twist-lock, about 12 g. If the plug won't twist into the ring, raise the Clearance by 0.05 mm and print them again; if it rattles or doesn't click, lower it. Most printers need 0.15–0.25 mm, and PETG 0.25–0.3.",
+    );
+    const glue = ex.files.find((f) => f.kind === 'text').text;
+    expect(glue).toContain('  Not sure about the fit? Print the fit test first (Split card → Download fit test): a ring Ø 56 mm with a plug, about 12 g.');
+    expect(glue).toContain("  The base (cut A) should twist in with a click and twist out again by hand. Try the fit test first: if its plug is too stiff to turn in its ring, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.");
+    // a base that only lifts out has no lock to try: no file, and no note sends you to one
+    const lifts = await client.fitTest([], version, { printing, split: split('lift'), name: 'bat' });
+    expect([lifts.stl, lifts.plug]).toEqual([null, undefined]);
+    expect((await exportFiles(split('lift'))).notes.map((n) => n.code)).not.toContain('PART_FIT');
+  });
+
+  const baseOf = (table) => table.parts.find((e) => e.kind === 'plug');
+  it('raised text under the bottom is where the base\'s lock goes: on the model alone and on the final result alike, the base gets none, and why', async () => {
+    await load(batLanternSolid().scale([3, 3, 3]));
+    const under = topItem('HI', { position: [0, 0, 0], normal: [0, 0, -1], size: 10, depth: 1.4 });
+    // the card's table before the final result is built: read on the model alone, the text under it counted all the same
+    const sketch = await client.parts([under], version, { printing, split: {} });
+    expect(sketch.estimate).toBe(true);
+    expect(baseOf(sketch)).toMatchObject({ lock: null, limit: 'under', least: { lock: null, tea: null } });
+    // the same once the final result is built: the finder reads the letters under the bottom
+    await client.result([under], version, { printing });
+    const built = await client.parts([under], version, { printing, split: {} });
+    expect(built.estimate).toBeUndefined();
+    expect(baseOf(built)).toMatchObject({ lock: null, limit: 'under' });
+    // and no text there: the base locks, on either
+    expect(baseOf(await client.parts([], version, { printing, split: {} })).lock).toMatchObject({ mech: 'plug', R: 21.4 });
+  }, 120000);
 
   it('builds the lock again for a new clearance, nozzle or layer height, and carves nothing while the face stays', async () => {
     const model = batLanternSolid().scale([3, 3, 3]);

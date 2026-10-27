@@ -205,7 +205,7 @@ const lid400 = {
 };
 const base400 = { kind: 'plug', name: 'Base', centre: [0, 0], face: 0, r: 28.7, side: 1, lock: { mech: 'plug', R: 28.7, opening: 57.4, theta: 17, tabs: 3, coin: 51.1, teaLight: true }, why: null, least: { lock: null, tea: null } };
 const lid100 = { ...lid400, face: 29.2, r: 8.026, lock: null, why: 'room', least: { lock: 2.8, tea: 3.8, opening: 23.06 }, wall: { t: 0.6, slope: 30 } };
-const base100 = { ...base400, r: 8.6, lock: null, why: 'room', least: { lock: 2.04, tea: 2.75, opening: 29.4 } };
+const base100 = { ...base400, r: 8.6, lock: null, why: 'room', window: [0, 8.6], ringOut: 9.32, least: { lock: 2.04, tea: 2.75, opening: 29.4 } };
 const bat400 = { scale: 4, most: 6, zmin: 0, zmax: 200, parts: [lid400, base400], handles: [{ foot: 114.6, top: 197.1, span: [-1, 0] }] };
 const bat100 = { scale: 1, most: 6, zmin: 0, zmax: 50, parts: [lid100, base100], handles: [{ foot: 28.65, top: 49.27, span: [-1, 0] }] };
 
@@ -252,11 +252,21 @@ describe('parts that come off', () => {
       detail: 'Too small for a lock at this size: its roof is 0.6 mm thick. A twist-lock fits from 280 % (a 23 mm opening); a 38 mm tea light fits through it from 380 %.',
       badge: '', offers: [300, 400], use: 'lift',
     });
-    // a base too small for a lock is offered the size only: lifting out, it would drop out of the lantern
+    // a base too small for a lock is offered the size only (lifting out, it would drop out of the lantern), and reads as
+    // an offer: what it gets from what size, why not at this one – its bottom against the lock's – and what the size
+    // offered gives it
     expect(partCard(base100, bat100)).toEqual({
-      kind: 'plug', name: 'Base', lock: false, title: 'Base – could twist off underneath from 205 % (a 29 mm opening); a 38 mm tea light fits through it from 275 %.',
-      detail: '', badge: '', offers: [300], use: null,
+      kind: 'plug', name: 'Base', lock: false, title: 'Base – twists off underneath once the model is 205 % or bigger.',
+      detail: 'Too small for its twist-lock at this size: its bottom is Ø 19 mm across, and the lock needs Ø 38 mm. A 38 mm tea light fits through it from 275 %; at 300 % it twists off and takes a tea light.',
+      badge: '', offers: [300], use: null,
     });
+    // at 200 % the bottom is nearly wide enough: tenths, so the two never read alike
+    expect(partCard({ ...base100, ringOut: 18.64, least: { lock: 1.004, tea: 1.375, opening: 29.4 } }, { ...bat100, scale: 2 }).detail).toBe(
+      'Too small for its twist-lock at this size: its bottom is Ø 37.2 mm across, and the lock needs Ø 37.5 mm. A 38 mm tea light fits through it from 275 %; at 300 % it twists off and takes a tea light.',
+    );
+    // a size that gives the lock but no tea light, and one that gives both at once
+    expect(partCard({ ...base100, least: { lock: 2.04, tea: null, opening: 29.4 } }, bat100).detail).toMatch(/needs Ø 38 mm\. At 300 % it twists off\.$/);
+    expect(partCard({ ...base100, least: { lock: 2.95, tea: 2.95, opening: 39 } }, bat100).detail).toMatch(/From 295 % a 38 mm tea light fits through it too; at 300 % it twists off and takes a tea light\.$/);
     // least scales are factors on the size now: at 200 % the same lid needs 1.4 times it, still 280 % of the model as loaded
     const lid200 = { ...lid100, why: 'tabs', least: { lock: 1.4, tea: 1.9, opening: 23.06 } };
     expect(partCard(lid200, { ...bat100, scale: 2 }).detail).toBe(
@@ -270,7 +280,17 @@ describe('parts that come off', () => {
     expect(partCard({ ...lid100, why: 'collar', least: { lock: null, tea: null } }, bat100)).toMatchObject({
       detail: 'Too small for a lock at this size: nothing under it is deep enough to carry one. No twist-lock fits it up to 600 %.', offers: [], use: 'lift',
     });
-    expect(partCard({ ...base100, least: { lock: null, tea: null } }, bat100).title).toBe('Base – no twist-lock fits it underneath up to 600 %.');
+    // none at any size the finder looks at: listed all the same, with what stops it
+    expect(partCard({ ...base100, least: { lock: null, tea: null } }, bat100)).toMatchObject({ title: 'Base – no twist-lock fits it underneath up to 600 %.', detail: '', offers: [] });
+    expect(partCard({ ...base100, least: { lock: null, tea: null }, limit: 'wall' }, bat100).detail).toBe('The wall round its bottom is too thin to hold one.');
+    expect(partCard({ ...base100, least: { lock: null, tea: null }, limit: 'floor' }, bat100).detail).toBe('Its bottom is too thin to hold one.');
+    expect(partCard({ ...base100, least: { lock: null, tea: null }, limit: 'tabs' }, bat100).detail).toBe('There is no room inside it for the click tabs.');
+    // raised text or a foot under the bottom: what to do about it, not a size
+    expect(partCard({ ...base100, least: { lock: null, tea: null }, limit: 'under' }, bat100)).toMatchObject({
+      title: 'Base – no twist-lock fits it underneath while something stands under its bottom.',
+      detail: "Raised text or a foot under its bottom is where the lock's slots and the floor that holds its lugs go: engrave the text, or move it off the bottom.",
+      offers: [], use: null,
+    });
     expect(percentOf(2.04, 1)).toBe(205);
     expect(percentOf(null, 1)).toBeNull();
   });
@@ -280,6 +300,10 @@ describe('parts that come off', () => {
     expect(partsNote({ solid: false, open: { d: 72.4 }, parts: [] })).toBe('The top is already open (Ø 72 mm).');
     expect(partsNote({ solid: false, open: null, parts: [] })).toBe('No part comes off cleanly here – click the model where it should open.');
     expect(partsNote({ solid: false, open: null, parts: [] }, { aiming: false })).toBe('No part comes off cleanly here.');
+    // turned on its side since it was loaded: the parts are looked for along Z, so how to stand it up again
+    expect(partsNote({ solid: false, open: null, parts: [] }, { tipped: true })).toBe(
+      'No part comes off cleanly here – click the model where it should open. Parts come off along Z, the model standing on its bottom: it was turned since it was loaded – if it lies on its side now, Undo the turn (or turn it back) and its top and base are looked for again.',
+    );
     expect(partsNote(bat400)).toBeNull();
   });
 
@@ -297,7 +321,6 @@ describe('parts that come off', () => {
     expect(noFitTestWords([{ name: 'Top', hold: 'lock', least: null }, { name: 'Base', kind: 'plug', hold: 'lock', least: 215 }])).toBe(
       'Nothing to try: the top lifts off at this size – no twist-lock fits; the base lifts out at this size – a twist-lock fits from 215 %.',
     );
-    expect(noFitTestWords([{ name: 'Base', kind: 'plug', hold: 'lock', locks: true }])).toBe("Nothing to try: the base's twist-lock has no fit test of its own.");
   });
 
   it('reads out the part under the pointer: the lid and its lock, the handle it leaves on, the base', () => {
@@ -317,6 +340,7 @@ describe('parts that come off', () => {
     expect(partMeta({ hold: 'lock', lock: lid400.lock, handle: true })).toBe('twist-lock, 3 lugs, 6 clicks – turn 19° · the handle stays');
     expect(partMeta({ hold: 'lock', kind: 'plug', lock: { mech: 'plug', theta: 23 } })).toBe('twist-lock, 3 lugs – turn 23° · coin slot');
     expect(partMeta({ hold: 'lock', known: true, least: 280 })).toBe('lifts off – too small for a lock here (twist-lock from 280 %)');
+    expect(partMeta({ hold: 'lock', kind: 'plug', known: true, why: 'under' })).toBe('lifts out – something under its bottom is where its twist-lock goes');
     expect(partMeta({ hold: 'lock', known: true })).toBe('lifts off – too small for a lock here');
     expect(partMeta({ hold: 'lock', known: true, why: 'pieces' })).toBe('lifts off – a twist-lock would leave it in pieces');
     expect(partMeta({ hold: 'lift', lock: null })).toBe('lifts off – sits on its cut face');
@@ -429,6 +453,18 @@ describe('picking a part on the model', () => {
     // just under the face, inside the band: the lid
     expect(pickPart(table, [31, 0, 114])).toMatchObject({ part: lid, on: 'under' });
     expect(pickPart(table, [10, 0, 3])).toMatchObject({ part: base, on: 'base' });
+    // low on the model, where a cut across would take the rest off as its top: the walls round the base pick it, and
+    // so does what stands on its floor inside its circle (its cup, seen through a window)
+    expect(pickPart(table, [36, 0, 25])).toMatchObject({ part: base, on: 'base' });
+    expect(pickPart(table, [36, 0, 39.9])).toMatchObject({ part: base, on: 'base' });
+    expect(pickPart(table, [36, 0, 40.5])).toEqual({ part: null, index: -1, on: null });
+    expect(pickPart({ ...table, parts: [lid, { ...base, top: 50 }] }, [5, 0, 48])).toMatchObject({ part: { name: 'Base' }, on: 'base' });
+    expect(pickPart({ ...table, parts: [lid, { ...base, top: 50 }] }, [36, 0, 48])).toEqual({ part: null, index: -1, on: null });
+    // with no handle a cut across low down takes no handle with it, and a base too small to lock is no better than one:
+    // the walls there place a cut across, as a band below the openings
+    expect(pickPart({ ...table, handles: [] }, [36, 0, 25])).toEqual({ part: null, index: -1, on: null });
+    expect(pickPart({ ...table, parts: [lid, { ...base, lock: null }] }, [36, 0, 25])).toEqual({ part: null, index: -1, on: null });
+    expect(pickPart({ ...table, parts: [lid, { ...base, lock: null }] }, [10, 0, 3])).toMatchObject({ on: 'base' });
     // the band round the lantern's middle, a post and the air between the legs: none
     expect(pickPart(table, [45, 0, 60])).toEqual({ part: null, index: -1, on: null });
     expect(pickPart(table, [39, 0, 150])).toEqual({ part: null, index: -1, on: null });

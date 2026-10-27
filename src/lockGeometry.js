@@ -23,7 +23,7 @@
  * returned is the caller's.
  */
 import { manifold } from './manifold.js';
-import { SEAT_WORD, collarReach, layout, plugDims, plugLayoutOk, twistFor } from './locks.js';
+import { SEAT_WORD, collarReach, layout, plugDims, plugLayoutOk, plugRing, twistFor } from './locks.js';
 
 /** Segments for a full turn of every revolve: 0.008 mm inside the circle at r 40, far under any clearance. */
 export const LOCK_SEGMENTS = 160;
@@ -480,6 +480,44 @@ export function twistCoupon(S, r0, { theta = twistFor(S, r0) } = {}) {
     const socket = revolve(k, [[rIn, 0], [rOut, 0], [rOut, S.sockTop + 1], [rIn, S.sockTop + 1]]);
     const lid = k.add(socket.subtract(L.cutters)).add(L.ridges);
     return { body: neck.translate([0, 0, floor]), lid, d: 2 * rOut };
+  } finally {
+    k.dispose();
+  }
+}
+
+/**
+ * The plug twist-lock's fit test: a base's lock exactly as the pieces get it – the same lugs, L-slots and their
+ * mouths, click tabs, ridges and grooves, and coin slot, at the same bore R, clearance and layers (`lockSolids`) – on
+ * a ring and a short plug, so a print of a few grams tries the clearance before the model. The ring is the body's
+ * bore with its slots, as thin as the plug's rule lets a body that holds it be (`plugRing`); the plug is a band from
+ * three lines inside its tabs' slits out to its face, with a bar across it carrying the coin slot. Both are as tall as
+ * the lock and a millimetre over it, on whole layers, and stand on their bottoms on the bed, as the lantern and its
+ * base print: every face the lock adds 45° or kinder, so neither needs support. Fit it as the base: the plug into the
+ * ring from underneath, turned θ to the left, then right until it clicks.
+ * @param {object} S `sizes()`
+ * @param {number} R the bore
+ * @returns {{ body: Manifold, plug: Manifold, d: number }} the caller's, each standing on z = 0 about the axis; `d` the
+ *   ring's outer diameter
+ */
+export function plugCoupon(S, R) {
+  const { Manifold } = manifold();
+  const k = kit();
+  try {
+    const d = plugDims(S, R);
+    const h = +(Math.ceil((d.top + 1) / S.hl - 1e-9) * S.hl).toFixed(6);
+    const L = lockSolids({ mech: 'plug', S, R, top: h });
+    [L.body.cut, L.part.add, L.part.cut, L.part.after].forEach((m) => k.add(m));
+    const out = plugRing(S, R, d);
+    const ring = revolve(k, [[R, 0], [out, 0], [out, h], [R, h]]);
+    const wall = Math.max(1.2, 3 * S.n);
+    const rIn = d.rp - S.td - S.g - wall;
+    // the bar runs half a millimetre into the band, the coin slot (a millimetre inside the slits) on into the band
+    const band = revolve(k, [[rIn, 0], [R, 0], [R, h], [rIn, h]]);
+    const tall = +(Math.ceil((COIN.ridge + wall) / S.hl - 1e-9) * S.hl).toFixed(6);
+    const bar = k.add(k.add(Manifold.cube([2 * (rIn + 0.5), COIN.width + 2 * wall, tall], false)).translate([-(rIn + 0.5), -(COIN.width / 2 + wall), 0]));
+    const blank = k.add(Manifold.union([band, bar, L.part.add]));
+    const plug = k.add(blank.subtract(L.part.cut)).add(L.part.after);
+    return { body: ring.subtract(L.body.cut), plug, d: 2 * out };
   } finally {
     k.dispose();
   }

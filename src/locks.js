@@ -555,6 +555,26 @@ export function plugFor(S, { Rwindow, solidTop, ringOutAt }) {
 }
 
 /**
+ * What stops every bore `plugFor` tries, where none takes a lock: 'floor' (the bottom too thin), 'tabs' (the narrower
+ * bores whose ring holds have no room for the click tabs) or the ring's 'wall' or 'cam' at the narrowest; null where
+ * one fits.
+ * @param {object} S `sizes()`
+ * @param {{ Rwindow: number, solidTop: number, ringOutAt: (zMax: number) => number }} model as for `plugFor`
+ * @returns {'floor'|'tabs'|'wall'|'cam'|null}
+ */
+export function plugWhy(S, model) {
+  let why = 'tabs'; // a window under 3 mm has no room for one
+  for (let k = Math.floor(model.Rwindow * 10 + 1e-6); k >= 30; k--) {
+    const P = plugAt(S, k / 10, model);
+    if (!P.why) return null;
+    // a ring that holds with no room for the tabs has less room still on a narrower bore
+    if (P.why === 'floor' || P.why === 'tabs') return P.why;
+    why = P.why;
+  }
+  return why;
+}
+
+/**
  * The plug twist-lock on a bore of radius R exactly, by `plugFor`'s rule –
  * the engine builds the base a part asks for, whose circle is its own – or
  * why none: 'floor' when the bottom is not solid a millimetre over the lock,
@@ -581,6 +601,21 @@ export function plugAt(S, R, { solidTop, ringOutAt }) {
     R, opening: r6(2 * R), theta: L.theta, wall: r6(wall), camOutN: Math.round(cam), ringOut: r6(ringOut),
     zl: d.zl, top: d.top, rp: d.rp, coin: d.coin, tabs: L.tabs.length, tabR, layout: L,
   };
+}
+
+/**
+ * The ring a base's fit test tries its lock in (`plugCoupon`): the least outside radius, in steps of 0.1 mm, that
+ * `plugAt` takes round a bore of radius R – two lines and a millimetre behind the slots, outlasting three times the
+ * plug's hold before its lugs could cam it open – so the ring is as light as a body that holds the plug can be, and as
+ * stiff as the model's is at least.
+ */
+export function plugRing(S, R, d = plugDims(S, R)) {
+  const need = 3 * Math.round(plugHold(S));
+  const from = Math.ceil((R + d.e + S.c + 2 * S.n + 1) * 10 - 1e-6);
+  let k = from;
+  // the ring's give falls with the cube of its wall, so a few millimetres more always outlast the hold
+  while (camOut(S, R, d, k / 10) < need && k < from + 10_000) k++;
+  return r6(k / 10);
 }
 
 // ---------- springs ----------

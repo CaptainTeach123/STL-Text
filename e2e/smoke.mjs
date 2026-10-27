@@ -1590,7 +1590,7 @@ try {
       await page.waitForTimeout(1000); // Chromium lets a page start about ten downloads a second
       await openStl(lanternFile, 'lantern');
       check(
-        (await page.locator('#splitHint').innerText()) === "Too big for your printer, or want the top to come off – a lantern's, a box's lid? Cut it into pieces that print one by one.",
+        (await page.locator('#splitHint').innerText()) === "Too big for your printer, or want a part to come off – a lantern's top or base, a box's lid? Cut it into pieces that print one by one.",
         "the split card's hint offers a top that comes off as well",
         await page.locator('#splitHint').innerText(),
       );
@@ -2500,6 +2500,36 @@ try {
     await setText('ALONE');
   }
 
+  console.log('\na newer version out while the page is open');
+  {
+    // the page asks for the build the site has now, never from a cache: one other than its own says so, with Reload;
+    // its own says nothing
+    const newer = await browser.newContext({ viewport: { width: 1400, height: 850 } });
+    const n = await newer.newPage();
+    let asked = 0;
+    await n.route('**/version.json*', (route) => {
+      asked++;
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ build: 'a-newer-build' }) });
+    });
+    await n.goto(url);
+    await n.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    await n.waitForFunction(() => !document.querySelector('#toast').hidden && /newer version/.test(document.querySelector('#toastText').textContent), null, { timeout: 30000 }).catch(() => null);
+    const said = await n.evaluate(() => ({ hidden: document.querySelector('#toast').hidden, text: document.querySelector('#toastText').textContent, action: document.querySelector('#toastAction').textContent }));
+    const own = await newer.newPage();
+    await own.goto(url);
+    await own.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    const served = await own.evaluate(async () => (await (await fetch('./version.json', { cache: 'no-store' })).json()).build);
+    await own.waitForTimeout(500);
+    const quiet = await own.evaluate(() => /newer version/.test(document.querySelector('#toastText').textContent));
+    check(
+      asked > 0 && !said.hidden && said.text === 'A newer version of STL Text is out – reload to use it (download what you have made first).' && said.action === 'Reload' &&
+        typeof served === 'string' && served.length > 0 && !quiet,
+      'a page older than the site says a newer version is out, with Reload; the build itself serves its version and says nothing',
+      JSON.stringify({ asked, said, served, quiet }),
+    );
+    await newer.close();
+  }
+
   console.log('\nresponsiveness while loading a large model');
   const bigFile = writeFixture('big.stl', soupOf(Manifold.sphere(30, 600)));
   const t0 = Date.now();
@@ -3375,7 +3405,13 @@ try {
         const el = document.querySelector('#cutReadout');
         return { hidden: el.hidden, first: el.firstElementChild?.textContent ?? null, buttons: [...el.querySelectorAll('button')].map((b) => b.textContent) };
       });
-    await phone.locator('#addApartBtn').scrollIntoViewIfNeeded();
+    // the parts card was scrolled into view under the button as it listed: the button is brought out from under the
+    // view, which stays over the top of the page, as a finger would
+    await phone.evaluate(() => {
+      const b = document.querySelector('#addApartBtn').getBoundingClientRect();
+      const under = document.querySelector('#stage').getBoundingClientRect().bottom;
+      if (b.top < under + 8) window.scrollBy(0, b.top - under - 40);
+    });
     await phone.locator('#addApartBtn').tap();
     await phoneIdle();
     await phone.evaluate(() => document.querySelector('#stage').scrollIntoView({ block: 'start' }));
@@ -3476,13 +3512,29 @@ try {
         if (type === 'webgl' || type === 'webgl2') attrs = { ...attrs, preserveDrawingBuffer: true };
         return getContext.call(this, type, attrs);
       };
-      // what the page asks the engine, in order: the split's modes ('parts', 'targets', …) and the previews
+      // what the page asks the engine, in order: the split's modes ('parts', 'targets', …) and the previews; and the
+      // parts table's answers held back while window.__holdParts (the seconds a dense model takes to find them)
       const Native = window.Worker;
       const posts = (window.__posts = []);
+      const partsAsked = new Set();
+      window.__heldParts = [];
       window.Worker = class extends Native {
         postMessage(message, transfer) {
           if (message?.type) posts.push(message.type === 'split.plan' ? `split.plan:${message.mode}` : message.type);
+          if (message?.type === 'split.plan' && message.mode === 'parts') partsAsked.add(message.id);
           return super.postMessage(message, transfer);
+        }
+        set onmessage(listener) {
+          super.onmessage =
+            listener &&
+            ((event) => {
+              const { id, type } = event.data ?? {};
+              if (window.__holdParts && partsAsked.has(id) && type !== 'progress') window.__heldParts.push(() => listener.call(this, event));
+              else listener.call(this, event);
+            });
+        }
+        get onmessage() {
+          return super.onmessage;
         }
       };
     });
@@ -3584,6 +3636,52 @@ try {
       "+ Removable part asks for the parts first, and what to do shows at the foot of the panel, over what scrolls under it",
       JSON.stringify({ asked, hint }),
     );
+    // the card opens at the foot of the panel, under the bar that holds that hint: it is scrolled into view, whole, the
+    // base's row and its button where a click lands on them
+    const shownWhole = await b.evaluate(() => {
+      const r = document.querySelector('#partsCard').getBoundingClientRect();
+      const bar = document.querySelector('.panel .actions').getBoundingClientRect();
+      const panel = document.querySelector('.panel').getBoundingClientRect();
+      const button = [...document.querySelectorAll('#partList li')].at(-1)?.querySelector('button');
+      const br = button?.getBoundingClientRect();
+      const hit = br ? document.elementFromPoint(br.left + br.width / 2, br.top + br.height / 2) : null;
+      return { top: Math.round(r.top), bottom: Math.round(r.bottom), bar: Math.round(bar.top), panel: Math.round(panel.top), button: button?.textContent ?? null, hit: !!hit && hit === button };
+    });
+    check(
+      shownWhole.top >= shownWhole.panel && shownWhole.bottom <= shownWhole.bar && shownWhole.button === 'Make it 300 %' && shownWhole.hit,
+      "+ Removable part scrolls the card into view above the bar, whole: the base's Make it 300 % is there to click",
+      JSON.stringify(shownWhole),
+    );
+    // at this size the base is too small for its lock: over it the readout says so, and a click there cuts nothing –
+    // a cut across there would take the rest of the lantern off it as its top – but shows its row, lit, its size to press
+    const st0 = await b.locator('#stage canvas').boundingBox();
+    const readoutLines = () => b.evaluate(() => {
+      const el = document.querySelector('#cutReadout');
+      return el.hidden ? null : [...el.children].map((c) => c.textContent);
+    });
+    let smallY = null;
+    for (let y = st0.y + st0.height - 12; y > st0.y + st0.height / 2 && smallY == null; y -= 4) {
+      await b.mouse.move(st0.x + st0.width / 2, y);
+      await b.waitForTimeout(40);
+      if ((await readoutLines())?.[0]?.startsWith('Base · too small')) smallY = y - 8;
+    }
+    await b.mouse.move(st0.x + st0.width / 2, smallY + 1);
+    await b.mouse.move(st0.x + st0.width / 2, smallY);
+    await b.waitForTimeout(300);
+    const overSmall = await readoutLines();
+    await b.mouse.click(st0.x + st0.width / 2, smallY);
+    await settle();
+    const smallClick = {
+      rows: (await partRows()).length, pressed: await b.getAttribute('#addApartBtn', 'aria-pressed'), status: await b.locator('#status').innerText(),
+      lit: await b.evaluate(() => document.querySelector('#partList li[data-part-kind="plug"]')?.classList.contains('flash') ?? false),
+    };
+    check(
+      smallY != null && overSmall?.[0] === 'Base · too small for a lock at this size – twists off from 215 %' && overSmall?.[1] === 'make it 300 % to take it out – click for its row' &&
+        smallClick.rows === 0 && smallClick.pressed === 'true' && smallClick.lit &&
+        smallClick.status === 'The base is too small for its twist-lock at this size – it twists off underneath from 215 %. Make it 300 % (in Parts that come off), then click it again.',
+      'a click on the base while it is too small for its lock places no cut across – it would take the top off – but says why and lights its row, its size offered',
+      JSON.stringify({ smallY, overSmall, smallClick }),
+    );
     await b.keyboard.press('Escape');
     await settle();
     const small = await card();
@@ -3593,7 +3691,8 @@ try {
         dome.title === 'Dome and cap – comes off inside the handle; the handle stays on the lantern.' &&
         dome.detail === 'Too small for a lock at this size: its roof is 0.7 mm thick. A twist-lock fits from 275 % (a 24 mm opening); a 38 mm tea light fits through it from 365 %.' &&
         JSON.stringify(dome.buttons) === JSON.stringify(['Make it 300 %', 'Make it 400 %', 'Use – it just lifts off']) &&
-        base.title === 'Base – could twist off underneath from 215 % (a 30 mm opening); a 38 mm tea light fits through it from 275 %.' &&
+        base.title === 'Base – twists off underneath once the model is 215 % or bigger.' &&
+        base.detail === 'Too small for its twist-lock at this size: its bottom is Ø 19 mm across, and the lock needs Ø 39 mm. A 38 mm tea light fits through it from 275 %; at 300 % it twists off and takes a tea light.' &&
         JSON.stringify(base.buttons) === JSON.stringify(['Make it 300 %']),
       '+ Removable part lists the dome and cap inside the handle and the base, each too small to lock at 100 % and from what size one fits',
       JSON.stringify(small),
@@ -4208,6 +4307,33 @@ try {
       'over the base its readout says it twists off underneath, and it lights up',
       JSON.stringify(onBase),
     );
+    // the walls low on the lantern, over its bottom: a cut across there would take the rest of it off as its top, so
+    // the base lights up there and a click takes it out – Alt still places a cut across
+    await b.keyboard.down('Alt');
+    let lowY = null;
+    let lowZ = null;
+    for (let y = pickAt.base; y > stage.y && lowY == null; y -= 3) {
+      await b.mouse.move(px, y);
+      await b.waitForTimeout(40);
+      const z = Number((await pickReadout())?.lines[0].match(/^Z ([\d.]+) mm/)?.[1]);
+      if (z > 21 && z < 28) [lowY, lowZ] = [y, z];
+    }
+    await b.keyboard.up('Alt');
+    await restAt(px, lowY);
+    const onLowWall = { ...(await pickReadout()), ...(await pickColours()) };
+    await b.mouse.click(px, lowY);
+    await settle();
+    const lowRows = await partRows();
+    await b.click('#undoBtn');
+    await settle();
+    check(
+      lowY != null && JSON.stringify(onLowWall.lines) === JSON.stringify(['Base twists off underneath · Ø 43 mm opening · twist-lock, 3 lugs, turn 23°']) && onLowWall.gold > 1000 &&
+        lowRows.length === 1 && lowRows[0].name === 'Base' && (await partRows()).length === 0,
+      "low on the lantern's walls, over its bottom, the base lights up and a click takes it out – not a cut across that takes the top off",
+      JSON.stringify({ lowY, lowZ, onLowWall, lowRows }),
+    );
+    await b.click('#addApartBtn');
+    await settle();
     // a click on the dome: its part, placed as the finder places it, selected; placing stops
     await b.mouse.click(px, pickAt.dome);
     await settle();
@@ -4431,6 +4557,50 @@ try {
       "a hollow ball's card offers nothing to press, and the spots' note says to pick a place on the model, not to use a part",
       JSON.stringify(ballCard),
     );
+    // a click on the model while its parts are still being found waits for them, and then takes what it landed on: on
+    // the base, too small at 100 %, no cut across that would take the top off – its row, lit
+    {
+      const w = await batContext.newPage();
+      w.on('pageerror', (e) => batProblems.push(`pageerror: ${e.message}`));
+      const idleW = async () => {
+        await w.waitForTimeout(80);
+        await w.waitForSelector('body[data-engine="idle"]', { timeout: 120000 });
+      };
+      await w.goto(url);
+      await w.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+      await w.setInputFiles('#stlFile', batFile);
+      await w.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('batlantern:'), null, { timeout: 60000 });
+      await idleW();
+      await w.evaluate(() => (document.querySelector('#toast').hidden = true));
+      await w.click('#itemList li:first-child');
+      await w.keyboard.press('Delete');
+      await idleW();
+      // the base where the first page found it at this size: the model is framed alike on loading
+      const st = await w.locator('#stage canvas').boundingBox();
+      await w.evaluate(() => (window.__holdParts = true));
+      await w.click('#addApartBtn');
+      await w.waitForFunction(() => document.querySelector('#partsNote').classList.contains('busy'), null, { timeout: 60000 });
+      await w.waitForFunction(() => window.__heldParts.length > 0, null, { timeout: 120000 });
+      const finding = await w.locator('#status').innerText();
+      await w.mouse.move(st.x + st.width / 2, smallY + 1);
+      await w.mouse.click(st.x + st.width / 2, smallY);
+      const waiting = { status: await w.locator('#status').innerText(), rows: await w.locator('#cutList > li').count() };
+      await w.evaluate(() => {
+        window.__holdParts = false;
+        window.__heldParts.splice(0).forEach((deliver) => deliver());
+      });
+      await w.waitForFunction(() => !document.querySelector('#partsNote').classList.contains('busy') && document.querySelectorAll('#partList li').length > 0, null, { timeout: 120000 });
+      await idleW();
+      const after = { status: await w.locator('#status').innerText(), rows: await w.locator('#cutList > li').count(), pressed: await w.getAttribute('#addApartBtn', 'aria-pressed') };
+      check(
+        finding.startsWith('Finding the parts that come off… Then click one that lights up') &&
+          waiting.status === 'Finding the parts that come off – your click takes what it landed on once they are in.' && waiting.rows === 0 &&
+          after.rows === 0 && after.pressed === 'true' && after.status.startsWith('The base is too small for its twist-lock at this size – it twists off underneath from 215 %.'),
+        'a click while the parts are still being found waits for them: on the base, too small at 100 %, it places no cut across but offers the base',
+        JSON.stringify({ smallY, finding, waiting, after }),
+      );
+      await w.close();
+    }
     check(batProblems.length === 0, 'no page errors with parts that come off', batProblems.join(' | '));
     await batContext.close();
   }
@@ -4518,6 +4688,33 @@ try {
       'Show pieces lists the seat on the base, the notes say a 38 mm tea light sits in it and how the base goes in with it, and the legend keys it',
       JSON.stringify(withSeat),
     );
+    // the base alone, the top left on: Download fit test saves a ring of its bore and a short plug with its lock, and
+    // the status says what they are and how they go together
+    {
+      const [dl] = await Promise.all([s.waitForEvent('download', { timeout: 60000 }).catch(() => null), s.click('#splitFitTestBtn')]);
+      let shells = [];
+      if (dl) {
+        const file = path.join(out, 'bat-seat-fit-test.stl');
+        await dl.saveAs(file);
+        const buf = fs.readFileSync(file);
+        const m = geometryToManifold(parseSTL(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)));
+        shells = m.decompose().map((x) => {
+          const b = x.boundingBox();
+          x.delete();
+          return [+(b.max[0] - b.min[0]).toFixed(1), +b.min[2].toFixed(3)];
+        });
+        m.delete();
+      }
+      await settle();
+      const said = await s.locator('#status').innerText();
+      check(
+        !!dl && /^bat-seat.*-fit-test\.stl$/.test(dl.suggestedFilename()) && shells.length === 2 && shells.every(([, z]) => z === 0) &&
+          /A ring Ø 75 mm and a plug with the base's twist-lock at this size \(about \d+ g\): looking at the plug's coin slot, it should go into the ring's bottom \(the side it printed on\) turned 17° to the left, turn right until it clicks/.test(said) &&
+          withSeat.notes.includes("a ring Ø 75 mm and a plug with the base's twist-lock"),
+        "with only the base taken out, Download fit test saves a file: a ring and a plug with the base's twist-lock, which the status and the notes describe",
+        JSON.stringify({ file: dl?.suggestedFilename() ?? null, shells, said }),
+      );
+    }
     // the view: Look at the lock, then the seat from over the base, its word on it; the base's own ▶ brings the base
     // back into view from wherever the camera is, the seat showing through the pieces faded round it
     const violet = () =>

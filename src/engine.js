@@ -26,9 +26,9 @@ import {
   buildSplitDisplay, carveParts, checkPart, clearSplitCaches, couponRow, cutPieces, drillPiece, fitTestCoupon, layoutSplit, lockFaces, lockMatrix, lockPieces, lockPoints, partFrame, partInFrame, partedSolids,
   partRows, pinAt, pinSheet, pinSpares, pinsPerSheet, placePart, planDovetails, probeLip, shellCounts, tabsAcross, wayOverlaps,
 } from './splitGeometry.js';
-import { FINE_SPECK, LEAST_MOST, WAY_START, WAY_STEP, findParts, fineSlices, freeWindows, sliceStack } from './partFinder.js';
-import { scalePercent, seatSizes, sizes, slitBridge, takesTeaLight } from './locks.js';
-import { twistCoupon } from './lockGeometry.js';
+import { EDGE_MOST, FINE_SPECK, LEAST_MOST, WAY_START, WAY_STEP, findParts, fineSlices, freeWindows, sliceStack } from './partFinder.js';
+import { plugLayoutOk, scalePercent, seatSizes, sizes, slitBridge, takesTeaLight } from './locks.js';
+import { plugCoupon, twistCoupon } from './lockGeometry.js';
 
 /**
  * The geometry engine: a pure request handler that owns Manifold objects,
@@ -2495,7 +2495,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * Why no lock fits a part at its size, where a bigger print may fit one (the parts table says from what size): a
    * lid's roof, tabs or collar, a base's floor, wall or ring – not a lock that would leave the part in pieces.
    */
-  const SMALL_WHY = new Set(['room', 'tabs', 'collar', 'floor', 'wall', 'cam']);
+  const SMALL_WHY = new Set(['room', 'tabs', 'collar', 'floor', 'wall', 'cam', 'under']);
 
   /**
    * What the parts that come off are worked out from, the model alone's (`model`, a Manifold): kept once for both the
@@ -3324,9 +3324,17 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         ...(x.apart.mech === 'twist' ? { bridge: slitBridge(built.S, x.apart.r0).long, slope: x.apart.slope } : {}),
       }));
     }
-    // the fit test tries the split's first twist-lock: said once, when a part has one
+    // the fit test tries the split's first twist-lock and its first base's plug lock: said once, when a part has one
     const tried = (layout.locks ?? []).find((l) => l.mech === 'twist');
-    if (tried && partSeams.some((s) => s.apart.mech === 'twist')) lockNotes.push(splitNote('PART_FIT', couponOf(tried.S, tried.r0, tried.theta)));
+    const lid = partSeams.find((s) => s.apart.mech === 'twist');
+    const plugged = (layout.locks ?? []).find((l) => l.mech === 'plug');
+    const base = partSeams.find((s) => s.apart.mech === 'plug');
+    if ((tried && lid) || (plugged && base)) {
+      lockNotes.push(splitNote('PART_FIT', {
+        ...(tried && lid ? { ...couponOf(tried), lid: lid.part.name } : {}),
+        ...(plugged && base ? { plug: { ...couponOf(plugged), name: base.part.name } } : {}),
+      }));
+    }
     notes.push(...given, ...lockNotes, ...plan.notes, ...smallPieceNotes(laid, cuts), ...cutNotes);
     // what prints on its own must fit the bed as it is saved too: a part lying pegs up, a pin on its flat
     for (const p of final.separate) {
@@ -3502,6 +3510,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const text = howToGlueText({
       name, pieces: split.pieces, seams, pins: split.pins, parts: final.separate.map((p) => ({ name: p.name })),
       clearance: spec.clearance, bed: U, printer, steps: assembly, ...(bridges.length ? { bridges } : {}),
+      fit: split.notes.find((n) => n.code === 'PART_FIT') ?? null,
     });
     const glue = glueFileName(name);
     files.push({ name: glue.replace(/\.txt$/, ''), file: glue, kind: 'text', text });
@@ -4575,7 +4584,27 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     if (unavailable || !final.solid) return { message: { parts: [], handles: [], solid: false, open: null, notes, ...extra }, transfer: [] };
     const { spec } = normaliseSplit({ ...(split ?? {}), cuts: [] });
     const table = partsTable(final, { n: printing?.nozzle ?? 0.4, hl: printing?.layerHeight ?? 0.2, c: spec.clearance }, progress);
-    return { message: { ...table, notes, ...extra }, transfer: [] };
+    return { message: { ...(estimate ? underBase(table, final.itemBounds ?? []) : table), notes, ...extra }, transfer: [] };
+  }
+
+  /**
+   * The parts table read on the model alone, with raised text standing under the model's bottom round its base: the
+   * final result's base has that text where its lock's slots go, and gets no lock at any size (the finder's 'under'),
+   * so the table says so here too rather than offer a lock the pieces won't have. Anything else as it is.
+   */
+  function underBase(table, itemBounds) {
+    const k = table.parts.findIndex((e) => e.kind === 'plug');
+    if (k < 0) return table;
+    const e = table.parts[k];
+    const reach = e.ringOut ?? e.r;
+    const height = table.zmax - table.zmin;
+    const under = itemBounds.filter((b) => !b.engrave && !b.separate && !b.part
+      && b.max[0] > e.centre[0] - reach && b.min[0] < e.centre[0] + reach && b.max[1] > e.centre[1] - reach && b.min[1] < e.centre[1] + reach);
+    const depth = Math.max(0, ...under.map((b) => table.zmin - b.min[2]));
+    if (!(depth > EDGE_MOST * height + 1e-9)) return table;
+    const parts = [...table.parts];
+    parts[k] = { ...e, lock: null, why: 'room', least: { lock: null, tea: null }, limit: 'under' };
+    return { ...table, parts };
   }
 
   /**
@@ -4964,27 +4993,30 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     });
   }
 
-  /** The twist-lock fit tests sized so far, by lock: their rings' diameter and weight (a few kept). */
+  /** The twist-lock fit tests sized so far, by lock: their coupons' diameter and weight (a few kept). */
   const coupons = new Map();
   const COUPONS = 8;
 
   /**
-   * A twist-lock's fit test (`twistCoupon`): its rings' outer diameter (`d`, mm) and their weight in PLA (`grams`),
-   * which a part's note and the fit test's own words quote alike. Kept by lock, so the note makes the rings once; with
-   * `keep` the rings are handed back too (the caller's).
+   * A twist-lock's fit test: a lid's collar lock on two rings (`twistCoupon`), a base's plug lock on a ring and a short
+   * plug (`plugCoupon`) – the outer diameter of its widest ring (`d`, mm) and the weight of both in PLA (`grams`),
+   * which a part's note and the fit test's own words quote alike. Kept by lock, so the note makes them once; with
+   * `keep` the two solids are handed back too (`solids`, the caller's).
+   * @param {{ mech: 'twist'|'plug', S: object, r0?: number, theta?: number, R?: number }} lock
    */
-  function couponOf(S, r0, theta, { keep = false } = {}) {
-    const key = stableKey({ S, r0, theta });
+  function couponOf(lock, { keep = false } = {}) {
+    const plug = lock.mech === 'plug';
+    const key = stableKey(plug ? { mech: 'plug', S: lock.S, R: lock.R } : { S: lock.S, r0: lock.r0, theta: lock.theta });
     const kept = coupons.get(key);
     if (kept && !keep) return kept;
-    const rings = twistCoupon(S, r0, { theta });
-    const size = { d: +rings.d.toFixed(2), grams: Math.round((rings.body.volume() + rings.lid.volume()) * PLA_DENSITY) };
+    const made = plug ? plugCoupon(lock.S, lock.R) : twistCoupon(lock.S, lock.r0, { theta: lock.theta });
+    const solids = plug ? [made.body, made.plug] : [made.body, made.lid];
+    const size = { d: +made.d.toFixed(2), grams: Math.round(solids.reduce((sum, m) => sum + m.volume(), 0) * PLA_DENSITY) };
     coupons.delete(key);
     coupons.set(key, size);
     while (coupons.size > COUPONS) coupons.delete(coupons.keys().next().value);
-    if (keep) return { ...size, rings };
-    rings.body.delete();
-    rings.lid.delete();
+    if (keep) return { ...size, solids };
+    solids.forEach((m) => m.delete());
     return size;
   }
 
@@ -5002,8 +5034,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * apart on a lip (or, without the model, where one is set to come apart)
    * it adds a small box and its lid with the same lip, held as that cut's
    * lip holds (`apart`: the hold of the first seam whose lip has clips,
-   * 'lift' when none has). No pins, pegs, tabs or lip (glue only) gives no
-   * file (`stl: null`).
+   * 'lift' when none has). A part's twist-lock as built is tried on a
+   * coupon of its own beside the rest, in a row: a lid's on two rings
+   * (`twist`), a base's on a ring and a short plug (`plug`), each with its
+   * widest diameter and its weight. No pins, pegs, tabs, lip or lock (glue
+   * only, or parts that just lift off) gives no file (`stl: null`).
    */
   function fitTest({ items = null, baseVersion = null, split = null, printing = null, bed = null, name = 'model', dovetail = null }, progress) {
     const { spec } = normaliseSplit({ ...(split ?? {}), cuts: [] });
@@ -5029,20 +5064,24 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         const clicking = lipped.find((s) => s.apart.clips > 0 && s.apart.hold !== 'lift');
         uses.apart = clicking ? clicking.apart.hold : lipped.length ? 'lift' : null;
         // a twist-lock as built – a full cut's in place of its lip, or a part's – is tried on a coupon of its own: the
-        // same neck, lugs, slots and click tabs, at the same clearance and layers
-        const twist = (parted.drill?.layout.locks ?? []).find((l) => l.mech === 'twist');
-        if (twist) uses.twist = { S: twist.S, r0: twist.r0, theta: twist.theta };
+        // same neck, lugs, slots and click tabs, at the same clearance and layers; a base's plug lock too, its lugs,
+        // slots, click tabs and coin slot at the same bore
+        const locks = parted.drill?.layout.locks ?? [];
+        const twist = locks.find((l) => l.mech === 'twist');
+        if (twist) uses.twist = { mech: 'twist', S: twist.S, r0: twist.r0, theta: twist.theta };
+        const plug = locks.find((l) => l.mech === 'plug');
+        if (plug) uses.plug = { mech: 'plug', S: plug.S, R: plug.R };
       }
     }
     if (dovetail !== null) uses.dovetail = Boolean(dovetail);
     const file = `${safeFileName(name)}-fit-test`;
-    if (!uses.pins && !uses.pegs && !uses.dovetail && !uses.apart && !uses.twist) {
+    if (!uses.pins && !uses.pegs && !uses.dovetail && !uses.apart && !uses.twist && !uses.plug) {
       return { message: { stl: null, name: file, triangles: 0, diameter: null, pins: false, dovetail: false, pegs: false, pegSize: null, apart: null }, transfer: [] };
     }
     progress?.('Making the fit test…');
     const temps = scope();
     try {
-      // with a twist-lock and nothing else to try, its rings alone; else beside the rest, in a row
+      // with a twist-lock and nothing else to try, its coupon alone; else beside the rest, in a row
       const others = uses.pins || uses.pegs || uses.dovetail || uses.apart;
       const shells = [];
       if (others) {
@@ -5052,9 +5091,15 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       }
       let twist = null;
       if (uses.twist) {
-        const { d, grams, rings } = couponOf(uses.twist.S, uses.twist.r0, uses.twist.theta, { keep: true });
-        shells.push(temps.add(rings.body), temps.add(rings.lid));
+        const { d, grams, solids } = couponOf(uses.twist, { keep: true });
+        shells.push(...solids.map((m) => temps.add(m)));
         twist = { r0: uses.twist.r0, theta: uses.twist.theta, d, grams };
+      }
+      let plug = null;
+      if (uses.plug) {
+        const { d, grams, solids } = couponOf(uses.plug, { keep: true });
+        shells.push(...solids.map((m) => temps.add(m)));
+        plug = { R: uses.plug.R, opening: +(2 * uses.plug.R).toFixed(6), theta: plugLayoutOk(uses.plug.S, uses.plug.R).theta, d, grams };
       }
       const coupon = shells.length === 1 ? shells[0] : temps.add(couponRow(shells));
       const soup = manifoldToSoup(coupon);
@@ -5062,7 +5107,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       return {
         message: {
           stl, name: file, triangles: soup.length / 9, diameter: uses.pins ? uses.diameter : null, pins: uses.pins, dovetail: uses.dovetail,
-          pegs: uses.pegs, pegSize: uses.pegs ? uses.pegSize : null, apart: uses.apart, ...(twist ? { twist } : {}),
+          pegs: uses.pegs, pegSize: uses.pegs ? uses.pegSize : null, apart: uses.apart, ...(twist ? { twist } : {}), ...(plug ? { plug } : {}),
         },
         transfer: [stl],
       };

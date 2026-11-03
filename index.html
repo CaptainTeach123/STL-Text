@@ -534,12 +534,16 @@
           </div>
           <div class="tools">
             <label class="field inline" title="The printer the pieces of a split must fit"><span>Printer</span><select id="bedPreset"></select></label>
+            <p class="hint tiny" id="bedCornerHint" hidden>Keeps its front-left corner clear, as Bambu Studio does.</p>
             <div class="grid3" title="The printer's build volume; changing it switches to Custom">
               <label class="field"><span>Bed X <small>mm</small></span><input type="number" id="bedX" min="20" max="2000" step="1" value="220" /></label>
               <label class="field"><span>Bed Y <small>mm</small></span><input type="number" id="bedY" min="20" max="2000" step="1" value="220" /></label>
               <label class="field"><span>Height <small>mm</small></span><input type="number" id="bedZ" min="20" max="2000" step="1" value="250" /></label>
             </div>
-            <label class="field inline" title="Kept clear on every side of the bed, for a brim, the purge line or clips"><span>Margin</span><input type="number" id="bedMargin" min="0" max="20" step="1" value="5" /><span class="unit">mm</span></label>
+            <div class="bed-limits">
+              <label class="field inline" title="Kept clear on every side of the bed, for a brim, the purge line or clips"><span>Margin</span><input type="number" id="bedMargin" min="0" max="20" step="1" value="5" /><span class="unit">mm</span></label>
+              <label class="field inline" title="Fit to my printer keeps every piece within this along each side, even if that takes more pieces – leave it blank for as big as your printer takes. A detail you keep whole may make the pieces round it longer."><span>Largest piece</span><input type="number" id="bedLargest" min="0" max="10000" step="1" placeholder="any" /><span class="unit">mm</span></label>
+            </div>
           </div>
         </details>
 

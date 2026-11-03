@@ -1475,6 +1475,116 @@ try {
     await idle();
     const keepBack = await page.locator('#keepList li').count();
     check(keepGone === 0 && keepBack === 1, "a detail kept whole's × lets it go, and Undo brings it back", `${keepGone}, then ${keepBack}`);
+
+    // Largest piece, under Printing: 12 mm reads as the least it takes, 30; at 100 mm the split card says so and Fit cuts
+    // more, smaller pieces – every side within 100 mm but for the pieces in line with the ribbon, which may be as long
+    // as the ribbon needs along X, and say so in their rows – and its note says which and why
+    await page.evaluate(() => (document.querySelector('#printing').open = true));
+    const bedLine = async () => (await page.locator('#splitBedText').innerText()).replace(/\s+/g, ' ');
+    const setLargest = async (v) => {
+      await page.fill('#bedLargest', v);
+      await page.dispatchEvent('#bedLargest', 'change');
+      await idle();
+    };
+    /** Fit to my printer, and the pieces it shows once they are worked out for its cuts. */
+    const fitPieces = async (cuts) => {
+      await page.click('#splitFitBtn');
+      await page.waitForFunction((n) => document.querySelectorAll('#cutList li').length === n, cuts, { timeout: 120000 }).catch(() => null);
+      await idle();
+      await page.waitForFunction(() => document.querySelector('#pieceList li:not(.predicted)') && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 120000 }).catch(() => null);
+      await idle();
+      return page.locator('#pieceList li').allInnerTexts();
+    };
+    const sidesOf = (row) => (row.match(/([\d.]+) × ([\d.]+) × ([\d.]+) mm/) ?? []).slice(1).map(Number);
+    await setLargest('12');
+    const floor = { box: await page.inputValue('#bedLargest'), line: await bedLine() };
+    // what is no number at all ("1-", "e") puts the value in force back: it does not clear it
+    const typeLargest = async (text) => {
+      await page.click('#bedLargest');
+      await page.keyboard.press('Control+A');
+      await page.keyboard.press('Backspace');
+      await page.keyboard.type(text);
+      await page.keyboard.press('Tab');
+      await idle();
+      return { box: await page.inputValue('#bedLargest'), line: await bedLine() };
+    };
+    const garbled = [await typeLargest('1-'), await typeLargest('e')];
+    check(
+      garbled.every((g) => g.box === '30' && / · Largest piece 30 mm$/.test(g.line)),
+      'Largest piece: typing something that is no number ("1-", "e") puts 30 mm back rather than clearing it',
+      JSON.stringify(garbled),
+    );
+    await setLargest('100');
+    const capLine = await bedLine();
+    const capRows = await fitPieces(3);
+    const capNotes = await splitNotes();
+    const ribbonSize = Number((await page.locator('#keepList .keep-size').innerText()).match(/\d+/)?.[0]);
+    const capRowOk = (row) => {
+      const over = sidesOf(row).filter((v) => v > 100.05).length;
+      return / · fits/.test(row) && (over === 0 ? !/over 100 mm/.test(row) : over === 1 && /over 100 mm to keep Ribbon whole/.test(row));
+    };
+    await page.screenshot({ path: path.join(out, '8-largest-piece.png') });
+    check(
+      floor.box === '30' && / · Largest piece 30 mm$/.test(floor.line) && / · Largest piece 100 mm$/.test(capLine) && capRows.length > 2 && capRows.every(capRowOk) &&
+        capRows.some((r) => /over 100 mm to keep Ribbon whole/.test(r)) && !capRows.some((r) => /loose/.test(r)) &&
+        new RegExp(`Every piece is within your 100 mm Largest piece except pieces [\\d, and]+, up to [\\d.]+ mm along X to keep Ribbon \\(${ribbonSize} mm\\) whole\\.`).test(capNotes) &&
+        /Ribbon stays whole, on piece \d+\./.test(capNotes),
+      'Largest piece 100 mm: the card says so, and Fit plans more pieces, every one within 100 mm but those in line with the ribbon, which keeps whole – their rows and the note say so',
+      JSON.stringify({ floor, capLine, capRows, capNotes, ribbonSize }),
+    );
+    // another Largest piece: Fit's note is for the one it planned for, so it goes – the cuts stay until Fit is asked again
+    const capCuts = await page.evaluate(() => [...document.querySelectorAll('#cutList input[data-cut-at]')].map((i) => i.value).join());
+    await setLargest('120');
+    await page.waitForFunction(() => !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 60000 }).catch(() => null);
+    await idle();
+    const at120 = {
+      line: await bedLine(),
+      notes: await splitNotes(),
+      cuts: await page.evaluate(() => [...document.querySelectorAll('#cutList input[data-cut-at]')].map((i) => i.value).join()),
+      rows: await page.locator('#pieceList li').allInnerTexts(),
+    };
+    check(
+      / · Largest piece 120 mm$/.test(at120.line) && !/Largest piece/.test(at120.notes) && /Ribbon stays whole/.test(at120.notes) && at120.cuts === capCuts &&
+        at120.rows.some((r) => /over 120 mm to keep Ribbon whole/.test(r)),
+      "changing Largest piece drops Fit's note planned for the old one, and leaves the cuts as they are",
+      JSON.stringify(at120),
+    );
+    // saved with the printer: a page opened afterwards has it
+    const reopenedPage = await context.newPage();
+    await reopenedPage.goto(url);
+    await reopenedPage.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    const reopened = { box: await reopenedPage.inputValue('#bedLargest'), line: (await reopenedPage.locator('#splitBedText').innerText()).replace(/\s+/g, ' ') };
+    await reopenedPage.close();
+    check(reopened.box === '120' && / · Largest piece 120 mm$/.test(reopened.line), 'Largest piece is saved with the printer', JSON.stringify(reopened));
+    // cleared: the card no longer names it, and Fit plans pieces as big as the printer takes again
+    await setLargest('');
+    const clearedLine = await bedLine();
+    const plainRows = await fitPieces(1);
+    check(
+      !/Largest/.test(clearedLine) && (await page.inputValue('#bedLargest')) === '' && plainRows.length === 2 && !plainRows.some((r) => /over \d+ mm/.test(r)) &&
+        !/Largest piece/.test(await splitNotes()),
+      'cleared, Largest piece leaves the card and Fit goes back to two pieces',
+      JSON.stringify({ clearedLine, plainRows }),
+    );
+    // too small for 64 pieces (the ribbon let go, so nothing is kept whole): Fit plans the smallest pieces 64 allow and
+    // says what to set it to
+    await page.click('#keepList .keep-remove');
+    await idle();
+    await setLargest('30');
+    await page.click('#splitFitBtn');
+    await page.waitForFunction(() => /the least 64 pieces allow/.test(document.querySelector('#splitNotes')?.innerText ?? ''), null, { timeout: 120000 }).catch(() => null);
+    await idle();
+    await page.waitForFunction(() => document.querySelector('#pieceList li:not(.predicted)') && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 120000 }).catch(() => null);
+    await idle();
+    const tinyRows = await page.locator('#pieceList li').allInnerTexts();
+    const tinyNotes = await splitNotes();
+    const least = Number(tinyNotes.match(/so these are up to (\d+) mm, the least 64 pieces allow – raise Largest piece to \1 mm, or clear it\./)?.[1]);
+    check(
+      least > 30 && tinyRows.length > 2 && tinyRows.length <= 64 && tinyRows.every((r) => sidesOf(r).every((v) => v <= least + 0.05)),
+      'a Largest piece that would take more than 64 pieces: Fit plans the smallest 64 allow, and says to raise it to that',
+      JSON.stringify({ least, pieces: tinyRows.length, note: tinyNotes.split(' / ').find((n) => /64 pieces/.test(n)) }),
+    );
+    await setLargest('');
     await page.click('#splitClearBtn');
     await idle();
 
@@ -2704,6 +2814,104 @@ try {
     await idle();
     await setLineSize(0, sizeBefore);
     await setText('ALONE');
+  }
+
+  console.log('\nthe Bambu Lab printers: an old saved printer, and the corner the X1 and P1 keep clear');
+  {
+    // a printer saved under the old name "A1 / P1S / X1" opens as the X1 / P1 – the smaller of the two it became – with
+    // the hint that its corner is kept clear; the list has both and not the old one
+    const bambu = await browser.newContext({ viewport: { width: 1400, height: 850 } });
+    await bambu.addInitScript(() => {
+      if (sessionStorage.getItem('seeded')) return;
+      localStorage.setItem('stltext.settings.v2', JSON.stringify({ bed: { preset: 'bambu256', size: [256, 256, 256], margin: 5 } }));
+      sessionStorage.setItem('seeded', '1');
+    });
+    const b = await bambu.newPage();
+    const errors = [];
+    b.on('pageerror', (e) => errors.push(e.message));
+    await b.goto(url);
+    await b.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    const idleB = async () => {
+      await b.waitForTimeout(60);
+      await b.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+      await b.waitForTimeout(60);
+      await b.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    };
+    const opened = await b.evaluate(() => ({
+      preset: document.querySelector('#bedPreset').value,
+      labels: [...document.querySelectorAll('#bedPreset option')].map((o) => o.textContent),
+      hint: document.querySelector('#bedCornerHint').hidden ? null : document.querySelector('#bedCornerHint').textContent,
+      line: document.querySelector('#splitBedText').innerText,
+    }));
+    check(
+      opened.preset === 'bambux1' && opened.labels.includes('Bambu Lab X1 / P1S / P1P') && opened.labels.includes('Bambu Lab A1 / P2S') && !opened.labels.some((l) => /A1 \/ P1S \/ X1/.test(l)) &&
+        opened.hint === 'Keeps its front-left 18 × 28 mm corner clear, as Bambu Studio does.' && opened.line === 'Your printer: 256 × 256 × 250 mm, front-left 18 × 28 mm kept clear',
+      'a printer saved as the old "A1 / P1S / X1" opens as the X1 / P1S / P1P, 256 × 256 × 250 mm with its front-left corner kept clear; the A1 / P2S is listed beside it',
+      JSON.stringify(opened),
+    );
+    // a 240 mm square plate: too big for the X1 once its corner is kept clear (not "bigger than" a 256 mm printer), which
+    // the notes and the toast say; Fit cuts it in two that fit beside or behind the corner
+    const plate = Manifold.cube([240, 240, 5], true);
+    const plateFile = writeFixture('corner-plate.stl', soupOf(plate));
+    plate.delete();
+    await b.setInputFiles('#stlFile', plateFile);
+    await b.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('corner-plate:'), null, { timeout: 60000 });
+    await idleB();
+    const x1 = {
+      note: (await b.locator('#modelNotes li').allInnerTexts()).find((t) => /240 × 240 × 5 mm/.test(t)) ?? '',
+      toast: (await b.locator('#toast').isHidden()) ? null : await b.locator('#toastText').innerText(),
+    };
+    await b.click('#splitFitBtn');
+    await b.waitForFunction(() => document.querySelector('#pieceList li:not(.predicted)') && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 120000 }).catch(() => null);
+    await idleB();
+    x1.rows = await b.locator('#pieceList li').allInnerTexts();
+    check(
+      /^240 × 240 × 5 mm – too big for your 256 × 256 × 250 mm printer once its front-left 18 × 28 mm corner is kept clear\./.test(x1.note) &&
+        x1.toast === "This model won't fit your 256 × 256 mm bed with its front-left corner kept clear." && x1.rows.length === 2 && x1.rows.every((r) => / · fits/.test(r)),
+      'on the X1 / P1 a 240 mm plate is too big once the corner is kept clear, which the notes and the toast say, and Fit cuts it into 2 pieces that fit',
+      JSON.stringify(x1),
+    );
+    // a 226 × 240 plate the X1 takes whole only beside or behind the corner: the notes and a plain download say to move
+    // it clear of the corner, as Bambu Studio refuses it in the middle of the bed
+    const side = Manifold.cube([226, 240, 5], true);
+    const sideFile = writeFixture('corner-side.stl', soupOf(side));
+    side.delete();
+    await b.setInputFiles('#stlFile', sideFile);
+    await b.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('corner-side:'), null, { timeout: 60000 });
+    await idleB();
+    const moveClear = "This model fits only beside or behind the bed's front-left 18 × 28 mm corner: in the slicer, move it clear of it – left in the middle of the bed it reaches into it.";
+    const beside = { model: await b.locator('#modelNotes li').allInnerTexts() };
+    await Promise.all([b.waitForEvent('download', { timeout: 60000 }).catch(() => null), b.click('#downloadBtn')]);
+    await b.waitForFunction(() => /^Downloaded /.test(document.querySelector('#status')?.textContent ?? ''), null, { timeout: 60000 }).catch(() => null);
+    beside.status = await b.locator('#status').innerText();
+    check(
+      beside.model.includes(moveClear) && beside.status.includes(moveClear) && !beside.model.some((t) => /too big/.test(t)),
+      'on the X1 / P1 a plate that fits only beside or behind the corner is told to move clear of it, in its notes and when downloaded whole',
+      JSON.stringify(beside),
+    );
+    await b.setInputFiles('#stlFile', plateFile);
+    await b.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('corner-plate:'), null, { timeout: 60000 });
+    await idleB();
+    // on the A1 / P2S, with nothing kept clear, it fits whole
+    await b.evaluate(() => (document.querySelector('#printing').open = true));
+    await b.selectOption('#bedPreset', 'bambua1');
+    await idleB();
+    await b.click('#splitFitBtn');
+    await b.waitForTimeout(400);
+    await idleB();
+    const a1 = {
+      line: await b.locator('#splitBedText').innerText(),
+      hidden: await b.evaluate(() => document.querySelector('#bedCornerHint').hidden),
+      cuts: await b.locator('#cutList li').count(),
+      notes: (await b.locator('#splitNotes li').allInnerTexts()).join(' / '),
+      model: (await b.locator('#modelNotes li').allInnerTexts()).join(' / '),
+    };
+    check(
+      a1.line === 'Your printer: 256 × 256 × 256 mm' && a1.hidden && a1.cuts === 0 && /already fits your printer/.test(a1.notes) && !/too big|bigger than/.test(a1.model) && !errors.length,
+      'on the A1 / P2S the plate fits whole: Fit takes its cut away, and no corner is named',
+      JSON.stringify({ ...a1, errors }),
+    );
+    await bambu.close();
   }
 
   console.log('\na newer version out while the page is open');

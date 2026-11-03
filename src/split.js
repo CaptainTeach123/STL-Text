@@ -22,15 +22,23 @@
  *  - piece numbers are 1-based, as in "piece 2 of 3" and the label "2A".
  */
 import { TEA_LIGHT, roundAngle, roundOpening, wayWords } from './locks.js';
-import { boxHang, columnGraph, columnsOf, HANG, looseTable, planeGrid, rasterRings, sampleWidths } from './hang.js';
+import { boxHang, columnGraph, columnsOf, HANG, hangAt, looseTable, planeGrid, rasterRings, sampleWidths } from './hang.js';
 
 // ---------- printers ----------
 
-/** Printers to choose from, with their build volume in mm (`custom` uses the size the user typed). */
+/**
+ * Printers to choose from, with their build volume in mm (`custom` uses the size the user typed) and, where the printer
+ * keeps a corner of its bed clear, that corner's sides [x, y] mm from the bed's front-left (`corner`).
+ */
 export const BED_PRESETS = Object.freeze({
   generic: Object.freeze({ label: 'Generic / Ender-3 class', size: Object.freeze([220, 220, 250]) }),
   a1mini: Object.freeze({ label: 'Bambu Lab A1 mini', size: Object.freeze([180, 180, 180]) }),
-  bambu256: Object.freeze({ label: 'Bambu Lab A1 / P1S / X1', size: Object.freeze([256, 256, 256]) }),
+  // Bambu Lab's sizes are Bambu Studio's own machine profiles (bambulab/BambuStudio, resources/profiles/BBL/machine):
+  // the X1, X1 Carbon, X1E, P1S and P1P print on 256 × 256 mm up to 250 mm (printable_height, from
+  // fdm_machine_common) and keep the bed's front-left 18 × 28 mm clear (bed_exclude_area 0x0,18x0,18x28,0x28); the
+  // A1 and P2S take 256 × 256 × 256 with nothing kept clear, the A1 mini 180 × 180 × 180
+  bambux1: Object.freeze({ label: 'Bambu Lab X1 / P1S / P1P', size: Object.freeze([256, 256, 250]), corner: Object.freeze([18, 28]) }),
+  bambua1: Object.freeze({ label: 'Bambu Lab A1 / P2S', size: Object.freeze([256, 256, 256]) }),
   mk4s: Object.freeze({ label: 'Prusa MK4S', size: Object.freeze([250, 210, 220]) }),
   coreone: Object.freeze({ label: 'Prusa CORE One', size: Object.freeze([250, 220, 270]) }),
   coreonel: Object.freeze({ label: 'Prusa CORE One L', size: Object.freeze([300, 300, 330]) }),
@@ -42,13 +50,19 @@ export const BED_PRESETS = Object.freeze({
  * print while an extra seam only costs a glue joint, so the default is a
  * common small printer. Copy the size array before changing it.
  */
-export const BED_DEFAULTS = Object.freeze({ preset: 'generic', size: Object.freeze([220, 220, 250]), margin: 5 });
+export const BED_DEFAULTS = Object.freeze({ preset: 'generic', size: Object.freeze([220, 220, 250]), margin: 5, largest: 0 });
+
+/** Printers renamed since: a setting saved with an old name reads as the one it became (the smaller, safe one). */
+export const PRESET_ALIASES = Object.freeze({ bambu256: 'bambux1' });
+
+/** The preset a bed setting names (an old name read as the one it became), or undefined for none or an unknown one. */
+export const presetOf = (bed) => BED_PRESETS[PRESET_ALIASES[bed?.preset] ?? bed?.preset];
 
 const clamp = (v, lo, hi, fallback) => (Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : fallback);
 
 /** The printer's own build volume [x, y, z] in mm, from a preset or the size typed for `custom`. */
 export function bedSize(bed = BED_DEFAULTS) {
-  const size = BED_PRESETS[bed?.preset]?.size ?? bed?.size;
+  const size = presetOf(bed)?.size ?? bed?.size;
   // a blank or nonsense box keeps the default for that side (Number('') and Number(null) are 0, not NaN)
   return [0, 1, 2].map((a) => {
     const v = Number(size?.[a]);
@@ -59,12 +73,94 @@ export function bedSize(bed = BED_DEFAULTS) {
 /**
  * The room a piece may use [x, y, z]: the margin is kept clear on every side
  * of the bed (a brim, the purge line, clips), and 1 mm is kept below the
- * top of the build volume.
+ * top of the build volume. A printer that keeps a corner of its bed clear
+ * (the preset's `corner`) adds that corner's sides [ex, ey]: [x, y, z, ex,
+ * ey]. A piece then fits beside the corner, (x − ex) × y, or behind it,
+ * x × (y − ey) – the margin, already off x and y, keeping it clear of the
+ * corner too (`footprintYaw`). Plain numbers, so every key and copy of the
+ * bed carries the corner; `bedCorner` reads it back.
  */
 export function usableBed(bed = BED_DEFAULTS) {
   const [x, y, z] = bedSize(bed);
   const m = clamp(Number(bed?.margin), 0, 20, BED_DEFAULTS.margin);
-  return [Math.max(1, x - 2 * m), Math.max(1, y - 2 * m), Math.max(1, z - 1)];
+  const U = [Math.max(1, x - 2 * m), Math.max(1, y - 2 * m), Math.max(1, z - 1)];
+  const c = presetOf(bed)?.corner;
+  return c?.[0] > 0 && c?.[1] > 0 ? [...U, Math.min(c[0], U[0]), Math.min(c[1], U[1])] : U;
+}
+
+/** The corner a usable bed keeps clear, [ex, ey] mm from the bed's front-left, or null when it keeps none. */
+export const bedCorner = (U) => (Number(U?.[3]) > 0 && Number(U?.[4]) > 0 ? [Number(U[3]), Number(U[4])] : null);
+
+// ---------- Largest piece ----------
+
+/**
+ * The least Largest piece (mm) the printer settings take: above the pins' shortest piece Fit plans with (the Ø5 probe's
+ * 27.3 mm) and a plaque's thickness (`PLATE_THICKNESS.slab`), which is never cut through.
+ */
+export const LARGEST_MIN = 30;
+
+/** A Largest piece setting as kept: 0 for none (blank, 0 or nonsense), else whole mm from `LARGEST_MIN` up to 10 m. */
+export function clampLargest(v) {
+  const n = Number(v);
+  if (!(n > 0) || !Number.isFinite(n)) return 0;
+  return Math.min(10000, Math.max(LARGEST_MIN, Math.round(n)));
+}
+
+/** The longest Fit may plan a piece along each axis for a Largest piece setting (mm): Infinity for none. */
+export const capOf = (largest) => (Number(largest) > 0 && Number.isFinite(Number(largest)) ? Number(largest) : Infinity);
+
+/**
+ * Largest piece: the most a slab [x0, x1] along an axis may be – `cap`, or more where it holds the whole span of a
+ * detail kept whole that is longer than that (`list`, the axis's `{ l, h, most }`: the slab may then be `most`).
+ */
+export function slabCap(cap, list, x0, x1) {
+  let most = cap;
+  if (list) for (const w of list) if (x0 <= w.l + 1e-6 && x1 >= w.h - 1e-6 && w.most > most) most = w.most;
+  return most;
+}
+
+/**
+ * Whether a box of `size` keeps within the Largest piece `cap` along each axis – where `box` (its edges, `{ min, max }`)
+ * holds a detail kept whole longer than that (`wide`, per axis `slabCap`'s list), as long as that detail's slab may be;
+ * without `box`, `wide` is taken to be held (the whole model).
+ */
+export function withinCap(size, cap, wide = null, box = null) {
+  if (!(cap < Infinity)) return true;
+  return size.every((v, a) => {
+    const list = wide?.[a] ?? null;
+    const most = box ? slabCap(cap, list, box.min[a], box.max[a]) : Math.max(cap, ...(list ?? []).map((w) => w.most));
+    return v <= most + 1e-6;
+  });
+}
+
+/**
+ * Per axis, the details kept whole (`keepsOf`'s) whose span – their box less `KEEP_INSIDE` at each end – is longer than
+ * the Largest piece `cap`, as `slabCap` reads them: `{ l, h, most, ids }`, overlapping spans merged (`ids` the details'). The slab that holds one
+ * may be as long as the detail needs: its span, run to the model's end (`bounds`) where that is nearer than `minEnd`
+ * (a cut there would leave a sliver), and a quarter of `cap` more for the cuts to find a good place off its ends. Null
+ * without a cap; an axis with none has an empty list.
+ */
+export function wideKeeps(keeps, cap, bounds, minEnd = 0) {
+  if (!(cap < Infinity)) return null;
+  return [0, 1, 2].map((a) => {
+    const spans = keeps
+      .map((x) => [x.box.min[a] + KEEP_INSIDE, x.box.max[a] - KEEP_INSIDE, x.id])
+      .filter(([l, h]) => h - l > cap + 1e-6)
+      .sort((p, q) => p[0] - q[0]);
+    const merged = [];
+    for (const [l, h, id] of spans) {
+      const last = merged[merged.length - 1];
+      if (last && l <= last[1] + 1e-6) {
+        last[1] = Math.max(last[1], h);
+        last[2].push(id);
+      } else merged.push([l, h, [id]]);
+    }
+    return merged.map(([l, h, ids]) => {
+      const l1 = l - bounds.min[a] < minEnd ? bounds.min[a] : l;
+      const h1 = bounds.max[a] - h < minEnd ? bounds.max[a] : h;
+      return { l, h, most: h1 - l1 + cap / 4, ids };
+    });
+  });
 }
 
 // ---------- settings and limits ----------
@@ -611,6 +707,21 @@ export function pegSizesForRoom(s, c, nozzle, depth, room) {
 }
 
 /**
+ * The shortest pieces Fit to my printer plans for a split's joints (`spec` clamped, as `normaliseSplit` gives it): an
+ * end piece must take a hole (or a peg's socket) and its wall (`minEnd`), a middle one one from each side (`minMid`),
+ * as deep as the joints' probe reaches (Ø5 pins for Auto); `pins` the Ø5 pins' sizes, for judging whether a face has
+ * room for them.
+ */
+export function planEnds(spec, nozzle = 0.4) {
+  const pegged = spec?.joint === 'pegs';
+  const clearance = spec?.clearance ?? SPLIT_DEFAULTS.clearance;
+  const sizes = pegged ? (d, ...rest) => pegSizesFor(pegSizeOf(d) || 5, ...rest) : (d, ...rest) => sizesFor(d || 5, ...rest);
+  const probe = sizes(spec?.diameter ?? 0, clearance, nozzle, spec?.depth ?? 0);
+  const pins = sizes(5, clearance, nozzle);
+  return { pegged, pins, minEnd: probe.reach + 1, minMid: 2 * probe.reach + 1 };
+}
+
+/**
  * How far a piece may reach past a cut with built-in pegs, for planning
  * before the pegs are laid out: the longest peg the cut's faces can take.
  * That is the peg's length at the size set, or at the largest automatic
@@ -852,25 +963,88 @@ export function clipPush(clips, { lead = 45, ...options } = {}) {
 
 const EPS = 1e-9;
 const RAD = Math.PI / 180;
+// the cosine and sine of each whole degree a footprint may be turned by: worked out once, the same numbers
+const COS = Float64Array.from({ length: 91 }, (_, deg) => Math.cos(deg * RAD));
+const SIN = Float64Array.from({ length: 91 }, (_, deg) => Math.sin(deg * RAD));
+
+/** The turns a footprint is tried at in order, straight first: a quarter turn ranks next, then 1…89° by the degree. */
+const turnRank = (yaw) => (yaw === 0 ? 0 : yaw === 90 ? 1 : 1 + yaw);
 
 /**
  * The smallest turn (whole degrees) that fits an a × b footprint inside the
  * bed's [x, y]: straight (0), a quarter turn (90), then 1…89 across the
- * diagonal. Null when none fits.
+ * diagonal. Null when none fits. On a bed that keeps a corner clear
+ * (`bedCorner`) the footprint must fit, turned if need be, beside the
+ * corner, (x − ex) × y, or behind it, x × (y − ey): the least turn either
+ * way. One that would fit only by reaching into the notch beside the
+ * corner is refused.
  */
 export function footprintYaw(a, b, U) {
-  const ux = U[0] + EPS;
-  const uy = U[1] + EPS;
+  const corner = bedCorner(U);
+  if (!corner) return yawIn(a, b, U[0], U[1]);
+  const beside = yawIn(a, b, U[0] - corner[0], U[1]);
+  const behind = yawIn(a, b, U[0], U[1] - corner[1]);
+  if (beside === null || behind === null) return beside ?? behind;
+  return turnRank(beside) <= turnRank(behind) ? beside : behind;
+}
+
+/** `footprintYaw` in one rectangle X × Y. */
+function yawIn(a, b, X, Y) {
+  const ux = X + EPS;
+  const uy = Y + EPS;
   if (a <= ux && b <= uy) return 0;
   if (b <= ux && a <= uy) return 90;
   // turning cannot help a footprint wider, in every direction, than the bed is narrow
   if (Math.min(a, b) > Math.min(ux, uy)) return null;
   for (let deg = 1; deg < 90; deg++) {
-    const c = Math.cos(deg * RAD);
-    const s = Math.sin(deg * RAD);
+    const c = COS[deg];
+    const s = SIN[deg];
     if (a * c + b * s <= ux && a * s + b * c <= uy) return deg;
   }
   return null;
+}
+
+/**
+ * The room an a × b footprint turned `yaw`° takes along the bed's x and y:
+ * its box once turned. A quarter turn is taken as already made (the sides
+ * as given), as a piece's laid `size` has it.
+ */
+export function turnedFootprint(a, b, yaw = 0) {
+  if (!yaw || yaw === 90) return [a, b];
+  const whole = Number.isInteger(yaw) && yaw > 0 && yaw < 90;
+  const c = whole ? COS[yaw] : Math.cos(yaw * RAD);
+  const s = whole ? SIN[yaw] : Math.sin(yaw * RAD);
+  return [a * c + b * s, a * s + b * c];
+}
+
+/**
+ * Whether a piece laid with sides `size` (as `chooseOrientation` gives it,
+ * a quarter turn made) and turned `yaw`° would reach into the corner its bed
+ * keeps clear (`bedCorner`), or the margin round it, if it were left in the
+ * middle of the bed – where a slicer puts a file it opens. Such a piece fits
+ * only beside or behind the corner, and must be moved there. False on a bed
+ * with no corner.
+ */
+export function reachesCorner(size, yaw, U) {
+  const corner = bedCorner(U);
+  if (!corner || !size) return false;
+  const [w, d] = turnedFootprint(size[0], size[1], yaw ?? 0);
+  // centred, it starts (U − w) / 2 in from where the margin ends, and is the margin clear of the corner only when
+  // that is the corner's side at least – along x or along y
+  return w > U[0] - 2 * corner[0] + 1e-6 && d > U[1] - 2 * corner[1] + 1e-6;
+}
+
+/**
+ * Whether a model `fitsBed` says the bed takes whole (`fit`, its result) fits
+ * only beside or behind the corner the bed keeps clear (`reachesCorner`, laid
+ * and turned as that says): left in the middle of the bed, where a slicer
+ * puts a file it opens, it would reach into it. False where it does not fit
+ * or the bed keeps no corner.
+ */
+export function fitReachesCorner(fit, U) {
+  if (!fit?.fits || !fit.footprint || !bedCorner(U)) return false;
+  const [a, b] = fit.footprint;
+  return reachesCorner(fit.yaw === 90 ? [b, a, fit.height] : [a, b, fit.height], fit.yaw, U);
 }
 
 /**
@@ -894,7 +1068,7 @@ export function fitsBed(dims, U, { flat = null } = {}) {
     if (h > U[2] + EPS) continue;
     const yaw = footprintYaw(a, b, U);
     if (yaw === null) continue;
-    const rank = yaw === 0 ? 0 : yaw === 90 ? 1 : 1 + yaw;
+    const rank = turnRank(yaw);
     if (!best || h < best.height - EPS || (Math.abs(h - best.height) <= EPS && rank < best.rank)) best = { down, height: h, yaw, rank, footprint: [a, b] };
   }
   if (!best) return { fits: false, down: null, height: null, yaw: null, footprint: null };
@@ -916,15 +1090,41 @@ export const evenCell = (E, k, grow = [0, 0, 0]) => E.map((e, a) => (e + 2 * k[a
  * pieces first, then fewest axes, then fewest Z cuts (a tall stack is the
  * least welcome). A thin plate is never cut through its thickness: it lies
  * flat, so that only makes layers to glue.
+ *
+ * With a Largest piece (`cap`), only grids whose k + 1 slabs on each axis
+ * can each be within it: the even slab is, or – where details kept whole
+ * are longer than the cap (`wide`, as `slabCap` reads them) – the model is
+ * no longer than each such detail's slab at its longest (its `most`, and
+ * what the printer takes of it with the other sides even, or the cap where
+ * that is less) and the other slabs at the cap. Both are what any plan
+ * needs, not what one will find.
  * @param {number[]} E the model's extents [x, y, z]
  * @param {number[]} U the usable bed
- * @param {{ flat?: number|null, grow?: number[], minCounts?: number[]|null }} options `flat` as for `fitsBed` (every
+ * @param {{ flat?: number|null, grow?: number[], minCounts?: number[]|null, cap?: number,
+ *   wide?: ({ l: number, h: number, most: number }[])[]|null }} options `flat` as for `fitsBed` (every
  *   piece lies flat on that axis); `grow` how far the pieces reach past each cut on each axis (dovetail tabs, see
- *   `evenCell`); `minCounts` the fewest cuts each axis may have (the cuts that come apart, which stay)
+ *   `evenCell`); `minCounts` the fewest cuts each axis may have (the cuts that come apart, which stay); `cap` the
+ *   Largest piece (mm), `wide` per axis the details kept whole longer than it (`wideKeeps`)
  * @returns {{ k: number[], pieces: number }[]}
  */
-export function gridCandidates(E, U, { flat = null, grow = [0, 0, 0], minCounts = null } = {}) {
+export function gridCandidates(E, U, { flat = null, grow = [0, 0, 0], minCounts = null, cap = Infinity, wide = null } = {}) {
   const found = [];
+  // Largest piece: k + 1 slabs of at most the cap cover (k + 1)·cap of the model; a detail's slab may be its `most`
+  const capOk = (k) => !(cap < Infinity) || [0, 1, 2].every((a) => {
+    const len = E[a] + 2 * k[a] * (grow[a] || 0);
+    if (len / (k[a] + 1) <= cap + 1e-6) return true;
+    const list = wide?.[a] ?? [];
+    if (!list.length || list.length > k[a] + 1) return false;
+    const even = evenCell(E, k, grow);
+    let room = (k[a] + 1 - list.length) * cap;
+    for (const w of list) {
+      const span = w.h - w.l;
+      const S = maxCellLength(even.map((v, b) => (b === a ? span : Math.min(v, cap))), a, U, { flat });
+      if (S < span - 1e-6) return false;
+      room += Math.min(S, w.most);
+    }
+    return len <= room + 1e-6;
+  });
   const most = [0, 1, 2].map((a) => (a === flat ? 0 : SPLIT_LIMITS.cuts));
   for (let kx = 0; kx <= most[0]; kx++) {
     for (let ky = 0; ky <= most[1]; ky++) {
@@ -933,7 +1133,7 @@ export function gridCandidates(E, U, { flat = null, grow = [0, 0, 0], minCounts 
         if (pieces > SPLIT_LIMITS.cells || kx + ky + kz > SPLIT_LIMITS.cuts) break; // more Z cuts only make more
         const k = [kx, ky, kz];
         if (minCounts && k.some((v, a) => v < (minCounts[a] || 0))) continue;
-        if (fitsBed(evenCell(E, k, grow), U, { flat }).fits) found.push({ k, pieces });
+        if (capOk(k) && fitsBed(evenCell(E, k, grow), U, { flat }).fits) found.push({ k, pieces });
       }
     }
   }
@@ -965,7 +1165,7 @@ export function maxCellLength(cell, axis, U, options = {}) {
   const fits = (len) => fitsBed(cell.map((v, a) => (a === axis ? len : v)), U, options).fits;
   let lo = cell[axis];
   if (!fits(lo)) return 0;
-  let hi = Math.hypot(...U) + 1; // nothing longer than the bed's diagonal fits
+  let hi = Math.hypot(U[0], U[1], U[2]) + 1; // nothing longer than the bed's diagonal fits
   for (let i = 0; i < 48 && hi - lo > 1e-9; i++) {
     const mid = (lo + hi) / 2;
     if (fits(mid)) lo = mid;
@@ -1082,18 +1282,24 @@ export function planAllowance(E, spec = {}, { passthrough = false } = {}) {
  * shape), or more where a piece would have nothing flat to stand on.
  * @param {number[]} E the model's extents
  * @param {number[]} U the usable bed
+ * With a Largest piece (`cap`) the model fits as it is only when it is
+ * within that too (but where a detail kept whole spans it, `wide`), and
+ * the grids counted are those whose pieces can all be (`gridCandidates`).
  * @param {{ joint?: string }} spec the split's settings
- * @param {{ passthrough?: boolean }} options whether the model has unrepaired triangles
- * @returns {{ fits: boolean, pieces: number, down: string|null, yaw: number|null }} `fits` when it fits as it is
- *   (`pieces` 1, `down` and `yaw` how it must lie); else `pieces` as the plan counts them, 0 when 64 would not do
+ * @param {{ passthrough?: boolean, cap?: number, wide?: object[]|null }} options whether the model has unrepaired
+ *   triangles; the Largest piece (mm) and the details kept whole longer than it, as for `gridCandidates`
+ * @returns {{ fits: boolean, pieces: number, down: string|null, yaw: number|null, corner?: true }} `fits` when it
+ *   fits as it is (`pieces` 1, `down` and `yaw` how it must lie, `corner` when only beside or behind the corner the
+ *   bed keeps clear, `fitReachesCorner`); else `pieces` as the plan counts them, 0 when 64 would not do
  */
-export function fitPieces(E, U, spec = {}, { passthrough = false } = {}) {
+export function fitPieces(E, U, spec = {}, { passthrough = false, cap = Infinity, wide = null } = {}) {
   const allowance = planAllowance(E, spec, { passthrough });
   const whole = fitsBed(E, U, { flat: allowance.flat });
-  if (whole.fits) return { fits: true, pieces: 1, down: whole.down, yaw: whole.yaw };
+  if (whole.fits && withinCap(E, cap, wide)) return { fits: true, pieces: 1, down: whole.down, yaw: whole.yaw, ...(fitReachesCorner(whole, U) ? { corner: true } : {}) };
+  const capped = cap < Infinity ? { cap, wide } : {};
   const slab = slabAxis(E);
-  const lying = slab === null ? 0 : gridCounts(E, U, { flat: slab, grow: allowance.grow }).pieces;
-  return { fits: false, pieces: lying || gridCounts(E, U, allowance).pieces, down: null, yaw: null };
+  const lying = slab === null ? 0 : gridCounts(E, U, { flat: slab, grow: allowance.grow, ...capped }).pieces;
+  return { fits: false, pieces: lying || gridCounts(E, U, { ...allowance, ...capped }).pieces, down: null, yaw: null };
 }
 
 // ---------- planning where the cuts go ----------
@@ -1367,11 +1573,21 @@ export function runsOf(samples, occupied, { lo, hi, sliver }) {
  * cuts, at its own sample, and reaches a tongue's height past it on one side
  * (`LIP_ALLOWANCE`, chosen as pegs are), whatever `grow` says there – never
  * tabs. The others are planned round them.
+ *
+ * With a Largest piece (`cap`) no piece may be longer than that either,
+ * tabs counted, and a cut's pegs or lip on both pieces either side (the
+ * pieces' pegs and lips are given out later by what fits the printer
+ * alone) – but one that holds the whole span of a detail kept whole that is
+ * longer than the cap (`roomy`, `slabCap`'s list), which may be as long as
+ * that detail's slab may. The minimums are not dropped for it: null then –
+ * but for a piece the cuts that come apart make on their own (between the
+ * model's end and one, or two of them: a thin lid), which is as it is.
  * @param {number[]} samples positions, ascending (from `planSamples`)
  * @param {number[]} costs one per sample (from `planCost`)
  * @param {{ lo: number, hi: number, k: number, S?: number, Sflat?: number, minEnd?: number, minMid?: number,
  *   grow?: ({ below: number, above: number, peg?: boolean }|null)[], occupied?: Uint8Array[]|null,
- *   fixed?: number[]|null, hang?: ((p: number, i: number) => number)|null }} limits
+ *   fixed?: number[]|null, hang?: ((p: number, i: number) => number)|null, cap?: number,
+ *   roomy?: { l: number, h: number, most: number }[]|null }} limits
  *   lo/hi the model's extent on the axis, S the longest piece that fits (`maxCellLength`), Sflat the longest that fits
  *   lying flat; `grow` per sample, for a cut there with dovetail tabs (or pegs, `peg`), how far the piece below it
  *   (`below`) and the piece above it (`above`) reach past it. The minimums are for the pieces between the cuts, tabs
@@ -1385,7 +1601,7 @@ export function runsOf(samples, occupied, { lo, hi, sliver }) {
  *   out, `parts` and `slivers` count them (null without `occupied`), `hang` what the boxes cost for what they leave
  *   (with `hang` only)
  */
-export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat = S, minEnd = 0, minMid = 0, grow = null, occupied = null, fixed = null, hang = null, perBox = 0 }) {
+export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat = S, minEnd = 0, minMid = 0, grow = null, occupied = null, fixed = null, hang = null, perBox = 0, cap = Infinity, roomy = null }) {
   const n = samples.length;
   const E = hi - lo;
   const tol = 1e-6;
@@ -1420,15 +1636,29 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
   // a piece between a cut `a` under it and a cut `b` over it (either may be the model's end): its length, then with
   // the tabs or pegs that reach past its cuts against what fits the way it may lie (tabs lay it flat, pegs do not)
   const flatBy = (x) => Boolean(x) && !x.peg;
-  const ok = (len, min, a, b) => len > tol && len >= min - tol
-    && len + (a ? a.above : 0) + (b ? b.below : 0) <= (flatBy(a) || flatBy(b) ? Sflat : S) + tol;
-  const run = (mEnd, mMid) => {
+  // and, with a Largest piece, its length with tabs and with its cuts' pegs or lips on it whichever side gets them
+  const capped = cap < Infinity;
+  const spans = capped && roomy?.length ? roomy : null;
+  const capReach = (x, side) => (x ? (x.peg ? Math.max(x.below, x.above) : x[side]) : 0);
+  const ok = (x0, x1, min, a, b) => {
+    const len = x1 - x0;
+    if (!(len > tol && len >= min - tol && len + (a ? a.above : 0) + (b ? b.below : 0) <= (flatBy(a) || flatBy(b) ? Sflat : S) + tol)) return false;
+    if (!capped) return true;
+    return len + capReach(a, 'above') + capReach(b, 'below') <= (spans ? slabCap(cap, spans, x0, x1) : cap) + tol;
+  };
+  // the pieces no cut may change, between the model's end and a cut that comes apart or between two of them (a lid
+  // thinner than an end piece may be, say): what they are is given, so with `given` the minimums are not theirs
+  const stays = new Uint8Array(n);
+  for (const f of must ?? []) if (f >= 0 && f < n) stays[f] = 1;
+  const run = (mEnd, mMid, given = false) => {
+    const endMin = (i) => (given && stays[i] ? 0 : mEnd);
+    const midMin = (p, i) => (given && stays[p] && stays[i] ? 0 : mMid);
     // the cheapest choice so far by state (a sample and one of its ways); the first found of equal ones stays, so the
     // pegs go below a cut where either side will do
     let prev = new Float64Array(n * W).fill(Infinity);
     for (let i = 0; i < n; i++) {
       ways(i).forEach((g, v) => {
-        if (firstOk(i) && ok(samples[i] - lo, mEnd, null, g)) prev[i * W + v] = own(i, 0) + parts(-1, i);
+        if (firstOk(i) && ok(lo, samples[i], endMin(i), null, g)) prev[i * W + v] = own(i, 0) + parts(-1, i);
       });
     }
     const back = [];
@@ -1442,7 +1672,7 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
           for (let u = 0; u < there.length; u++) {
             if (prev[p * W + u] === Infinity || passes(p, i)) continue;
             for (let v = 0; v < here.length; v++) {
-              if (!ok(samples[i] - samples[p], mMid, there[u], here[v])) continue;
+              if (!ok(samples[p], samples[i], midMin(p, i), there[u], here[v])) continue;
               const c = prev[p * W + u] + own(i, j) + parts(p, i);
               if (c < cur[i * W + v]) {
                 cur[i * W + v] = c;
@@ -1461,7 +1691,7 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
       const g = ways(Math.floor(x / W))[x % W];
       if (g === undefined || prev[x] === Infinity) continue;
       if (!lastOk(Math.floor(x / W))) continue;
-      if (total(x) < (best < 0 ? Infinity : total(best)) && ok(hi - samples[Math.floor(x / W)], mEnd, g, null)) best = x;
+      if (total(x) < (best < 0 ? Infinity : total(best)) && ok(samples[Math.floor(x / W)], hi, endMin(Math.floor(x / W)), g, null)) best = x;
     }
     if (best < 0) return null;
     const states = [best];
@@ -1482,8 +1712,12 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
     };
   };
   if (!(k > 0) || !n) return null;
-  const strict = run(minEnd, minMid);
+  // with a Largest piece, a piece the cuts that come apart make on their own is as it is: the others keep the minimums
+  const strict = run(minEnd, minMid, capped);
   if (strict) return { ...strict, relaxed: false };
+  // a tight printer may take pieces too short for the joints' probe; a Largest piece never does – what it would take
+  // is a sliver beside a cut that stays or a detail kept whole, so the cap gives way instead
+  if (capped && (minEnd > 0 || minMid > 0)) return null;
   const loose = run(0, 0);
   return loose ? { ...loose, relaxed: true } : null;
 }
@@ -1550,23 +1784,34 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
  * its axis's cuts, at its own sample, and reaches a tongue's height past it on
  * the side `pegSides` gives it, as pegs do (`chooseOffsets`). A grid with fewer
  * cuts on an axis than stay there is no plan.
+ *
+ * With a Largest piece (`cap`) every piece is planned within it along each
+ * axis, tabs counted and a cut's pegs or lip on both sides of it – but one
+ * that holds a detail kept whole longer than the cap (`wide`, per axis
+ * `slabCap`'s list), which may be as long as that detail's slab may – and the
+ * plan says what its cuts do to the details (`flaws`).
  * @param {number[]} k cuts per axis
  * @param {{ E: number[], U: number[], bounds: { min: number[], max: number[] }, flat?: number|null, minEnd?: number,
  *   minMid?: number, profileOf: function, support?: function|null, stable?: boolean, peg?: number|number[],
- *   fixed?: number[][]|null, descent?: boolean, starts?: number }} options E the
+ *   fixed?: number[][]|null, descent?: boolean, starts?: number, cap?: number, wide?: object[]|null }} options E the
  *   model's extents, `flat` the axis every piece lies flat on (a thin plate, or a slab planned lying flat) or null;
  *   `profileOf(axis, k)` gives `{ samples, costs, tabs, rings? }` for k cuts on that axis, `tabs` per sample
  *   `{ below, above, w, span, t }` when a cut there would take dovetail tabs (see `chooseOffsets`; `span` the plate's
  *   extent along w, `t` its thickness), `{ below, above, peg: true }` when it would take built-in pegs, else null, and
- *   `rings` per sample the slice's outlines in the axis's plane coordinates (`TO_PLANE`); `support(cutsByAxis)` gives
+ *   `rings` per sample the slice's outlines in the axis's plane coordinates (`TO_PLANE`), and `flags` per sample
+ *   `{ letters, nearLetters, neck }` (a cut there runs through letters, right beside them, or through a thin neck);
+ *   `support(cutsByAxis)` gives
  *   `cellSupport`'s map; `peg` the pegs' length when the joints are built-in pegs (per axis, or one for all), else 0;
  *   `fixed` per axis the positions of the cuts that come apart, each one of the samples `profileOf` gives (a plan
  *   whose samples miss one is null); `descent: false` stops at the plan each axis planned again gives, its whole cost
  *   counted all the same, and `starts` is how many other places on each axis cut once it starts from (3)
  * @returns {{ k: number[], offsets: number[][], cost: number, support: number, hang?: number, pieces: { cell: number[],
- *   size: number[], fits: true }[] }|null} `pieces` every box that makes a piece, as it will print, tabs and pegs
+ *   size: number[], fits: true }[], flaws?: { letters: number, nearLetters: number, necks: number, warned: number,
+ *   loose: number, slivers: number } }|null} `pieces` every box that makes a piece, as it will print, tabs and pegs
  *   counted; `support` the area (mm²) they need support under, as far as the boxes tell; with the outlines, `hang` what
- *   its boxes leave hanging, counted in `cost`
+ *   its boxes leave hanging, counted in `cost`; with a cap, `flaws` how many of its cuts run through letters, right
+ *   beside them or through a thin neck, how many parts it leaves held on only within `HANG.warn` of a cut, how much
+ *   of the model it leaves loose (mm³), and how many runs of model its boxes hold are slivers
  */
 export function planGrid(k, options) {
   const { E, U, flat = null, fixed = null } = options;
@@ -1613,6 +1858,45 @@ const keptCuts = (profileOf, fixed) => (a, k) => {
  */
 const DESCENT = Object.freeze({ rounds: 3, starts: 3, apart: 8, near: 1, slack: 25, tries: 10, fence: 4, assessed: 2 });
 
+/**
+ * How far Fit to my printer looks past the fewest pieces for a Largest piece: a plan of the fewest within it that cuts
+ * through or next to letters or through a thin neck, or leaves a part loose or held on only within `HANG.warn` of a
+ * cut, or leaves a sliver (`detailClean`), gives way to the best of `groups` more groups of grids – each with no more
+ * than `share` times its boxes – that does none of that; and the groups planned stop at `budget` times the first's
+ * boxes: past that the pieces are no longer "a few more".
+ */
+export const GUARD = Object.freeze({ groups: 1, share: 1.5, budget: 2 });
+
+/** Whether a plan's `flaws` (`planGrid`'s, with a Largest piece) are none: no cut that harms a detail Fit looks after. */
+export const detailClean = (flaws) => !flaws || (flaws.letters === 0 && flaws.nearLetters === 0 && flaws.necks === 0 && flaws.warned === 0
+  && flaws.loose < HANG.loose - 1e-6 && !(flaws.slivers > 0));
+
+/**
+ * The plan Fit to my printer takes of the groups of grids (box counts, fewest first; `planOf(group)` plans a group's
+ * grids when asked and gives the best, or null): the first group's that has one. With a Largest piece (`capped`) the
+ * groups planned stop at `GUARD.budget` times the first's boxes, and a plan that harms a detail (`detailClean`) gives
+ * way to the next group's – no more than `GUARD.share` times its boxes, `GUARD.groups` more at most – when that one
+ * harms none: whether the cap added pieces or only moved the cuts (a model the printer takes whole, cut for the cap
+ * where its fewest pieces leave the cut no choice), the details come before the fewest pieces it allows.
+ * @param {number[]} groups
+ * @param {(group: number) => object|null} planOf
+ * @param {{ capped?: boolean }} options
+ * @returns {object|null}
+ */
+export function pickGroup(groups, planOf, { capped = false } = {}) {
+  let first = null;
+  for (const group of groups) {
+    if (capped && group > GUARD.budget * groups[0] + 1e-9) break;
+    if (first && (group > GUARD.share * first.group + 1e-9 || first.extra >= GUARD.groups)) break;
+    const best = planOf(group);
+    if (first) first.extra++;
+    if (!best) continue;
+    if (!capped || detailClean(best.flaws)) return best;
+    first ??= { group, best, extra: 0 };
+  }
+  return first?.best ?? null;
+}
+
 /** The slice graph's tables kept for each axis's outlines, the latest used (each two of (samples + 2)² numbers). */
 const HANG_TABLES = 32;
 /** And the costs of the boxes of the latest few sets of columns. */
@@ -1626,7 +1910,7 @@ const hangGraphs = new WeakMap();
  * for, and the tables of the columns kept with the outlines.
  */
 function hangGraph({ rings, samples }, bounds, a) {
-  if (!rings) return { boxes: () => () => 0, loose: () => () => 0 };
+  if (!rings) return { boxes: () => () => 0, loose: () => () => 0, flaws: () => ({ warned: 0, loose: 0 }) };
   const key = `${bounds.min.join(',')}|${bounds.max.join(',')}|${samples.length}`;
   let got = hangGraphs.get(rings);
   if (!got || got.key !== key) {
@@ -1671,11 +1955,27 @@ function hangGraph({ rings, samples }, bounds, a) {
       const list = columnsOf(grid, offsets).map((c) => tableOf(c.rect));
       return (p, q) => list.reduce((v, t) => v + t.at(p, q), 0);
     },
+    // how many parts of `HANG.held` or more the cuts on this axis leave held on only within `HANG.warn` of one, what the
+    // notes would warn of (`hangAt`), and how much the boxes leave loose in bits (mm³: `looseTable`'s `bits`, the
+    // shells of a size being pieces of their own)
+    flaws: (offsets) => {
+      const list = columnsOf(grid, offsets).map((c) => tableOf(c.rect));
+      const at = [-1, ...offsets[a].map((t) => samples.indexOf(t)), n];
+      let warned = 0;
+      let loose = 0;
+      for (let j = 1; j < at.length; j++) {
+        for (const t of list) loose += t.bits(at[j - 1], at[j]);
+        if (j < at.length - 1 && at[j] >= 0) warned += hangAt(list, samples, at[j], at[j - 1], at[j + 1]).parts.filter((x) => x.w <= HANG.warn + 1e-9).length;
+      }
+      return { warned, loose };
+    },
   };
 }
 
 /** `planGrid` for one way of laying the pieces (`flat`, or any way). */
-function gridPlan(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0, profileOf, support = null, stable = true, peg = 0, descent = true, starts = DESCENT.starts, progress = null }) {
+function gridPlan(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0, profileOf, support = null, stable = true, peg = 0, descent = true, starts = DESCENT.starts, progress = null, cap = Infinity, wide = null }) {
+  // with a Largest piece, each axis's pieces within it (`chooseOffsets`), but where they hold a detail longer than that
+  const capLimits = (a) => (cap < Infinity ? { cap, roomy: wide?.[a]?.length ? wide[a] : null } : {});
   const axes = [0, 1, 2].filter((a) => k[a] > 0);
   const profile = new Map(axes.map((a) => [a, profileOf(a, k[a])]));
   // a cut that comes apart and is not among the samples cannot be kept
@@ -1716,7 +2016,7 @@ function gridPlan(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0, profil
       const Sflat = flat === null && ws.length ? Math.min(maxCellLength(cell, a, U, { flat: ws }), room?.flat[a] ?? Infinity) : S;
       const others = axes.some((b) => b !== a && grow[b] > 0);
       const fixed = profile.get(a).fixed ?? null;
-      limits.set(a, { lo: bounds.min[a], hi: bounds.max[a], k: k[a], S: others ? Sflat : S, Sflat, minEnd, minMid, grow: tabsOf.get(a), ...(fixed ? { fixed } : {}) });
+      limits.set(a, { lo: bounds.min[a], hi: bounds.max[a], k: k[a], S: others ? Sflat : S, Sflat, minEnd, minMid, grow: tabsOf.get(a), ...(fixed ? { fixed } : {}), ...capLimits(a) });
       const choice = chooseOffsets(profile.get(a).samples, profile.get(a).costs, limits.get(a));
       if (!choice) return null;
       offsets[a] = choice.offsets;
@@ -1767,6 +2067,31 @@ function gridPlan(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0, profil
     const at = ends(a, offsets);
     return at.slice(1).reduce((v, i, j) => v + box(at[j], i), sum);
   }, 0);
+  // what a plan's cuts do to the details Fit looks after: how many run through letters, right beside them or through a
+  // thin neck (the profile's `flags` per sample), how many parts they leave held on only within `HANG.warn` of a cut,
+  // how much of the model they leave loose in bits (mm³), and how many slivers its boxes hold
+  const detailFlaws = (offsets) => {
+    const out = { letters: 0, nearLetters: 0, necks: 0, warned: 0, loose: 0, slivers: 0 };
+    for (const a of axes) {
+      const { samples, flags } = profile.get(a);
+      for (const t of offsets[a]) {
+        const f = flags?.[samples.indexOf(t)];
+        if (f?.letters) out.letters++;
+        else if (f?.nearLetters) out.nearLetters++;
+        if (f?.neck) out.necks++;
+      }
+      const { warned, loose } = graphs.get(a).flaws(offsets);
+      out.warned += warned;
+      out.loose += loose;
+      // and how many runs of model its boxes hold that are slivers along the axis, as `loose` counts them
+      if (profile.get(a).rings) {
+        const runs = runsOf(samples, occupancy(a, offsets), { lo: bounds.min[a], hi: bounds.max[a], sliver: Math.max(minEnd, E[a] / (k[a] + 1) / 4) });
+        const at = [-1, ...offsets[a].map((t) => samples.indexOf(t)), samples.length];
+        for (let j = 1; j < at.length; j++) out.slivers += runs(at[j - 1], at[j]).thin;
+      }
+    }
+    return out;
+  };
   const total = (own) => [...own.values()].reduce((c, x) => c + x, 0);
   // a plan with these cuts (`own` the cost of each axis's), its whole cost `J` and what of it is the hang; with
   // `above`, null when it costs that much or more before its pieces are looked at (the support only adds to it)
@@ -1975,9 +2300,13 @@ function gridPlan(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0, profil
       if (c.flat === null && flat !== null) ways = ways === null || [].concat(ways).includes(flat) ? flat : [];
       return ways;
     };
+    // with a Largest piece, each box within it with its cuts' pegs or lips on it whichever side they go (the drill stage
+    // gives them out by the printer alone), but where it holds a detail longer than that
+    const reached = cap < Infinity ? new Map(cellSizes(bounds, cuts.map((c) => (c.peg > 0 ? { ...c, reach: [c.peg, c.peg] } : c)), { meets }).cells.map((c) => [c.cell.join(','), c])) : null;
+    const capped = (c) => !reached || withinCap(reached.get(c.cell.join(','))?.size ?? c.size, cap, wide, c);
     const fitting = (c) => {
       const s = held?.get(c.cell.join(','));
-      return (held && !s?.filled) || fitsBed(c.size, U, { flat: waysOf(c, s) }).fits;
+      return (held && !s?.filled) || (fitsBed(c.size, U, { flat: waysOf(c, s) }).fits && capped(c));
     };
     const { cells } = cellSizes(bounds, pegSides(bounds, cuts, fitting, { meets }), { meets });
     const pieces = [];
@@ -1986,7 +2315,7 @@ function gridPlan(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0, profil
       const s = held?.get(c.cell.join(','));
       if (held && !s?.filled) continue;
       const ways = waysOf(c, s);
-      pieces.push({ cell: c.cell, size: c.size, fits: fitsBed(c.size, U, { flat: ways }).fits });
+      pieces.push({ cell: c.cell, size: c.size, fits: fitsBed(c.size, U, { flat: ways }).fits && capped(c) });
       if (s?.lying) need += leastSupport(s, c.size, ways, U);
     }
     return { k, offsets, cost: cost + (PLAN_WEIGHTS.support * need) / broadest, support: need, cells, pieces };
@@ -2012,7 +2341,8 @@ function gridPlan(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0, profil
   const plan = attempt(reach) ?? (reach.some((v) => v > 0) ? attempt([0, 0, 0]) : null);
   if (!plan) return null;
   const { cells, ...rest } = plan;
-  return rest;
+  // with a Largest piece, what its cuts do to the details Fit looks after, for the guard (`GUARD`)
+  return cap < Infinity ? { ...rest, flaws: detailFlaws(plan.offsets) } : rest;
 }
 
 /**
@@ -2053,7 +2383,7 @@ function sharedRoom(box, U, flat) {
   const fits = (f) => fitsBed(box.map((v) => v * f), U, { flat }).fits;
   if (!fits(1)) return null;
   let lo = 1;
-  let hi = (Math.hypot(...U) + 1) / Math.max(EPS, Math.min(...box)); // nothing longer than the bed's diagonal fits
+  let hi = (Math.hypot(U[0], U[1], U[2]) + 1) / Math.max(EPS, Math.min(...box)); // nothing longer than the bed's diagonal fits
   for (let i = 0; i < 48 && hi - lo > 1e-9; i++) {
     const mid = (lo + hi) / 2;
     if (fits(mid)) lo = mid;
@@ -4597,6 +4927,12 @@ const mm1 = (v) => String(Math.round(v * 10) / 10);
 /** Box sides for a note: "262 × 120 × 80 mm". */
 export const formatSize = (dims) => `${dims.map(mm1).join(' × ')} mm`;
 
+/** The room a usable bed has, for a note: "246 × 246 × 249 mm", and ", clear of its front-left 18 × 28 mm corner" with one. */
+export const roomWords = (U) => {
+  const corner = bedCorner(U);
+  return `${formatSize(U.slice(0, 3))}${corner ? `, clear of its front-left ${corner.map(mm1).join(' × ')} mm corner` : ''}`;
+};
+
 /** "A", "A and B", "A, B and C". */
 function listOf(items) {
   if (items.length <= 1) return items.join('');
@@ -4715,6 +5051,7 @@ const NOTE_LEVELS = Object.freeze({
   DOWELS_CAPPED: 'info',
   LABELS_SKIPPED: 'info',
   PIECE_TOO_BIG: 'warn',
+  CORNER_PLACE: 'info',
   PIECE_UNSTABLE: 'warn',
   PART_TOO_BIG: 'warn',
   SMALL_PIECE: 'warn',
@@ -4737,6 +5074,8 @@ const NOTE_LEVELS = Object.freeze({
   SPLIT_UNAVAILABLE: 'warn',
   SPLIT_NOT_NEEDED: 'info',
   PLAN_TOO_MANY: 'warn',
+  PIECES_WITHIN: 'info',
+  LARGEST_TOO_SMALL: 'warn',
   BED_TOO_SMALL: 'info',
   PART_LIFTS: 'info',
   PART_LOCK: 'info',
@@ -4898,7 +5237,13 @@ const NOTE_TEXT = {
   ONE_CONNECTOR: ({ letter, pegs = false }) => `Only one ${pegs ? 'peg' : 'pin'} fits on part of cut ${letter} – line the pieces up while the glue sets.`,
   DOWELS_CAPPED: ({ placed, dropped, pegs = false }) => `${plural(placed, pegs ? 'peg' : 'pin')} placed; ${plural(dropped, 'small face is', 'small faces are')} glued flat.`,
   LABELS_SKIPPED: ({ letters = [] }) => `No room for a label at ${letters.length > 1 ? 'cuts' : 'cut'} ${listOf(letters)}.`,
-  PIECE_TOO_BIG: ({ pieceIndex, size, bed }) => `${pieceName(pieceIndex)} (${formatSize(size)}) doesn't fit your printer in any position${bed ? ` – it has room for ${formatSize(bed)}` : ''}.`,
+  PIECE_TOO_BIG: ({ pieceIndex, size, bed }) => `${pieceName(pieceIndex)} (${formatSize(size)}) doesn't fit your printer in any position${bed ? ` – it has room for ${roomWords(bed)}` : ''}.`,
+  CORNER_PLACE: ({ pieces = [], corner = null, whole = false }) => {
+    const many = pieces.length > 1;
+    const sides = corner ? `${corner.map(mm1).join(' × ')} mm ` : '';
+    if (whole) return `This model fits only beside or behind the bed's front-left ${sides}corner: in the slicer, move it clear of it – left in the middle of the bed it reaches into it.`;
+    return `${many ? `Pieces ${listOf(pieces)} fit` : `Piece ${pieces[0] ?? ''} fits`} only beside or behind the bed's front-left ${sides}corner: in the slicer, move ${many ? 'them' : 'it'} clear of it – left in the middle of the bed ${many ? 'they reach' : 'it reaches'} into it.`;
+  },
   PIECE_UNSTABLE: ({ pieceIndex, pegs = false, lip = false }) => {
     if (lip) return `${pieceName(pieceIndex)} has nothing flat to stand on but the face its lip stands out of – it rests on a curve or an edge and needs supports.`;
     return pegs
@@ -4906,7 +5251,7 @@ const NOTE_TEXT = {
       : `${pieceName(pieceIndex)} has nothing flat to stand on where it fits your printer – it rests on a curve or an edge and needs supports. Another cut through it gives it a flat face to lie on.`;
   },
   PART_TOO_BIG: ({ name, size, bed, pins = false }) => {
-    const room = `${formatSize(size)}${bed ? `; the printer has room for ${formatSize(bed)}` : ''}`;
+    const room = `${formatSize(size)}${bed ? `; the printer has room for ${roomWords(bed)}` : ''}`;
     return pins
       ? `The pins are too long for your printer (${room}) – use wooden dowels, or a smaller pin size.`
       : `${quoted(name)} prints separately and is too big for your printer (${room}) – make it smaller, or join it to the model without pegs so it is cut with the pieces.`;
@@ -4949,7 +5294,7 @@ const NOTE_TEXT = {
     if (Number.isFinite(moveTo)) s += ` Move cut ${letter} to ${signed1(moveTo)} mm or ${Number.isFinite(at) && moveTo > at ? 'higher' : 'lower'} to keep it on.`;
     return s;
   },
-  BARELY_HELD: ({ letter, volume = 0, box = null, w = 0, piece = null, moveTo = null, holds = null, kept = null }) => {
+  BARELY_HELD: ({ letter, volume = 0, box = null, w = 0, piece = null, moveTo = null, holds = null, kept = null, capped = null }) => {
     const where = box ? ` (${spanWords(box, 0)}, ${spanWords(box, 2)})` : '';
     let s = `${volumeWords(volume)} of ${partPiece(piece, 'a piece')}${where} holds on only over the ${heldWords(w)} mm next to cut ${letter}, and may snap off there.`;
     if (Number.isFinite(moveTo)) {
@@ -4957,6 +5302,9 @@ const NOTE_TEXT = {
     } else if (kept) {
       // the only place that holds it runs through a detail kept whole
       s += ` Moving cut ${letter} so it holds would run through ${kept}, which you keep whole – glue this joint with care, or print ${partPiece(piece, 'the piece')} with more walls.`;
+    } else if (capped) {
+      // the only places that hold it make a piece longer than the Largest piece
+      s += ` Moving cut ${letter} so it holds would make a piece longer than your ${mm1(capped)} mm Largest piece – raise it, glue this joint with care, or print ${partPiece(piece, 'the piece')} with more walls.`;
     }
     return s;
   },
@@ -4993,7 +5341,41 @@ const NOTE_TEXT = {
       : `This model already fits your printer${yaw ? ` (turned ${yaw}° on the bed)` : ''} – no need to split.`;
   },
   PLAN_TOO_MANY: () => `This would need more than ${SPLIT_LIMITS.cells} pieces – scale the model down or choose a bigger printer.`,
-  BED_TOO_SMALL: ({ size, bed }) => `${formatSize(size)} – bigger than your ${formatSize(bed)} printer.`,
+  PIECES_WITHIN: ({ cap, longer = [], over = [], all = false }) => {
+    const within = `Every piece is within your ${Number.isFinite(cap) ? `${mm1(cap)} mm ` : ''}Largest piece`;
+    const keep = (x) => `to keep ${x.name ?? 'the detail'}${Number.isFinite(x.size) ? ` (${mm1(x.size)} mm)` : ''} whole`;
+    let s;
+    if (all && longer.length === 1) {
+      // the detail's slab is the whole model along that axis: every piece is longer along it
+      const [x] = longer;
+      const others = [0, 1, 2].filter((a) => a !== x.axis).map((a) => AXES[a].toUpperCase());
+      s = `${within} along ${listOf(others)}; along ${AXES[x.axis].toUpperCase()} they are up to ${mm1(x.length)} mm, ${keep(x)}.`;
+    } else if (longer.length) {
+      s = `${within} except ${listOf(longer.map((x) => `${piecesOf(x.pieces)}, up to ${mm1(x.length)} mm along ${AXES[x.axis].toUpperCase()} ${keep(x)}`))}.`;
+    } else s = `${within}.`;
+    if (over.length) {
+      const most = Math.max(...over.map((x) => x.length));
+      s += over.length > 1
+        ? ` Pieces ${listOf(over.map((x) => x.piece))} are up to ${mm1(most)} mm long: loose bits went back to them.`
+        : ` Piece ${over[0].piece} is ${mm1(most)} mm long: a loose bit went back to it.`;
+    }
+    return s;
+  },
+  LARGEST_TOO_SMALL: ({ cap, least = null, used = null, why = 'many', kept = false }) => {
+    const limit = Number.isFinite(cap) ? `${mm1(cap)} mm` : 'your Largest piece';
+    if (why === 'plan') {
+      return `No plan keeps every piece within ${limit}${kept ? ' and every detail you keep whole' : ''} here, so these are as big as your printer takes – raise Largest piece, or clear it.`;
+    }
+    const many = `Pieces of ${limit} at most would take more than ${SPLIT_LIMITS.cells} pieces`;
+    if (Number.isFinite(used)) return `${many}, so these are up to ${mm1(used)} mm, the least ${SPLIT_LIMITS.cells} pieces allow – raise Largest piece to ${mm1(used)} mm, or clear it.`;
+    return `${many}, so these are as big as your printer takes – raise Largest piece${Number.isFinite(least) ? ` to about ${mm1(least)} mm` : ''}, or clear it.`;
+  },
+  BED_TOO_SMALL: ({ size, bed, corner = null, cap = null }) => {
+    if (Number(cap) > 0) return `${formatSize(size)} – longer than your ${mm1(cap)} mm Largest piece.`;
+    return corner
+      ? `${formatSize(size)} – too big for your ${formatSize(bed)} printer once its front-left ${corner.map(mm1).join(' × ')} mm corner is kept clear.`
+      : `${formatSize(size)} – bigger than your ${formatSize(bed)} printer.`;
+  },
   PART_LOCK: ({ letter, name, piece = null, home = null, handle = false, turn = 0, lift = 0, dir = null, span = null }) => {
     const verb = partMany(name) ? 'twist-lock' : 'twist-locks';
     const onto = partPiece(home, 'the model');
@@ -5126,7 +5508,11 @@ const NOTE_TEXT = {
  * take pegs, but neither piece could lie on the bed carrying them; `thin`: only one piece has room for the sockets, and the
  * other, too thin for them, could not lie flat carrying the pegs); ONE_CONNECTOR `{ letter, pegs }`;
  * DOWELS_CAPPED `{ placed, dropped, pegs }`; LABELS_SKIPPED `{ letters }`;
- * PIECE_TOO_BIG `{ pieceIndex, size, bed }`; SMALL_PIECE `{ pieceIndex, thickness, letters, cutId }`;
+ * PIECE_TOO_BIG `{ pieceIndex, size, bed }` (`bed` the usable bed, its corner kept clear too when it has one);
+ * CORNER_PLACE `{ pieces, corner, whole? }` (on a bed that keeps a corner clear, `corner` its sides: the pieces that fit
+ * only beside or behind it, and would reach into it left in the middle of the bed, `reachesCorner`; `whole` for a model
+ * printed whole that does, `fitReachesCorner`, with no pieces);
+ * SMALL_PIECE `{ pieceIndex, thickness, letters, cutId }`;
  * CUTS_MERGED `{ letters, cutIds }`; SPLIT_CHECK `{ ratio }` (signed, (pieces − model) / model);
  * ISLAND_JOINED `{ bits: [{ letter, cutId, volume, from, to }] }` (the bits the cuts would have left loose, each kept
  * on the piece `to` it hangs on, out of piece `from`); LOOSE_KEPT `{ letter, cutId, at, volume, box, why: 'hooks'|'big',
@@ -5134,8 +5520,9 @@ const NOTE_TEXT = {
  * `apart` – that hooks round piece `around`, so takes no pins, or would make piece `across`, which it hangs on, too big:
  * `away` the way it comes away to go on last ('-y' to the front, so slid on from the front), `moveTo` where the cut,
  * now at `at`, would keep it on its own box, `pegs` that the joints are built-in pegs);
- * BARELY_HELD `{ letter, cutId, axis, at, volume, box, w, piece, moveTo, holds, keepId?, kept? }` (`kept` the name of the
- * detail kept whole the only place to move the cut to runs through, with its `keepId`; `volume` mm³ of piece `piece`, in
+ * BARELY_HELD `{ letter, cutId, axis, at, volume, box, w, piece, moveTo, holds, keepId?, kept?, capped? }` (`kept` the name of the
+ * detail kept whole the only place to move the cut to runs through, with its `keepId`; `capped` the Largest piece the
+ * only places that hold it would make a piece longer than; `volume` mm³ of piece `piece`, in
  * `box`, comes loose when the `w` mm of it next to the cut are left out: it holds on only there; `moveTo` the nearest
  * place for the cut where it would hold on, over `holds` mm – null when nothing there comes loose);
  * KEEP_KEPT `{ keepId, name, piece }` (a detail marked to keep whole that no cut runs through, on printed piece
@@ -5150,7 +5537,17 @@ const NOTE_TEXT = {
  * face its pegs or its lip stand out of was flat); PART_TOO_BIG `{ name, size, bed, pins }`
  * (a part printed separately, or with `pins` a single pin, too big for the bed); SPLIT_NOT_NEEDED `{ yaw, down, apart }`
  * (down other than '-z' when it fits only on its side; `apart` the letters of the cuts that come apart, when the pieces
- * they make fit); BED_TOO_SMALL `{ size, bed, pieces }`.
+ * they make fit); BED_TOO_SMALL `{ size, bed, pieces, corner, cap }` (`bed` the printer's own size; `corner` its sides
+ * when the model would fit but for the corner the printer keeps clear; `cap` the Largest piece, when the model fits the
+ * printer but is longer than that);
+ * PIECES_WITHIN `{ cap, longer, over, all }` (Fit kept every piece within the Largest piece `cap` mm along each axis, but
+ * `longer`: `[{ pieces, axis, length, keepId, name, size }]`, the pieces of the slab that holds a detail kept whole
+ * longer than that, up to `length` mm along `axis`, the detail's box `size` mm along it (in whole mm, as its Keep whole
+ * row shows it); `all` when those are every
+ * piece; `over`: `[{ piece, length }]`, pieces a loose bit given back made longer);
+ * LARGEST_TOO_SMALL `{ cap, least, used, why, kept }` (`why` 'many': within `cap` would take more than 64 pieces, so the
+ * pieces are planned within `used` mm, the least 64 allow – or, with `used` null, as big as the printer takes, `least`
+ * the least that would do; 'plan': no plan keeps the pieces within it (and every detail kept whole, `kept`)).
  * A cut that takes out a part (`name` the part's, "Dome and cap", "Top", "Base" or "Part B"): PART_LOCK `{ letter, cutId,
  * name, piece, home, handle, turn, lift, dir, span }` (part `piece` twist-locks onto piece `home` turning `turn`°, and
  * comes out lifted `lift` mm and slid along `dir`, under a handle spanning `span` – vectors in any frame, the two
@@ -5185,6 +5582,17 @@ export function splitNote(code, fields = {}) {
   const text = NOTE_TEXT[code];
   if (!text) throw new Error(`Unknown split note "${code}"`);
   return { level: NOTE_LEVELS[code], code, text: text(fields), ...fields };
+}
+
+/**
+ * CORNER_PLACE for the pieces (`{ index, size, yaw, fits }`, laid as `chooseOrientation` lays them) that fit a bed
+ * keeping a corner clear only beside or behind it (`reachesCorner`); null when there are none, or no corner.
+ */
+export function cornerPlaceNote(pieces, U) {
+  const corner = bedCorner(U);
+  if (!corner) return null;
+  const list = pieces.filter((p) => p.fits !== false && reachesCorner(p.size, p.yaw, U)).map((p) => p.index).sort((a, b) => a - b);
+  return list.length ? splitNote('CORNER_PLACE', { pieces: list, corner }) : null;
 }
 
 // ---------- files and the glue sheet ----------
@@ -5459,11 +5867,12 @@ function fitWords(fit) {
  * @param {{ name: string, pieces: { index: number, cell: number[], size: number[], lies: string, yaw?: number, fits?: boolean, shells?: number,
  *   part?: string, name?: string, lids?: string[] }[],
  *   seams: object[], pins?: { d: number, length: number, count: number, spares?: number, own?: boolean }[],
- *   parts?: { name: string }[], clearance?: number, bed?: number[], printer?: { size: number[], margin: number }|null, steps?: object[],
+ *   parts?: { name: string }[], clearance?: number, bed?: number[], printer?: { size: number[], margin: number, corner?: number[]|null }|null, steps?: object[],
  *   bridges?: number[], fit?: object|null }} plan
  *   `seams` as for `assemblySteps`; a piece that is a part taken out has its cut's id (`part`), its `name` and the
- *   cut's letter (`lids`); `pins` one group per pin size (count without spares); `bed` the usable bed;
- *   `printer` the printer itself, when known, for the heading; `bridges` the clips' bridges' lengths as built (each
+ *   cut's letter (`lids`); `pins` one group per pin size (count without spares); `bed` the usable bed (with the
+ *   corner it keeps clear, the pieces that must be moved clear of it are told so); `printer` the printer itself, when
+ *   known, for the heading (`corner` the sides of the corner it keeps clear); `bridges` the clips' bridges' lengths as built (each
  *   hold's own on a 1.6 mm tongue when not given); `fit` the PART_FIT note's fields, for what the fit test holds
  * @returns {string}
  */
@@ -5498,9 +5907,11 @@ export function howToGlueText(plan) {
   const seated = seams.filter((s) => s.joint === 'part' && s.apart?.seat && s.part);
   const anyTwist = [...lips.values()].some((l) => l.twist) || locked.length > 0;
   const plainLips = [...lips.values()].some((l) => !l.twist);
+  // the corner the printer keeps clear, named with the printer and on each piece that must be moved clear of it
+  const corner = printer?.corner ?? bedCorner(bed);
   const where = printer?.size
-    ? `a ${formatSize(printer.size)} printer${printer.margin ? ` (${mm(printer.margin)} mm margin)` : ''}`
-    : bed ? `a printer with room for ${formatSize(bed)}` : 'your printer';
+    ? `a ${formatSize(printer.size)} printer${printer.margin || corner ? ` (${[printer.margin ? `${mm(printer.margin)} mm margin` : '', corner ? `its ${corner.map(mm1).join(' × ')} mm front-left corner kept clear` : ''].filter(Boolean).join(', ')})` : ''}`
+    : bed ? `a printer with room for ${roomWords(bed)}` : 'your printer';
   const out = [`${name} – ${plural(n, 'piece')} for ${where} – STL Text`, ''];
 
   const unsupported = [anyPins && 'holes', anyPegs && 'pegs and sockets', plainLips && (anyClips ? 'lips and clips' : 'lips'), anyTwist && 'twist-locks'].filter(Boolean);
@@ -5510,6 +5921,8 @@ export function howToGlueText(plan) {
   [...pieces].sort((p, q) => p.index - q.index).forEach((p) => {
     const extra = [p.fits === false ? 'TOO BIG for this printer' : 'fits'];
     if (p.yaw && p.yaw !== 90) extra.push(`turned ${p.yaw}° to fit`); // a quarter turn is already in the file and looks ordinary
+    // left in the middle of the bed, where the slicer puts it, it would reach into the corner the printer keeps clear
+    if (p.fits !== false && bed && reachesCorner(p.size, p.yaw, bed)) extra.push('move it clear of the front-left corner');
     if (p.shells > 1) extra.push(`${p.shells} parts${p.loose ? ` – ${p.loose} loose` : ''}`);
     for (const l of lips.values()) {
       if (l.male.has(p.index)) extra.push(`${l.twist ? 'twist-lock neck' : 'lip'} for cut ${l.letter}`);

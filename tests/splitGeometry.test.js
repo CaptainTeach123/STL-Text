@@ -1,8 +1,8 @@
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
 import {
-  AXES, CLIP, FILAMENT, LIP, PIN_DIAMETERS, TO_PLANE, apartMales, applyMat4, chooseOrientation, clipHold, clipShape, endBeds, endsAsWell, isSymmetric,
-  layPieces, normaliseSplit, pegMales, pegSizesFor, sizesFor,
+  AXES, CLIP, FILAMENT, LIP, PIN_DIAMETERS, TO_PLANE, apartMales, applyMat4, chooseOrientation, clipHold, clipShape, endBeds, endsAsWell, fitsBed, isSymmetric,
+  layPieces, normaliseSplit, pegMales, pegSizesFor, reachesCorner, sizesFor,
 } from '../src/split.js';
 import {
   bandFor,
@@ -184,6 +184,27 @@ describe('holes and pins', () => {
     expect(full.size[1]).toBeLessThanOrEqual(U[1]);
     // one more would need another row: the bed has no room for it
     expect(boxOf(own(pinSheet({ d: 8, length: 26, count: perSheet + 1 }, U))).size[1]).toBeGreaterThan(U[1]);
+    // the room it is laid out in is the bed's own
+    expect(pinsPerSheet({ d: 8, length: 26 }, U).room).toEqual(U);
+  });
+
+  it('on a printer that keeps a corner clear, a pins file misses the corner even left in the middle of the bed', () => {
+    const X1 = [246, 246, 249, 18, 28]; // the X1 / P1 at a 5 mm margin
+    for (const [d, length] of [[8, 26], [5, 16], [3, 10]]) {
+      const { perSheet, size, room } = pinsPerSheet({ d, length }, X1);
+      // 246 less the corner's side twice off its width, or off its depth: whichever holds more
+      expect([[210, 246, 249], [246, 190, 249]]).toContainEqual(room);
+      expect(perSheet).toBeLessThanOrEqual(pinsPerSheet({ d, length }, X1.slice(0, 3)).perSheet);
+      expect(size).toEqual(pinsPerSheet({ d, length }, X1.slice(0, 3)).size);
+      const full = boxOf(own(pinSheet({ d, length, count: perSheet }, room)));
+      expect(full.size[0]).toBeLessThanOrEqual(room[0] + 1e-6);
+      expect(full.size[1]).toBeLessThanOrEqual(room[1] + 1e-6);
+      expect(fitsBed(full.size, X1, { flat: 2 }).fits).toBe(true);
+      expect(reachesCorner(full.size, 0, X1)).toBe(false);
+      // laid out to the whole bed, as before, the same pins would reach into the corner
+      const wide = boxOf(own(pinSheet({ d, length, count: pinsPerSheet({ d, length }, X1.slice(0, 3)).perSheet }, X1)));
+      expect(reachesCorner(wide.size, 0, X1)).toBe(true);
+    }
   });
 
   for (const tear of [false, true]) {

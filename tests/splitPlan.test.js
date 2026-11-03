@@ -14,6 +14,8 @@ import {
   clipHold, clipPush, clipShape, layGrown, lipReach, lipSides, lipSizesFor, statsWithLip, SPOT, comesOffOf, endBeds, endShape, endsAsWell, keepsTo, lipMale,
   locateBend, locateSeam, pickSpots, profileSeams, seamKind, seamWords, snapTarget, spotScore, spotSide, spotStart, spotWhy, socketsAsWell,
   printedFace, printedRow, wayAt, waySteps, wayStep, KEEP_INSIDE, KEEP_LIMIT, keepCrossed, keepName, keepsOf, keepsThrough,
+  PRESET_ALIASES, bedCorner, cornerPlaceNote, fitReachesCorner, presetOf, reachesCorner, roomWords, turnedFootprint,
+  GUARD, LARGEST_MIN, capOf, clampLargest, detailClean, pickGroup, planEnds, slabCap, wideKeeps, withinCap,
 } from '../src/split.js';
 import { boxHang, columnGraph, columnsOf, looseTable, planeGrid, rasterRings, sampleWidths } from '../src/hang.js';
 
@@ -39,8 +41,32 @@ describe('bed', () => {
     expect(bedSize({ preset: 'custom', size: [123, 'x', null] })).toEqual([123, 220, 250]);
     expect(bedSize({ preset: 'custom', size: [0, -5, ''] })).toEqual([220, 220, 250]);
     expect(bedSize({ preset: 'nope' })).toEqual([220, 220, 250]);
-    expect(Object.keys(BED_PRESETS)).toEqual(['generic', 'a1mini', 'bambu256', 'mk4s', 'coreone', 'coreonel', 'custom']);
+    expect(Object.keys(BED_PRESETS)).toEqual(['generic', 'a1mini', 'bambux1', 'bambua1', 'mk4s', 'coreone', 'coreonel', 'custom']);
     expect(BED_PRESETS.generic.size).toEqual([220, 220, 250]);
+  });
+
+  it('the X1 / P1 keep their front-left 18 × 28 mm clear and print 250 mm high; the A1 / P2S take 256 mm and keep nothing clear', () => {
+    expect(BED_PRESETS.bambux1).toEqual({ label: 'Bambu Lab X1 / P1S / P1P', size: [256, 256, 250], corner: [18, 28] });
+    expect(BED_PRESETS.bambua1).toEqual({ label: 'Bambu Lab A1 / P2S', size: [256, 256, 256] });
+    expect(usableBed({ preset: 'bambux1', margin: 5 })).toEqual([246, 246, 249, 18, 28]);
+    expect(usableBed({ preset: 'bambua1', margin: 5 })).toEqual([246, 246, 255]);
+    expect(bedCorner(usableBed({ preset: 'bambux1', margin: 5 }))).toEqual([18, 28]);
+    // every printer without a corner, and Custom, has the three numbers it always had
+    for (const preset of Object.keys(BED_PRESETS).filter((k) => k !== 'bambux1')) {
+      expect(usableBed({ preset, size: [300, 200, 100], margin: 5 })).toHaveLength(3);
+      expect(bedCorner(usableBed({ preset, size: [300, 200, 100], margin: 5 }))).toBeNull();
+    }
+    expect(bedCorner([246, 246, 255])).toBeNull();
+    expect(bedCorner([246, 246, 255, 0, 0])).toBeNull();
+  });
+
+  it('a printer saved as the old “A1 / P1S / X1” reads as the X1 / P1, the smaller of the two', () => {
+    expect(PRESET_ALIASES).toEqual({ bambu256: 'bambux1' });
+    expect(BED_PRESETS.bambu256).toBeUndefined();
+    expect(presetOf({ preset: 'bambu256' })).toBe(BED_PRESETS.bambux1);
+    expect(bedSize({ preset: 'bambu256', size: [256, 256, 256] })).toEqual([256, 256, 250]);
+    expect(usableBed({ preset: 'bambu256', size: [256, 256, 256], margin: 5 })).toEqual([246, 246, 249, 18, 28]);
+    expect(presetOf({ preset: 'nope' })).toBeUndefined();
   });
 });
 
@@ -451,6 +477,249 @@ describe('fitsBed', () => {
     expect(fitsBed([200, 5, 120], U, { flat: 1 })).toMatchObject({ fits: true, down: '-y', height: 5 });
     expect(maxCellLength([150, 100, 5], 0, U, { flat: 2 })).toBeCloseTo(210, 6);
     expect(maxCellLength([150, 100, 5], 0, U)).toBeGreaterThan(280); // on its edge, across the diagonal
+  });
+});
+
+describe('a printer that keeps a corner of its bed clear', () => {
+  const X1 = [246, 246, 249, 18, 28]; // the X1 / P1's room at a 5 mm margin, its front-left 18 × 28 mm kept clear
+  const A1 = [246, 246, 255]; // the A1 / P2S's: the same bed, nothing kept clear
+  const RAD = Math.PI / 180;
+  /** The box an a × b footprint takes turned `yaw`° as `footprintYaw` turns it (a quarter turn swaps the sides). */
+  const turned = (a, b, yaw) => (yaw === 90 ? [b, a] : [a * Math.cos(yaw * RAD) + b * Math.sin(yaw * RAD), a * Math.sin(yaw * RAD) + b * Math.cos(yaw * RAD)]);
+  const within = ([w, d], [X, Y]) => w <= X + 1e-6 && d <= Y + 1e-6;
+  /** A seeded stream of numbers in [0, 1): the same boxes every run. */
+  const seeded = (seed) => () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+
+  it('a footprint fits beside the corner, (x − 18) × y, or behind it, x × (y − 28), turned if need be', () => {
+    // beside: 228 × 246; behind: 246 × 218
+    expect(footprintYaw(228, 246, X1)).toBe(0);
+    expect(footprintYaw(246, 218, X1)).toBe(0);
+    expect(footprintYaw(246, 219, X1)).toBe(90); // too deep for behind, turned it fits beside
+    expect(footprintYaw(230, 225, X1)).toBe(90);
+    expect(footprintYaw(229, 246, X1)).toBeNull(); // only by reaching into the notch beside the corner
+    expect(footprintYaw(240, 240, X1)).toBeNull();
+    expect(footprintYaw(240, 240, A1)).toBe(0);
+    // turned across the diagonal: a 300 × 20 bar fits behind the corner at 39°, as on the A1; 330 mm only on the A1
+    expect(footprintYaw(300, 20, X1)).toBe(39);
+    expect(footprintYaw(300, 20, A1)).toBe(39);
+    expect(within(turned(300, 20, 39), [246, 218])).toBe(true);
+    expect(within(turned(300, 20, 39), [228, 246])).toBe(false);
+    expect(fitsBed([330, 20, 5], X1).fits).toBe(false);
+    expect(fitsBed([330, 20, 5], A1)).toMatchObject({ fits: true, down: '-y', height: 20 });
+    // a piece the A1 takes standing up is too tall for the X1's 250 mm, and on its sides too big for the corner
+    expect(fitsBed([220, 236, 252], X1).fits).toBe(false);
+    expect(fitsBed([220, 236, 252], A1)).toMatchObject({ fits: true, down: '-z' });
+    expect(fitsBed([220, 236, 249], X1)).toMatchObject({ fits: true, down: '-z', yaw: 0 });
+  });
+
+  it('every turn it gives fits one of the two rectangles, and it is the least either way', () => {
+    const next = seeded(7);
+    const rooms = [[228, 246], [246, 218]];
+    let fitted = 0;
+    for (let i = 0; i < 2000; i++) {
+      const a = 5 + next() * 345;
+      const b = 5 + next() * 345;
+      const yaw = footprintYaw(a, b, X1);
+      // the least turn in each rectangle alone, as a bed of that size gives it
+      const each = rooms.map(([x, y]) => footprintYaw(a, b, [x, y, 249]));
+      const ranked = each.filter((y) => y !== null).sort((p, q) => (p === 0 ? 0 : p === 90 ? 1 : 1 + p) - (q === 0 ? 0 : q === 90 ? 1 : 1 + q));
+      expect(yaw).toBe(ranked[0] ?? null);
+      if (yaw === null) continue;
+      fitted++;
+      expect(rooms.some((room) => within(turned(a, b, yaw), room))).toBe(true);
+    }
+    expect(fitted).toBeGreaterThan(300);
+  });
+
+  it('the margin is kept between a piece and the corner too, at 0, 5 and 20 mm', () => {
+    for (const margin of [0, 5, 20]) {
+      const U = usableBed({ preset: 'bambux1', margin });
+      const W = 256 - 2 * margin;
+      expect(U).toEqual([W, W, 249, 18, 28]);
+      const flat = { flat: 2 };
+      // beside the corner, against the far margin: its near edge is the margin clear of the corner's side
+      expect(fitsBed([W - 18, W, 5], U, flat)).toMatchObject({ fits: true, yaw: 0 });
+      expect(256 - margin - (W - 18) - 18).toBe(margin);
+      expect(fitsBed([W - 18 + 0.5, W, 5], U, flat).fits).toBe(false);
+      // behind it, the full width; deeper than that it fits only turned beside it, and no deeper than that
+      expect(fitsBed([W, W - 28, 5], U, flat)).toMatchObject({ fits: true, yaw: 0 });
+      expect(fitsBed([W, W - 28 + 0.5, 5], U, flat)).toMatchObject({ fits: true, yaw: 90 });
+      expect(fitsBed([W, W - 18, 5], U, flat)).toMatchObject({ fits: true, yaw: 90 });
+      expect(fitsBed([W, W - 18 + 0.5, 5], U, flat).fits).toBe(false);
+      // a piece too tall to stand up: with no margin it fits on its side beside the corner, with a margin nowhere
+      expect(fitsBed([220, 236, 252], U)).toMatchObject(margin === 0 ? { fits: true, down: '-x', height: 220 } : { fits: false });
+    }
+    // at 20 mm every one of the X1's boxes above is refused: the bed is 216 mm less the corner
+    const U20 = usableBed({ preset: 'bambux1', margin: 20 });
+    for (const d of [[228, 246, 5], [246, 218, 5], [246, 219, 5], [230, 225, 5]]) expect(fitsBed(d, U20, { flat: 2 }).fits).toBe(false);
+    // at 0 a 229 × 246 plate fits beside the corner, touching its side
+    expect(fitsBed([229, 246, 5], usableBed({ preset: 'bambux1', margin: 0 }), { flat: 2 })).toMatchObject({ fits: true, yaw: 0 });
+  });
+
+  it('a plate lies flat: it may not stand on its edge to keep clear of the corner', () => {
+    expect(fitsBed([240, 240, 10], X1, { flat: 2 }).fits).toBe(false);
+    expect(fitsBed([240, 240, 10], X1)).toMatchObject({ fits: true, height: 240 }); // on its edge, as any box may
+    expect(fitsBed([240, 240, 10], A1, { flat: 2 })).toMatchObject({ fits: true, down: '-z', yaw: 0 });
+    expect(fitsBed([229, 246, 5], X1, { flat: 2 }).fits).toBe(false);
+    expect(fitsBed([229, 246, 5], X1)).toMatchObject({ fits: true, down: '-x' });
+    // the corner is a matter of the footprint: a plate stood up the other way round is no different
+    expect(fitsBed([246, 5, 219], X1, { flat: 1 })).toMatchObject({ fits: true, down: '-y', yaw: 90 });
+    expect(fitsBed([240, 5, 240], X1, { flat: 1 }).fits).toBe(false);
+  });
+
+  it('a printer with no corner fits every box as before', () => {
+    // the rule as it was, kept here: one rectangle, straight, a quarter turn, then 1…89°
+    const before = (a, b, [x, y]) => {
+      const ux = x + 1e-9;
+      const uy = y + 1e-9;
+      if (a <= ux && b <= uy) return 0;
+      if (b <= ux && a <= uy) return 90;
+      if (Math.min(a, b) > Math.min(ux, uy)) return null;
+      for (let deg = 1; deg < 90; deg++) {
+        const c = Math.cos(deg * RAD);
+        const s = Math.sin(deg * RAD);
+        if (a * c + b * s <= ux && a * s + b * c <= uy) return deg;
+      }
+      return null;
+    };
+    const fitsBefore = (dims, room, { flat = null } = {}) => {
+      let best = null;
+      const ways = flat == null ? [0, 1, 2] : [].concat(flat);
+      for (const down of ['-z', '-y', '-x'].filter((d) => ways.includes(dirAxis(d)))) {
+        const L = LAY_DOWN[down];
+        const [a, b, h] = [0, 1, 2].map((r) => Math.abs(L[r]) * dims[0] + Math.abs(L[4 + r]) * dims[1] + Math.abs(L[8 + r]) * dims[2]);
+        if (h > room[2] + 1e-9) continue;
+        const yaw = before(a, b, room);
+        if (yaw === null) continue;
+        const rank = yaw === 0 ? 0 : yaw === 90 ? 1 : 1 + yaw;
+        if (!best || h < best.height - 1e-9 || (Math.abs(h - best.height) <= 1e-9 && rank < best.rank)) best = { down, height: h, yaw, rank, footprint: [a, b] };
+      }
+      if (!best) return { fits: false, down: null, height: null, yaw: null, footprint: null };
+      const { down, height, yaw, footprint } = best;
+      return { fits: true, down, height, yaw, footprint };
+    };
+    const next = seeded(11);
+    const flats = [null, 0, 1, 2, [0, 2], [1, 2]];
+    for (let i = 0; i < 2000; i++) {
+      const room = [60 + next() * 300, 60 + next() * 300, 60 + next() * 300];
+      const dims = [next(), next(), next()].map((v) => (v < 0.1 ? 2 + v * 30 : 5 + v * 420));
+      const flat = flats[Math.floor(next() * flats.length)];
+      expect(fitsBed(dims, room, { flat })).toEqual(fitsBefore(dims, room, { flat }));
+      expect(footprintYaw(dims[0], dims[1], room)).toBe(before(dims[0], dims[1], room));
+    }
+  });
+
+  it('the grids, the longest cell and the fewest pieces honour the corner', () => {
+    // a 240 × 240 × 5 plate fits the A1 whole; the X1 needs it in two, either way
+    expect(fitPieces([240, 240, 5], A1, {})).toMatchObject({ fits: true, pieces: 1 });
+    expect(fitPieces([240, 240, 5], X1, {})).toMatchObject({ fits: false, pieces: 2 });
+    expect(fitPieces([240, 240, 5], X1.slice(0, 3), {})).toMatchObject({ fits: true }); // it is the corner alone
+    expect(gridCandidates([240, 240, 5], X1, { flat: 2 }).slice(0, 2)).toEqual([{ k: [0, 1, 0], pieces: 2 }, { k: [1, 0, 0], pieces: 2 }]);
+    expect(gridCandidates([240, 240, 5], A1, { flat: 2 })[0]).toEqual({ k: [0, 0, 0], pieces: 1 });
+    expect(gridCounts([240, 240, 5], X1, { flat: 2 })).toEqual({ pieces: 2, candidates: [[0, 1, 0], [1, 0, 0]] });
+    // a plate 240 mm deep may be up to 228 wide beside the corner (turned: 240 × 228 lies beside it as 228 × 240)
+    expect(maxCellLength([100, 240, 5], 0, X1, { flat: 2 })).toBeCloseTo(228, 6);
+    expect(maxCellLength([100, 240, 5], 0, A1, { flat: 2 })).toBeCloseTo(246, 6);
+    expect(maxCellLength([246, 100, 5], 1, X1, { flat: 2 })).toBeCloseTo(228, 6); // turned, beside it
+    expect(cellFits({ size: [228, 240, 5], flat: 2 }, X1)).toBe(true);
+    expect(cellFits({ size: [229, 240, 5], flat: 2 }, X1)).toBe(false);
+    expect(cellFits({ size: [229, 240, 5], flat: 2 }, A1)).toBe(true);
+    expect(evenCell([240, 240, 5], [0, 1, 0])).toEqual([240, 120, 5]);
+  });
+
+  it('a piece that fits only beside or behind the corner is named: left in the middle of the bed it reaches into it', () => {
+    // centred on the X1's 256 mm bed, a piece more than 210 wide and 190 deep comes within 5 mm of the corner
+    expect(reachesCorner([228, 235, 5], 0, X1)).toBe(true);
+    expect(reachesCorner([210, 235, 5], 0, X1)).toBe(false);
+    expect(reachesCorner([228, 190, 5], 0, X1)).toBe(false);
+    expect(reachesCorner([228, 235, 5], 0, A1)).toBe(false);
+    // a 220 × 236 piece centred starts 18 mm in from the bed's left and 10 mm from its front: inside the corner's margin
+    expect(reachesCorner([220, 236, 249], 0, X1)).toBe(true);
+    // turned, it is the box it takes on the bed that counts; a laid size has a quarter turn made already
+    expect(turnedFootprint(300, 20, 39).map((v) => +v.toFixed(2))).toEqual([245.73, 204.34]);
+    expect(reachesCorner([300, 20, 5], 39, X1)).toBe(true);
+    expect(turnedFootprint(246, 219, 90)).toEqual([246, 219]);
+    expect(reachesCorner([219, 246, 5], 90, X1)).toBe(true);
+    expect(reachesCorner([100, 246, 5], 90, X1)).toBe(false);
+    // with a 0 mm margin the corner's own sides: more than 220 × 200
+    const U0 = usableBed({ preset: 'bambux1', margin: 0 });
+    expect(reachesCorner([220, 235, 5], 0, U0)).toBe(false);
+    expect(reachesCorner([221, 201, 5], 0, U0)).toBe(true);
+
+    const pieces = [
+      { index: 2, size: [228, 235, 5], yaw: 0, fits: true },
+      { index: 1, size: [228, 235, 5], yaw: 0, fits: true },
+      { index: 3, size: [100, 100, 5], yaw: 0, fits: true },
+      { index: 4, size: [300, 300, 5], yaw: 0, fits: false }, // too big: PIECE_TOO_BIG says so
+    ];
+    const note = cornerPlaceNote(pieces, X1);
+    expect(note).toMatchObject({ level: 'info', code: 'CORNER_PLACE', pieces: [1, 2], corner: [18, 28] });
+    expect(note.text).toBe("Pieces 1 and 2 fit only beside or behind the bed's front-left 18 × 28 mm corner: in the slicer, move them clear of it – left in the middle of the bed they reach into it.");
+    expect(cornerPlaceNote(pieces.slice(1), X1).text).toBe("Piece 1 fits only beside or behind the bed's front-left 18 × 28 mm corner: in the slicer, move it clear of it – left in the middle of the bed it reaches into it.");
+    expect(cornerPlaceNote(pieces, A1)).toBeNull();
+    expect(cornerPlaceNote(pieces.slice(2), X1)).toBeNull();
+    expect(SPLIT_NOTE_CODES).toContain('CORNER_PLACE');
+  });
+
+  it('a model printed whole that fits only beside or behind the corner is told to move clear of it too', () => {
+    // a 230 × 225 block fits the X1 only turned a quarter, beside the corner; centred it reaches into it
+    const block = fitsBed([230, 225, 100], X1);
+    expect(block).toMatchObject({ fits: true, yaw: 90 });
+    expect(fitReachesCorner(block, X1)).toBe(true);
+    expect(fitPieces([230, 225, 100], X1, SPLIT_DEFAULTS)).toEqual({ fits: true, pieces: 1, down: '-z', yaw: 90, corner: true });
+    // a plate lies flat; one centred clear of the corner, the A1 (no corner) and one too big say nothing
+    expect(fitReachesCorner(fitsBed([226, 240, 5], X1, { flat: 2 }), X1)).toBe(true);
+    expect(fitPieces([226, 240, 5], X1, SPLIT_DEFAULTS)).toMatchObject({ fits: true, corner: true });
+    expect(fitReachesCorner(fitsBed([200, 200, 100], X1), X1)).toBe(false);
+    expect(fitPieces([200, 200, 100], X1, SPLIT_DEFAULTS)).toEqual({ fits: true, pieces: 1, down: '-z', yaw: 0 });
+    expect(fitReachesCorner(fitsBed([230, 225, 100], A1), A1)).toBe(false);
+    expect(fitPieces([230, 225, 100], A1, SPLIT_DEFAULTS)).not.toHaveProperty('corner');
+    expect(fitReachesCorner(fitsBed([300, 300, 100], X1), X1)).toBe(false);
+    expect(splitNote('CORNER_PLACE', { whole: true, corner: [18, 28] }))
+      .toMatchObject({ level: 'info', text: "This model fits only beside or behind the bed's front-left 18 × 28 mm corner: in the slicer, move it clear of it – left in the middle of the bed it reaches into it." });
+  });
+
+  it('the notes say what room the printer has, the corner with it', () => {
+    expect(roomWords(X1)).toBe('246 × 246 × 249 mm, clear of its front-left 18 × 28 mm corner');
+    expect(roomWords(A1)).toBe('246 × 246 × 255 mm');
+    const big = chooseOrientation(boxStats([240, 240, 260]), X1, 'auto', { pieceIndex: 3 });
+    expect(big.fits).toBe(false);
+    expect(big.notes[0].text).toBe("Piece 3 (240 × 240 × 260 mm) doesn't fit your printer in any position – it has room for 246 × 246 × 249 mm, clear of its front-left 18 × 28 mm corner.");
+    // a piece that fits only beside the corner lies there: no note
+    expect(chooseOrientation(boxStats([228, 240, 5]), X1)).toMatchObject({ fits: true, down: '-z', yaw: 0, notes: [] });
+    expect(splitNote('PART_TOO_BIG', { name: 'Star', size: [240, 240, 4], bed: X1 }).text)
+      .toBe('“Star” prints separately and is too big for your printer (240 × 240 × 4 mm; the printer has room for 246 × 246 × 249 mm, clear of its front-left 18 × 28 mm corner) – make it smaller, or join it to the model without pegs so it is cut with the pieces.');
+    expect(splitNote('BED_TOO_SMALL', { size: [240, 240, 5], bed: [256, 256, 250], pieces: 2, corner: [18, 28] }).text)
+      .toBe('240 × 240 × 5 mm – too big for your 256 × 256 × 250 mm printer once its front-left 18 × 28 mm corner is kept clear.');
+    expect(splitNote('BED_TOO_SMALL', { size: [300, 40, 20], bed: [256, 256, 250], pieces: 2 }).text).toBe('300 × 40 × 20 mm – bigger than your 256 × 256 × 250 mm printer.');
+    // no note prints the corner as two more sides of the bed
+    for (const n of [big.notes[0], splitNote('PART_TOO_BIG', { pins: true, size: [300, 9, 9], bed: X1 })]) expect(n.text).not.toMatch(/× 18 × 28/);
+  });
+
+  it('the glue sheet names the corner with the printer, and each piece to move clear of it', () => {
+    const pieces = [
+      { index: 1, cell: [0, 0, 0], size: [228, 235, 5], lies: 'flat as modelled', yaw: 0, fits: true, shells: 1 },
+      { index: 2, cell: [0, 1, 0], size: [228, 120, 5], lies: 'flat as modelled', yaw: 0, fits: true, shells: 1 },
+    ];
+    const seams = [{ letter: 'A', axis: 1, at: 0, pieces: [1, 2], joint: 'none', dowels: 0, labels: null }];
+    const x1 = howToGlueText({ name: 'plate', pieces, seams, bed: X1, printer: { size: [256, 256, 250], margin: 5, corner: [18, 28] } });
+    expect(x1).toMatch(/^plate – 2 pieces for a 256 × 256 × 250 mm printer \(5 mm margin, its 18 × 28 mm front-left corner kept clear\) – STL Text\n/);
+    expect(x1).toMatch(/piece 1 of 2 .* fits, move it clear of the front-left corner\n/);
+    expect(x1).toMatch(/piece 2 of 2 .* fits\n/);
+    // no margin: the corner alone; no printer: the room
+    expect(howToGlueText({ name: 'plate', pieces, seams, bed: usableBed({ preset: 'bambux1', margin: 0 }), printer: { size: [256, 256, 250], margin: 0, corner: [18, 28] } }))
+      .toMatch(/^plate – 2 pieces for a 256 × 256 × 250 mm printer \(its 18 × 28 mm front-left corner kept clear\) – STL Text\n/);
+    expect(howToGlueText({ name: 'plate', pieces, seams, bed: X1 })).toMatch(/^plate – 2 pieces for a printer with room for 246 × 246 × 249 mm, clear of its front-left 18 × 28 mm corner – STL Text\n/);
+    // the same pieces for the A1: as the sheet always was
+    const a1 = howToGlueText({ name: 'plate', pieces, seams, bed: A1, printer: { size: [256, 256, 256], margin: 5 } });
+    expect(a1).toMatch(/^plate – 2 pieces for a 256 × 256 × 256 mm printer \(5 mm margin\) – STL Text\n/);
+    expect(a1).not.toMatch(/corner/);
+    expect(howToGlueText({ name: 'plate', pieces, seams, bed: A1, printer: { size: [256, 256, 256], margin: 5, corner: null } })).toBe(a1);
   });
 });
 
@@ -3675,5 +3944,257 @@ describe('details kept whole', () => {
     });
     expect(splitNote('KEEP_NOT_KEPT', { name: 'Ribbon', letters: ['A', 'B'] }).text).toBe('No plan for your printer keeps Ribbon in one piece – cuts A and B run through it.');
     expect(SPLIT_NOTE_CODES).toEqual(expect.arrayContaining(['KEEP_KEPT', 'KEEP_CUT', 'KEEP_NOT_KEPT']));
+  });
+});
+
+describe('Largest piece', () => {
+  const X1 = [246, 246, 249, 18, 28];
+
+  it('is a printer setting of whole mm from 30 up, blank or 0 for none', () => {
+    expect(BED_DEFAULTS.largest).toBe(0);
+    expect(LARGEST_MIN).toBe(30);
+    expect([0, -5, NaN, '', null, undefined, Infinity].map(clampLargest)).toEqual([0, 0, 0, 0, 0, 0, 0]);
+    expect([12, 30, 199.6, 200, 20000].map(clampLargest)).toEqual([30, 30, 200, 200, 10000]);
+    expect([0, null, 200].map(capOf)).toEqual([Infinity, Infinity, 200]);
+  });
+
+  it('a slab may be as long as a detail kept whole longer than the cap needs, and no longer', () => {
+    const list = [{ l: 20, h: 250, most: 270 }];
+    expect(slabCap(100, list, 0, 260)).toBe(270);
+    expect(slabCap(100, list, 30, 260)).toBe(100); // it holds only part of the span: no cut runs inside one, so none
+    expect(slabCap(100, null, 0, 260)).toBe(100);
+    expect(withinCap([150, 50, 50], Infinity)).toBe(true);
+    expect(withinCap([150, 50, 50], 100)).toBe(false);
+    expect(withinCap([150, 50, 50], 100, [list, [], []])).toBe(true); // the whole model holds the span
+    expect(withinCap([150, 50, 50], 100, [list, [], []], { min: [0, 0, 0], max: [150, 50, 50] })).toBe(false);
+    expect(withinCap([260, 50, 50], 100, [list, [], []], { min: [0, 0, 0], max: [260, 50, 50] })).toBe(true);
+    expect(withinCap([260, 120, 50], 100, [list, [], []], { min: [0, 0, 0], max: [260, 120, 50] })).toBe(false); // the other axes keep the cap
+  });
+
+  it('the details longer than the cap, per axis: their span, run to the model\'s end where that is nearer than an end piece, and a quarter of the cap', () => {
+    const bounds = { min: [0, 0, 0], max: [600, 50, 50] };
+    // a 190 mm span 1 mm from the end runs to it; two that overlap in the middle are one, and do not; a short one is no
+    // exception
+    const keeps = [
+      { id: 'a', box: { min: [0, 0, 0], max: [192, 50, 50] } },
+      { id: 'b', box: { min: [239, 0, 0], max: [361, 50, 50] } },
+      { id: 'c', box: { min: [300, 0, 0], max: [420, 50, 50] } },
+      { id: 'd', box: { min: [500, 0, 0], max: [560, 50, 50] } },
+    ];
+    const wide = wideKeeps(keeps, 100, bounds, 14.2);
+    expect(wide[0]).toEqual([{ l: 1, h: 191, most: 191 + 25, ids: ['a'] }, { l: 240, h: 419, most: 179 + 25, ids: ['b', 'c'] }]);
+    expect(wide[1]).toEqual([]);
+    expect(wide[2]).toEqual([]);
+    expect(wideKeeps(keeps, Infinity, bounds, 14.2)).toBeNull();
+    // the shortest pieces Fit plans: an end one takes a hole and its wall, a middle one one from each side
+    const ends = planEnds({ ...SPLIT_DEFAULTS });
+    expect(ends.minMid).toBeCloseTo(2 * ends.minEnd - 1, 9);
+    expect(ends.minMid).toBeLessThan(LARGEST_MIN);
+  });
+
+  it('grids are counted within it, and without one the list is the same', () => {
+    expect(gridCandidates([300, 40, 20], U, { cap: Infinity })).toEqual(gridCandidates([300, 40, 20], U));
+    expect(gridCandidates([300, 40, 20], U)[0]).toEqual({ k: [1, 0, 0], pieces: 2 });
+    expect(gridCandidates([300, 40, 20], U, { cap: 100 })[0]).toEqual({ k: [2, 0, 0], pieces: 3 });
+    // a big model on the X1: 200 mm leaves the fewest pieces as they were, 150 takes more, 100 more than 64
+    const E = [320, 280, 600];
+    expect(gridCandidates(E, X1)[0]).toEqual({ k: [1, 1, 2], pieces: 12 });
+    expect(gridCandidates(E, X1, { cap: 200 })[0]).toEqual({ k: [1, 1, 2], pieces: 12 });
+    expect(gridCandidates(E, X1, { cap: 150 })[0]).toEqual({ k: [2, 1, 3], pieces: 24 });
+    expect(gridCandidates(E, X1, { cap: 100 })).toEqual([]);
+    // every slab of each grid can be within it
+    for (const { k } of gridCandidates(E, X1, { cap: 150 })) for (let a = 0; a < 3; a++) expect(E[a] / (k[a] + 1)).toBeLessThanOrEqual(150 + 1e-6);
+    // two details kept whole at the ends of a 600 mm bar, each needing a 190 mm slab: three cuts will do, not four
+    const wide = [[{ l: 1, h: 191, most: 215 }, { l: 409, h: 599, most: 215 }], [], []];
+    expect(gridCandidates([600, 50, 50], U, { cap: 100, wide })[0]).toEqual({ k: [3, 0, 0], pieces: 4 });
+    expect(gridCandidates([600, 50, 50], U, { cap: 100 })[0]).toEqual({ k: [5, 0, 0], pieces: 6 });
+    // and the model card's count
+    expect(fitPieces([300, 40, 20], U, {}, { cap: 100 })).toMatchObject({ fits: false, pieces: 3 });
+    expect(fitPieces([150, 40, 20], U, {}, { cap: 100 })).toMatchObject({ fits: false, pieces: 2 });
+    expect(fitPieces([150, 40, 20], U, {}, { cap: 100, wide: [[{ l: -70, h: 70, most: 180 }], [], []] })).toMatchObject({ fits: true, pieces: 1 });
+    expect(fitPieces([150, 40, 20], U, {}, { cap: Infinity })).toEqual(fitPieces([150, 40, 20], U));
+  });
+
+  it('chooseOffsets keeps each piece within it, pegs and lips counted on both sides, but a detail\'s slab', () => {
+    const samples = planSamples(0, 300, 1);
+    const dip = (at) => samples.map((t) => (Math.abs(t - at) < 1 ? 0 : 5));
+    const limits = { lo: 0, hi: 300, k: 1, S: 300 };
+    expect(chooseOffsets(samples, dip(60), limits).offsets).toEqual([60]);
+    const capped = chooseOffsets(samples, dip(60), { ...limits, cap: 160 }).offsets[0];
+    expect(capped).toBeGreaterThanOrEqual(140);
+    expect(capped).toBeLessThanOrEqual(160);
+    // a slab that holds a detail kept whole longer than the cap may be as long as its `most`
+    const roomy = [{ l: 20, h: 250, most: 270 }];
+    expect(chooseOffsets(samples, dip(261), { ...limits, cap: 160, roomy }).offsets).toEqual([261]);
+    expect(chooseOffsets(samples, dip(276), { ...limits, cap: 160, roomy }).offsets[0]).toBeLessThanOrEqual(270);
+    expect(chooseOffsets(samples, dip(261), { ...limits, cap: 160 }).offsets[0]).toBeLessThanOrEqual(160);
+    // no cap is no change: the same choice to the last digit
+    let seed = 7;
+    const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+    for (let n = 0; n < 20; n++) {
+      const k = 1 + (n % 3);
+      const s = planSamples(0, 400, k);
+      const costs = s.map(() => Math.round(rand() * 40) / 4);
+      const grow = s.map((_, i) => (i % 5 === 0 ? { below: 8, above: 8, peg: true } : null));
+      const lim = { lo: 0, hi: 400, k, S: 250, minEnd: 10, minMid: 20, grow };
+      expect(chooseOffsets(s, costs, { ...lim, cap: Infinity })).toEqual(chooseOffsets(s, costs, lim));
+    }
+    // a 600 mm bar with a 120 mm detail kept whole in the middle and a 100 mm cap: its slab may be 145 mm, so it takes
+    // six cuts – the slack all in that slab, as the printer would allow, would have taken four, its slab 204 mm long
+    const bar = { lo: 0, hi: 600, S: 300, cap: 100 };
+    const middle = wideKeeps([{ id: 'm', box: { min: [239, 0, 0], max: [361, 50, 50] } }], 100, { min: [0, 0, 0], max: [600, 50, 50] }, 14.2)[0];
+    expect(middle).toEqual([{ l: 240, h: 360, most: 145, ids: ['m'] }]);
+    const fenced = (s) => s.map((t) => (t > 240 && t < 360 ? Infinity : 0));
+    for (const k of [4, 5]) expect(chooseOffsets(planSamples(0, 600, k), fenced(planSamples(0, 600, k)), { ...bar, k, roomy: middle })).toBeNull();
+    expect(chooseOffsets(planSamples(0, 600, 4), fenced(planSamples(0, 600, 4)), { ...bar, k: 4, roomy: [{ ...middle[0], most: 300 }] })).not.toBeNull();
+    const six = planSamples(0, 600, 6);
+    const r = chooseOffsets(six, fenced(six), { ...bar, k: 6, roomy: middle });
+    const slabs = [0, ...r.offsets, 600].slice(1).map((t, i, all) => t - (i ? all[i - 1] : 0));
+    expect(Math.max(...slabs)).toBeLessThanOrEqual(145 + 1e-6);
+    expect(slabs.filter((v) => v > 100 + 1e-6)).toHaveLength(1);
+    // pegs: each piece within the cap with the pegs of both its cuts on it, whichever side they go
+    const s3 = planSamples(0, 300, 3);
+    const pegs = s3.map(() => ({ below: 8, above: 8, peg: true }));
+    expect(chooseOffsets(s3, s3.map(() => 0), { lo: 0, hi: 300, k: 2, S: 300, grow: pegs, cap: 100 })).toBeNull();
+    const three = chooseOffsets(s3, s3.map(() => 0), { lo: 0, hi: 300, k: 3, S: 300, grow: pegs, cap: 100 });
+    const ends = [0, ...three.offsets, 300];
+    for (let j = 1; j < ends.length; j++) expect(ends[j] - ends[j - 1] + (j > 1 ? 8 : 0) + (j < ends.length - 1 ? 8 : 0)).toBeLessThanOrEqual(100 + 1e-6);
+  });
+
+  it('chooseOffsets keeps the minimums but for the pieces the cuts that come apart make on their own: a thin lid', () => {
+    // a 300 mm bar whose last 10 mm lift off (a cut that comes apart at 140): the lid is under an end piece's minimum
+    const lo = -150;
+    const hi = 150;
+    const grid = planSamples(lo, hi, 2);
+    const samples = [...grid.filter((t) => Math.abs(t - 140) > 1e-6), 140].sort((p, q) => p - q);
+    const fixed = [samples.indexOf(140)];
+    const zero = samples.map(() => 0);
+    const ends = { minEnd: 14.2, minMid: 27.4 };
+    const lid = { lo, hi, k: 2, S: 300, fixed, ...ends };
+    // with a Largest piece: the lid is as it is, the other pieces keep the minimums and the cap, the lip counted
+    const r = chooseOffsets(samples, zero, { ...lid, cap: 160 });
+    expect(r).not.toBeNull();
+    expect(r.relaxed).toBe(false);
+    expect(r.offsets).toContain(140);
+    const [t] = r.offsets.filter((x) => x !== 140);
+    expect(t - lo).toBeGreaterThanOrEqual(ends.minEnd);
+    expect(140 - t).toBeGreaterThanOrEqual(ends.minMid);
+    expect(t - lo).toBeLessThanOrEqual(160 + 1e-6);
+    expect(140 - t + LIP_ALLOWANCE).toBeLessThanOrEqual(160 + 1e-6); // the lip counted on the piece below it too
+    expect(r.reach[r.offsets.indexOf(140)]).toEqual([LIP_ALLOWANCE, 0]);
+    // a cut beside the lid that would leave a piece too short for its joints is still refused
+    const near = samples.map((x) => (x === 140 || (x > 130 && x < 140) ? 0 : Infinity));
+    expect(chooseOffsets(samples, near, { ...lid, cap: 300 })).toBeNull();
+    expect(chooseOffsets(samples, near, lid)).toMatchObject({ relaxed: true });
+    // without a cap nothing changes: the minimums give way for every piece, as ever
+    const free = chooseOffsets(samples, zero, lid);
+    expect(free.relaxed).toBe(true);
+    // two cuts that come apart 10 mm from each other in the middle: the 10 mm piece between them is as it is
+    const pair = [...planSamples(lo, hi, 4).filter((x) => Math.abs(x) > 1e-6 && Math.abs(x - 10) > 1e-6), 0, 10].sort((p, q) => p - q);
+    const two = chooseOffsets(pair, pair.map(() => 0), { lo, hi, k: 4, S: 300, fixed: [pair.indexOf(0), pair.indexOf(10)], ...ends, cap: 100 });
+    expect(two).not.toBeNull();
+    expect(two.offsets).toEqual(expect.arrayContaining([0, 10]));
+    const cuts = [lo, ...two.offsets, hi];
+    for (let j = 1; j < cuts.length; j++) {
+      const len = cuts[j] - cuts[j - 1];
+      if (cuts[j - 1] === 0 && cuts[j] === 10) continue;
+      expect(len).toBeGreaterThanOrEqual(j === 1 || j === cuts.length - 1 ? ends.minEnd : ends.minMid);
+    }
+  });
+
+  it('planGrid keeps every piece within it, and says what its cuts do to the details', () => {
+    const bounds = { min: [-150, -20, 0], max: [150, 20, 20] };
+    const flat = (pegs = null) => (a, k) => {
+      const samples = planSamples(bounds.min[a], bounds.max[a], k);
+      return { samples, costs: samples.map(() => 0), tabs: samples.map(() => pegs) };
+    };
+    const options = { E: [300, 40, 20], U, bounds, profileOf: flat() };
+    expect(planGrid([1, 0, 0], { ...options, cap: Infinity })).toEqual(planGrid([1, 0, 0], options));
+    expect(planGrid([1, 0, 0], { ...options, cap: 100 })).toBeNull();
+    const plan = planGrid([2, 0, 0], { ...options, cap: 100 });
+    for (const p of plan.pieces) expect(Math.max(...p.size)).toBeLessThanOrEqual(100 + 1e-6);
+    expect(plan.flaws).toEqual({ letters: 0, nearLetters: 0, necks: 0, warned: 0, loose: 0, slivers: 0 });
+    // a cap that does not bind plans as none does
+    const loose = planGrid([1, 0, 0], { ...options, cap: 1000 });
+    expect(loose.offsets).toEqual(planGrid([1, 0, 0], options).offsets);
+    // built-in pegs: each piece within it with its cuts' pegs on it, wherever they go
+    const pegged = planGrid([3, 0, 0], { ...options, profileOf: flat({ below: 8, above: 8, peg: true }), peg: 8, cap: 100 });
+    const at = [-150, ...pegged.offsets[0], 150];
+    for (let j = 1; j < at.length; j++) expect(at[j] - at[j - 1] + (j > 1 ? 8 : 0) + (j < at.length - 1 ? 8 : 0)).toBeLessThanOrEqual(100 + 1e-6);
+    // letters at the even places of two cuts, and the next cheapest places clean: the cuts miss the letters, and the
+    // flaws say none; forced through them, they say so
+    const letterAt = (t) => [-50, 50].some((x) => Math.abs(t - x) <= 6);
+    const lettered = (force = false) => (a, k) => {
+      const samples = planSamples(bounds.min[a], bounds.max[a], k);
+      const profile = samples.map((t) => ({ t, area: 800, perimeter: 120, letters: letterAt(t) }));
+      const costs = planCost(profile).map((c, i) => (force && !letterAt(samples[i]) ? Infinity : c));
+      return { samples, costs, tabs: samples.map(() => null), flags: profile.map((p) => ({ letters: p.letters, nearLetters: false, neck: false })) };
+    };
+    const clean = planGrid([2, 0, 0], { ...options, profileOf: lettered(), cap: 110 });
+    for (const t of clean.offsets[0]) expect(letterAt(t)).toBe(false);
+    expect(clean.flaws.letters).toBe(0);
+    expect(planGrid([2, 0, 0], { ...options, profileOf: lettered(true), cap: 110 }).flaws.letters).toBe(2);
+  });
+
+  it('a plan within the cap that harms a detail gives way to one of a few more pieces that does not', () => {
+    const plans = { 16: { id: 16, flaws: { letters: 0, nearLetters: 0, necks: 0, warned: 1, loose: 0, slivers: 0 } }, 20: { id: 20, flaws: { letters: 0, nearLetters: 0, necks: 0, warned: 0, loose: 0, slivers: 0 } } };
+    const asked = [];
+    const planOf = (from) => (g) => {
+      asked.push(g);
+      return from[g] ?? null;
+    };
+    expect(pickGroup([16, 20, 24], planOf(plans), { capped: true }).id).toBe(20);
+    // whether or not the cap added pieces: the first group may be the printer's own fewest (a model the printer takes
+    // whole, cut for the cap), and its cut have no room to miss the letters
+    expect(pickGroup([2, 3], planOf({ 2: plans[16], 3: plans[20] }), { capped: true })).toBe(plans[20]);
+    // without a cap the fewest pieces win as ever
+    expect(pickGroup([16, 20, 24], planOf(plans)).id).toBe(16);
+    // the next group harms one too, or has no plan: the first stands, and no third group is planned
+    asked.length = 0;
+    expect(pickGroup([16, 20, 24], planOf({ 16: plans[16], 20: { id: 20, flaws: { ...plans[20].flaws, necks: 1 } } }), { capped: true }).id).toBe(16);
+    expect(asked).toEqual([16, 20]);
+    asked.length = 0;
+    expect(pickGroup([16, 20, 24], planOf({ 16: plans[16] }), { capped: true }).id).toBe(16);
+    expect(asked).toEqual([16, 20]);
+    // never one of more than half as many pieces again
+    asked.length = 0;
+    expect(pickGroup([16, 25], planOf({ 16: plans[16], 25: plans[20] }), { capped: true }).id).toBe(16);
+    expect(asked).toEqual([16]);
+    // and under a cap no group of more than twice the first's boxes is planned at all
+    asked.length = 0;
+    expect(pickGroup([4, 6, 8, 9, 12], planOf({ 12: plans[20] }), { capped: true })).toBeNull();
+    expect(asked).toEqual([4, 6, 8]);
+    expect(pickGroup([4, 6, 8, 9, 12], planOf({ 12: plans[20] }))).toBe(plans[20]); // no cap: every group, as ever
+    expect(GUARD).toEqual({ groups: 1, share: 1.5, budget: 2 });
+    // what counts as harm: a cut through or beside letters or through a thin neck, a part held on only within 15 mm of
+    // a cut, a bit of 1 cm³ or more left loose, a sliver
+    const none = { letters: 0, nearLetters: 0, necks: 0, warned: 0, loose: 999, slivers: 0 };
+    expect(detailClean(none)).toBe(true);
+    expect(detailClean(undefined)).toBe(true);
+    for (const [k, v] of [['letters', 1], ['nearLetters', 1], ['necks', 1], ['warned', 1], ['loose', 1000], ['slivers', 1]]) expect(detailClean({ ...none, [k]: v }), k).toBe(false);
+  });
+
+  it('its notes read as in the design', () => {
+    expect(splitNote('PIECES_WITHIN', { cap: 200 })).toMatchObject({ level: 'info', text: 'Every piece is within your 200 mm Largest piece.' });
+    expect(splitNote('PIECES_WITHIN', { cap: 200, longer: [{ pieces: [2, 4, 5], axis: 0, length: 230.5, keepId: 'k1', name: 'Bow', size: 210 }] }).text)
+      .toBe('Every piece is within your 200 mm Largest piece except pieces 2, 4 and 5, up to 230.5 mm along X to keep Bow (210 mm) whole.');
+    expect(splitNote('PIECES_WITHIN', { cap: 120, longer: [{ pieces: [3], axis: 2, length: 140, name: 'Bow', size: 131 }, { pieces: [1, 2], axis: 1, length: 125, name: 'Rim', size: 118 }] }).text)
+      .toBe('Every piece is within your 120 mm Largest piece except piece 3, up to 140 mm along Z to keep Bow (131 mm) whole and pieces 1 and 2, up to 125 mm along Y to keep Rim (118 mm) whole.');
+    expect(splitNote('PIECES_WITHIN', { cap: 100, all: true, longer: [{ pieces: [1, 2], axis: 0, length: 160, keepId: 'k1', name: 'Ribbon', size: 148 }] }).text)
+      .toBe('Every piece is within your 100 mm Largest piece along Y and Z; along X they are up to 160 mm, to keep Ribbon (148 mm) whole.');
+    expect(splitNote('PIECES_WITHIN', { cap: 200, over: [{ piece: 4, length: 202.4 }] }).text).toBe('Every piece is within your 200 mm Largest piece. Piece 4 is 202.4 mm long: a loose bit went back to it.');
+    expect(splitNote('PIECES_WITHIN', { cap: 200, over: [{ piece: 4, length: 202.4 }, { piece: 7, length: 205 }] }).text).toBe('Every piece is within your 200 mm Largest piece. Pieces 4 and 7 are up to 205 mm long: loose bits went back to them.');
+    expect(splitNote('LARGEST_TOO_SMALL', { cap: 90, least: 95, used: 95, why: 'many' })).toMatchObject({
+      level: 'warn', text: 'Pieces of 90 mm at most would take more than 64 pieces, so these are up to 95 mm, the least 64 pieces allow – raise Largest piece to 95 mm, or clear it.',
+    });
+    expect(splitNote('LARGEST_TOO_SMALL', { cap: 90, least: 95, used: null, why: 'many' }).text)
+      .toBe('Pieces of 90 mm at most would take more than 64 pieces, so these are as big as your printer takes – raise Largest piece to about 95 mm, or clear it.');
+    expect(splitNote('LARGEST_TOO_SMALL', { cap: 100, why: 'plan' }).text).toBe('No plan keeps every piece within 100 mm here, so these are as big as your printer takes – raise Largest piece, or clear it.');
+    expect(splitNote('LARGEST_TOO_SMALL', { cap: 100, why: 'plan', kept: true }).text)
+      .toBe('No plan keeps every piece within 100 mm and every detail you keep whole here, so these are as big as your printer takes – raise Largest piece, or clear it.');
+    expect(splitNote('BARELY_HELD', { letter: 'D', volume: 5400, w: 11, piece: 7, capped: 160 }).text)
+      .toMatch(/ Moving cut D so it holds would make a piece longer than your 160 mm Largest piece – raise it, glue this joint with care, or print piece 7 with more walls\.$/);
+    expect(splitNote('BED_TOO_SMALL', { size: [230, 120, 80], bed: [256, 256, 250], cap: 200 }).text).toBe('230 × 120 × 80 mm – longer than your 200 mm Largest piece.');
+    expect(splitNote('BED_TOO_SMALL', { size: [300, 120, 80], bed: [256, 256, 250] }).text).toBe('300 × 120 × 80 mm – bigger than your 256 × 256 × 250 mm printer.');
   });
 });

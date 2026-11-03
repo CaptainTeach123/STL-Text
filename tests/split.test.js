@@ -9,7 +9,8 @@ import { manifold } from '../src/manifold.js';
 import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
 import {
-  APART_HOLDS, FILAMENT, SPLIT_DEFAULTS, TO_PLANE, cellSizes, cellSupport, cutPlane, fitPieces, isSymmetric, keepCrossed, orientationStats, pegSizesFor, sizesFor,
+  APART_HOLDS, FILAMENT, SPLIT_DEFAULTS, TO_PLANE, cellSizes, cellSupport, cutPlane, fitPieces, fitsBed, isSymmetric, keepCrossed, orientationStats, pegSizesFor,
+  reachesCorner, sizesFor,
 } from '../src/split.js';
 import { clearSplitCaches, dowelHole, halfHole, pegAt, pinAt, pinSolid, socketAt } from '../src/splitGeometry.js';
 import { lipLine, lipVerdict } from '../src/aim.js';
@@ -83,8 +84,8 @@ const withTriangle = (solid, tri) => {
   return both;
 };
 
-const exportSplit = (split, { items = [], name = 'box', bed = BED, archive = 'files' } = {}) => client.export(items, version, name, { printing, split, bed, archive });
-const resultSplit = (split, { items = [], bed = BED } = {}) => client.result(items, version, { printing, split, bed });
+const exportSplit = (split, { items = [], name = 'box', bed = BED, archive = 'files', largest = 0 } = {}) => client.export(items, version, name, { printing, split, bed, archive, ...(largest ? { largest } : {}) });
+const resultSplit = (split, { items = [], bed = BED, largest = 0 } = {}) => client.result(items, version, { printing, split, bed, ...(largest ? { largest } : {}) });
 const piecesOf = (ex) => ex.files.filter((f) => f.kind === 'piece');
 const pieceSolid = (f) => own(solidOfStl(f.stl));
 /** A piece put back where it was in the model: its file read back, moved by its print → world matrix. */
@@ -522,6 +523,89 @@ describe('checking and planning cuts', () => {
     expect(noteOf(ex, 'PIECE_TOO_BIG')).toMatchObject({ level: 'warn', pieceIndex: 2 });
     expect(ex.pieces.map((x) => x.fits)).toEqual([true, false]);
     expect(piecesOf(ex)).toHaveLength(2);
+  });
+
+  it('on a printer that keeps a corner of its bed clear, every piece fits beside or behind it, and those that must be moved there are named', async () => {
+    const X1 = [246, 246, 249, 18, 28]; // the X1 / P1 at a 5 mm margin, its front-left 18 × 28 mm kept clear
+    const A1 = [246, 246, 255]; // the A1 / P2S: the same bed, nothing kept clear
+    const plan = (bed, split = SPLIT_DEFAULTS) => client.planSplit([], version, { printing, split, bed, mode: 'fit' });
+    // a 240 × 240 × 5 plate fits the A1 whole; on the X1 it is two pieces, each fitting beside or behind the corner
+    await load(cube([240, 240, 5]), 'plate');
+    expect(codes(await plan(A1))).toEqual(['SPLIT_NOT_NEEDED']);
+    const p = await plan(X1);
+    expect(p.cuts).toHaveLength(1);
+    expect(p.pieces).toHaveLength(2);
+    for (const x of p.pieces) {
+      expect(x.fits).toBe(true);
+      expect(fitsBed(x.size, X1, { flat: 2 }).fits).toBe(true);
+    }
+    const fitted = await exportSplit({ ...SPLIT_DEFAULTS, cuts: [{ id: 'c1', ...p.cuts[0] }], labels: false }, { name: 'plate', bed: X1 });
+    expect(codes(fitted)).not.toContain('PIECE_TOO_BIG');
+    expect(fitted.pieces.map((x) => x.fits)).toEqual([true, true]);
+    for (const f of piecesOf(fitted)) expect(fitsBed(f.size, X1, { flat: 2 }).fits).toBe(true);
+
+    // a cut of the user's own that leaves a 240 mm cube: too big for the X1 in any position, with the corner said
+    await load(cube([300, 240, 240]), 'block');
+    const cut = S({ cuts: [cutAt(0, -90)], diameter: 5, labels: false });
+    const big = await exportSplit(cut, { name: 'block', bed: X1 });
+    expect(big.pieces.map((x) => x.fits)).toEqual([true, false]);
+    expect(noteOf(big, 'PIECE_TOO_BIG')).toMatchObject({ pieceIndex: 2, bed: X1 });
+    expect(noteOf(big, 'PIECE_TOO_BIG').text).toMatch(/it has room for 246 × 246 × 249 mm, clear of its front-left 18 × 28 mm corner\.$/);
+    expect(codes(await exportSplit(cut, { name: 'block', bed: A1 }))).not.toContain('PIECE_TOO_BIG');
+    // the pins files fit, and miss the corner even left in the middle of the bed
+    const pins = big.files.filter((f) => f.kind === 'pins');
+    expect(pins.length).toBeGreaterThan(0);
+    for (const f of pins) {
+      expect(f.fits).toBe(true);
+      expect(reachesCorner(f.size, 0, X1)).toBe(false);
+    }
+    // the pieces as the view shows them say so too
+    const shown = await resultSplit(cut, { bed: X1 });
+    expect(shown.pieces.map((x) => x.fits)).toEqual([true, false]);
+    expect(codes(shown)).toContain('PIECE_TOO_BIG');
+
+    // a 226 × 470 plate's halves fit beside the corner only: Fit, the download, its glue sheet and the pieces view say
+    // to move them clear of it
+    const dowels = { ...SPLIT_DEFAULTS, joint: 'dowels', labels: false };
+    await load(cube([226, 470, 5]), 'tall');
+    const q = await plan(X1, dowels);
+    expect(q.pieces.map((x) => x.fits)).toEqual([true, true]);
+    expect(noteOf(q, 'CORNER_PLACE')).toMatchObject({ level: 'info', pieces: [1, 2], corner: [18, 28] });
+    const halves = { ...dowels, cuts: [{ id: 'c1', ...q.cuts[0] }] };
+    const ex = await exportSplit(halves, { name: 'tall', bed: X1 });
+    expect(noteOf(ex, 'CORNER_PLACE')).toMatchObject({ pieces: [1, 2] });
+    expect(noteOf(ex, 'CORNER_PLACE').text).toBe("Pieces 1 and 2 fit only beside or behind the bed's front-left 18 × 28 mm corner: in the slicer, move them clear of it – left in the middle of the bed they reach into it.");
+    const sheet = ex.files.find((f) => f.kind === 'text').text;
+    expect(sheet.match(/move it clear of the front-left corner/g)).toHaveLength(2);
+    expect(codes(await resultSplit(halves, { bed: X1 }))).toContain('CORNER_PLACE');
+    // on the A1 nothing is said; nor of halves that miss the corner in the middle of the X1's bed
+    expect(codes(await plan(A1, dowels))).not.toContain('CORNER_PLACE');
+    const a1 = await exportSplit(halves, { name: 'tall', bed: A1 });
+    expect(codes(a1)).not.toContain('CORNER_PLACE');
+    expect(a1.files.find((f) => f.kind === 'text').text).not.toMatch(/corner/);
+    await load(cube([200, 470, 5]), 'narrow');
+    const n = await plan(X1, dowels);
+    expect(n.pieces).toHaveLength(2);
+    expect(codes(n)).not.toContain('CORNER_PLACE');
+
+    // a model the X1 takes whole only beside or behind the corner – a 230 × 225 block turned a quarter, a 226 × 240
+    // plate – is told to move clear of it by Fit and by a plain download; on the A1, and for one that misses the corner
+    // in the middle of the bed, nothing is said
+    const whole = "This model fits only beside or behind the bed's front-left 18 × 28 mm corner: in the slicer, move it clear of it – left in the middle of the bed it reaches into it.";
+    for (const size of [[230, 225, 100], [226, 240, 5]]) {
+      await load(cube(size), 'whole');
+      const w = await plan(X1);
+      expect(codes(w), `${size}`).toEqual(['SPLIT_NOT_NEEDED', 'CORNER_PLACE']);
+      expect(noteOf(w, 'CORNER_PLACE')).toMatchObject({ level: 'info', whole: true, corner: [18, 28], text: whole });
+      const plain = await client.export([], version, 'whole', { printing, split: null, bed: X1, archive: 'zip' });
+      expect(codes(plain)).toEqual(['CORNER_PLACE']);
+      expect(noteOf(plain, 'CORNER_PLACE').text).toBe(whole);
+      expect(codes(await plan(A1))).toEqual(['SPLIT_NOT_NEEDED']);
+      expect(codes(await client.export([], version, 'whole', { printing, split: null, bed: A1, archive: 'zip' }))).toEqual([]);
+    }
+    await load(cube([200, 200, 100]), 'small');
+    expect(codes(await plan(X1))).toEqual(['SPLIT_NOT_NEEDED']);
+    expect(codes(await client.export([], version, 'small', { printing, split: null, bed: X1, archive: 'zip' }))).toEqual([]);
   });
 
   it('Fit to my printer plans thin plates lying flat, with their dovetail tabs counted', async () => {
@@ -2922,5 +3006,247 @@ describe('placing a cut that comes apart', () => {
     } finally {
       watch.stop();
     }
+  });
+});
+
+describe('Largest piece', () => {
+  const fit = (split = SPLIT_DEFAULTS, { items = [], bed = BED, largest = 0 } = {}) => client.planSplit(items, version, { printing, split, bed, mode: 'fit', ...(largest ? { largest } : {}) });
+  const along = (c) => c.normal.indexOf(1);
+  const at = (c) => c.position[along(c)];
+  const ids = (p) => p.cuts.map((c, i) => ({ ...c, id: `c${i + 1}` }));
+  /** Each piece file's material, put back where it was in the model: its box's sides along the model's axes. */
+  const material = (ex) => piecesOf(ex).map((f) => boxOf(assembled(f)).size);
+
+  it('Fit plans more, smaller pieces, every one within it; a cap that does not bind changes nothing, and the plan is kept for it', async () => {
+    await load(cube([300, 40, 20]), 'bar');
+    const plain = await fit();
+    expect(plain.cuts).toHaveLength(1);
+    const p = await fit(SPLIT_DEFAULTS, { largest: 100 });
+    expect(p.cuts.map(at)).toEqual([expect.closeTo(-50, 3), expect.closeTo(50, 3)]);
+    expect(p.pieces).toHaveLength(3);
+    for (const x of p.pieces) expect(Math.max(...x.size)).toBeLessThanOrEqual(100 + 1e-6);
+    expect(noteOf(p, 'PIECES_WITHIN')).toMatchObject({ level: 'info', text: 'Every piece is within your 100 mm Largest piece.', longer: [], over: [] });
+    // the download holds those pieces, each within it
+    const ex = await exportSplit({ ...SPLIT_DEFAULTS, cuts: ids(p) }, { name: 'bar', largest: 100 });
+    expect(piecesOf(ex)).toHaveLength(3);
+    for (const size of material(ex)) expect(Math.max(...size)).toBeLessThanOrEqual(100 + 0.05);
+    // asked again with it, the plan comes back at once; another cap plans again; none and 0 are the plan without one
+    stages.length = 0;
+    expect(await fit(SPLIT_DEFAULTS, { largest: 100 })).toEqual(p);
+    expect(stages).not.toContain('Planning cuts…');
+    expect((await fit(SPLIT_DEFAULTS, { largest: 120 })).pieces).toHaveLength(3);
+    expect(stages).toContain('Planning cuts…');
+    expect(await fit()).toEqual(plain);
+    stages.length = 0;
+    expect(await client.planSplit([], version, { printing, split: SPLIT_DEFAULTS, bed: BED, mode: 'fit', largest: 0 })).toEqual(plain);
+    expect(stages).not.toContain('Planning cuts…');
+    // longer than anything the printer takes, or than the model: no cap at all
+    expect(await fit(SPLIT_DEFAULTS, { largest: 400 })).toEqual(plain);
+    await load(cube([240, 40, 20]), 'short');
+    expect(codes(await fit(SPLIT_DEFAULTS, { largest: 250 }))).toEqual(['SPLIT_NOT_NEEDED']);
+    // a model the printer takes whole is split for it
+    const two = await fit(SPLIT_DEFAULTS, { largest: 150 });
+    expect(two.pieces.map((x) => x.size[0])).toEqual([expect.closeTo(120, 3), expect.closeTo(120, 3)]);
+  });
+
+  it('hand cuts are never refused for it: the pieces fit as the printer says, and a move that would break it is not suggested', async () => {
+    await load(cube([300, 40, 20]), 'bar');
+    const r = await resultSplit(S({ cuts: [cutAt(0, 0)] }), { largest: 80 });
+    expect(r.pieces.map((x) => x.fits)).toEqual([true, true]);
+    expect(codes(r)).not.toContain('PIECE_TOO_BIG');
+    expect(codes(r).filter((c) => c === 'PIECES_WITHIN' || c === 'LARGEST_TOO_SMALL')).toEqual([]);
+    const m = await client.planSplit([], version, { printing, split: S({ cuts: [cutAt(0, 0)] }), bed: BED, mode: 'measure', largest: 80 });
+    expect(m.notes.map((n) => n.code)).toEqual([]);
+    // the ribbon fixture cut across its middle: the move that would hold the ribbon's right half makes a piece longer
+    // than 80 mm, so the note says so instead of suggesting it
+    await load(own(ribbonColumn()), 'ribbon');
+    const bed = [120, 120, 300];
+    const free = await resultSplit(S({ cuts: [cutAt(0, 0)] }), { bed });
+    expect(noteOf(free, 'BARELY_HELD')).toMatchObject({ moveTo: -10 });
+    const held = await resultSplit(S({ cuts: [cutAt(0, 0)] }), { bed, largest: 80 });
+    expect(held.pieces.map((x) => x.fits)).toEqual([true, true]);
+    expect(noteOf(held, 'BARELY_HELD')).toMatchObject({ moveTo: null, capped: 80 });
+    expect(noteOf(held, 'BARELY_HELD').text).toMatch(/Moving cut A so it holds would make a piece longer than your 80 mm Largest piece – raise it, glue this joint with care, or print piece 2 with more walls\.$/);
+  });
+
+  it('a detail kept whole longer than it keeps its slab as long as it needs, along that axis only, and Fit says which pieces', async () => {
+    await load(own(ribbonColumn()), 'ribbon');
+    const found = await client.planSplit([], version, { printing, split: null, mode: 'keep', point: [0, -47, 135] });
+    const keep = [{ id: 'k1', name: 'Ribbon', point: found.point, normal: [0, -1, 0], box: found.box }];
+    const split = { ...SPLIT_DEFAULTS, keep };
+    const ribbonLong = found.box.max[0] - found.box.min[0];
+    expect(ribbonLong).toBeGreaterThan(100);
+    // without the cap: a Z cut under the ribbon; with it, more cuts, none through the ribbon and none across X (the
+    // ribbon spans it but for a sliver at each end)
+    const plain = await fit(split);
+    const p = await fit(split, { largest: 100 });
+    expect(p.pieces.length).toBeGreaterThan(plain.pieces.length);
+    expect(p.cuts.map(along)).not.toContain(0);
+    for (const c of p.cuts) expect(keepCrossed(found.box, along(c), at(c))).toBe(false);
+    expect(noteOf(p, 'KEEP_KEPT')).toBeTruthy();
+    const within = noteOf(p, 'PIECES_WITHIN');
+    expect(within.longer).toEqual([expect.objectContaining({ axis: 0, keepId: 'k1', name: 'Ribbon', size: Math.round(ribbonLong) })]);
+    expect(within.longer[0].length).toBeGreaterThan(100);
+    expect(within.longer[0].length).toBeLessThanOrEqual(BED[0] * Math.SQRT2);
+    expect(within.text).toMatch(/^Every piece is within your 100 mm Largest piece except pieces .+, up to \d+(\.\d)? mm along X to keep Ribbon \(\d+ mm\) whole\.$/);
+    expect(codes(p)).not.toContain('BARELY_HELD');
+    expect(codes(p)).not.toContain('LARGEST_TOO_SMALL');
+    // the download: the ribbon whole on its piece, every piece one shell, within 100 mm along Y and Z – and along X but
+    // for the pieces the note names, which the printer takes
+    const ex = await exportSplit({ ...split, cuts: ids(p) }, { name: 'ribbon', largest: 100 });
+    expect(piecesOf(ex)).toHaveLength(p.pieces.length);
+    expect(ex.pieces.map((x) => [x.shells, x.fits])).toEqual(ex.pieces.map(() => [1, true]));
+    expect(codes(ex).filter((c) => ['BARELY_HELD', 'LOOSE_KEPT', 'KEEP_CUT'].includes(c))).toEqual([]);
+    material(ex).forEach((size, i) => {
+      expect(size[1]).toBeLessThanOrEqual(100 + 0.05);
+      expect(size[2]).toBeLessThanOrEqual(100 + 0.05);
+      if (!within.longer[0].pieces.includes(i + 1)) expect(size[0]).toBeLessThanOrEqual(100 + 0.05);
+    });
+    // a cap the detail is no longer than: no exception, and the X cut comes back
+    const short = await fit(SPLIT_DEFAULTS, { largest: 100 });
+    expect(short.cuts.map(along)).toContain(0);
+    expect(noteOf(short, 'PIECES_WITHIN').longer).toEqual([]);
+  });
+
+  it('a detail no printer plan keeps whole is cut as ever, and every piece still kept within it', async () => {
+    await load(own(ribbonColumn()), 'ribbon');
+    const found = await client.planSplit([], version, { printing, split: null, mode: 'keep', point: [0, -47, 135] });
+    const keep = [{ id: 'k1', name: 'Ribbon', point: found.point, normal: [0, -1, 0], box: found.box }];
+    // a printer 100 mm across and 140 mm high cannot take the ribbon's 148 mm in one piece
+    const p = await fit({ ...SPLIT_DEFAULTS, keep }, { bed: [100, 100, 140], largest: 100 });
+    expect(noteOf(p, 'KEEP_NOT_KEPT')).toBeTruthy();
+    expect(codes(p)).not.toContain('LARGEST_TOO_SMALL');
+    for (const x of p.pieces) expect(Math.max(...x.size)).toBeLessThanOrEqual(100 + 1e-6);
+  });
+
+  it('cuts round a detail just under it where they have room, and says when no plan keeps the pieces within it', async () => {
+    // a 95 mm detail kept whole on a 300 mm bar: with two cuts no layout of pieces within 100 mm misses it, with three one does
+    await load(cube([300, 40, 20]), 'bar');
+    const box = { min: [-61, -20, -10], max: [36, 20, 10] };
+    const keep = [{ id: 'k1', name: 'Plaque', point: [0, 20, 0], normal: [0, 1, 0], box }];
+    const p = await fit({ ...SPLIT_DEFAULTS, keep }, { largest: 100 });
+    expect(p.pieces).toHaveLength(4);
+    for (const c of p.cuts) expect(keepCrossed(box, along(c), at(c))).toBe(false);
+    for (const x of p.pieces) expect(Math.max(...x.size)).toBeLessThanOrEqual(100 + 1e-6);
+    expect(noteOf(p, 'KEEP_KEPT')).toBeTruthy();
+    // a cut that comes apart right beside the detail: its piece, the lip counted, is longer than the cap – the details
+    // kept come first, the cap gives way, and the note says why
+    const apart = { ...cutAt(0, -53), joint: 'apart', hold: 'lift' };
+    const near = { ...SPLIT_DEFAULTS, cuts: [apart], keep: [{ ...keep[0], box: { min: [-149, -20, -10], max: [-54, 20, 10] } }] };
+    const q = await fit(near, { largest: 100 });
+    expect(noteOf(q, 'LARGEST_TOO_SMALL')).toMatchObject({ level: 'warn', why: 'plan', kept: true, cap: 100 });
+    expect(noteOf(q, 'LARGEST_TOO_SMALL').text).toBe('No plan keeps every piece within 100 mm and every detail you keep whole here, so these are as big as your printer takes – raise Largest piece, or clear it.');
+    expect(noteOf(q, 'KEEP_KEPT')).toBeTruthy();
+    expect(codes(q)).not.toContain('PIECES_WITHIN');
+  });
+
+  it('more than 64 pieces within it: the pieces are planned within the least 64 allow, and the note says what to set', async () => {
+    await load(cube([300, 300, 300]), 'cube');
+    const p = await fit(SPLIT_DEFAULTS, { largest: 30 });
+    expect(noteOf(p, 'LARGEST_TOO_SMALL')).toMatchObject({ level: 'warn', why: 'many', cap: 30, least: 75, used: 75 });
+    expect(noteOf(p, 'LARGEST_TOO_SMALL').text).toBe('Pieces of 30 mm at most would take more than 64 pieces, so these are up to 75 mm, the least 64 pieces allow – raise Largest piece to 75 mm, or clear it.');
+    expect(p.pieces).toHaveLength(64);
+    for (const x of p.pieces) expect(Math.max(...x.size)).toBeLessThanOrEqual(75 + 1e-6);
+    expect(codes(p)).not.toContain('PIECES_WITHIN');
+  });
+
+  it('more cuts do not go through letters or a thin neck that Fit kept clear of without it', async () => {
+    // HELLO across the middle of a 300 mm bar: without the cap one cut beside it, with it two, neither through it
+    await load(cube([300, 40, 20]), 'bar');
+    const hello = createItem({ text: 'HELLO', fontId: 'inter', size: 12, position: [0, 0, 10], normal: [0, 0, 1] });
+    const shown = await client.preview(hello, version);
+    const [x0, x1] = [shown.bounds.min[0], shown.bounds.max[0]];
+    for (const largest of [0, 100, 80]) {
+      const p = await fit(SPLIT_DEFAULTS, { items: [hello], largest });
+      for (const c of p.cuts) expect(at(c) < x0 - 1 || at(c) > x1 + 1, `${largest}: ${at(c)}`).toBe(true);
+      if (largest) {
+        expect(p.pieces.length).toBeGreaterThan(2);
+        const ex = await exportSplit({ ...SPLIT_DEFAULTS, cuts: ids(p), labels: false }, { items: [hello], name: 'bar', largest });
+        expect(codes(ex)).not.toContain('CUT_THROUGH_TEXT');
+      }
+    }
+    // where the fewest pieces within it leave the cut no choice but the letters – two of 150 mm from 300, of 100 mm
+    // from a 200 mm bar the printer takes whole – one more piece keeps clear of them, the cap kept, on the X1 as on
+    // the default printer
+    for (const [L, largest, bed] of [[300, 150, BED], [200, 100, BED], [200, 120, BED], [200, 100, [246, 246, 249, 18, 28]]]) {
+      await load(cube([L, 40, 20]), `bar${L}`);
+      const p = await fit(SPLIT_DEFAULTS, { items: [hello], largest, bed });
+      expect(p.pieces, `${L} ${largest}`).toHaveLength(3);
+      for (const c of p.cuts) expect(at(c) < x0 - 1 || at(c) > x1 + 1, `${L} ${largest}: ${at(c)}`).toBe(true);
+      for (const x of p.pieces) expect(Math.max(...x.size)).toBeLessThanOrEqual(largest + 1e-6);
+      expect(noteOf(p, 'PIECES_WITHIN')).toBeTruthy();
+    }
+    // a bar with a 6 × 6 mm neck where the even cuts of three pieces would go: the cuts miss it, with the cap as without
+    const neck = [-55, -45];
+    const bar = own(own(cube([95, 40, 40], [-102.5, 0, 0]).add(cube([10, 6, 6], [-50, 0, 0]))).add(cube([195, 40, 40], [52.5, 0, 0])));
+    await load(bar, 'neck');
+    for (const largest of [0, 120, 110]) {
+      const p = await fit(SPLIT_DEFAULTS, { largest });
+      expect(p.pieces).toHaveLength(largest ? 3 : 2);
+      for (const c of p.cuts) expect(at(c) < neck[0] || at(c) > neck[1], `${largest}: ${at(c)}`).toBe(true);
+    }
+  });
+
+  it('a lid that comes apart thinner than an end piece may be, or two such cuts close together, keep the pieces within it', async () => {
+    // a 300 mm bar whose last 10 mm lift off: without a cap two pieces and the lid; with one, every piece within it
+    await load(cube([300, 40, 40]), 'bar');
+    const lid = { ...SPLIT_DEFAULTS, cuts: [{ ...cutAt(0, 140), joint: 'apart', hold: 'lift' }] };
+    for (const largest of [150, 100]) {
+      const p = await fit(lid, { largest });
+      expect(codes(p), `${largest}`).not.toContain('LARGEST_TOO_SMALL');
+      expect(noteOf(p, 'PIECES_WITHIN')).toMatchObject({ over: [], longer: [] });
+      expect(at(p.cuts[0])).toBe(140);
+      for (const x of p.pieces) expect(Math.max(...x.size)).toBeLessThanOrEqual(largest + 1e-6);
+      if (largest === 100) {
+        const ex = await exportSplit({ ...lid, cuts: ids(p).map((c, i) => (i === 0 ? { ...lid.cuts[0] } : c)) }, { name: 'bar', largest });
+        expect(piecesOf(ex)).toHaveLength(p.pieces.length);
+        for (const size of material(ex)) expect(Math.max(...size)).toBeLessThanOrEqual(100 + 0.05);
+      }
+    }
+    // two cuts that come apart 10 mm from each other: the ring between them is as it is, the rest planned round them
+    const ring = { ...SPLIT_DEFAULTS, cuts: [{ ...cutAt(0, 0), joint: 'apart', hold: 'lift' }, { ...cutAt(0, 10, 'c2'), joint: 'apart', hold: 'lift' }] };
+    const q = await fit(ring, { largest: 100 });
+    expect(codes(q)).not.toContain('LARGEST_TOO_SMALL');
+    expect(noteOf(q, 'PIECES_WITHIN')).toBeTruthy();
+    expect(q.cuts.slice(0, 2).map(at)).toEqual([0, 10]);
+    for (const x of q.pieces) expect(Math.max(...x.size)).toBeLessThanOrEqual(100 + 1e-6);
+  });
+
+  it('a plan made as big as the printer takes, as none within it was found, that keeps within it all the same says so', async () => {
+    // a detail kept whole from 145 mm either side of the middle of a 300 mm bar leaves 5 mm ends: no plan keeps the end
+    // pieces long enough for pins, so the printer's plan stands – and its pieces are within 295 mm
+    await load(cube([300, 40, 20]), 'bar');
+    const keep = [{ id: 'k1', name: 'Plaque', point: [0, 20, 0], normal: [0, 1, 0], box: { min: [-145, -20, -10], max: [145, 20, 10] } }];
+    const p = await fit({ ...SPLIT_DEFAULTS, keep }, { bed: [292, 60, 60], largest: 295 });
+    expect(p.pieces.map((x) => x.size[0])).toEqual([expect.closeTo(6, 0), expect.closeTo(288, 0), expect.closeTo(6, 0)]);
+    expect(codes(p)).not.toContain('LARGEST_TOO_SMALL');
+    expect(noteOf(p, 'PIECES_WITHIN')).toMatchObject({ text: 'Every piece is within your 295 mm Largest piece.', over: [] });
+    expect(noteOf(p, 'KEEP_KEPT')).toBeTruthy();
+  });
+
+  it('built-in pegs on a narrow bar are counted as long as Fit plans them: its pieces are within it, and the note says so', async () => {
+    for (const size of [[300, 40, 20], [300, 20, 20]]) {
+      await load(cube(size), 'bar');
+      const pegs = { ...SPLIT_DEFAULTS, joint: 'pegs', labels: false };
+      const p = await fit(pegs, { largest: 95 });
+      expect(noteOf(p, 'PIECES_WITHIN'), `${size}`).toMatchObject({ text: 'Every piece is within your 95 mm Largest piece.', over: [], longer: [] });
+      const ex = await exportSplit({ ...pegs, cuts: ids(p) }, { name: 'bar', largest: 95 });
+      for (const m of material(ex)) expect(Math.max(...m)).toBeLessThanOrEqual(95 + 0.05);
+    }
+  });
+
+  it('built-in pegs and a lip count on both pieces: every download is within it whichever piece the drill stage gives them', async () => {
+    await load(cube([300, 40, 20]), 'bar');
+    const pegs = { ...SPLIT_DEFAULTS, joint: 'pegs' };
+    const p = await fit(pegs, { largest: 100 });
+    expect(p.pieces.length).toBeGreaterThan(3);
+    const ex = await exportSplit({ ...pegs, cuts: ids(p) }, { name: 'bar', largest: 100 });
+    expect(piecesOf(ex)).toHaveLength(p.pieces.length);
+    for (const size of material(ex)) expect(Math.max(...size)).toBeLessThanOrEqual(100 + 0.05);
+    // a cut that comes apart, its lip on whichever piece still fits
+    const apart = { ...SPLIT_DEFAULTS, cuts: [{ ...cutAt(0, 40), joint: 'apart', hold: 'lift' }] };
+    const q = await fit(apart, { largest: 100 });
+    const qx = await exportSplit({ ...apart, cuts: ids(q).map((c, i) => (i === 0 ? { ...apart.cuts[0] } : c)) }, { name: 'bar', largest: 100 });
+    for (const size of material(qx)) expect(Math.max(...size)).toBeLessThanOrEqual(100 + 0.05);
   });
 });

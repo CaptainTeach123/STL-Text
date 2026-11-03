@@ -37,6 +37,7 @@ import {
   TO_WORLD,
   applyMat4,
   axisCuts,
+  bedCorner,
   boxesBeside,
   catchSizes,
   clipShape,
@@ -487,17 +488,30 @@ function lyingPinBox(d, length) {
 /**
  * How many pins of Ø d × length one pins file can hold so that it fits the
  * bed lying as laid out: rows wrapped to the bed's width, as many rows as
- * its depth takes (at least one pin, even one too long for the bed).
+ * its depth takes (at least one pin, even one too long for the bed). On a
+ * bed that keeps a corner clear (`bedCorner`) the sheet is laid in the
+ * room that misses the corner even left in the middle of the bed – less
+ * the corner's side twice off its width, or off its depth, whichever holds
+ * more pins: a sheet can be any shape, so it need not be moved by hand.
  * @param {{ d: number, length: number }} group
  * @param {number[]} U the usable bed
- * @returns {{ perSheet: number, size: number[] }} `size` one pin's box as laid
+ * @returns {{ perSheet: number, size: number[], room: number[] }} `size` one pin's box as laid; `room` the room the
+ *   sheet is laid out in (for `pinSheet`), the bed's own without a corner
  */
 export function pinsPerSheet({ d, length }, U) {
   const b = lyingPinBox(d, length);
   const size = b.max.map((v, a) => v - b.min[a]);
-  const perRow = Math.max(1, Math.floor((U[0] + PIN_GAP) / (size[0] + PIN_GAP)));
-  const rows = Math.max(1, Math.floor((U[1] + PIN_GAP) / (size[1] + PIN_GAP)));
-  return { perSheet: perRow * rows, size };
+  const corner = bedCorner(U);
+  const rooms = corner
+    ? [[Math.max(1, U[0] - 2 * corner[0]), U[1]], [U[0], Math.max(1, U[1] - 2 * corner[1])]]
+    : [[U[0], U[1]]];
+  let best = null;
+  for (const [w, h] of rooms) {
+    const perRow = Math.max(1, Math.floor((w + PIN_GAP) / (size[0] + PIN_GAP)));
+    const rows = Math.max(1, Math.floor((h + PIN_GAP) / (size[1] + PIN_GAP)));
+    if (!best || perRow * rows > best.perSheet) best = { perSheet: perRow * rows, room: [w, h, U[2]] };
+  }
+  return { perSheet: best.perSheet, size, room: best.room };
 }
 
 /**
@@ -507,7 +521,7 @@ export function pinsPerSheet({ d, length }, U) {
  * on z = 0. Put spares in `count` (`pinSpares`); more than the bed takes
  * (`pinsPerSheet`) go in more than one file.
  * @param {{ d: number, length: number, count: number }} group
- * @param {number[]|null} U the usable bed (only its x is used)
+ * @param {number[]|null} U the room to lay it out in, `pinsPerSheet`'s (only its x is used)
  * @returns {Manifold}
  */
 export function pinSheet({ d, length, count }, U = null) {

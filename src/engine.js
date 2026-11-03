@@ -18,7 +18,8 @@ import {
   planCost, planGrid, planSamples, plateAxis, safeFileName, slabAxis, sizesFor, smallPieceNotes, soupCells, splitActive, splitNote, usableBed,
   zipFileName, cellSupport, flatProbes, outlineColumns, textNotes, baseAxis, modelPlates, layGrown, pegAllowance, pegMales, pegSizeOf, pegSizesFor,
   pegSides, cellFits, uprightPegNotes, apartMales, cellSizes, clipHold, clipShape, lipSides, APART_HOLDS, LIP_ALLOWANCE, orientationStats, pieceHolding,
-  applyMat4, transposeMat4, keepCrossed, keepsOf, keepsThrough,
+  applyMat4, transposeMat4, keepCrossed, keepsOf, keepsThrough, cornerPlaceNote, fitReachesCorner, bedCorner, capOf, slabCap, withinCap, wideKeeps, pickGroup,
+  chooseOffsets, planEnds,
   AXES, CLIP, LIP, SPOT, catchSizes, comesOffOf, endShape, endsAsWell, keepsTo, locateBend, locateSeam, pickSpots, profileSeams, seamKind, spotScore, spotSide,
   spotStart, spotWhy, socketsAsWell,
 } from './split.js';
@@ -49,10 +50,10 @@ import { HANG, columnGraph, columnsOf, heldParts, looseTable, moveCut, planeGrid
  *                                                          (units: the share of the transforms that only puts
  *                                                          the file's numbers in mm, left out of its size)
  *   preview     { item, baseVersion, printing }         -> { empty } | { geometry, bounds, stats, notes }
- *   result      { items, baseVersion, printing, split?, bed? }
+ *   result      { items, baseVersion, printing, split?, bed?, largest? }
  *                                                       -> { display, notes, info }
  *                                                          (+ pieces, grid, seams, diameter, pegSize with a split)
- *   export      { items, baseVersion, name, printing, split?, bed?, printer?, archive?: 'zip'|'files' }
+ *   export      { items, baseVersion, name, printing, split?, bed?, printer?, archive?: 'zip'|'files', largest? }
  *                                                       -> { stl, triangles, notes, extra }
  *                                                          (stl null, + files, zip, pieces, seams, assembly, diameter,
  *                                                          pegSize with a split; a part taken out is a piece with its
@@ -60,7 +61,7 @@ import { HANG, columnGraph, columnsOf, heldParts, looseTable, moveCut, planeGrid
  *                                                          'part'` and `part: { kind, name, centre, r, side, cap, top,
  *                                                          handle, way }`, `way` its way out in the world: `{ turn,
  *                                                          up, lift, dir, out, reach }`)
- *   split.plan  { items, baseVersion, printing, split, bed, mode: 'fit'|'measure'|'probe'|'spots'|'targets'|'parts'|'part'|'keep' }
+ *   split.plan  { items, baseVersion, printing, split, bed, largest?, mode: 'fit'|'measure'|'probe'|'spots'|'targets'|'parts'|'part'|'keep' }
  *                                                       -> fit: { cuts, counts, pieces, notes } (the cuts that come
  *                                                          apart first, as stored, then the new ones without ids)
  *                                                          measure: { bounds, cuts, notes } (each cut with `keeps`,
@@ -118,8 +119,14 @@ import { HANG, columnGraph, columnsOf, heldParts, looseTable, moveCut, planeGrid
  * a cut that comes apart with `joint: 'apart'` and its `hold`, see split.js);
  * no cuts means no split, and the replies are exactly those of
  * a model that was never split. `bed` is the room a piece may use on the
- * printer, [x, y, z] mm (`usableBed`); `printer` ({ size, margin }) only
- * names the printer on the glue sheet.
+ * printer, [x, y, z] mm (`usableBed`), and on a printer that keeps a corner
+ * of its bed clear that corner's sides too, [x, y, z, ex, ey]; `printer`
+ * ({ size, margin, corner }) only names the printer on the glue sheet.
+ * `largest` is the printer setting Largest piece, mm (0 or none: as big as
+ * the printer takes): Fit to my printer plans every piece within it along
+ * each axis (but where a detail kept whole is longer), and the pieces'
+ * notes suggest no move of a cut that would make one longer; it never makes
+ * a piece too big, nor is it sent with a measure or a fit test.
  *
  * Final geometry has fixed semantics regardless of item order:
  *   union(model, all raised text) minus union(all cut-in text).
@@ -439,8 +446,12 @@ function numberedCuts(cuts) {
   });
 }
 
-/** A bed size from a request: the usable [x, y, z] mm, or the default printer's when it is missing or nonsense. */
-const bedOf = (bed) => (Array.isArray(bed) && bed.length === 3 && bed.every((v) => Number(v) > 0) ? bed.map(Number) : usableBed());
+/**
+ * A bed size from a request: the usable [x, y, z] mm – with the corner it keeps clear, [x, y, z, ex, ey] – or the
+ * default printer's when it is missing or nonsense.
+ */
+const bedOf = (bed) => (Array.isArray(bed) && (bed.length === 3 || bed.length === 5) && bed.slice(0, 3).every((v) => Number(v) > 0)
+  && bed.slice(3).every((v) => Number(v) >= 0) ? bed.map(Number) : usableBed());
 
 export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance = LOD_TOLERANCE, splitKeepTriangles = SPLIT_KEEP_TRIANGLES }) {
   const { Manifold } = wasm;
@@ -2181,10 +2192,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     }
   }
 
-  function resultDisplay({ items, baseVersion, printing, split = null, bed = null }, progress) {
+  function resultDisplay({ items, baseVersion, printing, split = null, bed = null, largest = 0 }, progress) {
     unsplit(split);
     const final = finalFor(items, baseVersion, printing, progress);
-    const parted = splitFor(final, items, { split, bed, printing }, progress);
+    const parted = splitFor(final, items, { split, bed, printing, largest }, progress);
     if (parted?.cut) return splitResult(final, parted, progress);
     releaseSplit(final);
     if (!final.display) {
@@ -2222,10 +2233,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     };
   }
 
-  function exportStl({ items, baseVersion, printing, name = 'model', split = null, bed = null, printer = null, archive = 'zip' }, progress) {
+  function exportStl({ items, baseVersion, printing, name = 'model', split = null, bed = null, printer = null, archive = 'zip', largest = 0 }, progress) {
     unsplit(split);
     const final = finalFor(items, baseVersion, printing, progress);
-    const parted = splitFor(final, items, { split, bed, printing }, progress);
+    const parted = splitFor(final, items, { split, bed, printing, largest }, progress);
     if (parted?.cut) return splitExport(final, parted, { name, printer, archive }, progress);
     releaseSplit(final);
     const soup = concatSoups([final.solid ? manifoldToSoup(final.solid) : null, final.passthrough]);
@@ -2236,10 +2247,25 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const partSoup = manifoldToSoup(p.local); // lying on its top face, pegs up, ready to print
       return { name: p.name, stl: writeBinarySTL(partSoup, `STL-Text ${p.name}`), triangles: partSoup.length / 9 };
     });
+    const notes = parted ? [...final.notes, ...parted.notes] : final.notes;
+    // printed whole on a printer that keeps a corner of its bed clear: one it takes only beside or behind it is moved
+    const U = bed ? bedOf(bed) : null;
+    const placed = U && bedCorner(U) && final.solid ? wholeCornerNote(withSoup(splitBounds(final), final.passthrough), U) : null;
     return {
-      message: { stl, triangles: soup.length / 9, notes: parted ? [...final.notes, ...parted.notes] : final.notes, skipped: final.skipped, extra },
+      message: { stl, triangles: soup.length / 9, notes: placed ? [...notes, placed] : notes, skipped: final.skipped, extra },
       transfer: [stl, ...extra.map((e) => e.stl)],
     };
+  }
+
+  /**
+   * CORNER_PLACE for a model printed whole, with box `box`, that the printer `U` takes only beside or behind the corner
+   * of its bed it keeps clear, laid as Fit lays a model it takes whole (a plate flat); null when it does not, or does
+   * not fit.
+   */
+  function wholeCornerNote(box, U) {
+    const E = box.max.map((v, a) => v - box.min[a]);
+    const fit = fitsBed(E, U, { flat: plateAxis(E) });
+    return fitReachesCorner(fit, U) ? splitNote('CORNER_PLACE', { whole: true, corner: bedCorner(U) }) : null;
   }
 
   /* ---------------------------------------------------- split for printing */
@@ -2467,7 +2493,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * without cuts; `{ notes }` when the model is exported whole after all (it
    * cannot be split, or every cut missed); else the split.
    */
-  function splitFor(final, items, { split, bed, printing }, progress) {
+  function splitFor(final, items, { split, bed, printing, largest = 0 }, progress) {
     if (!splitActive(split)) return null;
     if (base.kind !== 'none' && !base.current?.watertight) return { notes: [splitNote('SPLIT_UNAVAILABLE')] };
     if (!final.solid) return { notes: [] }; // nothing solid to cut: the unrepaired triangles are exported as they are
@@ -2490,7 +2516,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const hl = printing?.layerHeight ?? 0.2;
     const drill = drillStage(work, cut, laid, { cuts, spec, joints: plan.joints, nozzle, hl, U, flat, parted: parted.carved ? parted : null }, progress);
     const lying = layGrown(laid, drill.layout, U, spec.orient, { flat }).map((o, i) => lowered(o, drill.heights?.get(laid[i].index)));
-    return summarise({ final: work, spec, cuts, U, given, plan, cut, laid, lying, drill, parted: parted.carved ? parted : null, keeps });
+    // a move a note suggests keeps the pieces within the Largest piece, but where a detail kept whole is longer
+    const cap = capOf(largest);
+    const wide = cap < Infinity && keeps.length ? wideKeeps(keeps, cap, withSoup(splitBounds(work), work.passthrough), planEnds(spec, nozzle).minEnd) : null;
+    return summarise({ final: work, spec, cuts, U, given, plan, cut, laid, lying, drill, parted: parted.carved ? parted : null, keeps, cap, wide });
   }
 
   /**
@@ -3223,7 +3252,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * next to them (`heldNotes`, the slice graph) have notes of their own.
    */
   function summarise(split) {
-    const { final, spec, cuts, U, given, plan, cut, laid, lying, drill, parted = null, keeps = [] } = split;
+    const { final, spec, cuts, U, given, plan, cut, laid, lying, drill, parted = null, keeps = [], cap = Infinity, wide = null } = split;
     const { layout } = drill;
     const n = laid.length;
     const lips = layout.lips ?? [];
@@ -3427,7 +3456,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     }
     const bitNotes = [...(bits.joined.length ? [splitNote('ISLAND_JOINED', { bits: bits.joined })] : []), ...bits.loose.map((l) => splitNote('LOOSE_KEPT', l))];
     // what of the pieces hangs on only next to a cut, where it may snap off
-    const holdNotes = heldNotes(final, cuts, cut.pieces, laid, U, spec, null, keeps);
+    const holdNotes = heldNotes(final, cuts, cut.pieces, laid, U, spec, null, keeps, cap, wide);
     notes.push(...given, ...lockNotes, ...plan.notes, ...smallPieceNotes(laid, cuts), ...bitNotes, ...holdNotes, ...keepNotes(keeps, cuts, laid, U, keeps.length ? withSoup(splitBounds(final), final.passthrough) : null), ...cutNotes);
     // what prints on its own must fit the bed as it is saved too: a part lying pegs up, a pin on its flat
     for (const p of final.separate) {
@@ -3445,6 +3474,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const held = laid[i].stats.allowed.length < 6 || o.pegged;
       notes.push(...o.notes.filter((x) => !(held && x.code === 'ORIENT_FALLBACK')));
     });
+    // on a printer that keeps a corner of its bed clear, the pieces that fit only beside or behind it
+    const placed = cornerPlaceNote(pieces, U);
+    if (placed) notes.push(placed);
     // pegs that all print pointing up (on a plate under a thick top) are weaker across their layers: said once a cut,
     // naming pins only where they would fit
     // a cut whose twist-lock was not built says what its lip gives instead
@@ -3579,11 +3611,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       if (g.own) continue;
       // as many pins files as the bed needs, each lying as it is laid out
       const all = g.count + g.spares;
-      const { perSheet } = pinsPerSheet(g, U);
+      const { perSheet, room } = pinsPerSheet(g, U);
       const sheets = Math.ceil(all / perSheet);
       for (let i = 0; i < sheets; i++) {
         const count = Math.floor(all / sheets) + (i < all % sheets ? 1 : 0); // shared out evenly
-        const sheet = pinSheet({ d: g.d, length: g.length, count }, U);
+        const sheet = pinSheet({ d: g.d, length: g.length, count }, room);
         try {
           const b = boxOf(sheet);
           const size = b.max.map((v, a) => v - b.min[a]);
@@ -3687,7 +3719,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * placing a cut that comes apart, are `aimRequest`'s.
    */
   function planSplitRequest(request, progress) {
-    const { items, baseVersion, printing, split = null, bed = null, mode = 'fit' } = request;
+    const { items, baseVersion, printing, split = null, bed = null, mode = 'fit', largest = 0 } = request;
     if (mode === 'probe' || mode === 'spots' || mode === 'targets') return aimRequest(request, progress);
     if (mode === 'parts') return partsRequest(request, progress);
     if (mode === 'part') return partRequest(request, progress);
@@ -3717,9 +3749,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       // in the notes, which take the names it has now
       const keeps = keepsOf(split, splitBounds(final));
       const marks = keeps.length ? { keeps: keeps.map((k) => [k.id, k.box.min, k.box.max]) } : {};
-      const key = stableKey({ U, nozzle, joint: spec.joint, diameter: spec.diameter, depth: spec.depth, clearance: spec.clearance, ...fixed, ...parts, ...marks });
+      // and every piece within the Largest piece, when there is one (none plans as it always has)
+      const cap = capOf(largest);
+      const key = stableKey({ U, nozzle, joint: spec.joint, diameter: spec.diameter, depth: spec.depth, clearance: spec.clearance, ...fixed, ...parts, ...marks, ...(cap < Infinity ? { cap } : {}) });
       const state = splitState(final);
-      if (state.fit?.key !== key) state.fit = { key, plan: fitCuts(final, items, split, U, printing, kept, progress), made: new Map() };
+      if (state.fit?.key !== key) state.fit = { key, plan: fitCuts(final, items, split, U, printing, kept, progress, cap), made: new Map() };
       // how the pieces lie decides which loose parts print apart: worked out again only for another way of laying them
       if (!state.fit.made.has(spec.orient)) {
         state.fit.made.set(spec.orient, planPieces(final, items, state.fit.plan, spec, U, printing, progress));
@@ -3732,8 +3766,13 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const said = ({ level, code, text, ...fields }) =>
         splitNote(code, { ...fields, name: named.get(fields.keepId) ?? fields.name, ...(code === 'KEEP_KEPT' ? { piece: made.keptOn?.get(fields.keepId) ?? null } : {}) });
       const notes = keeps.length ? planned.map((n) => (n.code === 'KEEP_KEPT' || n.code === 'KEEP_NOT_KEPT' ? said(n) : n)) : planned;
-      // and so does a part held on only next to a cut that may move only through one
-      const held = made.notes.map(({ level, code, text, ...fields }) => (code === 'BARELY_HELD' && fields.keepId ? splitNote(code, { ...fields, kept: named.get(fields.keepId) ?? fields.kept }) : { level, code, text, ...fields }));
+      // and so does a part held on only next to a cut that may move only through one, and a detail that makes the pieces
+      // of its slab longer than the Largest piece
+      const held = made.notes.map(({ level, code, text, ...fields }) => {
+        if (code === 'BARELY_HELD' && fields.keepId) return splitNote(code, { ...fields, kept: named.get(fields.keepId) ?? fields.kept });
+        if (code === 'PIECES_WITHIN' && fields.longer?.length) return splitNote(code, { ...fields, longer: fields.longer.map((x) => ({ ...x, name: named.get(x.keepId) ?? x.name })) });
+        return { level, code, text, ...fields };
+      });
       message = { cuts, counts, pieces: made.pieces, notes: held.length ? [...notes, ...held] : notes };
     }
     return { message, transfer: [] };
@@ -3747,12 +3786,14 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * would be held over the bed counts as each piece it prints as. Each is
    * given the size of its box as planned, tabs counted, and whether it fits
    * as it will lie; `notes` say what of them hangs on only next to a cut
-   * (`heldNotes`, as the split will). Should the cut fail, the boxes stand:
+   * (`heldNotes`, as the split will) and, on a printer that keeps a corner
+   * of its bed clear, which fit only beside or behind it (`cornerPlaceNote`,
+   * as the split will). Should the cut fail, the boxes stand:
    * the split itself will say what is wrong.
    */
   function planPieces(final, items, plan, spec, U, printing, progress) {
     const boxes = plan.pieces.map(({ cell, size, fits }) => ({ cell, size, fits }));
-    if (!plan.cuts.length) return { pieces: boxes.map(({ size, fits }) => ({ size, fits })), notes: [] };
+    if (!plan.cuts.length) return { pieces: boxes.map(({ size, fits }) => ({ size, fits })), notes: plan.short ? [splitNote('LARGEST_TOO_SMALL', plan.short)] : [] };
     try {
       // the cuts as the document will hold them once taken, numbered as it numbers them – the ones kept keep their
       // ids, the new ones follow on – so the split that follows finds this cut
@@ -3764,9 +3805,25 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const box = new Map(boxes.map((b) => [b.cell.join(','), b]));
       const pieces = laid.map((p) => ({ size: box.get(p.cell.join(','))?.size ?? p.lying.size, fits: p.lying.fits }));
       const keptOn = plan.keeps?.length ? keptPieces(plan.keeps, cuts, laid) : null;
-      return { pieces, notes: heldNotes(work, cuts, cut.pieces, laid, U, spec, progress, plan.keeps ?? []), ...(keptOn ? { keptOn } : {}) };
+      // within the Largest piece: which pieces a detail kept whole made longer, and which a bit given back did. A plan
+      // made as big as the printer takes, as no plan within it was found, may keep within it all the same: then it is
+      // the plan within it, and says so instead of the warning
+      const measured = plan.short && Number.isFinite(plan.asked)
+        ? piecesWithin(cut, laid, cuts, spec, plan.asked, plan.wide, plan.keeps ?? [], splitBounds(work))
+        : null;
+      const inside = measured && !measured.over.length;
+      const cap = plan.cap ?? (inside ? plan.asked : Infinity);
+      const notes = heldNotes(work, cuts, cut.pieces, laid, U, spec, progress, plan.keeps ?? [], cap, plan.wide ?? null);
+      const within = cap < Infinity && cap === plan.asked
+        ? (measured ?? piecesWithin(cut, laid, cuts, spec, cap, plan.wide, plan.keeps ?? [], splitBounds(work)))
+        : null;
+      if (within) notes.push(within);
+      else if (plan.short) notes.push(splitNote('LARGEST_TOO_SMALL', plan.short));
+      // on a printer that keeps a corner of its bed clear, the pieces that fit only beside or behind it
+      const placed = cornerPlaceNote(laid.map((p) => ({ index: p.index, size: p.lying.size, yaw: p.lying.yaw, fits: p.lying.fits })), U);
+      return { pieces, notes: placed ? [...notes, placed] : notes, ...(keptOn ? { keptOn } : {}) };
     } catch {
-      return { pieces: boxes.map(({ size, fits }) => ({ size, fits })), notes: [] };
+      return { pieces: boxes.map(({ size, fits }) => ({ size, fits })), notes: plan.short ? [splitNote('LARGEST_TOO_SMALL', plan.short)] : [] };
     }
   }
 
@@ -3783,6 +3840,54 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       on.set(k.id, pieceHolding(laid, cellOfPoint(middle, by), k.box.min, k.box.max));
     }
     return on;
+  }
+
+  /**
+   * PIECES_WITHIN for the pieces Fit planned within the Largest piece `cap` (as `planPieces` cuts and lays them): each
+   * piece's material along each model axis, a peg's or a lip's length more past each face on a cut that will carry them
+   * (on whichever piece the drill stage gives them; a peg as long as Fit planned for faces as wide as the model across
+   * that axis, `solid` its box, as no face's pegs are longer), against the cap – the pieces of the slab that holds a
+   * detail kept whole longer than that (`wide`) by that detail, as long as that slab may be, the others by a bit the
+   * cut gave back to them. The parts that come off are not the grid's pieces.
+   */
+  function piecesWithin(cut, laid, cuts, spec, cap, wide, keeps, solid) {
+    const by = axisCuts(cuts);
+    const E = [0, 1, 2].map((a) => solid.max[a] - solid.min[a]);
+    const peg = [0, 1, 2].map((a) => (spec.joint === 'pegs' ? pegAllowance(spec, [E[(a + 1) % 3], E[(a + 2) % 3]]) : 0));
+    const apart = new Set(cuts.filter((c) => c.apart).map((c) => `${c.axis}|${c.at}`));
+    const reach = (a, t) => (apart.has(`${a}|${t}`) ? LIP_ALLOWANCE : peg[a]);
+    const parts = new Set(cut.pieces.filter((p) => p.part).map((p) => p.index));
+    const longer = new Map();
+    const over = [];
+    for (const p of laid) {
+      if (parts.has(p.from) || !p.cell) continue;
+      const box = p.stats?.bbox ?? p.bbox;
+      if (!box) continue;
+      let worst = null;
+      for (let a = 0; a < 3; a++) {
+        const below = p.cell[a] > 0 ? by[a][p.cell[a] - 1] : -Infinity;
+        const above = p.cell[a] < by[a].length ? by[a][p.cell[a]] : Infinity;
+        const len = box.max[a] - box.min[a]
+          + (Number.isFinite(below) && box.min[a] <= below + 0.05 ? reach(a, below) : 0)
+          + (Number.isFinite(above) && box.max[a] >= above - 0.05 ? reach(a, above) : 0);
+        if (len <= cap + 0.05) continue;
+        // a slab that holds a detail longer than the cap: that detail is why
+        const span = (wide?.[a] ?? []).find((w) => below <= w.l + 1e-6 && above >= w.h - 1e-6 && len <= w.most + 0.05);
+        if (span) {
+          const id = `${a}|${span.l}`;
+          const x = keeps.filter((k) => span.ids?.includes(k.id)).sort((q, r) => (r.box.max[a] - r.box.min[a]) - (q.box.max[a] - q.box.min[a]))[0];
+          const got = longer.get(id) ?? { pieces: [], axis: a, length: 0, keepId: x?.id ?? null, name: x?.name ?? null, size: x ? Math.round(x.box.max[a] - x.box.min[a]) : null };
+          if (!got.pieces.includes(p.index)) got.pieces.push(p.index);
+          got.length = Math.max(got.length, len);
+          longer.set(id, got);
+        } else worst = Math.max(worst ?? 0, len);
+      }
+      if (worst !== null) over.push({ piece: p.index, length: worst });
+    }
+    const list = [...longer.values()].map((x) => ({ ...x, pieces: x.pieces.sort((q, r) => q - r), length: Math.round(x.length * 10) / 10 }));
+    const counted = laid.filter((p) => !parts.has(p.from) && p.cell);
+    const all = list.length > 0 && counted.every((p) => list.some((x) => x.pieces.includes(p.index)));
+    return splitNote('PIECES_WITHIN', { cap, longer: list, over: over.map((x) => ({ ...x, length: Math.round(x.length * 10) / 10 })), all });
   }
 
   /**
@@ -3886,18 +3991,28 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * mm of its box next to the cut are left out – the piece it is part of as the pieces print, where it is and how far
    * it holds – with the nearest place for the cut where it would hold on (`moveCut`), the pieces either side still
    * fitting the bed (`U`, any way down; built-in pegs counted on each), and never through a detail kept whole
-   * (`keeps`, `keepsOf`'s).
+   * (`keeps`, `keepsOf`'s). With a Largest piece (`cap`), the move makes no piece longer along the axis than that –
+   * a lip or a peg counted on each face that is a cut, as Fit counts them – or than it is already, or than the slab of
+   * a detail kept whole longer than the cap may be (`wide`, `wideKeeps`'): where only a longer piece would hold it, the
+   * note says so (`capped`).
    * @param {object} final the result the pieces were cut from
    * @param {object[]} cuts normalised (full-plane)
    * @param {object[]} pieces the cut stage's (plain)
    * @param {object[]} laid `layPieces`' of them
    */
-  function heldNotes(final, cuts, pieces, laid, U, spec, progress, keeps = []) {
+  function heldNotes(final, cuts, pieces, laid, U, spec, progress, keeps = [], cap = Infinity, wide = null) {
     const notes = [];
     if (!final.solid || !cuts.length) return notes;
     const by = axisCuts(cuts);
     const flat = slabOf(final);
     const peg = spec.joint === 'pegs' ? pegAllowance(spec) : 0;
+    // and against a Largest piece, as Fit plans: on each face that is a cut, a lip, or the pegs faces as wide as the
+    // model across the axis take (no face's are longer), whichever piece the drill stage gives them
+    const solid = splitBounds(final);
+    const solidE = [0, 1, 2].map((a) => solid.max[a] - solid.min[a]);
+    const capPeg = [0, 1, 2].map((a) => (spec.joint === 'pegs' ? pegAllowance(spec, [solidE[(a + 1) % 3], solidE[(a + 2) % 3]]) : 0));
+    const apart = cuts.filter((c) => c.apart).map((c) => [c.axis, c.at]);
+    const faceReach = (axis, t, end) => (Math.abs(t - end) <= 1e-6 ? 0 : apart.some(([a, at]) => a === axis && Math.abs(at - t) <= 1e-6) ? LIP_ALLOWANCE : capPeg[axis]);
     // the model's triangles, for the slices not drawn yet: read once for every axis
     let mesh = null;
     const meshOf = () => (mesh ??= final.solid.getMesh());
@@ -3919,7 +4034,13 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         while (ax.graphs.size > HANG_GRAPHS) ax.graphs.delete(ax.graphs.keys().next().value);
       }
       const along = { graphs: columns.map((c) => c.graph), tables: columns.map((c) => c.table), widths, samples, lo, hi, grid };
-      const fits = (size) => !U || fitsBed(size.map((v, a) => v + (a === axis ? peg : 0)), U, { flat }).fits;
+      const roomy = (size) => !U || fitsBed(size.map((v, a) => v + (a === axis ? peg : 0)), U, { flat }).fits;
+      // with a Largest piece, no longer along the axis than that, than its slab may be, or than the box was before
+      const capLength = (size, slab) => size[axis] + faceReach(axis, slab[0], lo) + faceReach(axis, slab[1], hi);
+      const fits = cap < Infinity
+        ? (size, slab, before) => roomy(size) && (!slab || capLength(size, slab) <= slabCap(cap, wide?.[axis], slab[0], slab[1]) + 1e-6
+          || size[axis] <= (before?.()?.[axis] ?? -Infinity) + 1e-6)
+        : roomy;
       // never into a detail kept whole
       const allowed = (t) => !keeps.some((k) => keepCrossed(k.box, axis, t));
       // each cut's sample, and the next ones' either side (or the model's ends)
@@ -3939,14 +4060,17 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
               cell[grid.u] = col.i;
               cell[grid.v] = col.j;
               const moved = moveCut(along, i, L, R, { part, side, column: k }, { fits, allowed });
+              // nowhere to move it but where a piece would be longer than the Largest piece: said, with what to do instead
+              const longer = !moved && cap < Infinity ? moveCut(along, i, L, R, { part, side, column: k }, { fits: roomy, allowed }) : null;
               // nowhere to move it but through a detail kept whole: said, with what to do instead
-              const free = !moved && keeps.length ? moveCut(along, i, L, R, { part, side, column: k }, { fits }) : null;
+              const free = !moved && !longer && keeps.length ? moveCut(along, i, L, R, { part, side, column: k }, { fits }) : null;
               const blocked = free ? keeps.find((x) => keepCrossed(x.box, axis, free.at)) : null;
               const piece = cellPiece(pieces, laid, cell);
               notes.push(splitNote('BARELY_HELD', {
                 letter: c.letter, cutId: c.id, axis, at: c.at, volume: part.volume, w: part.w, box: worldBox(part, samples, grid),
                 piece, moveTo: moved ? +moved.at.toFixed(2) : null, holds: moved?.holds ?? null,
                 ...(blocked ? { keepId: blocked.id, kept: blocked.name } : {}),
+                ...(longer ? { capped: cap } : {}),
               }));
             }
           }
@@ -5007,7 +5131,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * takes them, the other cuts are planned on the body they leave and none
    * runs through one, which would leave the part out (`PART_CROSSED`).
    */
-  function fitCuts(model, items, split, U, printing, { cuts: kept, parts, stored }, progress) {
+  function fitCuts(model, items, split, U, printing, { cuts: kept, parts, stored }, progress, cap = Infinity) {
     progress?.('Planning cuts…');
     const nozzle = printing?.nozzle ?? 0.4;
     const { spec } = normaliseSplit({ ...(split ?? {}), cuts: [] });
@@ -5023,12 +5147,21 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const bounds = withSoup(solidBox, final.passthrough);
     const E = [0, 1, 2].map((a) => bounds.max[a] - bounds.min[a]);
     const flat = plateAxis(E);
+    // the pieces at either end must take a hole (or a peg's socket) and its wall, and middle ones one from each side
+    const { minEnd, minMid, pins, pegged } = planEnds(spec, nozzle);
+    // a Largest piece holds only where it is shorter than the model and than anything the printer could take: else no
+    // plan is any different for it
+    const capNow = cap < Math.min(Math.max(...E), Math.hypot(U[0], U[1], U[2])) ? cap : Infinity;
+    // the details kept whole longer than a cap, per axis, with the most their slab may be (`wideKeeps`)
+    const wideOf = (list, c) => wideKeeps(list, c, bounds, minEnd);
     // the body a part comes out of prints standing as modelled
     const whole = fitsBed(E, U, { flat: lids.length ? 2 : flat });
     // the cuts that come apart are lettered first once the plan is taken, as they come first in it
     const keptLetters = stored.map((_, i) => letterFor(i));
-    if (whole.fits && !kept.length) {
+    if (whole.fits && !kept.length && withinCap(E, capNow, wideOf(keeps, capNow))) {
       const notes = [splitNote('SPLIT_NOT_NEEDED', parts.length ? { apart: keptLetters } : { yaw: whole.yaw, down: whole.down })];
+      // on a printer that keeps a corner of its bed clear, a model it takes only beside or behind it must be moved there
+      if (fitReachesCorner(whole, U)) notes.push(splitNote('CORNER_PLACE', { whole: true, corner: bedCorner(U) }));
       return { cuts: [...stored], counts: [0, 0, 0], pieces: [{ cell: [0, 0, 0], size: E, fits: true }], notes };
     }
     let mesh = null;
@@ -5039,9 +5172,14 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const by = axisCuts(kept);
       const held = cellSupport((mesh ??= final.solid.getMesh()), by);
       const isPiece = (c) => held.get(c.cell.join(','))?.filled !== false;
-      const fits = (c) => !isPiece(c) || cellFits(c, U);
+      // with a Largest piece, each box within it with the lips on both sides (the drill stage gives them out by the
+      // printer alone), but where it holds a detail kept whole longer than that
+      const wide = wideOf(keeps, capNow);
+      const reached = capNow < Infinity ? new Map(cellSizes(bounds, kept.map((c) => ({ ...c, reach: [LIP_ALLOWANCE, LIP_ALLOWANCE] }))).cells.map((c) => [c.cell.join(','), c.size])) : null;
+      const inCap = (c) => !reached || withinCap(reached.get(c.cell.join(',')) ?? c.size, capNow, wide, c);
+      const fits = (c) => !isPiece(c) || (cellFits(c, U) && inCap(c));
       const boxes = cellSizes(bounds, pegSides(bounds, kept.map((c) => ({ ...c, peg: LIP_ALLOWANCE })), fits)).cells.filter(isPiece);
-      if (boxes.every((c) => cellFits(c, U))) {
+      if (boxes.every((c) => cellFits(c, U) && inCap(c))) {
         return {
           cuts: [...stored], counts: by.map((list) => list.length), pieces: boxes.map(({ cell, size }) => ({ cell, size, fits: true })),
           notes: [splitNote('SPLIT_NOT_NEEDED', { apart: keptLetters })],
@@ -5055,20 +5193,46 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const ways = slab === null ? [flat] : [slab, null];
     // a detail too big for the printer, every way the pieces may lie, is in no piece that fits it: no plan keeps it
     // whole, and the others are kept whole without it
-    let fence = keeps.filter((x) => ways.some((lying) => fitsBed(keepSize(x), U, { flat: lying }).fits));
+    // and none that a cut that comes apart runs through: no plan keeps it whole (its note says which cut)
+    let fence = keeps.filter((x) => ways.some((lying) => fitsBed(keepSize(x), U, { flat: lying }).fits)
+      && !kept.some((c) => keepCrossed(x.box, c.axis, c.at)));
     // tabs only make pieces longer, so the grids whose plain even cells fit are the only ones worth a profile; a grid
-    // with fewer cuts on an axis than come apart there is none
+    // with fewer cuts on an axis than come apart there is none. With a Largest piece, only those whose pieces can all
+    // be within it – worked out for each set of details kept whole, as those longer than it may make their slab longer
     const minCounts = kept.length ? fixedAt.map((list) => list.length) : null;
-    const candidatesOf = new Map(ways.map((lying) => [lying, gridCandidates(E, U, { flat: lying, minCounts }).filter((c) => c.pieces > 1)]));
+    const candidateCache = new Map();
+    const gridsFor = (lying, c) => {
+      const id = `${lying}|${c}|${c < Infinity ? fence.map((x) => x.id).join(',') : ''}`;
+      if (!candidateCache.has(id)) candidateCache.set(id, gridCandidates(E, U, { flat: lying, minCounts, ...(c < Infinity ? { cap: c, wide: wideOf(fence, c) } : {}) }).filter((g) => g.pieces > 1));
+      return candidateCache.get(id);
+    };
+    // and of those, under a cap, the ones whose cuts have somewhere to go
+    const candidatesFor = (lying, c) => {
+      if (!(c < Infinity)) return gridsFor(lying, c);
+      const id = `room|${lying}|${c}|${fence.map((x) => x.id).join(',')}`;
+      if (!candidateCache.has(id)) candidateCache.set(id, gridsFor(lying, c).filter((g) => roomFor(g.k, c, wideOf(fence, c))));
+      return candidateCache.get(id);
+    };
+    // under a cap, whether the cuts of a grid have somewhere to go on each axis, with no slicing: k cuts at the samples
+    // the profile would have, none through a detail kept whole or a part that comes off, the cuts that come apart where
+    // they are, and every slab within the cap – a detail just under it, a lid or a cut that stays can leave none
+    const roomCache = new Map();
+    const roomFor = (k, c, wide) => [0, 1, 2].every((a) => {
+      if (!k[a] || (!fence.length && !lids.length && !fixedAt[a].length)) return true;
+      const id = `${a}|${k[a]}|${c}|${fence.map((x) => x.id).join(',')}`;
+      if (!roomCache.has(id)) {
+        const own = fixedAt[a];
+        const grid = planSamples(solidBox.min[a], solidBox.max[a], k[a]);
+        const samples = own.length ? [...grid.filter((t) => !own.some((f) => Math.abs(f - t) <= 1e-6)), ...own].sort((p, q) => p - q) : grid;
+        const costs = samples.map((t) => (crosses(a, t) || fence.some((x) => keepCrossed(x.box, a, t)) ? Infinity : 0));
+        const fixed = own.map((t) => samples.findIndex((x) => Math.abs(x - t) <= 1e-6));
+        const got = chooseOffsets(samples, costs, { lo: bounds.min[a], hi: bounds.max[a], k: k[a], cap: c, roomy: wide?.[a]?.length ? wide[a] : null, ...(own.length ? { fixed } : {}) });
+        roomCache.set(id, Boolean(got && Number.isFinite(got.cost)));
+      }
+      return roomCache.get(id);
+    });
     const tooMany = { cuts: [], counts: null, pieces: [], notes: [splitNote('PLAN_TOO_MANY')] };
-    if (![...candidatesOf.values()].some((list) => list.length)) return tooMany;
-    // the pieces at either end must take a hole (or a peg's socket) and its wall, and middle ones one from each side
-    const pegged = spec.joint === 'pegs';
-    const sizes = pegged ? (d, ...rest) => pegSizesFor(pegSizeOf(d) || 5, ...rest) : (d, ...rest) => sizesFor(d || 5, ...rest);
-    const probe = sizes(spec.diameter, spec.clearance, nozzle, spec.depth);
-    const pins = sizes(5, spec.clearance, nozzle);
-    const minEnd = probe.reach + 1;
-    const minMid = 2 * probe.reach + 1;
+    if (!ways.some((lying) => candidatesFor(lying, Infinity).length)) return tooMany;
     const tabsOn = (spec.joint === 'auto' || spec.joint === 'dovetail' || pegged) && !final.passthrough.length;
     // built-in pegs make one of the pieces either side of every other cut longer, as far as the longest peg the cut's
     // faces take stands out
@@ -5158,7 +5322,17 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         }
         // no cut may run through a part that comes off
         const costs = planCost(profile, { items: text.map((b) => [b.min[a], b.max[a]]) }).map((c, i) => (crosses(a, samples[i]) ? Infinity : c));
-        const made = { samples, costs, tabs, rings: profile.map((p) => p.rings) };
+        // and what a cut at each sample would do to the details Fit looks after, for the guard of a Largest piece: run
+        // through letters, right beside them, or through a thin neck (under half the slices' median area, as `planCost`)
+        const areas = profile.filter((p) => p.area > 0).map((p) => p.area).sort((p, q) => p - q);
+        const medianA = areas.length ? (areas[(areas.length - 1) >> 1] + areas[areas.length >> 1]) / 2 : 0;
+        const letterTs = profile.filter((p) => p.letters).map((p) => p.t);
+        const flags = profile.map((p) => ({
+          letters: Boolean(p.letters),
+          nearLetters: !p.letters && (Boolean(p.nearLetters) || letterTs.some((t) => t !== p.t && Math.abs(t - p.t) <= 2 + 1e-9)),
+          neck: p.area > 0 && p.area < 0.5 * medianA,
+        }));
+        const made = { samples, costs, tabs, rings: profile.map((p) => p.rings), flags };
         profiles.set(key, made);
         return made;
       };
@@ -5183,41 +5357,90 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         return held.get(key);
       };
       const centre = bounds.min.map((v, a) => (v + bounds.max[a]) / 2);
-      const search = () => {
+      // the plan of a grid, as the split takes it: the cuts that come apart first, as they are stored, then the new ones
+      const taken = (best, c, wide) => {
+        const added = best.offsets.flatMap((list, a) =>
+          list
+            .filter((t) => !fixedAt[a].some((f) => Math.abs(f - t) <= 1e-6))
+            .map((t) => ({ position: centre.map((v, i) => (i === a ? t : v)), normal: [0, 1, 2].map((i) => (i === a ? 1 : 0)) })),
+        );
+        const notes = stored.length ? [splitNote('APART_KEPT', { letters: keptLetters })] : [];
+        return { cuts: [...stored, ...added], counts: best.k, pieces: best.pieces, notes, ...(c < Infinity ? { cap: c, wide } : {}) };
+      };
+      // the grids of the fewest pieces first, each group's best plan taken – within the Largest piece `c` when one
+      // holds. Then a plan that harms a detail Fit looks after (`detailClean`) gives way to the next group's when that
+      // does none of it and has few more pieces (`GUARD`); and the groups planned stop at `GUARD.budget` times the
+      // first's boxes
+      const search = (c) => {
+        const wide = wideOf(fence, c);
+        const capped = c < Infinity ? { cap: c, wide } : {};
         for (const stable of [true, false]) {
           for (const lying of ways) {
             // nor in one that lies a way it does not fit: the pieces that would hold it whole would not either
             if (fence.some((x) => !fitsBed(keepSize(x), U, { flat: lying }).fits)) continue;
-            const candidates = candidatesOf.get(lying);
-            for (const group of new Set(candidates.map((c) => c.pieces))) {
-              let best = null;
-              for (const { k } of candidates.filter((c) => c.pieces === group)) {
-                const plan = planGrid(k, { E, U, bounds, flat: lying, minEnd, minMid, profileOf, support, stable, peg, progress, ...(kept.length ? { fixed: fixedAt } : {}) });
+            const candidates = candidatesFor(lying, c);
+            const groups = [...new Set(candidates.map((g) => g.pieces))];
+            const best = pickGroup(groups, (group) => {
+              let got = null;
+              for (const { k } of candidates.filter((g) => g.pieces === group)) {
+                const plan = planGrid(k, { E, U, bounds, flat: lying, minEnd, minMid, profileOf, support, stable, peg, progress, ...(kept.length ? { fixed: fixedAt } : {}), ...capped });
                 // an L leaves a box empty: fewer pieces win, then the cost; candidates come fewest axes first, then fewest
                 // Z cuts, so an equal cost keeps the earlier one
-                if (plan && (!best || plan.pieces.length < best.pieces.length || (plan.pieces.length === best.pieces.length && plan.cost < best.cost - 1e-9))) best = plan;
+                if (plan && (!got || plan.pieces.length < got.pieces.length || (plan.pieces.length === got.pieces.length && plan.cost < got.cost - 1e-9))) got = plan;
               }
-              if (!best) continue;
-              // the cuts that come apart first, as they are stored, then the new ones
-              const added = best.offsets.flatMap((list, a) =>
-                list
-                  .filter((t) => !fixedAt[a].some((f) => Math.abs(f - t) <= 1e-6))
-                  .map((t) => ({ position: centre.map((c, i) => (i === a ? t : c)), normal: [0, 1, 2].map((i) => (i === a ? 1 : 0)) })),
-              );
-              const notes = stored.length ? [splitNote('APART_KEPT', { letters: keptLetters })] : [];
-              return { cuts: [...stored, ...added], counts: best.k, pieces: best.pieces, notes };
-            }
+              return got;
+            }, { capped: c < Infinity });
+            if (best) return taken(best, c, wide);
           }
         }
         return null;
       };
-      let found = search();
+      // the least Largest piece (whole 5 mm, above `c`) for which some grid of 64 pieces or fewer could be within it
+      const leastCap = (c) => {
+        for (let x = (Math.floor(c / 5) + 1) * 5; x < Math.max(...E) + 5; x += 5) {
+          if (ways.some((lying) => gridsFor(lying, x).length)) return x;
+        }
+        return null;
+      };
+      // for each set of details kept whole – all of them, then without the largest, and so on – within the Largest piece
+      // first, then as big as the printer takes: the details the user marked come before the cap, the printer before
+      // both, and the cap comes back once a detail has to go anyway. Within the cap would take more than 64 pieces: the
+      // least cap that 64 allow instead
+      let short = null;
+      const plan = () => {
+        if (capNow === Infinity) return search(Infinity);
+        // within the cap some grid of 64 pieces or fewer would do, though its cuts may have nowhere to go
+        if (ways.some((lying) => gridsFor(lying, capNow).length)) {
+          const got = search(capNow);
+          if (got) return got;
+          const loose = search(Infinity);
+          if (loose) short = { why: 'plan', kept: fence.length > 0 };
+          return loose;
+        }
+        const least = leastCap(capNow);
+        const got = least !== null ? search(least) : null;
+        if (got) {
+          short = { why: 'many', least, used: least };
+          return got;
+        }
+        const loose = search(Infinity);
+        if (loose) short = { why: 'many', least, used: null };
+        return loose;
+      };
+      let found = plan();
       while (!found && fence.length) {
         const largest = fence.reduce((x, y) => (keepSize(y).reduce((v, w) => v * w, 1) > keepSize(x).reduce((v, w) => v * w, 1) ? y : x));
         fence = fence.filter((x) => x !== largest);
-        found = search();
+        found = plan();
       }
       if (!found) return tooMany;
+      if (capNow < Infinity) found.asked = capNow;
+      // planned as big as the printer takes, as no plan within the cap was found: `planPieces` says so once it has
+      // measured the pieces, which may keep within it all the same
+      if (short?.why === 'plan') {
+        found.short = { cap: capNow, ...short };
+        found.wide ??= wideOf(fence, capNow);
+      } else if (short) found.notes.push(splitNote('LARGEST_TOO_SMALL', { cap: capNow, ...short }));
       if (keeps.length) {
         // each detail kept whole: whole, on the piece the plan's pieces say (`planPieces`), or the cuts through it
         const planes = found.cuts.map((c, i) => ({ ...cutPlane(c), letter: letterFor(i), part: !!c.part }));

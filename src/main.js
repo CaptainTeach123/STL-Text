@@ -14,8 +14,9 @@ import { TEA_LIGHT, gminOf, offerPercent, roundZ } from './locks.js';
 import { SIDES, placementMatrix, snapPartTo } from './placement.js';
 import { BUNDLED_FONTS, canQueryLocalFonts, fetchBundledFont, listLocalFonts, localFontBytes } from './fontCatalog.js';
 import {
-  BED_DEFAULTS, BED_PRESETS, FILAMENT, KEEP_LIMIT, PIECE_COLORS, SPLIT_LIMITS, SPLIT_NOTE_CODES, axisCuts, bedSize, cellFits, cellSizes, cutPlane, fitPieces, formatSize,
-  keepName, keepsOf, keepsThrough, letterFor, nextCut, noSeatWords, pegSizeOf, pieceColorIndex, pieceColors, sheetName, splitActive, splitNote, usableBed, wayStep,
+  BED_DEFAULTS, BED_PRESETS, FILAMENT, KEEP_LIMIT, PIECE_COLORS, PRESET_ALIASES, SPLIT_LIMITS, SPLIT_NOTE_CODES, axisCuts, bedCorner, bedSize, capOf, cellFits, cellSizes,
+  clampLargest, cutPlane, fitPieces, formatSize, keepName, keepsOf, keepsThrough, letterFor, nextCut, noSeatWords, pegSizeOf, pieceColorIndex, pieceColors, planEnds,
+  presetOf, reachesCorner, sheetName, splitActive, splitNote, usableBed, wayStep, wideKeeps,
 } from './split.js';
 
 const $ = (id) => document.getElementById(id);
@@ -45,7 +46,7 @@ let partCount = 0;
 const printing = { nozzle: 0.4, layerHeight: 0.2 };
 const defaults = { fontId: 'inter', size: 10, mode: 'emboss', depth: 1.5, quality: 'normal', roundCorners: false };
 // the printer the pieces of a split must fit (not in `printing`: that is part of every preview's key)
-const bed = { preset: BED_DEFAULTS.preset, size: [...BED_DEFAULTS.size], margin: BED_DEFAULTS.margin };
+const bed = { preset: BED_DEFAULTS.preset, size: [...BED_DEFAULTS.size], margin: BED_DEFAULTS.margin, largest: BED_DEFAULTS.largest };
 // the split settings used last, which the next model's split starts from
 const splitDefaults = Object.fromEntries(Object.entries(SPLIT_DEFAULTS).filter(([key]) => key !== 'cuts'));
 
@@ -222,10 +223,13 @@ function loadSettings() {
     Object.assign(printing, saved.printing ?? {});
     Object.assign(defaults, saved.defaults ?? {});
     if (!BUNDLED_FONTS.some((f) => f.id === defaults.fontId)) defaults.fontId = 'inter';
-    // older saves have no printer or split settings: what they lack keeps its default
-    if (BED_PRESETS[saved.bed?.preset]) bed.preset = saved.bed.preset;
+    // older saves have no printer or split settings: what they lack keeps its default; a printer saved under a name it
+    // no longer has reads as the one it became
+    const preset = PRESET_ALIASES[saved.bed?.preset] ?? saved.bed?.preset;
+    if (BED_PRESETS[preset]) bed.preset = preset;
     if (Array.isArray(saved.bed?.size)) bed.size = bedSize({ preset: 'custom', size: saved.bed.size });
     if (Number.isFinite(saved.bed?.margin)) bed.margin = Math.min(20, Math.max(0, saved.bed.margin));
+    if (Number.isFinite(saved.bed?.largest)) bed.largest = clampLargest(saved.bed.largest);
     for (const key of Object.keys(splitDefaults)) {
       if (typeof saved.splitDefaults?.[key] === typeof splitDefaults[key]) splitDefaults[key] = saved.splitDefaults[key];
     }
@@ -301,10 +305,18 @@ function describeModel() {
   }
   const tooBig = bedTooSmall();
   if (tooBig) notes.push(tooBig);
+  else if (wholeOnCorner()) notes.push(wholeOnCorner());
   return { text, notes };
 }
 
-let tooBigFor = { key: null, note: null };
+/** CORNER_PLACE for a model with no cuts yet that the printer takes whole only beside or behind its bed's corner. */
+function wholeOnCorner() {
+  if (!modelInfo?.hasModel || !modelInfo.size || splitActive(doc.split)) return null;
+  bedTooSmall();
+  return tooBigFor.corner;
+}
+
+let tooBigFor = { key: null, note: null, corner: null };
 /**
  * The "bigger than your printer" note for a model with no cuts yet, with a
  * first guess from its box at the pieces it takes (`pieces`, 0 when even 64
@@ -313,17 +325,33 @@ let tooBigFor = { key: null, note: null };
  * but it is never printed that way. Built-in pegs make pieces longer by as
  * far as they stand out, which the peg size and depth decide. Worked out
  * here, not by the engine: it knows no printer. The number the note offers
- * is the plan's (`offerLabel`).
+ * is the plan's (`offerLabel`). A model it takes whole only beside or behind
+ * the corner its bed keeps clear gets CORNER_PLACE instead (`tooBigFor.corner`):
+ * a slicer puts it in the middle of the bed, where it reaches into it.
  */
 function bedTooSmall() {
   if (!modelInfo?.hasModel || !modelInfo.size || splitActive(doc.split)) return null;
   const U = usableBed(bed);
   const spec = { ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split }; // the joints decide whether a plate's pieces grow tabs
   const passthrough = (modelInfo.passthroughTriangles ?? 0) > 0; // unrepaired triangles rule dovetails out
-  const key = `${modelInfo.size}|${U}|${bedSize(bed)}|${spec.joint}|${spec.diameter}|${spec.depth}|${passthrough}`;
+  // with a Largest piece the pieces are counted within it too – but where a detail kept whole is longer than that, as
+  // Fit plans them: a model longer than the cap only along a detail kept whole needs no cut for it
+  const cap = capOf(bed.largest);
+  const keeps = cap < Infinity && modelInfo.bounds ? keepsOf(doc.split, modelInfo.bounds) : [];
+  const key = `${modelInfo.size}|${U}|${bedSize(bed)}|${spec.joint}|${spec.diameter}|${spec.depth}|${passthrough}|${bed.largest || 0}|${keeps.map((k) => [k.box.min, k.box.max].join(',')).join(';')}`;
   if (tooBigFor.key !== key) {
-    const fit = fitPieces(modelInfo.size, U, spec, { passthrough });
-    tooBigFor = { key, note: fit.fits ? null : splitNote('BED_TOO_SMALL', { size: modelInfo.size, bed: bedSize(bed), pieces: fit.pieces }) };
+    const wide = keeps.length ? wideKeeps(keeps, cap, modelInfo.bounds, planEnds(spec, printing.nozzle).minEnd) : null;
+    const capped = cap < Infinity ? { cap, wide } : {};
+    const fit = fitPieces(modelInfo.size, U, spec, { passthrough, ...capped });
+    // a model the printer takes whole is only longer than the Largest piece: the note says so, not that it is too big
+    const printer = !fit.fits && cap < Infinity ? fitPieces(modelInfo.size, U, spec, { passthrough }).fits : false;
+    // a model that would fit but for the corner the printer keeps clear is not bigger than the printer: the note says so
+    const corner = !fit.fits && !printer && bedCorner(U) && fitPieces(modelInfo.size, U.slice(0, 3), spec, { passthrough }).fits ? bedCorner(U) : null;
+    tooBigFor = {
+      key,
+      note: fit.fits ? null : splitNote('BED_TOO_SMALL', { size: modelInfo.size, bed: bedSize(bed), pieces: fit.pieces, ...(printer ? { cap } : {}), ...(corner ? { corner } : {}) }),
+      corner: fit.fits && fit.corner ? splitNote('CORNER_PLACE', { whole: true, corner: bedCorner(U) }) : null,
+    };
   }
   return tooBigFor.note;
 }
@@ -1142,7 +1170,7 @@ async function showResult(on, { keep = false } = {}) {
   if (split) setSplitPending(true);
   try {
     if (!(await syncBase())) return; // the model is still being re-derived for a newer change, which re-renders
-    const r = await client.result(doc.items, version(), { printing, split, bed: usableBed(bed) });
+    const r = await client.result(doc.items, version(), { printing, split, bed: usableBed(bed), ...largestOf() });
     if (!r || !$('resultToggle').checked || lastContentKey !== requestedFor || lastSplitKey !== splitFor) return; // stale
     const entering = viewer.viewMode !== 'pieces';
     if (r.pieces) viewer.setPieces(r.display, r.pieces, r.grid, waysOf(r.seams));
@@ -1243,8 +1271,9 @@ async function download() {
       printing,
       split,
       bed: usableBed(bed),
-      printer: { size: bedSize(bed), margin: bed.margin }, // names the printer on the glue sheet
+      printer: { size: bedSize(bed), margin: bed.margin, corner: bedCorner(usableBed(bed)) }, // names the printer on the glue sheet
       archive: 'zip',
+      ...largestOf(),
     });
     if (!r) return setStatus('The model changed while the download was being prepared – try again.', '');
     const warnings = r.notes.filter((n) => n.level === 'warn');
@@ -1267,11 +1296,17 @@ async function download() {
     }
     const main = save(r.stl, name);
     const extras = (r.extra ?? []).map((e, i) => save(e.stl, `${name}-part-${i + 1}-${e.name}`));
+    const tooBig = bedTooSmall();
+    // printed whole, a model the printer takes only beside or behind the corner it keeps clear must be moved there
+    const placed = r.notes.find((n) => n.code === 'CORNER_PLACE');
     setStatus(
       `Downloaded ${main.name} (${main.kb} KB, ${r.triangles.toLocaleString()} triangles)` +
         (extras.length ? ` and ${extras.length} separate part file${extras.length > 1 ? 's' : ''} (${extras.map((e) => e.name).join(', ')}) to print and glue in.` : '.') +
         warned +
-        (bedTooSmall() && canSplit() ? '\nBigger than your printer – use Split for printing (step 6).' : ''),
+        (placed ? `\n${placed.text}` : '') +
+        (tooBig && canSplit()
+          ? `\n${tooBig.cap ? 'Longer than your Largest piece' : tooBig.corner ? 'Too big for your printer once its corner is kept clear' : 'Bigger than your printer'} – use Split for printing (step 6).`
+          : ''),
       warnings.length ? 'error' : 'ok',
     );
   } catch (err) {
@@ -1335,6 +1370,40 @@ const piecesCurrent = () => !!lastPieces && lastPieces.key === lastSplitKey && l
 const cellTooBig = (cell) => !cellFits(cell, usableBed(bed));
 
 /**
+ * The Largest piece for a request that plans or says what the pieces are (Fit to my printer, the pieces view, the
+ * download): sent only when set, so that without one every request – and every key made of them – is as it was. A
+ * measure and the fit test never take it: it makes no piece too big.
+ */
+const largestOf = () => (bed.largest > 0 ? { largest: bed.largest } : {});
+
+/**
+ * What the pieces list says of a piece longer than the Largest piece set – told, never refused: whether it fits is the
+ * printer's to say. `overLargest()` gives a function of a piece's size (the longest side, as its row shows it), its box
+ * between the cuts (`cellSizes`', along the model's axes) and whether it is a part taken out: "over 200 mm", or "over
+ * 200 mm to keep Ribbon whole" when along every side its box is longer than that the run of boxes between the cuts holds
+ * a detail kept whole that is longer – as Fit plans them, as long as that detail needs. '' for none, or with no Largest
+ * piece set.
+ */
+function overLargest() {
+  const cap = capOf(bed.largest);
+  const bounds = cutBounds();
+  if (!(cap < Infinity) || !bounds) return () => '';
+  const keeps = keepsOf(doc.split, bounds);
+  const wide = keeps.length ? wideKeeps(keeps, cap, bounds) : null;
+  return (size, box, part = false) => {
+    if (!size || part || !(Math.max(...size) > cap + 0.05)) return '';
+    const long = box ? [0, 1, 2].filter((a) => box.size[a] > cap + 0.05) : [];
+    const why = long.map((a) => {
+      const span = wide?.[a]?.find((w) => box.min[a] <= w.l + 1e-6 && box.max[a] >= w.h - 1e-6);
+      // of details merged into one run, the longest along it
+      return span && keeps.filter((k) => span.ids.includes(k.id)).sort((p, q) => q.box.max[a] - q.box.min[a] - (p.box.max[a] - p.box.min[a]))[0];
+    });
+    const kept = why.length && why.every(Boolean) ? [...new Set(why.map((k) => k.name))] : null;
+    return kept ? `over ${cap} mm to keep ${listOf(kept)} whole` : `over ${cap} mm`;
+  };
+}
+
+/**
  * The cuts, each with what the last measure found its dovetail tabs add to
  * the pieces either side, or its built-in pegs to the one that carries them
  * (`reach`), and the side those pieces must lie on (`w`, tabs only), for
@@ -1392,6 +1461,7 @@ const fitSettings = () => ({
   base: version(),
   printing,
   bed: usableBed(bed),
+  ...largestOf(),
   split: { ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split, cuts: (doc.split?.cuts ?? []).filter((c) => c.joint === 'apart') },
 });
 
@@ -1400,7 +1470,7 @@ const planKey = () => stableKey({ items: doc.items, ...fitSettings() });
 
 /** Fit to my printer's plan for the model and its text as they are now (the engine keeps the last one: asked again, it answers at once). */
 const planFit = () =>
-  client.planSplit(doc.items, version(), { printing, split: { ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split }, bed: usableBed(bed), mode: 'fit' });
+  client.planSplit(doc.items, version(), { printing, split: { ...SPLIT_DEFAULTS, ...splitDefaults, ...doc.split }, bed: usableBed(bed), ...largestOf(), mode: 'fit' });
 
 let offerTimer = 0;
 let offerFor = null; // the plan key the offer's plan is timed for
@@ -2268,9 +2338,17 @@ function fillSplit() {
       : "Too big for your printer, or want a part to come off – a lantern's top or base, a box's lid? Cut it into pieces that print one by one.";
   $('splitHint').textContent = hint;
   $('splitHint').hidden = !hint;
-  $('splitBedText').textContent = `Your printer: ${formatSize(bedSize(bed))}`;
+  // the printer as Fit plans for it: the corner it keeps clear and the Largest piece set, by the setting's own name (on
+  // one line of its own when the line wraps)
+  const corner = presetOf(bed)?.corner;
+  $('splitBedText').textContent =
+    `Your printer: ${formatSize(bedSize(bed))}${corner ? `, front-left ${corner.join(' × ')} mm kept clear` : ''}${bed.largest > 0 ? ` · Largest\u00a0piece\u00a0${bed.largest}\u00a0mm` : ''}`;
   const bounds = cutBounds();
   $('splitFitBtn').disabled = !usable;
+  $('splitFitBtn').title =
+    bed.largest > 0
+      ? `Cut into the fewest pieces that fit your printer and keep within your ${bed.largest} mm Largest piece, away from letters and thin spots`
+      : 'Cut into the fewest pieces that fit your printer, away from letters and thin spots';
   $('splitFitTestBtn').disabled = !usable || (glueOnly && !apart.length); // nothing to try the fit of, but a lip's
   $('splitFitTestBtn').title = fitTestTitle(fitTestHolds(settings));
   $('addCutBtn').disabled = !usable || !roomForAnyCut() || (!!bounds && !nextCut(bounds, planeCuts()));
@@ -2811,6 +2889,11 @@ function renderPieces() {
       // a base's tea-light seat, with or without a lock round it
       if (s.apart?.seat) lockOn(piece, `tea-light seat Ø ${round(s.apart.seat.d, 1)} mm`);
     }
+    const U = usableBed(bed);
+    // the box each piece comes from, along the model's axes: which side the Largest piece is over and why
+    const over = overLargest();
+    const b = cutBounds();
+    const boxes = b && bed.largest > 0 ? new Map(cellSizes(b, cutsWithTabs()).cells.map((c) => [c.cell.join(','), c])) : null;
     rows = computed.pieces.map((p) => ({
       index: p.index,
       // a piece with a name of its own: a part taken out, or the lantern it came out of
@@ -2820,6 +2903,10 @@ function renderPieces() {
       fits: p.fits,
       lies: `lies ${p.lies}${p.yaw ? `, turned ${p.yaw}°` : ''}`,
       extra: [
+        // longer than the Largest piece: a cut by hand may make it so, and Fit to keep a detail whole
+        over(p.size, p.cell && boxes?.get(p.cell.join(',')), !!p.part),
+        // left in the middle of the bed it would reach into the corner the printer keeps clear (CORNER_PLACE says so)
+        p.fits && reachesCorner(p.size, p.yaw, U) ? 'move clear of the corner' : '',
         // a bit a cut leaves loose that prints in the file with the rest of its box: the notes say how it goes on
         p.shells > 1 ? `${p.shells} parts${p.loose ? ` – ${p.loose} loose` : ''}` : '',
         p.dowels ? `${p.dowels} ${p.dowels === 1 ? 'pin' : 'pins'}` : '',
@@ -2836,8 +2923,14 @@ function renderPieces() {
     // a box whose loose parts print apart (a bookcase's shelves between two cuts) says how many pieces it makes
     const counted = measuredPieces();
     const makes = (cell) => counted?.filter((p) => p.cell.join(',') === cell.join(',')).length ?? 1;
+    const over = overLargest();
     rows = filledBoxes().map((c, i) => ({
-      index: i + 1, cell: c.cell, size: c.size, fits: !cellTooBig(c), predicted: true, extra: makes(c.cell) > 1 ? [`prints as ${makes(c.cell)} pieces`] : [],
+      index: i + 1,
+      cell: c.cell,
+      size: c.size,
+      fits: !cellTooBig(c),
+      predicted: true,
+      extra: [over(c.size, c), makes(c.cell) > 1 ? `prints as ${makes(c.cell)} pieces` : ''].filter(Boolean),
     }));
     // each part taken out is a piece of its own, past the boxes: its size is known once it is cut, its circle now
     (doc.split?.cuts ?? []).forEach((c, i) => {
@@ -2943,13 +3036,13 @@ function renderSplitNotes() {
   const pieced = active && lastPieces && (piecesCurrent() || $('resultToggle').checked);
   if (pieced) notes = lastPieces.notes;
   else if (active && measured) notes = measured.notes;
-  // what Fit to my printer said of how its cuts hold on, the pieces say again once they are worked out
-  // and of the details kept whole, but for one no plan keeps whole: that it could not says more than that a cut runs
-  // through it
+  // what Fit to my printer said of how its cuts hold on, of the details kept whole and of the pieces that fit only
+  // beside or behind the corner the printer keeps clear, the pieces say again once they are worked out – but for a
+  // detail no plan keeps whole: that it could not says more than that a cut runs through it
   if (planNotes?.key === lastSplitKey && planNotes.content === lastContentKey) {
     const unkept = new Set(planNotes.notes.filter((n) => n.code === 'KEEP_NOT_KEPT').map((n) => n.keepId));
     const own = notes.filter((n) => !(n.code === 'KEEP_CUT' && unkept.has(n.keepId)));
-    notes = [...planNotes.notes.filter((n) => !pieced || (n.code !== 'BARELY_HELD' && n.code !== 'KEEP_KEPT')), ...own];
+    notes = [...planNotes.notes.filter((n) => !pieced || (n.code !== 'BARELY_HELD' && n.code !== 'KEEP_KEPT' && n.code !== 'CORNER_PLACE')), ...own];
   }
   const shown = JSON.stringify(notes.map((n) => [n.code, n.text]));
   if (shown === splitNotesShown) return;
@@ -4388,7 +4481,8 @@ function offerSplit() {
     return;
   }
   const [x, y] = bedSize(bed);
-  offered = `This model won't fit your ${x} × ${y} mm bed.`;
+  if (note.cap) offered = `This model is longer than your ${note.cap} mm Largest piece.`;
+  else offered = note.corner ? `This model won't fit your ${x} × ${y} mm bed with its front-left corner kept clear.` : `This model won't fit your ${x} × ${y} mm bed.`;
   toast(offered, note.pieces > 1 && canSplit() ? { label: 'Split it', run: autoSplit } : null);
 }
 
@@ -4607,6 +4701,12 @@ function bindSplit() {
     preset.value = bed.preset;
     bedSize(bed).forEach((v, a) => ($(['bedX', 'bedY', 'bedZ'][a]).value = v));
     $('bedMargin').value = bed.margin;
+    // blank for none: as big as the printer takes
+    $('bedLargest').value = bed.largest > 0 ? String(bed.largest) : '';
+    // a printer that keeps a corner of its bed clear says so under its name
+    const corner = presetOf(bed)?.corner;
+    $('bedCornerHint').hidden = !corner;
+    if (corner) $('bedCornerHint').textContent = `Keeps its front-left ${corner.join(' × ')} mm corner clear, as Bambu Studio does.`;
   };
   const bedChanged = () => {
     fillBed();
@@ -4638,6 +4738,26 @@ function bindSplit() {
     bed.margin = Math.min(20, v);
     bedChanged();
   });
+  // Largest piece: blank or 0 for none; a value under the least it takes reads as that least, shown in the box at once.
+  // The user's own limit, not the printer's: choosing another printer leaves it as it is
+  $('bedLargest').addEventListener('change', () => {
+    const box = $('bedLargest');
+    const raw = box.value.trim();
+    // a number box reads as empty when what is typed is no number ("1-", "e"): that is nonsense, not a cleared box
+    if (box.validity?.badInput) return fillBed();
+    const v = raw === '' ? 0 : Number.parseFloat(raw);
+    if (!(v >= 0)) return fillBed(); // nonsense: the value in force again
+    const largest = clampLargest(v);
+    if (largest === bed.largest) return fillBed(); // 12 typed over 30 shows 30 again
+    bed.largest = largest;
+    bedChanged();
+  });
+  // nor does a box left with no number in it go on showing it: the browser may not even say it changed
+  for (const id of ['bedMargin', 'bedLargest']) {
+    $(id).addEventListener('blur', () => {
+      if ($(id).validity?.badInput) fillBed();
+    });
+  }
 }
 
 /* ----------------------------------------------------------------- render */
@@ -4973,7 +5093,7 @@ function render() {
   const contentChanged = contentKey !== lastContentKey;
   lastContentKey = contentKey;
   // the pieces also depend on the split, the printer and the nozzle – none of which is content the previews depend on
-  const splitKey = stableKey({ split: activeSplit(), bed: usableBed(bed), nozzle: printing.nozzle });
+  const splitKey = stableKey({ split: activeSplit(), bed: usableBed(bed), nozzle: printing.nozzle, ...largestOf() });
   const splitChanged = splitKey !== lastSplitKey;
   lastSplitKey = splitKey;
   // selecting an item lets go of the cut, and an undo can take the cut away

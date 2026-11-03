@@ -610,7 +610,9 @@ export function boxExtent(graph, { down, up }, samples, p, q, grid) {
  * Where to move the cut at sample i, the next cuts at samples L and R (−1 and n the model's ends), so that what it
  * leaves holds on: the nearest sample where it leaves nothing loose and nothing held within `HANG.reach` mm (no cost
  * at all), or failing that one where it leaves no more loose than it does now and nothing held within `HANG.warn` mm;
- * with the boxes either side at least `least` mm long and each of what they hold passing `fits` (its size), and the
+ * with the boxes either side at least `least` mm long and each of what they hold passing `fits` (its size; then the
+ * slab it is in along the axis, [from, to], and a function giving what that side's box held before the move – the
+ * sizes of the box from the cut's old place, or null), and the
  * place itself passing `allowed` (where it is along the axis: not through a detail kept whole, say). And how
  * far `part` (one of `heldParts`', on `side` of the cut in column `column`) then holds: the least w that frees any of
  * its islands there – on that side, or on the other where the cut moved past it – or null when none of it comes loose.
@@ -630,9 +632,10 @@ export function moveCut(axis, i, L, R, { part, side, column }, { fits = () => tr
     candidates.push(j);
   }
   candidates.sort((p, q) => Math.abs(samples[p] - samples[i]) - Math.abs(samples[q] - samples[i]) || p - q);
-  const holdsOn = (j) => graphs.every((g) => [[L, j], [j, R]].every(([p, q]) => {
+  const edge = (x) => (x < 0 ? lo : x >= n ? hi : samples[x]);
+  const holdsOn = (j) => graphs.every((g) => [[L, j, L, i], [j, R, i, R]].every(([p, q, p0, q0]) => {
     const size = boxExtent(g, widths, samples, p, q, grid);
-    return !size || fits(size);
+    return !size || fits(size, [edge(p), edge(q)], () => boxExtent(g, widths, samples, p0, q0, grid));
   }));
   const pick = (ok) => candidates.find((j) => ok(hangAt(tables, samples, j, L, R)) && holdsOn(j));
   const j = pick((h) => h.cost <= 1e-9) ?? pick((h) => h.loose <= now.loose + 1e-6 && !h.parts.some((x) => x.w <= HANG.warn + 1e-9));

@@ -22,6 +22,7 @@
  *  - piece numbers are 1-based, as in "piece 2 of 3" and the label "2A".
  */
 import { TEA_LIGHT, roundAngle, roundOpening, wayWords } from './locks.js';
+import { boxHang, columnGraph, columnsOf, HANG, looseTable, planeGrid, rasterRings, sampleWidths } from './hang.js';
 
 // ---------- printers ----------
 
@@ -206,6 +207,53 @@ function partMisses({ axis, at, centre, r, side }, bounds) {
   return Math.hypot(...off) >= r - CUT_TOLERANCE;
 }
 
+// ---------- details kept whole ----------
+
+/**
+ * A detail kept whole (`split.keep`, the box round it the detail finder gives, 1 mm past it): a cut this far (mm)
+ * inside one of the box's sides runs past the detail, not through it.
+ */
+export const KEEP_INSIDE = 1;
+
+/** The most details one split keeps whole. */
+export const KEEP_LIMIT = 8;
+
+/** True when a full cut across `axis` at `at` runs through a keep box: more than `KEEP_INSIDE` inside both its sides. */
+export const keepCrossed = (box, axis, at) => box.min[axis] + KEEP_INSIDE < at && at < box.max[axis] - KEEP_INSIDE;
+
+/** A detail's name: its own, or "Detail 2" by its place in the list. */
+export const keepName = (mark, index) => String(mark?.name ?? '').trim() || `Detail ${index + 1}`;
+
+/**
+ * The details a split keeps whole, as the planner and the notes read them: `{ id, name, box }` in list order, a box
+ * clamped to `bounds` when they are given (the model's). A mark with no box, or one wholly off the model, is left out.
+ * @param {{ keep?: { id?: string, name?: string, box?: { min: number[], max: number[] }|null }[] }|null} split
+ * @param {{ min: number[], max: number[] }|null} bounds
+ * @returns {{ id: string, name: string, box: { min: number[], max: number[] } }[]}
+ */
+export function keepsOf(split, bounds = null) {
+  const out = [];
+  (Array.isArray(split?.keep) ? split.keep : []).slice(0, KEEP_LIMIT).forEach((mark, index) => {
+    const b = mark?.box;
+    if (!b || ![0, 1, 2].every((a) => Number.isFinite(b.min?.[a]) && Number.isFinite(b.max?.[a]) && b.max[a] > b.min[a])) return;
+    const min = b.min.map((v, a) => (bounds ? Math.max(v, bounds.min[a]) : v));
+    const max = b.max.map((v, a) => (bounds ? Math.min(v, bounds.max[a]) : v));
+    if (min.some((v, a) => !(max[a] > v))) return;
+    out.push({ id: mark.id ?? `k${index + 1}`, name: keepName(mark, index), box: { min, max } });
+  });
+  return out;
+}
+
+/**
+ * The details a cut runs through (`keepsOf`'s), by id: none for a cut that takes out only a part, or that is not
+ * straight. Takes a stored or a normalised cut.
+ */
+export function keepsThrough(keeps, cut) {
+  if (cut?.part || Array.isArray(cut?.centre)) return [];
+  const plane = cutPlane(cut);
+  return plane ? keeps.filter((k) => keepCrossed(k.box, plane.axis, plane.at)).map((k) => k.id) : [];
+}
+
 /**
  * Settings clamped to their ranges, and the cuts snapped to the axes,
  * checked against the model and put in their canonical order (x, then y,
@@ -222,9 +270,10 @@ function partMisses({ axis, at, centre, r, side }, bounds) {
  * @param {{ min: number[], max: number[] }|null} bounds the solid's bounds with the unrepaired triangles; null skips the miss test
  * @returns {{ spec: object, cuts: { id: string, letter: string, axis: number, at: number, apart?: { hold: string } }[],
  *   parts: { id: string, letter: string, axis: number, at: number, centre: number[], r: number, side: number, hold: string,
- *   auto: boolean, seat?: true }[], notes: object[], grid: number[] }} `spec` holds the clamped settings (no cuts), `grid`
- *   the number of cuts on each axis; `apart` only on a cut that comes apart; `seat` only on a part whose base is to have
- *   a tea-light seat. No cuts left means: export unsplit, with the notes.
+ *   auto: boolean, seat?: true }[], notes: object[], grid: number[], keeps?: { id: string, name: string, box: object }[] }}
+ *   `spec` holds the clamped settings (no cuts), `grid` the number of cuts on each axis; `apart` only on a cut that comes
+ *   apart; `seat` only on a part whose base is to have a tea-light seat; `keeps` the details kept whole (`keepsOf`), only
+ *   when there are some. No cuts left means: export unsplit, with the notes.
  * @throws {SplitError} `SPLIT_INVALID` for more than 12 cuts and parts or 64 pieces
  */
 export function normaliseSplit(split, bounds = null) {
@@ -297,7 +346,8 @@ export function normaliseSplit(split, bounds = null) {
   if (count > SPLIT_LIMITS.cuts || cells > SPLIT_LIMITS.cells) {
     throw new SplitError('SPLIT_INVALID', `A split can have up to ${SPLIT_LIMITS.cuts} cuts and ${SPLIT_LIMITS.cells} pieces – remove some cuts.`, { cuts: count, cells });
   }
-  return { spec, cuts, parts, notes, grid };
+  const keeps = keepsOf(s, bounds);
+  return { spec, cuts, parts, notes, grid, ...(keeps.length ? { keeps } : {}) };
 }
 
 /**
@@ -1309,6 +1359,10 @@ export function runsOf(samples, occupied, { lo, hi, sliver }) {
  * more (`PLAN_WEIGHTS.sliver`) when it is a sliver: shorter along the axis
  * than a quarter of an even piece, or than an end piece may be.
  *
+ * With `hang`, what each box between two cuts leaves loose or held on only
+ * next to them (`boxHang`, the slice graph's) is added to it too: the plan
+ * that leaves the least hanging wins over one a little cheaper by its cuts.
+ *
  * Cuts that come apart stay where they are (`fixed`): each is one of the k
  * cuts, at its own sample, and reaches a tongue's height past it on one side
  * (`LIP_ALLOWANCE`, chosen as pegs are), whatever `grow` says there – never
@@ -1317,18 +1371,21 @@ export function runsOf(samples, occupied, { lo, hi, sliver }) {
  * @param {number[]} costs one per sample (from `planCost`)
  * @param {{ lo: number, hi: number, k: number, S?: number, Sflat?: number, minEnd?: number, minMid?: number,
  *   grow?: ({ below: number, above: number, peg?: boolean }|null)[], occupied?: Uint8Array[]|null,
- *   fixed?: number[]|null }} limits
+ *   fixed?: number[]|null, hang?: ((p: number, i: number) => number)|null }} limits
  *   lo/hi the model's extent on the axis, S the longest piece that fits (`maxCellLength`), Sflat the longest that fits
  *   lying flat; `grow` per sample, for a cut there with dovetail tabs (or pegs, `peg`), how far the piece below it
  *   (`below`) and the piece above it (`above`) reach past it. The minimums are for the pieces between the cuts, tabs
  *   left out.
- *   `occupied` per sample, a flag per column; `fixed` the indices of the samples where a cut must be (counted in k)
+ *   `occupied` per sample, a flag per column; `fixed` the indices of the samples where a cut must be (counted in k);
+ *   `hang(p, i)` what the box from the cut at sample p to the one at i (−1 and the sample count: the model's ends)
+ *   costs for what it leaves; `perBox` what each box that holds model costs on top (with `occupied`)
  * @returns {{ offsets: number[], reach: (number[]|null)[], cost: number, parts: number|null, slivers: number|null,
- *   relaxed: boolean }|null} null when no choice keeps every piece within S; `reach` per cut [below, above] as counted
- *   (a peg's length on one side for pegs), null for a plain one; `cost` leaves the parts out, `parts` and `slivers`
- *   count them (null without `occupied`)
+ *   hang?: number, relaxed: boolean }|null} null when no choice keeps every piece within S; `reach` per cut [below,
+ *   above] as counted (a peg's length on one side for pegs), null for a plain one; `cost` leaves the parts and the hang
+ *   out, `parts` and `slivers` count them (null without `occupied`), `hang` what the boxes cost for what they leave
+ *   (with `hang` only)
  */
-export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat = S, minEnd = 0, minMid = 0, grow = null, occupied = null, fixed = null }) {
+export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat = S, minEnd = 0, minMid = 0, grow = null, occupied = null, fixed = null, hang = null, perBox = 0 }) {
   const n = samples.length;
   const E = hi - lo;
   const tol = 1e-6;
@@ -1353,10 +1410,12 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
   const W = 2; // states per sample: a cut there with each of its ways
   // each run of model a box between two cuts holds is a piece, or a loose part of one, and a thin one a sliver
   const runs = occupied?.length === n ? runsOf(samples, occupied, { lo, hi, sliver: Math.max(minEnd, cell / 4) }) : null;
+  // and what it leaves loose or held on only next to its cuts (`boxHang`), with it
   const parts = (p, i) => {
-    if (!runs) return 0;
-    const { count, thin } = runs(p, i);
-    return PLAN_WEIGHTS.parts * count + PLAN_WEIGHTS.sliver * thin;
+    const left = hang ? hang(p, i) : 0;
+    if (!runs) return left;
+    const { count, filled, thin } = runs(p, i);
+    return PLAN_WEIGHTS.parts * count + PLAN_WEIGHTS.sliver * thin + perBox * filled + left;
   };
   // a piece between a cut `a` under it and a cut `b` over it (either may be the model's end): its length, then with
   // the tabs or pegs that reach past its cuts against what fits the way it may lie (tabs lay it flat, pegs do not)
@@ -1419,6 +1478,7 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
       cost: idx.reduce((c, i, j) => c + own(i, j), 0),
       parts: boxes ? boxes.reduce((m, x) => m + x.count, 0) : null,
       slivers: boxes ? boxes.reduce((m, x) => m + x.thin, 0) : null,
+      ...(hang ? { hang: ends.slice(1).reduce((c, i, j) => c + hang(ends[j], i), 0) } : {}),
     };
   };
   if (!(k > 0) || !n) return null;
@@ -1452,6 +1512,19 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
  * through its stretcher a strip held loose over the rest. The plan so moved
  * stands when its pieces fit.
  *
+ * Then the plan is judged whole: its own cost (its cuts, the loose parts and
+ * slivers of every axis, the support) and what each of its boxes leaves loose
+ * or held on only next to its cuts (`boxHang`, the slice graph drawn from the
+ * same outlines; a ribbon left on a 12 mm root costs about what a cut through
+ * letters does). Each axis is planned again with the others where they are and
+ * that counted in (`chooseOffsets`' hang), a few times round; a move stands only
+ * when the whole cost falls and it makes no more boxes that hold model. The
+ * same is tried from a few other places on each axis cut once – the cheapest
+ * dips of its cost with the hang, the other axes planned round each – as the
+ * cuts of one axis change what the others' boxes leave, and the plan with the
+ * fewest pieces, then the least whole cost, wins. A plan that is the cheapest
+ * that way is kept as it was.
+ *
  * A dovetail cut keeps its tabs as the cut stage would: not when a cut
  * along the plate's thickness runs through that plate (it would part the
  * tabs into layers), not when a piece beside it cannot lie flat on the
@@ -1462,7 +1535,9 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
  * longer, the one `pegSides` gives them, as the pieces fit best; and as
  * pegs lay nothing flat, the pieces are first planned lying the way the even
  * ones would with no pegs: so a 30 mm slab's quarters still lie flat, its
- * cuts a little off centre and the shorter pieces carrying the pegs.
+ * cuts a little off centre and the shorter pieces carrying the pegs – unless
+ * that leaves a sliver, and lying any way makes fewer pieces (a long piece
+ * stood on its end where a detail kept whole leaves the cuts little room).
  * With `support` (what each box holds of the model), boxes that hold
  * nothing are no pieces, a piece must be able to lie on something flat –
  * one of its cut faces, or a flat side of the model where it ends – unless
@@ -1478,7 +1553,7 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
  * @param {number[]} k cuts per axis
  * @param {{ E: number[], U: number[], bounds: { min: number[], max: number[] }, flat?: number|null, minEnd?: number,
  *   minMid?: number, profileOf: function, support?: function|null, stable?: boolean, peg?: number|number[],
- *   fixed?: number[][]|null }} options E the
+ *   fixed?: number[][]|null, descent?: boolean, starts?: number }} options E the
  *   model's extents, `flat` the axis every piece lies flat on (a thin plate, or a slab planned lying flat) or null;
  *   `profileOf(axis, k)` gives `{ samples, costs, tabs, rings? }` for k cuts on that axis, `tabs` per sample
  *   `{ below, above, w, span, t }` when a cut there would take dovetail tabs (see `chooseOffsets`; `span` the plate's
@@ -1486,10 +1561,12 @@ export function chooseOffsets(samples, costs, { lo, hi, k, S = Infinity, Sflat =
  *   `rings` per sample the slice's outlines in the axis's plane coordinates (`TO_PLANE`); `support(cutsByAxis)` gives
  *   `cellSupport`'s map; `peg` the pegs' length when the joints are built-in pegs (per axis, or one for all), else 0;
  *   `fixed` per axis the positions of the cuts that come apart, each one of the samples `profileOf` gives (a plan
- *   whose samples miss one is null)
- * @returns {{ k: number[], offsets: number[][], cost: number, support: number, pieces: { cell: number[], size: number[],
- *   fits: true }[] }|null} `pieces` every box that makes a piece, as it will print, tabs and pegs counted; `support` the area
- *   (mm²) they need support under, as far as the boxes tell
+ *   whose samples miss one is null); `descent: false` stops at the plan each axis planned again gives, its whole cost
+ *   counted all the same, and `starts` is how many other places on each axis cut once it starts from (3)
+ * @returns {{ k: number[], offsets: number[][], cost: number, support: number, hang?: number, pieces: { cell: number[],
+ *   size: number[], fits: true }[] }|null} `pieces` every box that makes a piece, as it will print, tabs and pegs
+ *   counted; `support` the area (mm²) they need support under, as far as the boxes tell; with the outlines, `hang` what
+ *   its boxes leave hanging, counted in `cost`
  */
 export function planGrid(k, options) {
   const { E, U, flat = null, fixed = null } = options;
@@ -1502,7 +1579,11 @@ export function planGrid(k, options) {
   if (flat === null && [0, 1, 2].some((a) => k[a] > 0 && profileOf(a, k[a]).tabs.some((x) => x?.peg))) {
     const lie = fitsBed(evenCell(E, k), U).down;
     const lying = lie ? gridPlan(k, { ...planned, flat: dirAxis(lie) }) : null;
-    if (lying) return lying;
+    // unless lying so leaves a sliver or more (where a detail kept whole leaves the cuts little room, say), and lying
+    // any way makes fewer pieces, or as many for less
+    if (lying && lying.cost < PLAN_WEIGHTS.sliver) return lying;
+    const any = lying ? gridPlan(k, planned) : null;
+    if (lying) return any && (any.pieces.length < lying.pieces.length || (any.pieces.length === lying.pieces.length && any.cost < lying.cost)) ? any : lying;
   }
   return gridPlan(k, planned);
 }
@@ -1521,8 +1602,80 @@ const keptCuts = (profileOf, fixed) => (a, k) => {
   return { ...profile, fixed: idx, tabs: profile.tabs.map((x, i) => (idx.includes(i) ? APART_GROW : x)) };
 };
 
+/**
+ * How far the planner looks once each axis is planned (`gridPlan`): `rounds` times round the axes at most, from the
+ * plan and from up to `starts` other places on each axis cut once, `apart` mm or more from each other and from its
+ * cut – unless the plan costs within `near` of the cheapest any plan could. A place is followed only when, before its
+ * pieces are looked at, it costs less than `slack` more than the best plan so far: each grid's pieces take a pass over
+ * the model's triangles (`cellSupport`), about half a second on two million of them. An axis's move refused (its cuts
+ * leave another axis's boxes a sliver, say) is fenced off `fence` mm either side and the axis planned again, `tries`
+ * times at most and no more once `assessed` moves have had their pieces looked at in vain, the best move kept.
+ */
+const DESCENT = Object.freeze({ rounds: 3, starts: 3, apart: 8, near: 1, slack: 25, tries: 10, fence: 4, assessed: 2 });
+
+/** The slice graph's tables kept for each axis's outlines, the latest used (each two of (samples + 2)² numbers). */
+const HANG_TABLES = 32;
+/** And the costs of the boxes of the latest few sets of columns. */
+const HANG_BOXES = 8;
+const hangGraphs = new WeakMap();
+
+/**
+ * What the boxes along axis `a` leave loose or held on only next to their cuts, from a profile's outlines (`rings`,
+ * per sample): `boxes(offsets)` gives `(p, i) => cost` (`boxHang`, summed over the columns the other axes' cuts at
+ * `offsets` make) for the box from the cut at sample p to the one at i. The slices are drawn once, when first asked
+ * for, and the tables of the columns kept with the outlines.
+ */
+function hangGraph({ rings, samples }, bounds, a) {
+  if (!rings) return { boxes: () => () => 0, loose: () => () => 0 };
+  const key = `${bounds.min.join(',')}|${bounds.max.join(',')}|${samples.length}`;
+  let got = hangGraphs.get(rings);
+  if (!got || got.key !== key) {
+    got = { key, grid: planeGrid(bounds, a), slices: null, widths: sampleWidths(samples, bounds.min[a], bounds.max[a]), tables: new Map(), boxes: new Map() };
+    hangGraphs.set(rings, got);
+  }
+  const { grid, widths, tables } = got;
+  const tableOf = (rect) => {
+    const id = rect.join(',');
+    let table = tables.get(id);
+    if (table) tables.delete(id);
+    else {
+      got.slices ??= rings.map((r) => rasterRings(r ?? [], grid));
+      table = looseTable(columnGraph(got.slices, grid, rect), widths);
+    }
+    tables.set(id, table);
+    while (tables.size > HANG_TABLES) tables.delete(tables.keys().next().value);
+    return table;
+  };
+  const n = samples.length;
+  const N = n + 2;
+  return {
+    boxes: (offsets) => {
+      const columns = columnsOf(grid, offsets);
+      const id = columns.map((c) => c.rect.join(',')).join('|');
+      let box = got.boxes.get(id);
+      if (!box) {
+        const list = columns.map((c) => tableOf(c.rect));
+        const memo = new Float64Array(N * N).fill(NaN);
+        box = (p, q) => {
+          const x = (p + 1) * N + (q + 1);
+          if (Number.isNaN(memo[x])) memo[x] = boxHang(list, samples, p, q);
+          return memo[x];
+        };
+        got.boxes.set(id, box);
+        while (got.boxes.size > HANG_BOXES) got.boxes.delete(got.boxes.keys().next().value);
+      }
+      return box;
+    },
+    // what the box from the cut at sample p to the one at q leaves loose, whatever its share (mm³: `looseTable`'s `at`)
+    loose: (offsets) => {
+      const list = columnsOf(grid, offsets).map((c) => tableOf(c.rect));
+      return (p, q) => list.reduce((v, t) => v + t.at(p, q), 0);
+    },
+  };
+}
+
 /** `planGrid` for one way of laying the pieces (`flat`, or any way). */
-function gridPlan(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0, profileOf, support = null, stable = true, peg = 0 }) {
+function gridPlan(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0, profileOf, support = null, stable = true, peg = 0, descent = true, starts = DESCENT.starts, progress = null }) {
   const axes = [0, 1, 2].filter((a) => k[a] > 0);
   const profile = new Map(axes.map((a) => [a, profileOf(a, k[a])]));
   // a cut that comes apart and is not among the samples cannot be kept
@@ -1537,13 +1690,19 @@ function gridPlan(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0, profil
   const [, e1, e2] = [...E].sort((p, q) => p - q);
   const broadest = Math.max(e1 * e2, EPS);
   // whether each column the other axes' cuts make holds model at each sample of axis a, from the outlines sliced there
+  // (kept for the other axes' cuts: a plan is looked at again and again)
+  const occupied = new Map();
   const occupancy = (a, offsets) => {
     const [u, v] = [(a + 1) % 3, (a + 2) % 3];
+    const key = `${a}|${offsets[u].join(',')}|${offsets[v].join(',')}`;
+    if (occupied.has(key)) return occupied.get(key);
     const eu = [bounds.min[u], ...offsets[u], bounds.max[u]];
     const ev = [bounds.min[v], ...offsets[v], bounds.max[v]];
     const rects = [];
     for (let i = 0; i + 1 < eu.length; i++) for (let j = 0; j + 1 < ev.length; j++) rects.push([eu[i], ev[j], eu[i + 1], ev[j + 1]]);
-    return profile.get(a).rings.map((rings) => Uint8Array.from(rects, (r) => (rings?.length && clippedArea(rings, r) > MIN_HELD ? 1 : 0)));
+    const flags = profile.get(a).rings.map((rings) => Uint8Array.from(rects, (r) => (rings?.length && clippedArea(rings, r) > MIN_HELD ? 1 : 0)));
+    occupied.set(key, flags);
+    return flags;
   };
   // `grow` how far the pieces are taken to reach past the cuts of each axis; `room`: when given, no piece may be
   // longer on an axis than it says
@@ -1565,6 +1724,7 @@ function gridPlan(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0, profil
     }
     if (!axes.every((a) => profile.get(a).rings)) return assess(offsets, [...costs.values()].reduce((c, x) => c + x, 0));
     const first = assess(offsets, [...costs.values()].reduce((c, x) => c + x, 0) + loose(offsets));
+    const own = new Map(costs);
     // each axis again, now that the others' cuts are known: every run of model in a box between them is a piece, or a
     // loose part of one, so the cuts move to leave few and no slivers (one just inside a table's apron leaves the boxes
     // between its legs a sliver of it each). Twice round, as an axis's new cuts change the others' boxes
@@ -1581,9 +1741,192 @@ function gridPlan(k, { E, U, bounds, flat = null, minEnd = 0, minMid = 0, profil
       }
       if (!again) break;
     }
-    if (!moved) return first;
-    const second = assess(better, [...costs.values()].reduce((c, x) => c + x, 0) + loose(better));
-    return second && (!fitted(first) || fitted(second)) ? second : first;
+    let start = { plan: first, own };
+    if (moved) {
+      const second = assess(better, [...costs.values()].reduce((c, x) => c + x, 0) + loose(better));
+      if (!fitted(first) || fitted(second)) start = { plan: second, own: new Map(costs) };
+    }
+    // then on the plan's whole cost, what its boxes leave hanging counted in: from that plan and from a few other
+    // places on each axis cut once, the fewest pieces winning, then the cheapest
+    return settle(start, limits);
+  };
+  // the slice graph of each axis, from the outlines at its samples: what each box a plan's cuts make leaves loose or
+  // held on only next to them (`boxHang`), per column the other axes' cuts make
+  const graphs = new Map(axes.map((a) => [a, hangGraph(profile.get(a), bounds, a)]));
+  const hangOf = (a, offsets) => graphs.get(a).boxes(offsets);
+  const ends = (a, offsets) => [-1, ...offsets[a].map((t) => profile.get(a).samples.indexOf(t)), profile.get(a).samples.length];
+  // what a plan's boxes leave hanging, on every axis
+  const hanging = (offsets) => axes.reduce((sum, a) => {
+    const box = hangOf(a, offsets);
+    const at = ends(a, offsets);
+    return at.slice(1).reduce((c, i, j) => c + box(at[j], i), sum);
+  }, 0);
+  // what a plan's boxes leave loose, every part of 1 cm³ or more however large its share (mm³, on every axis)
+  const looseIn = (offsets) => axes.reduce((sum, a) => {
+    const box = graphs.get(a).loose(offsets);
+    const at = ends(a, offsets);
+    return at.slice(1).reduce((v, i, j) => v + box(at[j], i), sum);
+  }, 0);
+  const total = (own) => [...own.values()].reduce((c, x) => c + x, 0);
+  // a plan with these cuts (`own` the cost of each axis's), its whole cost `J` and what of it is the hang; with
+  // `above`, null when it costs that much or more before its pieces are looked at (the support only adds to it)
+  // each plan judged once: a descent round tries the same moves again
+  const judged = new Map();
+  // (or, with `most`, when it leaves more of the model loose than that, mm³)
+  const judge = (offsets, own, above = Infinity, most = Infinity) => {
+    const id = `${offsets.map((list) => list.join(',')).join('|')}#${[...own].map(([a, c]) => `${a}:${c}`).join(',')}`;
+    const seen = judged.get(id) ?? {};
+    if (seen.got) return seen.got;
+    seen.apart ??= looseIn(offsets);
+    if (seen.apart > most) {
+      judged.set(id, seen);
+      return null;
+    }
+    seen.hang ??= hanging(offsets);
+    seen.before ??= total(own) + loose(offsets);
+    if (seen.before + seen.hang >= above) {
+      judged.set(id, seen);
+      return null;
+    }
+    const plan = assess(offsets, seen.before);
+    const got = { plan, own, J: plan.cost + seen.hang, hang: seen.hang, apart: seen.apart };
+    judged.set(id, { got });
+    return got;
+  };
+  // a plan that leaves more of the model loose than another, by a part of `HANG.loose` or more: a ribbon's end cut
+  // off where it is a third of its box is no bit, but it prints loose all the same
+  const looser = (x, y) => x.apart > y.apart + HANG.loose - 1e-6;
+  const same = (x, y) => x.every((list, a) => list.length === y[a].length && list.every((t, i) => t === y[a][i]));
+  // coordinate descent: each axis planned again with the others where they are, what its boxes leave hanging counted
+  // in (`chooseOffsets`' hang), up to `DESCENT.rounds` times round; a move stands only when it makes no more boxes that
+  // hold model, leaves no more of the model loose (`looser`), and the whole cost falls (or its pieces fit where the
+  // plan's did not). A move refused is fenced off and the axis planned again, `DESCENT.tries` times at most, the best
+  // move kept: on an axis cut once, everything past the place refused too, as a cut moved further out leaves the box
+  // beyond it no less a sliver
+  // how far the weighing has got, for the progress: each axis of each round of each descent a step
+  const weighed = { done: 0, total: 0 };
+  const step = (n = 1) => {
+    weighed.done = Math.min(weighed.done + n, weighed.total);
+    progress?.('Weighing where to cut…', { done: weighed.done, total: weighed.total });
+  };
+  const descend = (from, limits) => {
+    let cur = from;
+    let left = DESCENT.rounds * axes.length;
+    for (let round = 0; round < DESCENT.rounds; round++) {
+      let moved = false;
+      for (const a of axes) {
+        step();
+        left--;
+        const { samples } = profile.get(a);
+        let { costs } = profile.get(a);
+        const occupied = occupancy(a, cur.plan.offsets);
+        const hang = hangOf(a, cur.plan.offsets);
+        const here = cur.plan.offsets[a];
+        // pieces that all fit stand over any that do not, whatever they cost
+        const wins = (x, y) => (fitted(x.plan) && !fitted(y.plan)) || (fitted(x.plan) === fitted(y.plan) && x.J < y.J - 1e-9);
+        let best = null;
+        let assessed = 0;
+        for (let tries = 0; tries < DESCENT.tries && assessed < DESCENT.assessed; tries++) {
+          const choice = chooseOffsets(samples, costs, { ...limits.get(a), occupied, hang });
+          if (!choice || same([choice.offsets], [here])) break;
+          // a plan that costs as much before its pieces are looked at cannot do better, once they all fit; nor can one
+          // that leaves more of the model loose
+          const top = best ?? cur;
+          const above = fitted(top.plan) ? top.J - 1e-9 : Infinity;
+          const along = (c) => judge(cur.plan.offsets.map((list, b) => (b === a ? c.offsets : list)), new Map(cur.own).set(a, c.cost), above, cur.apart + HANG.loose - 1e-6);
+          let next = along(choice);
+          if (next && next.plan.pieces.length > cur.plan.pieces.length) {
+            // it makes more boxes that hold model: the axis planned once more with each such box costing as much as a
+            // sliver, for its best move that makes none
+            const fewer = chooseOffsets(samples, costs, { ...limits.get(a), occupied, hang, perBox: PLAN_WEIGHTS.sliver });
+            next = fewer && !same([fewer.offsets], [here]) ? along(fewer) : null;
+          }
+          const ok = next && next.plan.pieces.length <= cur.plan.pieces.length && !looser(next, cur);
+          if (ok && wins(next, top)) best = next;
+          else if (next) assessed++;
+          // the places it moved to fenced off (and, refused on an axis cut once, all past them), and the axis planned
+          // again for its next best move
+          const moves = choice.offsets.filter((t) => !here.includes(t));
+          const past = !ok && here.length === 1 && moves.length === 1 ? Math.sign(moves[0] - here[0]) : 0;
+          costs = costs.map((x, i) => (moves.some((t) => Math.abs(samples[i] - t) <= DESCENT.fence || (past && (samples[i] - t) * past >= 0)) ? Infinity : x));
+        }
+        if (best) {
+          cur = best;
+          moved = true;
+        }
+      }
+      if (!moved) break;
+    }
+    if (left > 0) step(left);
+    return cur;
+  };
+  // fewest boxes that hold model first, then the whole cost – never one that leaves more of the model loose
+  const beats = (x, y) => !looser(x, y) && ((fitted(x.plan) && !fitted(y.plan))
+    || (fitted(x.plan) === fitted(y.plan) && (x.plan.pieces.length < y.plan.pieces.length || (x.plan.pieces.length === y.plan.pieces.length && x.J < y.J - 1e-9))));
+  const settle = (start, limits) => {
+    if (!descent) {
+      const kept = judge(start.plan.offsets, start.own);
+      return { ...kept.plan, cost: kept.J, hang: kept.hang };
+    }
+    weighed.total = DESCENT.rounds * axes.length;
+    let best = descend(judge(start.plan.offsets, start.own), limits);
+    // the cheapest any plan could be: each axis's cheapest samples, nothing else counted
+    const floor = axes.reduce((sum, a) => sum + profile.get(a).costs.filter(Number.isFinite).sort((p, q) => p - q).slice(0, k[a]).reduce((c, x) => c + x, 0), 0);
+    if (best.J > floor + DESCENT.near) {
+      for (const a of axes.filter((x) => k[x] === 1 && !profile.get(x).fixed?.length)) {
+        const places = startsOn(a, best.plan.offsets);
+        weighed.total += places.length * DESCENT.rounds * axes.length;
+        for (const i of places) {
+          const tried = startAt(a, i, best.plan.offsets, limits, best.J + DESCENT.slack);
+          if (!tried) {
+            step(DESCENT.rounds * axes.length);
+            continue;
+          }
+          const got = descend(tried, limits);
+          if (beats(got, best)) best = got;
+        }
+      }
+    }
+    return { ...best.plan, cost: best.J, hang: best.hang };
+  };
+  // the other places to start from on an axis cut once: the cheapest dips of its samples' cost with what a cut there
+  // leaves hanging (the middle of a dip's flat bottom), apart from each other and from the cut the plan has
+  const startsOn = (a, offsets) => {
+    const { samples, costs } = profile.get(a);
+    const box = hangOf(a, offsets);
+    const n = samples.length;
+    const c = costs.map((x, i) => (Number.isFinite(x) ? x + box(-1, i) + box(i, n) : Infinity));
+    const dips = [];
+    for (let i = 0; i < n;) {
+      let e = i;
+      while (e + 1 < n && Math.abs(c[e + 1] - c[i]) <= 1e-9) e++;
+      if (Number.isFinite(c[i]) && (i === 0 || c[i - 1] > c[i]) && (e === n - 1 || c[e + 1] > c[i])) dips.push((i + e) >> 1);
+      i = e + 1;
+    }
+    dips.sort((p, q) => c[p] - c[q] || p - q);
+    const picked = [];
+    for (const i of dips) {
+      if (picked.length >= starts) break;
+      if ([...picked.map((j) => samples[j]), ...offsets[a]].every((t) => Math.abs(samples[i] - t) >= DESCENT.apart)) picked.push(i);
+    }
+    return picked;
+  };
+  // a plan with axis a's cut at sample i, the other axes planned round it (null where it costs `above` or more before
+  // its pieces are looked at)
+  const startAt = (a, i, from, limits, above) => {
+    const { samples, costs } = profile.get(a);
+    const forced = chooseOffsets(samples, costs.map((x, j) => (j === i ? x : Infinity)), limits.get(a));
+    if (!forced) return null;
+    const offsets = from.map((list, b) => (b === a ? forced.offsets : [...list]));
+    const own = new Map([[a, forced.cost]]);
+    for (const b of axes) {
+      if (b === a) continue;
+      const choice = chooseOffsets(profile.get(b).samples, profile.get(b).costs, { ...limits.get(b), occupied: occupancy(b, offsets), hang: hangOf(b, offsets) });
+      if (!choice) return null;
+      offsets[b] = choice.offsets;
+      own.set(b, choice.cost);
+    }
+    return judge(offsets, own, above);
   };
   // what a grid's loose parts and slivers cost, beyond one piece to a box: so that, of two grids with as many boxes,
   // the one that leaves none wins too
@@ -2934,6 +3277,77 @@ export function layPieces(pieces, U, orient = 'auto', { flat = null, soups = nul
 }
 
 /**
+ * How the cut stage's pieces (`cutPieces`, one a box) print (`layPieces`): `holding(piece, k)` the printed piece with
+ * its k-th part (any, without k), `mainOf(piece)` its largest part, `atCell(cell)` the box's piece, `bodyOf(piece)` the
+ * printed piece holding its largest part.
+ */
+function piecesOfBoxes(pieces, laid) {
+  const holding = (piece, k) => laid.find((l) => l.from === piece.index && (k == null || !l.parts || l.parts.includes(k)));
+  const mainOf = (piece) => (piece.parts ? piece.parts.reduce((best, x, k) => (x.volume > piece.parts[best].volume ? k : best), 0) : null);
+  const atCell = (cell) => pieces.find((p) => !p.part && p.cell.join(',') === cell.join(','));
+  const bodyOf = (piece) => (piece ? holding(piece, mainOf(piece))?.index ?? null : null);
+  return { holding, mainOf, atCell, bodyOf };
+}
+
+/**
+ * The number of the printed piece that holds the most of a box (`cell`) of the cut stage's pieces – its largest part,
+ * where its parts print apart – or null where the box holds nothing.
+ * @param {object[]} pieces `cutPieces`' (plain)
+ * @param {object[]} laid `layPieces`' of them
+ * @param {number[]} cell
+ */
+export function cellPiece(pieces, laid, cell) {
+  const { atCell, bodyOf } = piecesOfBoxes(pieces, laid);
+  return bodyOf(atCell(cell));
+}
+
+/**
+ * What the give-back did (`cutPieces`), in the numbers the pieces print as
+ * (`layPieces`): each bit a cut would have left loose that stays on the
+ * piece it hangs on (`joined`: `from` the piece it would have been loose
+ * in, `to` the one it stays on), and each bit kept loose in its box
+ * (`loose`): the piece whose file holds it, whether that is a piece of its
+ * own (`apart`), the piece it hooks round (`around`, the one holding the
+ * rest of its box) and the one it hangs on across the cut (`across`).
+ * @param {object[]} pieces `cutPieces`' (plain: `joined`, and each part's `loose`)
+ * @param {object[]} laid `layPieces`' of them
+ * @param {{ id: string, axis: number, at: number }[]} cuts normalised
+ * @returns {{ joined: { letter, cutId, volume, from, to }[], loose: { letter, cutId, axis, at, volume, box, why, piece, apart,
+ *   around, across, away, moveTo }[] }}
+ */
+export function keptBits(pieces, laid, cuts) {
+  const { holding, atCell, bodyOf, mainOf } = piecesOfBoxes(pieces, laid);
+  const joined = [];
+  const loose = [];
+  for (const p of pieces) {
+    for (const j of p.joined ?? []) {
+      joined.push({ letter: j.letter, cutId: j.cutId, volume: j.volume, from: bodyOf(atCell(j.fromCell)), to: holding(p, j.part ?? null)?.index ?? null });
+    }
+    (p.parts ?? []).forEach((x, k) => {
+      if (!x.loose) return;
+      const l = x.loose;
+      const home = holding(p, k);
+      const cut = cuts.find((c) => c.id === l.cutId);
+      loose.push({
+        letter: l.letter, cutId: l.cutId, axis: cut?.axis ?? null, at: cut?.at ?? null, volume: x.volume, box: x.box, why: l.why,
+        piece: home?.index ?? null, apart: Boolean(home?.parts) && !home.parts.includes(mainOf(p)), around: bodyOf(p),
+        across: bodyOf(atCell(l.across)), away: l.away ?? null, moveTo: l.moveTo ?? null, ...(l.pins ? { pins: true } : {}),
+      });
+    });
+  }
+  // where the bits of one cut would have it go opposite ways, only the largest bit's place is said
+  for (const id of new Set(loose.map((l) => l.cutId))) {
+    const list = loose.filter((l) => l.cutId === id && Number.isFinite(l.moveTo) && Number.isFinite(l.at));
+    const lower = list.filter((l) => l.moveTo < l.at);
+    const higher = list.filter((l) => l.moveTo > l.at);
+    if (!lower.length || !higher.length || Math.min(...lower.map((l) => l.moveTo)) >= Math.max(...higher.map((l) => l.moveTo))) continue;
+    const largest = list.reduce((p, q) => (q.volume > p.volume ? q : p));
+    for (const l of list) if (l !== largest) l.moveTo = null;
+  }
+  return { joined, loose };
+}
+
+/**
  * Which piece of each pair across a cut with built-in pegs carries them
  * (the male; the other gets the sockets), for every pair at once: one piece
  * of each face pair carries all of that face's pegs, and as they stand out
@@ -4190,6 +4604,8 @@ function listOf(items) {
 }
 
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+/** "Cut A runs", "Cuts A and B run". */
+const cutsRun = (letters) => (letters.length > 1 ? `Cuts ${listOf(letters)} run` : `Cut ${letters[0] ?? ''} runs`);
 const pieceName = (index) => (index ? `Piece ${index}` : 'A piece');
 const quoted = (name) => (/^“/.test(name ?? '') ? name : `“${name ?? ''}”`);
 /** A length that is needed, to a tenth of a millimetre and never less: 9.35 → "9.4". */
@@ -4205,6 +4621,24 @@ const piecesOf = (list, fallback) => {
 const mover = (axis, piece) => (axis == null || axis === 2 ? 'the top' : piecesOf(piece, 2));
 /** Whether what comes off is more than one piece by name (pieces across an X or Y cut), and its verb plural. */
 const manyMove = (axis, piece) => !(axis == null || axis === 2) && [piece].flat().filter((x) => x != null).length > 1;
+/** A place along an axis to a tenth, with a true minus sign: "−24.2". */
+const signed1 = (v) => mm1(v).replace('-', '−');
+/** A volume for a note: "120.4 mm³" under 1 cm³, else "15.4 cm³"; a crumb under 0.1 mm³ to one figure. */
+const volumeWords = (v) => {
+  if (Math.round(v * 10) / 10 >= 1000) return `${(Math.round(v / 100) / 10).toFixed(1)} cm³`;
+  return v >= 0.05 ? `${(Math.round(v * 10) / 10).toFixed(1)} mm³` : `${Number(Number(v).toPrecision(1))} mm³`;
+};
+/** Where a box lies along one axis, to the millimetre: "x 10–72", "x −72 to −44". */
+const spanWords = (box, a) => {
+  const [lo, hi] = [box.min[a], box.max[a]].map((v) => Math.round(v) + 0);
+  const at = (v) => String(v).replace('-', '−');
+  return `${AXES[a]} ${at(lo)}${lo < 0 ? ' to ' : '–'}${at(hi)}`;
+};
+/** How far a part holds on next to a cut, to the millimetre and never under 1: "12". */
+const heldWords = (w) => String(Math.max(1, Math.round(w)));
+/** Where a bit kept loose goes on from, by the way it comes away: '-y' – it comes away to the front – "from the front". */
+const fromWords = (way) => ({ '-y': 'from the front', '+y': 'from the back', '+z': 'from above', '-z': 'from below', '-x': 'from the left', '+x': 'from the right' })[way] ?? 'by hand';
+
 /** "Move the cut to 190.5 mm." when there is a place to move it to. */
 const moveTo = (at) => (Number.isFinite(at) ? ` Move the cut to ${mm(at)} mm.` : '');
 /** A part that comes off as a sentence names it ("Dome and cap" → "the dome and cap"; "Part B" → "the part"). */
@@ -4288,6 +4722,12 @@ const NOTE_LEVELS = Object.freeze({
   CUT_NOT_STRAIGHT: 'warn',
   CUTS_MERGED: 'info',
   SLIVER_REMOVED: 'info',
+  ISLAND_JOINED: 'info',
+  LOOSE_KEPT: 'warn',
+  BARELY_HELD: 'warn',
+  KEEP_KEPT: 'info',
+  KEEP_CUT: 'warn',
+  KEEP_NOT_KEPT: 'warn',
   SPLIT_CHECK: 'warn',
   CUT_THROUGH_TEXT: 'info',
   PART_SPANS_CUT: 'info',
@@ -4478,6 +4918,56 @@ const NOTE_TEXT = {
   SLIVER_REMOVED: ({ count }) => (count === 1
     ? 'Removed 1 paper-thin sliver where a cut lies exactly on a flat face of the model.'
     : `Removed ${count} paper-thin slivers where cuts lie exactly on flat faces of the model.`),
+  ISLAND_JOINED: ({ bits = [] }) => {
+    if (!bits.length) return 'The cuts would have left bits of the model loose: each stays on the piece it hangs on.';
+    if (bits.length === 1) {
+      const [b] = bits;
+      return `Cut ${b.letter} would have left a ${volumeWords(b.volume)} bit loose in ${partPiece(b.from, 'its box')}: it stays on ${partPiece(b.to, 'the piece')}, which it hangs on.`;
+    }
+    const letters = [...new Set(bits.map((b) => b.letter))].sort();
+    const all = bits.reduce((n, b) => n + b.volume, 0);
+    return `${letters.length > 1 ? 'Cuts' : 'Cut'} ${listOf(letters)} would have left ${bits.length} bits loose (${volumeWords(all)} in all): each stays on the piece it hangs on.`;
+  },
+  LOOSE_KEPT: ({ letter, volume = 0, box = null, why = 'hooks', at = null, piece, apart = true, around = null, across = null, away = null, moveTo = null, pegs = false, pins = false }) => {
+    const none = pegs ? 'no pegs' : 'no pins';
+    const where = box ? ` (${spanWords(box, 0)}, ${spanWords(box, 2)})` : '';
+    let s = `Cut ${letter} leaves ${volumeWords(volume)} of the model loose${where}: `;
+    // the piece it prints as, of its own, or the one whose file it is loose in
+    const prints = apart ? `prints as ${partPiece(piece, 'a piece of its own')}` : `prints loose in ${Number.isFinite(piece) ? `piece ${piece}'s` : 'its box\'s'} file`;
+    const round = apart ? partPiece(around, 'the rest of its box') : Number.isFinite(piece) ? `the rest of piece ${piece}` : 'the rest of its box';
+    if (why === 'big') {
+      // it comes away along the cut: it goes onto the piece across first, then the rest of its box over it
+      s += `it would make ${partPiece(across, 'the piece it hangs on')} too big for your printer, so it ${prints}.`;
+      s += ` Glue it onto ${partPiece(across, 'the piece it hangs on')} first${away ? `, pushed on ${fromWords(away)}` : ''}, before ${round}.`;
+    } else if (pins) {
+      // hooked round its box towards the cut, but free to go on last the other way: along its pins, if it has any
+      s += `it wraps round ${round}, so it ${prints}. Glue it on last, pushed on ${fromWords(away)}.`;
+    } else {
+      s += `it wraps round ${round}, so it ${prints}, with ${none}.`;
+      s += away ? ` Glue it on last, slid on ${fromWords(away)}.` : ` Put it in place round ${round} first, then glue them on together.`;
+    }
+    if (Number.isFinite(moveTo)) s += ` Move cut ${letter} to ${signed1(moveTo)} mm or ${Number.isFinite(at) && moveTo > at ? 'higher' : 'lower'} to keep it on.`;
+    return s;
+  },
+  BARELY_HELD: ({ letter, volume = 0, box = null, w = 0, piece = null, moveTo = null, holds = null, kept = null }) => {
+    const where = box ? ` (${spanWords(box, 0)}, ${spanWords(box, 2)})` : '';
+    let s = `${volumeWords(volume)} of ${partPiece(piece, 'a piece')}${where} holds on only over the ${heldWords(w)} mm next to cut ${letter}, and may snap off there.`;
+    if (Number.isFinite(moveTo)) {
+      s += ` Move cut ${letter} to ${signed1(moveTo)} mm and it ${Number.isFinite(holds) ? `holds over ${heldWords(holds)} mm` : 'holds on firmly'}.`;
+    } else if (kept) {
+      // the only place that holds it runs through a detail kept whole
+      s += ` Moving cut ${letter} so it holds would run through ${kept}, which you keep whole – glue this joint with care, or print ${partPiece(piece, 'the piece')} with more walls.`;
+    }
+    return s;
+  },
+  KEEP_KEPT: ({ name = 'The detail', piece = null }) => `${name} stays whole${Number.isFinite(piece) ? `, on piece ${piece}` : ''}.`,
+  KEEP_CUT: ({ name = 'the detail', letters = [], fits = true, size = null }) => {
+    const s = `${cutsRun(letters)} through ${name}, which you asked to keep whole.`;
+    if (fits || !size) return `${s} Fit to my printer keeps it whole.`;
+    return `${s} At ${formatSize(size)} it is too big for your printer in one piece.`;
+  },
+  KEEP_NOT_KEPT: ({ name = 'the detail', letters = [], size = null }) =>
+    `No plan for your printer keeps ${name} in one piece – ${letters.length ? `${cutsRun(letters).replace(/^C/, 'c')} through it` : 'every plan cuts through it'}.${size ? ` It needs a piece of at least ${formatSize(size)}.` : ''}`,
   SPLIT_CHECK: ({ ratio }) => {
     const pct = Math.abs(ratio) * 100;
     return `The pieces add up to ${pct < 0.01 ? 'under 0.01' : pct.toFixed(2)} % ${ratio < 0 ? 'less' : 'more'} than the model – check them in your slicer.`;
@@ -4638,6 +5128,20 @@ const NOTE_TEXT = {
  * DOWELS_CAPPED `{ placed, dropped, pegs }`; LABELS_SKIPPED `{ letters }`;
  * PIECE_TOO_BIG `{ pieceIndex, size, bed }`; SMALL_PIECE `{ pieceIndex, thickness, letters, cutId }`;
  * CUTS_MERGED `{ letters, cutIds }`; SPLIT_CHECK `{ ratio }` (signed, (pieces − model) / model);
+ * ISLAND_JOINED `{ bits: [{ letter, cutId, volume, from, to }] }` (the bits the cuts would have left loose, each kept
+ * on the piece `to` it hangs on, out of piece `from`); LOOSE_KEPT `{ letter, cutId, at, volume, box, why: 'hooks'|'big',
+ * piece, apart, around, across, away, moveTo }` (a bit the cut leaves loose in piece `piece` – a piece of its own when
+ * `apart` – that hooks round piece `around`, so takes no pins, or would make piece `across`, which it hangs on, too big:
+ * `away` the way it comes away to go on last ('-y' to the front, so slid on from the front), `moveTo` where the cut,
+ * now at `at`, would keep it on its own box, `pegs` that the joints are built-in pegs);
+ * BARELY_HELD `{ letter, cutId, axis, at, volume, box, w, piece, moveTo, holds, keepId?, kept? }` (`kept` the name of the
+ * detail kept whole the only place to move the cut to runs through, with its `keepId`; `volume` mm³ of piece `piece`, in
+ * `box`, comes loose when the `w` mm of it next to the cut are left out: it holds on only there; `moveTo` the nearest
+ * place for the cut where it would hold on, over `holds` mm – null when nothing there comes loose);
+ * KEEP_KEPT `{ keepId, name, piece }` (a detail marked to keep whole that no cut runs through, on printed piece
+ * `piece`); KEEP_CUT `{ keepId, name, cutIds, letters, fits, size }` (cuts `letters` run through it: `fits` that its box,
+ * `size` mm, fits the printer, so Fit to my printer keeps it whole); KEEP_NOT_KEPT `{ keepId, name, cutIds, letters,
+ * size }` (no plan for the printer keeps it whole: Fit's cuts `letters` run through it, and it needs a piece of `size`);
  * CUT_THROUGH_TEXT `{ itemId, cutId, letter, name, pieces, pairs }` (`pairs` the pieces either side of each stretch of
  * the cut that splits letters, when there is more than one); PART_SPANS_CUT `{ itemId, name, letter }`;
  * DOVETAIL_NOT_PLATE `{ letter, lying, pegs }` (`lying`: through a plate, but a piece beside it can't lie flat on it;
@@ -4739,13 +5243,33 @@ const pegCount = (seam) => (Array.isArray(seam.pegs) ? seam.pegs.length : Number
  *   part (its pieces the one it comes out of, then the part; `apart.mech` the twist-lock it has, if any, turning
  *   `theta`°, and `part.way` how it comes out once turned free; a base whose opening Ø `apart.opening` takes a tea
  *   light (`apart.teaLight`) is fitted with a light standing on it, in its tea-light seat `apart.seat` when it has one)
+ * @param {object[]} [plan.loose] the bits kept loose (`keptBits`): one that hooks round its box and is free to go on
+ *   some way is glued on last, that way, its own seams with no pins taken out of its cut's step
  * @returns {{ letter: string, axis: number, pieces: number[], joins: number[], pins: number, pegs: number, text: string,
- *   apart?: true }[]} `pieces` already in place, `joins` the ones put on in this step; `apart` on a cut that comes apart
+ *   apart?: true, loose?: true }[]} `pieces` already in place, `joins` the ones put on in this step; `apart` on a cut that
+ *   comes apart, `loose` on a bit glued on last
  */
-export function assemblySteps({ pieces = [], seams = [] } = {}) {
+export function assemblySteps({ pieces = [], seams = [], loose = [] } = {}) {
   const cells = new Map(pieces.map((p) => [p.index, p.cell]));
   const groups = new Map();
+  const last = loose.filter((l) => l.why === 'hooks' && l.away && l.piece != null && l.across != null);
+  // a bit kept loose for the piece it would make too big comes away along its cut: it goes onto the piece across first,
+  // in its cut's step, before the rest of its box
+  const first = loose.filter((l) => l.why === 'big' && l.piece != null && l.across != null);
+  // a piece of its own glued on last takes its seams with it: those with no pins, and all of them where it goes on
+  // along its pins
+  const later = (seam) => last.some((l) => l.apart && seam.letter === l.letter && seam.pieces.includes(l.piece) && (l.pins || (!dowelCount(seam) && !pegCount(seam))));
+  // a seam between pieces whose boxes also lie apart along a later axis (a bit one took across another cut meets the
+  // other) is glued when that axis's step brings them together: it goes in with that step
+  const crossing = [];
   for (const seam of seams) {
+    if (later(seam)) continue;
+    const [cp, cq] = seam.pieces.map((i) => cells.get(i));
+    const late = cp && cq && !seam.apart && !seam.part ? [0, 1, 2].filter((b) => b > seam.axis && cp[b] !== cq[b]) : [];
+    if (late.length) {
+      crossing.push({ seam, axis: Math.max(...late) });
+      continue;
+    }
     const a = seam.axis;
     let [p, q] = seam.pieces;
     let [lp, lq] = seam.labels ?? [null, null];
@@ -4762,19 +5286,49 @@ export function assemblySteps({ pieces = [], seams = [] } = {}) {
     if (!groups.has(key)) groups.set(key, { sort: [apart, a, ...line, seam.at ?? 0], letter: seam.letter, axis: a, seams: [] });
     groups.get(key).seams.push({ p, q, lp, lq, joint: seam.joint, pins: dowelCount(seam), pegs: pegCount(seam), male: seam.male ?? null, apart: seam.apart ?? null, part: seam.part ?? null });
   }
+  for (const { seam, axis } of crossing) {
+    const [p, q] = [...seam.pieces].sort((i, j) => cells.get(i)[axis] - cells.get(j)[axis]);
+    const has = (g, i) => g.seams.some((s) => s.p === i || s.q === i);
+    const home = [...groups.values()].find((g) => g.axis === axis && !g.sort[0] && has(g, p) && has(g, q));
+    if (home) home.seams.push({ p, q, lp: null, lq: null, joint: seam.joint, pins: dowelCount(seam), pegs: pegCount(seam), male: seam.male ?? null, apart: null, part: null });
+  }
   const list = [...groups.values()].sort((g, h) => {
     for (let i = 0; i < g.sort.length; i++) if (g.sort[i] !== h.sort[i]) return g.sort[i] - h.sort[i];
     return 0;
   });
-  return list.map(({ letter, axis, seams: group }) => {
+  const steps = list.map(({ letter, axis, seams: group }) => {
     group.sort((s, t) => s.p - t.p || s.q - t.q);
     const lower = [...new Set(group.map((s) => s.p))];
     const upper = [...new Set(group.map((s) => s.q))];
     const pins = group.reduce((n, s) => n + s.pins, 0);
     const pegs = group.reduce((n, s) => n + s.pegs, 0);
     const apart = group.some((s) => s.apart);
-    return { letter, axis, pieces: lower, joins: upper, pins, pegs, text: stepText(letter, group, lower, upper, pins, axis), ...(apart ? { apart: true } : {}) };
+    const firsts = apart ? [] : first.filter((l) => l.letter === letter && group.some((s) => [s.p, s.q].includes(l.across) && [s.p, s.q].includes(l.piece)));
+    return { letter, axis, pieces: lower, joins: upper, pins, pegs, text: stepText(letter, group, lower, upper, pins, axis, firsts), ...(apart ? { apart: true } : {}) };
   });
+  if (!last.length) return steps;
+  // the bits kept loose go on once everything they hook round is glued, before the cuts that come apart
+  const ends = last.map((l) => {
+    const who = l.apart ? `piece ${l.piece}` : `the loose part of piece ${l.piece}`;
+    const own = l.apart ? seams.filter((x) => x.letter === l.letter && x.pieces.includes(l.piece)) : [];
+    const pins = l.pins ? own.reduce((n, x) => n + dowelCount(x), 0) : 0;
+    const pegs = l.pins ? own.reduce((n, x) => n + pegCount(x), 0) : 0;
+    // the faces' labels: the one across it, and its own
+    const labelOf = (i) => own.map((x) => x.labels?.[x.pieces.indexOf(i)]).find(Boolean) ?? null;
+    const [into, mine] = [labelOf(l.across), labelOf(l.piece)];
+    const way = fromWords(l.away);
+    let text;
+    if (pins) {
+      text = `Cut ${l.letter}: glue ${who} on last – glue ${plural(pins, 'pin')} into ${into ? `face ${into}` : `piece ${l.across}`}, a thin film on the face, then slide it onto them ${way}${mine ? ` (${mine})` : ''}. Hold 1 minute.`;
+    } else if (pegs) {
+      text = `Cut ${l.letter}: glue ${who} on last – a little glue in the sockets and on the face, then slide it on ${way}, pegs in${mine ? ` (${mine})` : ''}. Hold 1 minute.`;
+    } else {
+      const none = l.pins ? '' : ` (it has no ${l.pegs ? 'pegs' : 'pins'})`;
+      text = `Cut ${l.letter}: glue ${who} on last – a thin film of glue on its face, then slide it on ${way} against piece ${l.across}${none}. Hold until it sets.`;
+    }
+    return { letter: l.letter, axis: l.axis, pieces: [l.across], joins: [l.piece], pins, pegs, loose: true, text };
+  });
+  return [...steps.filter((x) => !x.apart), ...ends, ...steps.filter((x) => x.apart)];
 }
 
 const pieceList = (list) => `${list.length > 1 ? 'pieces' : 'piece'} ${listOf(list)}`;
@@ -4842,13 +5396,21 @@ function apartStepText(letter, group, lower, upper, axis) {
   return `${lead} ${set} and line the edges up – nothing holds ${verb('it', 'them')}.`;
 }
 
-function stepText(letter, group, lower, upper, pins, axis) {
+function stepText(letter, group, lower, upper, pins, axis, firsts = []) {
   if (group.some((s) => s.apart)) return apartStepText(letter, group, lower, upper, axis);
   if (group.every((s) => s.joint === 'dovetail')) {
     return `Cut ${letter}: a thin film of glue on the tabs, lay ${pieceList(lower)} flat and lower ${pieceList(upper)} onto ${lower.length > 1 ? 'them' : 'it'}. Hold 1 minute.`;
   }
-  const lowerLabels = group.map((s) => s.lp).filter(Boolean);
-  const upperLabels = group.map((s) => s.lq).filter(Boolean);
+  // a bit kept loose that would make the piece across too big: put in place on it before the rest of its box goes on
+  const ahead = firsts.filter((l) => l.apart).map((l) => l.piece);
+  // each face's label once, however many of its seams the step names
+  const lowerLabels = [...new Set(group.map((s) => s.lp).filter(Boolean))];
+  const upperLabels = [...new Set(group.filter((s) => !ahead.includes(s.q)).map((s) => s.lq).filter(Boolean))];
+  const rest = upper.filter((i) => !ahead.includes(i));
+  if (firsts.length && rest.length) upper = rest;
+  const before = firsts.length
+    ? `set ${listOf(firsts.map((l) => (l.apart ? `piece ${l.piece}` : `the loose part of piece ${l.piece}`)))} in place on ${pieceList([...new Set(firsts.map((l) => l.across))])} first, then `
+    : '';
   const faces = group.length > 1 ? 'faces' : 'face';
   const pegged = group.filter((s) => s.pegs > 0);
   if (pegged.length) {
@@ -4864,14 +5426,14 @@ function stepText(letter, group, lower, upper, pins, axis) {
     const also = flat.length
       ? ` and press ${pieceList([...new Set(flat.map((s) => s.q))])} onto ${pieceList([...new Set(flat.map((s) => s.p))])}`
       : '';
-    return `Cut ${letter}: a little glue in the sockets of ${into} and on the ${faces}, push ${pieceList(owners)}'s pegs${marks.length ? ` (${marks.join(', ')})` : ''} in${also}. Hold 1 minute.`;
+    return `Cut ${letter}: a little glue in the sockets of ${into} and on the ${faces}, ${before}push ${pieceList(owners)}'s pegs${marks.length ? ` (${[...new Set(marks)].join(', ')})` : ''} in${also}. Hold 1 minute.`;
   }
   if (pins > 0) {
     const into = lowerLabels.length ? `${lowerLabels.length > 1 ? 'faces' : 'face'} ${listOf(lowerLabels)}` : pieceList(lower);
     const onto = upperLabels.length ? ` (${upperLabels.join(', ')})` : '';
-    return `Cut ${letter}: glue ${plural(pins, 'pin')} into ${into}, a thin film on the ${faces}, push ${pieceList(upper)} on${upper.length > 1 ? ' together' : ''}${onto}. Hold 1 minute.`;
+    return `Cut ${letter}: glue ${plural(pins, 'pin')} into ${into}, a thin film on the ${faces}, ${before}push ${pieceList(upper)} on${upper.length > 1 ? ' together' : ''}${onto}. Hold 1 minute.`;
   }
-  return `Cut ${letter}: a thin film of glue on the ${faces}, press ${pieceList(upper)} onto ${pieceList(lower)} and line the edges up. Hold until it sets.`;
+  return `Cut ${letter}: a thin film of glue on the ${faces}, ${before}press ${pieceList(upper)} onto ${pieceList(lower)} and line the edges up. Hold until it sets.`;
 }
 
 const pad = (s, n) => (s.length >= n ? `${s}   ` : s + ' '.repeat(n - s.length + 3));
@@ -4908,7 +5470,7 @@ function fitWords(fit) {
 export function howToGlueText(plan) {
   const { name = 'model', pieces = [], seams = [], parts = [], clearance = SPLIT_DEFAULTS.clearance, bed = null, printer = null, fit = null } = plan;
   const pins = (Array.isArray(plan.pins) ? plan.pins : plan.pins ? [plan.pins] : []).filter((g) => g.count > 0);
-  const steps = plan.steps ?? assemblySteps({ pieces, seams });
+  const steps = plan.steps ?? assemblySteps({ pieces, seams, loose: plan.loose ?? [] });
   const n = pieces.length;
   const anyPins = seams.some((s) => dowelCount(s) > 0);
   const anyPegs = seams.some((s) => pegCount(s) > 0);
@@ -4948,7 +5510,7 @@ export function howToGlueText(plan) {
   [...pieces].sort((p, q) => p.index - q.index).forEach((p) => {
     const extra = [p.fits === false ? 'TOO BIG for this printer' : 'fits'];
     if (p.yaw && p.yaw !== 90) extra.push(`turned ${p.yaw}° to fit`); // a quarter turn is already in the file and looks ordinary
-    if (p.shells > 1) extra.push(`${p.shells} parts`);
+    if (p.shells > 1) extra.push(`${p.shells} parts${p.loose ? ` – ${p.loose} loose` : ''}`);
     for (const l of lips.values()) {
       if (l.male.has(p.index)) extra.push(`${l.twist ? 'twist-lock neck' : 'lip'} for cut ${l.letter}`);
       if (l.off.has(p.index)) extra.push(`comes off at cut ${l.letter}`);
@@ -5067,6 +5629,25 @@ const mod = (v, m) => ((v % m) + m) % m;
  * preview and the computed pieces agree.
  */
 export const pieceColorIndex = ([i, j, k]) => mod(i + j + k, 2) + 2 * mod(7 * i + 3 * j + 5 * k, 3);
+
+/**
+ * Each piece's colour in `PIECE_COLORS`, by its number: its cell's (`pieceColorIndex`), the second and later pieces of
+ * one cell (a bit printed apart beside the piece it hooks round) the next shades of the same family, so they stand out
+ * from it and still from the pieces across the cuts.
+ * @param {{ index: number, cell: number[] }[]} pieces
+ * @returns {Map<number, number>}
+ */
+export function pieceColors(pieces) {
+  const seen = new Map();
+  const out = new Map();
+  for (const p of [...pieces].sort((x, y) => x.index - y.index)) {
+    const key = p.cell.join(',');
+    const nth = seen.get(key) ?? 0;
+    seen.set(key, nth + 1);
+    out.set(p.index, mod(pieceColorIndex(p.cell) + 2 * nth, PIECE_COLORS.length));
+  }
+  return out;
+}
 
 /**
  * How far a cell moves in the exploded view: Σ (cell − cuts/2)·gap along

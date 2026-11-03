@@ -438,10 +438,12 @@
           <p class="hint" id="splitBedHint"><span id="splitBedText">Your printer: 220 × 220 × 250 mm</span> · <a href="#printing" id="splitBedLink">change</a></p>
           <div class="row">
             <button type="button" id="splitFitBtn" class="btn accent" title="Cut into the fewest pieces that fit your printer, away from letters and thin spots">Fit to my printer</button>
+            <button type="button" id="keepWholeBtn" class="btn" aria-pressed="false" title="Click a detail – a ribbon, a handle, a tail – that no cut may go through">Keep whole…</button>
             <button type="button" id="addCutBtn" class="btn" title="Add a cut across the middle of the longest piece">+ Cut</button>
             <button type="button" id="addApartBtn" class="btn" aria-pressed="false" title="Click the model where it should come apart">+ Removable part</button>
             <button type="button" id="splitClearBtn" class="btn small ghost" hidden>Remove split</button>
           </div>
+          <ul class="plan" id="keepList" aria-label="Details kept whole"></ul>
           <ul class="plan" id="cutList" aria-label="Cuts"></ul>
           <div class="spots" id="spotsRow" hidden>
             <div class="row spread">
@@ -562,6 +564,7 @@
             <span id="legendPass" hidden><i class="dot pass"></i> unrepaired</span>
             <span id="legendCut" hidden><i class="dot cut"></i> cut</span>
             <span id="legendApart" hidden><i class="dot apart"></i> comes apart</span>
+            <span id="legendKeep" hidden><i class="dot keep"></i> kept whole</span>
             <span id="legendPieces" hidden><i class="dot pieces"></i> pieces</span>
             <span id="legendLock" hidden><i class="dot lock"></i> lock</span>
             <span id="legendLugs" hidden><i class="dot lug"></i> lugs</span>

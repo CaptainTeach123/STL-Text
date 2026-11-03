@@ -59,6 +59,7 @@ import {
   pegSizesForRoom,
   polygonsCentroid,
   dovetailSize,
+  fitsBed,
   flatProbes,
   sizesFor,
   sizesForRoom,
@@ -2263,33 +2264,511 @@ function insideOut(m) {
   return wasm.Manifold.ofMesh(new wasm.Mesh({ numProp: mesh.numProp, vertProperties: mesh.vertProperties, triVerts }));
 }
 
+// ---------- loose bits kept on the piece they hang on ----------
+
+/**
+ * A shell a cut leaves loose in its box is a bit hanging on the piece across the cut when it is a crumb (under this,
+ * mm³) or no more than this share of its box's largest shell: shells of a size – a U's two arms, a bookcase's
+ * shelves, plates – are the box's own.
+ */
+const BIT_CRUMB = 1000;
+const BIT_SHARE = 0.25;
+/** A bit lies on a cut when its box ends this near it (mm), and hangs on what it meets there over this much (mm²). */
+const BIT_NEAR = 0.05;
+const BIT_CONTACT = 0.5;
+/** The plate that joins a bit to the piece it hangs on: their shared face eased in this far, this thick either side (mm). */
+const PLATE_EASE = 0.03;
+const PLATE_HALF = 0.1;
+/** Where that plate leaves the faces the two share as a double wall, it covers all they share, grown this much (mm). */
+const PLATE_GROW = 0.05;
+/** A plate smaller than this (mm²) once eased joins nothing. */
+const PLATE_LEAST = 0.1;
+/**
+ * The ways a bit kept loose may go on, as the way it comes away (the axis and which way along it), in the order a
+ * glue step would rather say: from the front, the back, above, below, the left, the right.
+ */
+const BIT_WAYS = Object.freeze([['-y', 1, -1], ['+y', 1, 1], ['+z', 2, 1], ['-z', 2, -1], ['-x', 0, -1], ['+x', 0, 1]]);
+/** What lies in the way of a bit moved beyond its own reach blocks it from this much (mm³: 0.5 mm² over a step). */
+const BIT_BLOCKED = 0.25;
+/**
+ * A bit kept loose stays on its own box where a cut moved past its root holds it over at least this much (mm), the
+ * root looked for this far (mm) and in steps of this (mm).
+ */
+const HOLD_FIRM = 30;
+const HOLD_REACH = 64;
+const HOLD_STEP = 1;
+/** Neighbouring slices of a root are one where they overlap by more than this (mm²). */
+const HOLD_LINK = 0.25;
+
+/**
+ * Loose bits given back to the piece they hang on. A cut can leave a bit of
+ * the model loose in its box – a crumb of a letter, the end of a ribbon cut
+ * off from the column it is wrapped round – where across the cut it is part
+ * of the piece next to it. Each bit (`BIT_CRUMB`, `BIT_SHARE`) that lies on a
+ * planar cut is measured against the shells across it that are no bits
+ * themselves, on slices 0.02 mm inside each side; the one it meets most, by
+ * 0.5 mm² or more, is the piece it hangs on. It goes to that piece when it
+ * can come away from what stays in its own box along the cut's normal
+ * (`comesAway`: a pin would go in that way) and the piece, grown by it, still
+ * fits the bed (one too big without it is no worse with it); it is joined to
+ * it by a plate 0.2 mm thick over their shared face (each side's slices at
+ * 0.02 and 0.1 mm, eased in 0.03 mm), so the union is one shell – two solids
+ * that only touch stay two – and the join must be clean as its file will be
+ * (`weldedClean`: no double wall left where the faces meet), else a plate
+ * over all they share, grown 0.05 mm, is tried, else the bit stays loose. A
+ * bit that meets only bits looks again once they have gone to their piece,
+ * round by round, and a crumb that meets only a bit kept loose goes with it.
+ * A bit that cannot go is kept where it is, saying why (`kept`): it hooks
+ * round its box (`hooks`), or it would make the piece too big for the bed
+ * (`big`: it comes away along the cut, so it goes onto that piece first,
+ * `away` the way it came off); with the place the cut would hold it on over
+ * 30 mm, `moveTo`. A hooked bit that goes on last from beyond its side of the
+ * cut, onto its pins (`goesOnLast`), says so (`pins`, `away` that way); one
+ * that cannot takes no pins on its own face (`face`, which both keep), and
+ * says the first way it is free to go on (`away`). A bit that meets nothing but other bits
+ * is the model's own loose part and is left alone, unsaid.
+ * @param {{ m: Manifold, v: number, box: object, hollows: Manifold[], cell: number[] }[]} shells `cutPieces`' (theirs:
+ *   `own`, `drop`); `hollows` are their sealed hollows as solids, kept by `keep`
+ * @param {object[]} cuts normalised
+ * @param {object} bounds the model's box
+ * @param {{ bed?: number[]|null, flat?: number|null, skip?: Set<string>, own: function, drop: function, keep: object }} options
+ *   `bed` the usable bed (none: any size fits); `flat` the plate axis every piece lies flat on; `skip` the ids of the cuts
+ *   whose faces are not plain planes (dovetails)
+ * @returns {{ shells: object[], fits: { dims: number[], flat: number|null, fits: boolean }[] }|null} null when there is
+ *   no bit to look at; else the shells as they now are (a piece grown by bits is one shell with `joined`, a bit kept
+ *   loose has `kept`), and every bed check made, for whether another bed would decide the same
+ */
+function giveBack(shells, cuts, bounds, { bed = null, flat = null, skip = new Set(), own, drop, keep }) {
+  const { Manifold, CrossSection } = manifold();
+  const by = axisCuts(cuts);
+  const key = (cell) => cell.join(',');
+  const cells = new Map();
+  let ids = 0;
+  for (const sh of shells) {
+    sh.id = ids++;
+    const k = key(sh.cell);
+    if (!cells.has(k)) cells.set(k, []);
+    cells.get(k).push(sh);
+  }
+  const bits = [];
+  for (const list of cells.values()) {
+    if (list.length < 2) continue;
+    const main = list.reduce((x, y) => (y.v > x.v ? y : x));
+    for (const sh of list) if (sh !== main && (sh.v < BIT_CRUMB || sh.v <= BIT_SHARE * main.v)) bits.push(sh);
+  }
+  const planes = cuts.filter((c) => !skip.has(c.id) && !c.apart);
+  // a bit on a cut: its box ends on it, on its own cell's side (+1 above it)
+  const sideOn = (sh, c) => {
+    const i = by[c.axis].indexOf(c.at);
+    if (sh.cell[c.axis] === i + 1 && Math.abs(sh.box.min[c.axis] - c.at) < BIT_NEAR) return 1;
+    if (sh.cell[c.axis] === i && Math.abs(sh.box.max[c.axis] - c.at) < BIT_NEAR) return -1;
+    return 0;
+  };
+  // a shell on that side of a cut (+1 above it) that reaches it: one grown by a bit from across it reaches past it
+  const reaches = (sh, c, side) => (side > 0 ? sh.box.min[c.axis] <= c.at + BIT_NEAR : sh.box.max[c.axis] >= c.at - BIT_NEAR);
+  const placed = bits.filter((b) => planes.some((c) => sideOn(b, c)));
+  if (!placed.length) return null;
+  const isBit = new Set(bits);
+  const t = scope();
+  const fits = [];
+  const fitsOn = (dims) => {
+    if (!bed) return true;
+    const ok = fitsBed(dims, bed, { flat }).fits;
+    fits.push({ dims, flat, fits: ok });
+    return ok;
+  };
+  const sizeOf = (b) => b.max.map((v, a) => v - b.min[a]);
+  const unionBox = (p, q) => ({ min: p.min.map((v, a) => Math.min(v, q.min[a])), max: p.max.map((v, a) => Math.max(v, q.max[a])) });
+  const across = (p, q, a, gap = 0) => [0, 1, 2].every((k) => k === a || (p.min[k] < q.max[k] + gap && q.min[k] < p.max[k] + gap));
+  try {
+    // a shell's own face on a cut, in plane coordinates, on one side of it (+1 above): sliced 0.02 mm inside it, turned
+    // once. A shell grown by a bit from across the cut has material on both sides of it
+    const faces = new Map();
+    const faceOf = (sh, c, side) => {
+      const k = `${sh.id}|${c.id}|${side}`;
+      if (!faces.has(k)) {
+        const turned = sh.m.transform(TO_PLANE[c.axis]);
+        try {
+          faces.set(k, { near: t.add(turned.slice(c.at + side * FACE_INSIDE)), deep: t.add(turned.slice(c.at + side * PLATE_HALF)) });
+        } finally {
+          turned.delete();
+        }
+      }
+      return faces.get(k);
+    };
+    const others = (sh) => cells.get(key(sh.cell)).filter((x) => x !== sh && !x.gone);
+    const composed = (list) => (list.length > 1 ? t.add(Manifold.compose(list.map((x) => x.m))) : list[0]?.m ?? null);
+    // the shells with material in a cell: its own, and those grown by bits taken from it across a cut
+    const holding = (cell) => {
+      const k = key(cell);
+      const list = [...(cells.get(k) ?? [])];
+      for (const xs of cells.values()) for (const x of xs) if (!list.includes(x) && (x.joined ?? []).some((j) => key(j.fromCell) === k)) list.push(x);
+      return list;
+    };
+    // the boxes the pieces grow to, by cell, as bits go to them
+    const grown = new Map();
+    const order = [...placed].sort((p, q) => p.cell[2] - q.cell[2] || p.cell[1] - q.cell[1] || p.cell[0] - q.cell[0] || q.v - p.v);
+    const out = [...shells];
+    const inside = (p, q) => [0, 1, 2].every((a) => p.min[a] >= q.min[a] - 1e-3 && p.max[a] <= q.max[a] + 1e-3);
+    // round by round: a bit whose only neighbours were bits may hang on one of them once it has gone to its piece
+    for (let round = 0; ; round++) {
+      let moved = false;
+      for (const b of order) {
+        if (b.gone || b.kept || b.done) continue;
+        // what it hangs on: the shells across a cut it lies on that are no bits, the one it meets most (and the others of
+        // that shell's own cell that it meets)
+        let best = null;
+        for (const c of planes) {
+          const s = sideOn(b, c);
+          if (!s) continue;
+          const a = c.axis;
+          const cell = [...b.cell];
+          cell[a] -= s;
+          const list = holding(cell).filter((x) => !isBit.has(x) && across(x.box, b.box, a, 0.5) && reaches(x, c, -s));
+          if (!list.length) continue;
+          const mine = faceOf(b, c, s).near;
+          let met = [];
+          for (const x of list) {
+            const area = t.add(mine.intersect(faceOf(x, c, -s).near)).area();
+            if (area > 0) met.push({ x, area });
+          }
+          if (!met.length) continue;
+          const top = met.reduce((p, q) => (q.area > p.area ? q : p));
+          met = met.filter((m) => key(m.x.cell) === key(top.x.cell));
+          const contact = met.reduce((n, m) => n + m.area, 0);
+          if (contact >= BIT_CONTACT && (!best || contact > best.contact)) best = { c, s, cell, to: [...top.x.cell], met, contact };
+        }
+        if (!best) continue;
+        b.done = true;
+        const { c, s, cell, to: home, contact } = best;
+        const away = comesAway(b.m, composed(others(b)), c.axis, c.at, s);
+        const record = { c, s, cell, home, contact, anchors: best.met.map((m) => m.x) };
+        if (!away.free) {
+          b.kept = { ...record, why: 'hooks', blocked: away.blocked, at: away.at };
+          continue;
+        }
+        const to = key(home);
+        const was = grown.get(to) ?? cells.get(to).filter((x) => !x.gone).map((x) => x.box).reduce(unionBox);
+        const box = unionBox(was, b.box);
+        // it would make the piece too big for the bed: one already too big without it is no bigger a problem with it
+        if (!fitsOn(sizeOf(box)) && fitsOn(sizeOf(was))) {
+          b.kept = { ...record, why: 'big' };
+          continue;
+        }
+        grown.set(to, box);
+        b.gone = record;
+        b.round = round;
+      }
+
+      // ---- each piece that takes bits fused with them: one union of the shells they meet, the bits and their plates ----
+      const gifts = new Map();
+      for (const b of order) {
+        if (!b.gone || b.round !== round) continue;
+        const to = key(b.gone.home);
+        if (!gifts.has(to)) gifts.set(to, []);
+        gifts.get(to).push(b);
+      }
+      for (const [to, list] of gifts) {
+        const anchors = [...new Set(list.flatMap((b) => b.gone.anchors))];
+        // the plates inside both sides' material first; where they leave the faces the two share as a double wall,
+        // plates over all of them
+        const made = fuse(anchors, list, false) ?? fuse(anchors, list, true);
+        if (!made) {
+          // nothing to join them by after all: they stay where they are, as the model's own loose parts
+          for (const b of list) b.gone = null;
+          continue;
+        }
+        moved = true;
+        for (const x of made) {
+          x.cell = list[0].gone.home;
+          x.id = ids++;
+          x.joined = [];
+        }
+        const hostOf = (box) => made.find((x) => inside(box, x.box)) ?? made.reduce((p, q) => (q.v > p.v ? q : p));
+        for (const member of [...anchors, ...list]) {
+          for (const h of member.hollows) {
+            const host = hostOf(boxOf(h));
+            host.hollows.push(h);
+            host.v -= h.volume();
+          }
+        }
+        // what the shells it met had taken already stays with them
+        for (const x of anchors) for (const j of x.joined ?? []) hostOf(j.box).joined.push(j);
+        for (const b of list) hostOf(b.box).joined.push({ volume: b.v, fromCell: [...b.cell], cutId: b.gone.c.id, letter: b.gone.c.letter, contact: b.gone.contact, box: b.box });
+        const at = out.indexOf(anchors[0]);
+        out.splice(at, 1, ...made);
+        for (const x of [...anchors.slice(1), ...list]) out.splice(out.indexOf(x), 1);
+        for (const x of [...anchors, ...list]) drop(x.m);
+        cells.set(to, [...cells.get(to).filter((x) => !anchors.includes(x)), ...made]);
+        for (const b of list) cells.set(key(b.cell), cells.get(key(b.cell)).filter((x) => x !== b));
+      }
+      if (!moved) break;
+      // the bits that met nothing but bits look again
+      for (const b of order) if (!b.gone && !b.kept) b.done = false;
+    }
+
+    // ---- a crumb that meets nothing but a bit kept loose goes with it: the tip of a ribbon's loose end ----
+    for (const b of order) {
+      if (b.gone || b.kept || b.v >= BIT_CRUMB) continue;
+      let best = null;
+      for (const c of planes) {
+        const s = sideOn(b, c);
+        if (!s) continue;
+        const cell = [...b.cell];
+        cell[c.axis] -= s;
+        for (const x of cells.get(key(cell)) ?? []) {
+          if (!x.kept || !across(x.box, b.box, c.axis, 0.5)) continue;
+          const area = t.add(faceOf(b, c, s).near.intersect(faceOf(x, c, -s).near)).area();
+          if (area >= BIT_CONTACT && (!best || area > best.contact)) best = { c, s, cell, home: x.cell, contact: area, anchors: [x] };
+        }
+      }
+      if (!best) continue;
+      const [x] = best.anchors;
+      b.gone = best;
+      const made = fuse([x], [b], false) ?? fuse([x], [b], true);
+      b.gone = null;
+      if (!made || made.length !== 1) {
+        (made ?? []).forEach((y) => drop(y.m));
+        continue;
+      }
+      // the bit kept loose is the two of them now, in its own box
+      const [y] = made;
+      drop(x.m);
+      drop(b.m);
+      Object.assign(x, { m: y.m, box: y.box, id: ids++, hollows: [...x.hollows, ...b.hollows] });
+      x.v = y.v - x.hollows.reduce((n, h) => n + h.volume(), 0);
+      x.joined = [...(x.joined ?? []), { volume: b.v, fromCell: [...b.cell], cutId: best.c.id, letter: best.c.letter, contact: best.contact, box: b.box }];
+      out.splice(out.indexOf(b), 1);
+      cells.set(key(b.cell), cells.get(key(b.cell)).filter((z) => z !== b));
+    }
+
+    // ---- a bit kept loose: which way it goes on, and where the cut would keep it on its own box ----
+    for (const b of order) {
+      delete b.done;
+      delete b.round;
+      if (!b.kept) continue;
+      const { c, s, cell, contact, why } = b.kept;
+      // one that hooks round its box towards the cut may still go on last the other way, pushed onto its pins
+      const pins = why === 'hooks' && onLast(b);
+      const away = why === 'hooks' && !pins ? wayOn(b) : wayAlong(c.axis, s);
+      const moveTo = keepOnAt(b);
+      b.kept = {
+        cutId: c.id, letter: c.letter, why, across: cell, contact, ...(why === 'hooks' ? { blocked: b.kept.blocked } : {}), away, moveTo,
+        ...(pins ? { pins: true } : {}),
+        // its own face: where it takes no pins, as it would have to go in along them – or, going on last, where its pins
+        // have no say in the model's size of them
+        ...(why === 'hooks' ? { face: polygonsOf(faceOf(b, c, s).near).map((ring) => ring.map(([u, v]) => [+u.toFixed(4), +v.toFixed(4)])) } : {}),
+      };
+    }
+    return { shells: out, fits };
+
+    /**
+     * The shells that bits hang on, fused with them: one union of the shells, the bits and a plate over each bit's face
+     * (`plateOf`). Null where that does not join every bit to what it hangs on – more shells come out than went in – or
+     * leaves a shell unclean where a bit met it once written down (`cleanNear`).
+     */
+    function fuse(anchors, list, over) {
+      const plates = list.map((b) => plateOf(b, over));
+      if (!plates.every(Boolean)) return null;
+      const fused = t.add(Manifold.union([...anchors.map((x) => x.m), ...list.map((b) => b.m), ...plates]));
+      const solids = [];
+      const hollows = [];
+      for (const m of fused.decompose()) {
+        const v = m.volume();
+        (v > 0 ? solids : hollows).push({ m: own(m), v, box: boxOf(m), hollows: [] });
+      }
+      if (solids.length && solids.length <= anchors.length && list.every((b) => solids.every((x) => cleanNear(x.m, b)))) {
+        // a hollow the bit closes over is sealed again, inside its piece
+        hostHollows(solids, hollows, (h) => keep.add(insideOut(h)));
+        hollows.forEach((h) => drop(h.m));
+        return solids;
+      }
+      [...solids, ...hollows].forEach((x) => drop(x.m));
+      return null;
+    }
+
+    /**
+     * The plate over a bit's face, ±0.1 mm about the cut: where it and what it hangs on are both solid 0.02 and 0.1 mm
+     * from the cut, eased in 0.03 mm, so it lies inside their material; or, `over`, where they meet 0.02 mm from it,
+     * grown 0.05 mm, so that every face they share lies inside it and none is left as a double wall.
+     */
+    function plateOf(b, over) {
+      const { c, s, anchors } = b.gone;
+      const mine = faceOf(b, c, s);
+      const sides = anchors.map((x) => faceOf(x, c, -s));
+      const near = sides.length > 1 ? t.add(CrossSection.union(sides.map((f) => f.near))) : sides[0].near;
+      let shared;
+      if (over) {
+        shared = t.add(t.add(mine.near.intersect(near)).offset(PLATE_GROW, 'Round', 2, 16));
+      } else {
+        const deep = sides.length > 1 ? t.add(CrossSection.union(sides.map((f) => f.deep))) : sides[0].deep;
+        shared = t.add(t.add(t.add(t.add(mine.near.intersect(mine.deep)).intersect(near)).intersect(deep)).offset(-PLATE_EASE, 'Round', 2, 16));
+      }
+      if (shared.area() < PLATE_LEAST) return null;
+      return t.add(t.add(t.add(extrudeSection(shared, 2 * PLATE_HALF)).translate([0, 0, c.at - PLATE_HALF])).transform(TO_WORLD[c.axis]));
+    }
+
+    /** Whether a shell is clean, as its file will be, round the place a bit was joined to it (`weldedClean`). */
+    function cleanNear(m, b) {
+      const { c } = b.gone;
+      const a = c.axis;
+      const lo = b.box.min.map((v) => v - 1);
+      const hi = b.box.max.map((v) => v + 1);
+      lo[a] = c.at - 2 * PLATE_HALF;
+      hi[a] = c.at + 2 * PLATE_HALF;
+      return weldedClean(m, { min: lo, max: hi });
+    }
+
+    /** Whether a bit kept loose can go on last along its cut, pushed onto its pins: nothing of the model in its way. */
+    function onLast(b) {
+      const { c, s } = b.kept;
+      const a = c.axis;
+      const lane = { min: b.box.min.map((v) => v - 1), max: b.box.max.map((v) => v + 1) };
+      if (s > 0) lane.max[a] = bounds.max[a] + 1;
+      else lane.min[a] = bounds.min[a] - 1;
+      const list = [...cells.values()].flat().filter((x) => x !== b && [0, 1, 2].every((k) => x.box.min[k] < lane.max[k] && lane.min[k] < x.box.max[k]));
+      return goesOnLast(b.m, composed(list), a, c.at, s).free;
+    }
+
+    /** The way a bit comes away along its cut, away from the piece across it: the way its pins go in, reversed. */
+    function wayAlong(axis, side) {
+      return BIT_WAYS.find(([, x, sign]) => x === axis && sign === side)[0];
+    }
+
+    /** The first way a bit kept loose comes away from all the rest of the model, as it goes on last: null for none. */
+    function wayOn(b) {
+      const rest = composed(cells.get(key(b.cell)).filter((x) => x !== b));
+      for (const [name, axis, sign] of BIT_WAYS) {
+        if (axis === b.kept.c.axis && sign === -b.kept.s) continue; // along its pins: it hooks
+        const at = sign < 0 ? b.box.min[axis] : b.box.max[axis];
+        if (!comesAway(b.m, rest, axis, at, sign < 0 ? 1 : -1).free) continue;
+        if (blockedBeyond(b, axis, sign)) continue;
+        return name;
+      }
+      return null;
+    }
+
+    /** Whether anything of the model lies in a bit's way past its own reach, moved along an axis (sign the way). */
+    function blockedBeyond(b, axis, sign) {
+      const w0 = sign < 0 ? bounds.min[axis] - 1 : b.box.max[axis] + 0.05;
+      const w1 = sign < 0 ? b.box.min[axis] - 0.05 : bounds.max[axis] + 1;
+      if (w1 - w0 < 0.1) return false;
+      const lane = { min: [...b.box.min], max: [...b.box.max] };
+      lane.min[axis] = w0;
+      lane.max[axis] = w1;
+      const list = [...cells.values()].flat().filter((x) => x !== b && [0, 1, 2].every((k) => x.box.min[k] < lane.max[k] && lane.min[k] < x.box.max[k]));
+      if (!list.length) return false;
+      const outline = t.add(t.add(t.add(b.m.transform(TO_PLANE[axis])).project()).offset(-0.05, 'Round', 2, 16));
+      if (outline.isEmpty()) return false;
+      const prism = t.add(t.add(t.add(extrudeSection(outline, w1 - w0)).translate([0, 0, w0])).transform(TO_WORLD[axis]));
+      return list.some((x) => t.add(x.m.intersect(prism)).volume() > BIT_BLOCKED);
+    }
+
+    /**
+     * Where the cut would keep a bit on the rest of its own box, held over `HOLD_FIRM` mm: moved into the piece across
+     * it past the bit's root – the first place within `HOLD_REACH` mm where, slice by slice, the material between
+     * joins the bit to the rest of its box – as long as that leaves the cut inside the model, short of the next cut,
+     * and the box grown that way still fits the bed. Null where there is none.
+     */
+    function keepOnAt(b) {
+      const { c, s, cell } = b.kept;
+      const a = c.axis;
+      const list = by[a];
+      const i = list.indexOf(c.at);
+      const limit = s > 0 ? (i > 0 ? list[i - 1] : bounds.min[a]) : (i < list.length - 1 ? list[i + 1] : bounds.max[a]);
+      const room = Math.abs(c.at - limit) - 1;
+      const reach = Math.min(HOLD_REACH, room - HOLD_FIRM);
+      if (!(reach >= HOLD_STEP)) return null;
+      // the rest of its box on the cut, and the material of the piece across the cut, under the bit's box's column
+      const mates = cells.get(key(b.cell)).filter((x) => x !== b && !isBit.has(x) && reaches(x, c, s));
+      if (!mates.length) return null;
+      const lo = [0, 1, 2].map((k) => (k === a ? (s > 0 ? c.at - reach : c.at) : (b.cell[k] > 0 ? by[k][b.cell[k] - 1] : bounds.min[k] - 1)));
+      const hi = [0, 1, 2].map((k) => (k === a ? (s > 0 ? c.at : c.at + reach) : (b.cell[k] < by[k].length ? by[k][b.cell[k]] : bounds.max[k] + 1)));
+      const slab = { min: lo, max: hi };
+      const beside = (cells.get(key(cell)) ?? []).filter((x) => [0, 1, 2].every((k) => x.box.min[k] < slab.max[k] && slab.min[k] < x.box.max[k]));
+      if (!beside.length) return null;
+      const room3 = t.add(t.add(Manifold.cube(hi.map((v, k) => v - lo[k]), false)).translate(lo));
+      const cutOut = beside.map((x) => t.add(x.m.intersect(room3)));
+      const turned = t.add(t.add(Manifold.compose(cutOut)).transform(TO_PLANE[a]));
+      // the slices' islands, joined where neighbouring slices overlap; the bit and the rest of its box start it
+      const parent = [0, 1];
+      const find = (n) => (parent[n] === n ? n : (parent[n] = find(parent[n])));
+      const join = (p, q) => {
+        parent[find(p)] = find(q);
+      };
+      const mine = faceOf(b, c, s).near;
+      const theirs = mates.length > 1 ? t.add(CrossSection.union(mates.map((x) => faceOf(x, c, s).near))) : faceOf(mates[0], c, s).near;
+      let prev = [{ n: 0, cs: mine, r: mine.bounds() }, { n: 1, cs: theirs, r: theirs.bounds() }];
+      const meets = (p, q) => p.r.min[0] < q.r.max[0] && q.r.min[0] < p.r.max[0] && p.r.min[1] < q.r.max[1] && q.r.min[1] < p.r.max[1]
+        && t.add(p.cs.intersect(q.cs)).area() > HOLD_LINK;
+      for (let d = FACE_INSIDE; d <= reach + 1e-9; d = d < HOLD_STEP ? HOLD_STEP : d + HOLD_STEP) {
+        const islands = t.add(turned.slice(c.at - s * d)).decompose().map((cs) => {
+          t.add(cs);
+          parent.push(parent.length);
+          return { n: parent.length - 1, cs, r: cs.bounds() };
+        });
+        for (const p of islands) for (const q of prev) if (meets(p, q)) join(p.n, q.n);
+        if (find(0) === find(1)) {
+          const at = +(c.at - s * (d + HOLD_FIRM)).toFixed(1);
+          // its box grown by what of the piece across lies between the cut's new place and the old
+          const along = s > 0 ? [at, c.at] : [c.at, at];
+          let grownBox = cells.get(key(b.cell)).map((x) => x.box).reduce(unionBox);
+          for (const x of cells.get(key(cell)) ?? []) {
+            const min = x.box.min.map((v, k) => Math.max(v, k === a ? along[0] : slab.min[k]));
+            const max = x.box.max.map((v, k) => Math.min(v, k === a ? along[1] : slab.max[k]));
+            if (min.every((v, k) => v < max[k])) grownBox = unionBox(grownBox, { min, max });
+          }
+          return fitsOn(sizeOf(grownBox)) ? at : null;
+        }
+        prev = islands;
+      }
+      return null;
+    }
+  } finally {
+    t.dispose();
+  }
+}
+
 /**
  * The model cut into one piece per cell, axis by axis (x, y, z). A planar
  * axis is cut by taking away the boxes over every other cell, then the
  * rest; a dovetail axis by taking away everything outside each cell's
  * solid. Shells under 1e-3 mm³ are removed as dust; every other shell goes
  * to the cell its box overlaps most, and a cell's shells make one piece
- * (`layPieces` may print some of them apart). A sealed hollow that no cut
- * opens stays inside the shell around it. Pieces are numbered bottom layer
- * first, then front to back, then left to right. Each shell comes with its
+ * (`layPieces` may print some of them apart) – but a bit a cut leaves loose
+ * in its box goes to the piece across the cut it hangs on, joined to it in
+ * one shell, where it can come away from its box along the cut and that
+ * piece still fits the bed (`giveBack`). A sealed hollow that no cut opens
+ * stays inside the shell around it. Pieces are numbered bottom layer first,
+ * then front to back, then left to right. Each shell comes with its
  * orientation statistics, and the piece with theirs together: a shell whose
  * material meets a dovetail seam may only lie flat (±w, either plate's where
  * dovetails through two plates meet at it), and every shell of a thin plate
- * (`flat`) lies flat on it.
+ * (`flat`) lies flat on it. Where no bit moves and none is kept, the result
+ * is what it was before bits were given back.
  * @param {Manifold} solid the model (borrowed, never deleted)
  * @param {{ id, letter, axis, at }[]} cuts normalised
  * @param {{ dove?: { ids: string[], w: number|object, clearance: number }|null, tabs?: object|null, bounds?: object,
- *   flat?: number|null, frame?: function, progress?: function }} options `tabs` the tabs `planDovetails` placed for
- *   `dove` (worked out again when missing); `flat` the thickness axis when the whole model is a thin plate (`plateAxis`)
+ *   flat?: number|null, frame?: function, progress?: function, bed?: number[]|null }} options `tabs` the tabs
+ *   `planDovetails` placed for `dove` (worked out again when missing); `flat` the thickness axis when the whole model
+ *   is a thin plate (`plateAxis`); `bed` the usable bed a piece grown by bits must still fit (none: any size)
  * @returns {{ pieces: { index: number, cell: number[], solid: Manifold, shells: number, volume: number,
- *   bbox: { min: number[], max: number[] }, cuts: string[], stats: object,
- *   parts?: { box: object, volume: number, cuts: string[], stats: object }[] }[], grid: number[],
- *   dovetails: { cutId, letter, axis, at, w, tabs: number }[], notes: object[], dust: number, gap: number, volume: number }}
+ *   bbox: { min: number[], max: number[] }, cuts: string[], stats: object, joined?: object[],
+ *   parts?: { box: object, volume: number, cuts: string[], stats: object, loose?: object }[] }[], grid: number[],
+ *   dovetails: { cutId, letter, axis, at, w, tabs: number }[], notes: object[], dust: number, gap: number, volume: number,
+ *   fits?: object[] }}
  *   the piece solids belong to the caller; `parts` each shell of a piece with more than one, in the order
- *   `partedSolids` reads; `gap` is the volume the dovetail clearances took, `dust` the slivers removed
+ *   `partedSolids` reads; `gap` is the volume the dovetail clearances took, `dust` the slivers removed. `joined` the
+ *   bits a piece took from the boxes beside it: `{ volume, fromCell, cutId, letter, contact, box, part? }` (`part` its
+ *   shell holding it, when it has several); a part's `loose` a bit kept loose in its box: `{ cutId, letter, why:
+ *   'hooks'|'big', across, contact, blocked?, away, moveTo, face? }` (`across` the cell of the piece it hangs on, `away`
+ *   the first way it is free to go on – '-y' it comes away to the front – or null, `moveTo` where the cut would keep it
+ *   on its box, or null, `face` its own face on the cut, in plane coordinates, for a bit that hooks); `fits` every bed
+ *   check the give-back made, `{ dims, flat, fits }`, when it made any: another bed that answers each the same gives
+ *   the same pieces
  * @throws {SplitError} `INTERNAL` when a piece comes out broken
  */
-export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null, flat = null, frame = null, progress = null } = {}) {
+export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null, flat = null, frame = null, progress = null, bed = null } = {}) {
   const { Manifold } = manifold();
   const box = bounds ?? boxOf(solid);
   const by = axisCuts(cuts);
@@ -2406,9 +2885,12 @@ export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null
     }
     if (dustCount) notes.push(splitNote('SLIVER_REMOVED', { count: dustCount }));
 
+    // a bit a cut leaves loose in its box goes to the piece across the cut it hangs on, where it can
+    for (const sh of shells) sh.cell = cellOf(sh.box, by);
+    const given = giveBack(shells, cuts, box, { bed, flat, skip: new Set(cuts.filter((c) => doveAxes.some((x) => x.axis === c.axis)).map((c) => c.id)), own, drop, keep: temps });
     const groups = new Map();
-    for (const sh of shells) {
-      const cell = cellOf(sh.box, by);
+    for (const sh of given?.shells ?? shells) {
+      const { cell } = sh;
       const key = cell.join(',');
       if (!groups.has(key)) groups.set(key, { cell, list: [] });
       groups.get(key).list.push(sh);
@@ -2427,8 +2909,10 @@ export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null
         const allowed = flatOn.length ? flatOn.flatMap((a) => [`-${AXES[a]}`, `+${AXES[a]}`]) : undefined;
         const mesh = x.m.getMesh();
         const stats = orientationStats(mesh.vertProperties, mesh.numProp, mesh.triVerts, touching, allowed ? { allowed } : {});
-        return { box: x.box, volume: x.v, cuts: touching.map((c) => c.id), stats };
+        return { box: x.box, volume: x.v, cuts: touching.map((c) => c.id), stats, ...(x.kept ? { loose: x.kept } : {}) };
       });
+      // the bits it took from the boxes beside it, and which of its shells holds each
+      const joined = list.flatMap((x, k) => (x.joined ?? []).map((j) => ({ ...j, ...(list.length > 1 ? { part: k } : {}) })));
       let m = list[0].m;
       if (list.length > 1) {
         m = own(Manifold.compose(list.map((x) => x.m)));
@@ -2453,6 +2937,7 @@ export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null
         cuts: cuts.filter((c) => ids.has(c.id)).map((c) => c.id),
         stats: mergeStats(info.map((x) => x.stats)),
         ...(info.length > 1 ? { parts: info } : {}),
+        ...(joined.length ? { joined } : {}),
       };
     });
 
@@ -2464,7 +2949,7 @@ export function cutPieces(solid, cuts, { dove = null, tabs = null, bounds = null
     if (Math.abs(ratio) > 1e-4) notes.push(splitNote('SPLIT_CHECK', { ratio }));
     const dovetails = (plan?.seams ?? []).map((x) => ({ cutId: x.cutId, letter: x.letter, axis: x.axis, at: x.at, w: x.w ?? plan.w, tabs: x.tabs.length }));
     for (const p of pieces) owned.delete(p.solid);
-    return { pieces, grid: by.map((l) => l.length), dovetails, notes, dust, gap, volume };
+    return { pieces, grid: by.map((l) => l.length), dovetails, notes, dust, gap, volume, ...(given?.fits.length ? { fits: given.fits } : {}) };
   } finally {
     for (const m of owned) m.delete();
     owned.clear();
@@ -2922,6 +3407,175 @@ export function patchesFor(band, cut, cuts = []) {
   } catch (err) {
     face.delete();
     throw err;
+  } finally {
+    t.dispose();
+  }
+}
+
+/** The step (mm) a shell is moved by when it is tried coming away along a cut, and how much of the material left in
+ * its box (mm²) may stand in its way: less is the shells only grazing each other. */
+const AWAY_STEP = 0.5;
+const AWAY_BLOCK = 0.5;
+/** How far inside its side a piece is sliced for its own face on a cut (mm): exactly on the cut the slice is empty. */
+const FACE_INSIDE = 0.02;
+
+/**
+ * Whether a shell left on one side of a cut can come away along the cut's
+ * normal, towards the other side, without running into `rest`, the material
+ * that stays on its own side: a pin goes in that way, so a bit hooked round
+ * the rest of its box (a ribbon's end round a column) cannot be pinned to the
+ * piece across the cut. Scanned from the shell's far end to the plane in
+ * 0.5 mm steps: at each place, what of the shell lies at or beyond it,
+ * flattened onto the plane, must not meet the rest's slice there by more
+ * than 0.5 mm². Exact for the straight move, to the step.
+ * @param {Manifold} island the shell (borrowed)
+ * @param {Manifold|null} rest what stays on its side (borrowed); only what lies within 1 mm of the shell's box counts
+ * @param {number} axis the cut's
+ * @param {number} at the cut's place
+ * @param {number} side +1 where the shell lies above the plane (it comes away towards −axis), −1 below
+ * @returns {{ free: boolean, blocked: number, at: number|null }} `blocked` the most of the rest in its way (mm²), `at`
+ *   where along the axis
+ */
+export function comesAway(island, rest, axis, at, side) {
+  const { Manifold } = manifold();
+  const t = scope();
+  try {
+    const box = boxOf(island);
+    const far = side > 0 ? box.max[axis] : box.min[axis];
+    const span = Math.abs(far - at);
+    if (!rest || rest.isEmpty() || span <= 1e-6) return { free: true, blocked: 0, at: null };
+    // the rest near the shell: its box, 1 mm wider across the cut, from 1 mm beyond the plane to its far end
+    const lo = box.min.map((v) => v - 1);
+    const hi = box.max.map((v) => v + 1);
+    if (side > 0) {
+      lo[axis] = at - 1;
+      hi[axis] = box.max[axis];
+    } else {
+      lo[axis] = box.min[axis];
+      hi[axis] = at + 1;
+    }
+    const near = t.add(rest.intersect(t.add(t.add(Manifold.cube(hi.map((v, a) => v - lo[a]), false)).translate(lo))));
+    if (near.isEmpty()) return { free: true, blocked: 0, at: null };
+    const ip = t.add(island.transform(TO_PLANE[axis]));
+    const rp = t.add(near.transform(TO_PLANE[axis]));
+    const rb = boxOf(near);
+    let shadow = null;
+    let worst = { area: 0, at: null };
+    for (let j = Math.ceil(span / AWAY_STEP); j >= 1; j--) {
+      const x = at + side * Math.min(span - 0.01, j * AWAY_STEP);
+      const s = t.add(ip.slice(x));
+      shadow = shadow ? t.add(shadow.add(s)) : s;
+      if (x < rb.min[axis] - 1e-9 || x > rb.max[axis] + 1e-9) continue;
+      const area = t.add(t.add(rp.slice(x)).intersect(shadow)).area();
+      if (area > worst.area) worst = { area, at: x };
+    }
+    return { free: worst.area <= AWAY_BLOCK, blocked: worst.area, at: worst.at };
+  } finally {
+    t.dispose();
+  }
+}
+
+/**
+ * Whether a solid is clean, as a file of it will be, within a box: its
+ * vertices welded where they are one in single precision (as a slicer reads
+ * an STL), and the triangles that lose a corner so left out (as the piece
+ * files leave them out, `withoutCollapsed`), no edge with a vertex in the box
+ * has more than two triangles. Two faces left touching as a double wall are
+ * not: their vertices meet.
+ * @param {Manifold} m (borrowed)
+ * @param {{ min: number[], max: number[] }} box
+ * @returns {boolean}
+ */
+export function weldedClean(m, box) {
+  const mesh = m.getMesh();
+  const { numProp } = mesh;
+  const pos = mesh.vertProperties;
+  const tri = mesh.triVerts;
+  const inBox = (v) => {
+    const o = v * numProp;
+    for (let a = 0; a < 3; a++) if (pos[o + a] < box.min[a] || pos[o + a] > box.max[a]) return false;
+    return true;
+  };
+  const ids = new Map();
+  const weld = (v) => {
+    const o = v * numProp;
+    const k = `${pos[o]},${pos[o + 1]},${pos[o + 2]}`;
+    if (!ids.has(k)) ids.set(k, ids.size);
+    return ids.get(k);
+  };
+  const edges = new Map();
+  for (let i = 0; i < tri.length; i += 3) {
+    if (!inBox(tri[i]) && !inBox(tri[i + 1]) && !inBox(tri[i + 2])) continue;
+    const [p, q, r] = [weld(tri[i]), weld(tri[i + 1]), weld(tri[i + 2])];
+    if (p === q || q === r || r === p) continue;
+    for (const [u, v] of [[p, q], [q, r], [r, p]]) {
+      const k = u < v ? u * 4294967296 + v : v * 4294967296 + u;
+      const n = (edges.get(k) ?? 0) + 1;
+      if (n > 2) return false;
+      edges.set(k, n);
+    }
+  }
+  return true;
+}
+
+/**
+ * Whether a shell left on one side of a cut can go on last along the cut's
+ * normal: slid in towards the cut from beyond its own far side once `rest`
+ * is in place, as its pins go in when it is the last piece on – a ribbon's
+ * end hooked round a column cannot come away from it towards the cut, but
+ * once the column is on it is pushed on from the other side. Scanned from
+ * the shell's near side outwards in 0.5 mm steps, to as far as the rest
+ * reaches: at each place, what of the shell lies at or before it, flattened
+ * onto the plane, must not meet the rest's slice there by more than 0.5 mm².
+ * @param {Manifold} island the shell (borrowed)
+ * @param {Manifold|null} rest everything else that is in place before it (borrowed); only what lies within 1 mm of the
+ *   shell's box across the cut, and beyond its near side, counts
+ * @param {number} axis the cut's
+ * @param {number} at the cut's place
+ * @param {number} side +1 where the shell lies above the plane (it goes on moving towards −axis), −1 below
+ * @returns {{ free: boolean, blocked: number, at: number|null }} as `comesAway`'s
+ */
+export function goesOnLast(island, rest, axis, at, side) {
+  const { Manifold } = manifold();
+  const t = scope();
+  try {
+    if (!rest || rest.isEmpty()) return { free: true, blocked: 0, at: null };
+    const box = boxOf(island);
+    const near = side > 0 ? Math.max(at, box.min[axis]) : Math.min(at, box.max[axis]);
+    const far = side > 0 ? box.max[axis] : box.min[axis];
+    const rb = boxOf(rest);
+    const lo = box.min.map((v) => v - 1);
+    const hi = box.max.map((v) => v + 1);
+    if (side > 0) {
+      lo[axis] = near + 0.01;
+      hi[axis] = rb.max[axis] + 1;
+    } else {
+      lo[axis] = rb.min[axis] - 1;
+      hi[axis] = near - 0.01;
+    }
+    if (!(hi[axis] > lo[axis])) return { free: true, blocked: 0, at: null };
+    const lane = t.add(rest.intersect(t.add(t.add(Manifold.cube(hi.map((v, a) => v - lo[a]), false)).translate(lo))));
+    if (lane.isEmpty()) return { free: true, blocked: 0, at: null };
+    const lb = boxOf(lane);
+    const end = side > 0 ? lb.max[axis] : lb.min[axis];
+    const reach = Math.abs(far - near);
+    const span = (end - near) * side;
+    const ip = t.add(island.transform(TO_PLANE[axis]));
+    const rp = t.add(lane.transform(TO_PLANE[axis]));
+    let shadow = null;
+    let worst = { area: 0, at: null };
+    for (let j = 1; (j - 1) * AWAY_STEP < span; j++) {
+      const d = j * AWAY_STEP;
+      const x = near + side * d;
+      if (d - AWAY_STEP < reach) {
+        const s = t.add(ip.slice(near + side * Math.min(d, reach - 0.01)));
+        shadow = shadow ? t.add(shadow.add(s)) : s;
+      }
+      if (x < lb.min[axis] - 1e-9 || x > lb.max[axis] + 1e-9) continue;
+      const area = t.add(t.add(rp.slice(x)).intersect(shadow)).area();
+      if (area > worst.area) worst = { area, at: x };
+    }
+    return { free: worst.area <= AWAY_BLOCK, blocked: worst.area, at: worst.at };
   } finally {
     t.dispose();
   }
@@ -3540,7 +4194,13 @@ export function probeLip(solid, cut, {
  * order. For each cut: the band of solid round it, the face's patches (one
  * per pair of pieces), the exact shadow of air and of holes (or pegs and
  * sockets) placed by earlier cuts, and hole depths capped by the parallel
- * cuts either side. With an automatic diameter a sizing pass first picks
+ * cuts either side. A face belongs to the pieces whose material it is: where
+ * a box's shells print apart, each patch is shared out by each piece's own
+ * face (the piece sliced 0.02 mm inside its side), a face that is one piece
+ * on both sides takes nothing, and a piece printed apart that cannot come
+ * away from the rest of its box along the cut (`comesAway`: it hooks round
+ * it) takes no pins or pegs there – it is glued (`glued`). With an automatic
+ * diameter a sizing pass first picks
  * one size for the whole model (the largest of 8, 6, 5, 4, 3 mm that takes
  * two pins on every patch that can take any, at most a third of its width).
  * Then each patch gets its pins, falling back to shallower holes, then
@@ -3579,13 +4239,19 @@ export function probeLip(solid, cut, {
  * where the lock is not built after all, and what it gives (`fallbacks`).
  * @param {Manifold} solid the model (borrowed)
  * @param {{ id, letter, axis, at }[]} cuts normalised, in canonical order
- * @param {{ index: number, cell: number[], up?: string, boxes?: object[] }[]} pieces from `cutPieces`, or `layPieces`, with
- *   the way each prints up (`chooseOrientation(...).up`); a hole is a teardrop on a piece whose up is not along the cut.
- *   Where a cell holds more than one, `boxes` (its shells') tell which holds each face
+ * @param {{ index: number, cell: number[], up?: string, boxes?: object[], volume?: number,
+ *   joined?: { fromCell: number[] }[], loose?: { cutId: string, face: number[][][] }[] }[]} pieces from `cutPieces`, or
+ *   `layPieces`, with the way each prints up (`chooseOrientation(...).up`); a hole is a teardrop on a piece whose up is
+ *   not along the cut. `joined` the bits of other cells it holds, given to it across a cut: it has material in those
+ *   cells too; `loose` the faces of its bits kept loose that hook round their box (plane coordinates), which are glued
+ *   with no pins or pegs, in whichever file they print. Where a cell holds more than
+ *   one, their material (`solids`) tells which holds each part of a face, and the largest (`volume`) stays put while the
+ *   others are tried coming away from it; without `solids`, `boxes` (its shells') tell which holds each face
  * @param {object} spec the normalised settings (joint, diameter, depth, clearance, count, labels)
  * @param {{ nozzle?: number, hl?: number, joints?: Object<string, string>, tabs?: object|null, font?: object, bounds?: object,
- *   progress?: function, pegMales?: function|null, apartMales?: function|null }} options `hl` the layer height a
- *   twist-lock's heights are whole layers of;
+ *   progress?: function, pegMales?: function|null, apartMales?: function|null, solids?: function|null }} options `hl` the
+ *   layer height a twist-lock's heights are whole layers of; `solids(index)` a piece's solid (borrowed), asked only for
+ *   the pieces of a cell that holds more than one;
  *   `joints` per cut id (from `planDovetails`; dowels when missing, pegs when the joint is built-in pegs, a lip on a cut
  *   that comes apart); `tabs` its
  *   dovetail tabs, whose sockets reach past their cut right through the model, so the holes of a crossing cut keep out
@@ -3602,8 +4268,13 @@ export function probeLip(solid, cut, {
  *   `{ H, clips, area }` or null, `{ male, piece, down, alt? }` or null; `given` the ways down the lips of the cuts
  *   before have given pieces, a Map by number); when not given the one with the better lip, else the one below
  * @returns {{ diameter: number|null, pegSize: number|null, dowels: object[], pegs: object[], labels: object[],
- *   lips: object[], locks?: object[], seams: object[], notes: object[], pinnable: string[] }} `pinnable` the ids of the
- *   cuts with pegs whose faces would take pins instead (3 mm or larger), for the note on pegs printed standing up;
+ *   lips: object[], locks?: object[], seams: object[], notes: object[], pinnable: string[], glued?: object[] }} `pinnable`
+ *   the ids of the cuts with pegs whose faces would take pins instead (3 mm or larger), for the note on pegs printed
+ *   standing up; `glued`, only when some, each piece printed apart that cannot come away from the rest of its box along
+ *   a cut, so its faces there are glued with no pins or pegs: `{ cutId, letter, piece, across, blocked }`, `across` the
+ *   piece it is glued to, `blocked` how much of its box stands in its way (mm²); `last`, only when some, each such piece
+ *   that keeps its pins or pegs as it goes on last instead, pushed onto them from beyond its own side of the cut
+ *   (`goesOnLast`): `{ cutId, letter, axis, side, piece, across }`, `side` +1 where it lies above the cut;
  *   `locks` the twist-locks of the cuts that take one (`cutTwist`'s, with `cutId`, `letter`, `axis`, `socket` 'ring', `male`
  *   the side with the neck, `down` the way both pieces lie and `sides: [{ piece, role: 'body'|'part' }]`), only when
  *   some cut does, and `fallbacks` by cut id what it gets where its lock is not built: `{ notes, apart, joint }`, the
@@ -3628,7 +4299,7 @@ export function probeLip(solid, cut, {
  */
 export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
   const { CrossSection, Manifold } = manifold();
-  const { nozzle = 0.4, hl = 0.2, joints = {}, tabs = null, font = null, progress = null, pegMales = null, apartMales = null } = options;
+  const { nozzle = 0.4, hl = 0.2, joints = {}, tabs = null, font = null, progress = null, pegMales = null, apartMales = null, solids = null } = options;
   const bounds = options.bounds ?? boxOf(solid);
   const by = axisCuts(cuts);
   const c = Number.isFinite(spec.clearance) ? spec.clearance : SPLIT_DEFAULTS.clearance;
@@ -3644,10 +4315,19 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     if (!inCell.has(key)) inCell.set(key, []);
     inCell.get(key).push(p);
   }
-  // the piece of a cell that holds a point of a face: a cell's shells printed apart are pieces of their own, and the
-  // point lies in the box of one of their shells (the smallest, where boxes nest)
+  // the pieces with material in each cell: its own, and those holding a bit of it given to them across a cut
+  const holders = new Map();
+  for (const p of own) {
+    for (const cell of [p.cell, ...(p.joined ?? []).map((j) => j.fromCell)]) {
+      const key = cell.join(',');
+      if (!holders.has(key)) holders.set(key, []);
+      if (!holders.get(key).includes(p)) holders.get(key).push(p);
+    }
+  }
+  // without the pieces' solids, the piece of a cell that holds a point of a face: a cell's shells printed apart are
+  // pieces of their own, and the point lies in the box of one of their shells (the smallest, where boxes nest)
   const pieceAt = (cell, point) => {
-    const list = inCell.get(cell.join(','));
+    const list = holders.get(cell.join(','));
     if (!list || list.length === 1) return list?.[0];
     let best = list[0];
     let room = Infinity;
@@ -3663,6 +4343,100 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     }
     return best;
   };
+  // a piece's own face on a cut, in plane coordinates: the piece sliced just inside its side (on the cut it is empty)
+  const ownFaces = new Map();
+  const ownFace = (p, cut, side) => {
+    const key = `${p.index}|${cut.id}|${side}`;
+    if (!ownFaces.has(key)) {
+      const t = scope();
+      try {
+        ownFaces.set(key, keep.add(t.add(solids(p.index).transform(TO_PLANE[cut.axis])).slice(cut.at + side * FACE_INSIDE)));
+      } finally {
+        t.dispose();
+      }
+    }
+    return ownFaces.get(key);
+  };
+  // the piece of a cell that stays put, the one with the most material, while the others are tried coming away from it
+  const volumes = new Map();
+  const volumeOf = (p) => {
+    if (!volumes.has(p.index)) volumes.set(p.index, p.volume ?? solids(p.index).volume());
+    return volumes.get(p.index);
+  };
+  const bodyOf = (key) => inCell.get(key).reduce((x, y) => (volumeOf(y) > volumeOf(x) ? y : x));
+  // whether a piece printed apart comes away from the rest of its box along a cut, towards the other side
+  const aways = new Map();
+  const awayOf = (p, cut, side) => {
+    const key = `${p.index}|${cut.id}`;
+    if (!aways.has(key)) {
+      const others = holders.get(p.cell.join(',')).filter((x) => x !== p).map((x) => solids(x.index));
+      const t = scope();
+      try {
+        aways.set(key, comesAway(solids(p.index), others.length > 1 ? t.add(Manifold.compose(others)) : others[0] ?? null, cut.axis, cut.at, side));
+      } finally {
+        t.dispose();
+      }
+    }
+    return aways.get(key);
+  };
+  // whether it goes on last along the cut instead, pushed towards it once everything else in its way is on: the pieces
+  // of its own cell and those beyond it along the axis, across its box
+  const lasts = new Map();
+  const lastOf = (p, cut, side) => {
+    const key = `${p.index}|${cut.id}`;
+    if (!lasts.has(key)) {
+      const a = cut.axis;
+      const mine = (p.boxes ?? []).length ? p.boxes.reduce((x, y) => ({ min: x.min.map((v, k) => Math.min(v, y.min[k])), max: x.max.map((v, k) => Math.max(v, y.max[k])) })) : boxOf(solids(p.index));
+      const lane = { min: mine.min.map((v) => v - 1), max: mine.max.map((v) => v + 1) };
+      if (side > 0) lane.max[a] = bounds.max[a] + 1;
+      else lane.min[a] = bounds.min[a] - 1;
+      const meets = (b) => [0, 1, 2].every((k) => b.min[k] < lane.max[k] && lane.min[k] < b.max[k]);
+      const others = own.filter((x) => x !== p && (!x.boxes?.length || x.boxes.some(meets))).map((x) => solids(x.index));
+      const t = scope();
+      try {
+        lasts.set(key, goesOnLast(solids(p.index), others.length > 1 ? t.add(Manifold.compose(others)) : others[0] ?? null, a, cut.at, side));
+      } finally {
+        t.dispose();
+      }
+    }
+    return lasts.get(key);
+  };
+  /**
+   * A face's patch shared out among the pieces whose material it is, either side: where a side's cell holds one piece
+   * it is all that piece's, and where it holds more each one's part is where its own face meets the patch – all of it
+   * when only one does, by the boxes when none does (an edge). One patch per pair of pieces and island; the patch
+   * itself, given its pieces, where it needs no sharing.
+   */
+  const shareOut = (patch, cut, cells, point) => {
+    const owners = cells.map((cell, k) => {
+      const list = holders.get(cell.join(',')) ?? [];
+      if (list.length < 2 || !solids) return [{ p: pieceAt(cell, point), cs: null }];
+      const parts = [];
+      for (const p of list) {
+        const cs = keep.add(patch.cs.intersect(ownFace(p, cut, k === 0 ? -1 : 1)));
+        if (cs.area() >= MIN_PATCH) parts.push({ p, cs });
+      }
+      return parts.length > 1 ? parts : [{ p: parts[0]?.p ?? pieceAt(cell, point), cs: null }];
+    });
+    if (owners.every((list) => list.length === 1)) return [Object.assign(patch, { lo: owners[0][0].p, hi: owners[1][0].p })];
+    const out = [];
+    for (const lo of owners[0]) {
+      for (const hi of owners[1]) {
+        const region = lo.cs && hi.cs ? keep.add(lo.cs.intersect(hi.cs)) : lo.cs ?? hi.cs;
+        for (const cs of region.decompose()) {
+          keep.add(cs);
+          const area = cs.area();
+          if (area < MIN_PATCH) continue;
+          const polygons = polygonsOf(cs);
+          const centroid = polygonsCentroid(polygons);
+          out.push({ cs, area, polygons, centroid, uv: insidePoint(polygons, centroid), lo: lo.p, hi: hi.p });
+        }
+      }
+    }
+    return out;
+  };
+  const glued = [];
+  const last = [];
   const reachMax = Math.max(LABEL_REACH, sizesFor(manual || AUTO_DIAMETERS[0], c, nozzle, depth).reach);
   const pegManual = pegSizeOf(manual);
   const pegReach = Math.max(LABEL_REACH, pegSizesFor(pegManual || AUTO_PEGS[0], c, nozzle, depth).reach);
@@ -3753,7 +4527,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     let best = null;
     for (const ctx of list) {
       for (const patch of ctx.patches) {
-        if (patch.skip || patch.area < SIZING_PATCH) continue;
+        if (patch.skip || patch.glue || patch.last || patch.area < SIZING_PATCH) continue;
         const t = scope();
         try {
           const found = sizeOn(ctx, patch, PIN, PIN.auto, (s) => s.reach, ctx.room, t)?.d ?? null;
@@ -4215,17 +4989,85 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
       face.delete();
       const a = cut.axis;
       const lo = by[a].indexOf(cut.at);
-      for (const patch of patches) {
-        keep.add(patch.cs);
-        const [u, v] = insidePoint(patch.polygons, patch.centroid);
-        patch.uv = [u, v];
+      for (const raw of patches) keep.add(raw.cs);
+      const shared = [];
+      for (const raw of patches) {
+        const [u, v] = insidePoint(raw.polygons, raw.centroid);
+        raw.uv = [u, v];
         const point = applyMat4(TO_WORLD[a], [u, v, cut.at]);
         const cell = cellOfPoint(point, by);
-        cell[a] = lo;
-        patch.lo = pieceAt(cell, point);
-        cell[a] = lo + 1;
-        patch.hi = pieceAt(cell, point);
-        patch.skip = !patch.lo || !patch.hi;
+        const cells = [0, 1].map((k) => cell.map((x, b) => (b === a ? lo + k : x)));
+        for (const patch of shareOut(raw, cut, cells, point)) shared.push(Object.assign(patch, { cells: cells.map((x) => x.join(',')) }));
+      }
+      patches.splice(0, patches.length, ...shared);
+      // the face of a bit kept loose that hooks round its box (`loose`, its own face as the cut found it) takes no pins
+      // or pegs, whichever file it prints in: they would go in along the cut. That part of a patch is glued – or, where
+      // the bit goes on last from beyond its side of the cut (`pins`), takes them but has no say in their size
+      const hooks = (p) => (p?.loose ?? []).filter((l) => l.cutId === cut.id);
+      if ((joint === 'dowels' || joint === 'pegs') && patches.some((patch) => patch.lo !== patch.hi && (hooks(patch.lo).length || hooks(patch.hi).length))) {
+        const parted = [];
+        for (const patch of patches) {
+          const bits = patch.lo === patch.hi ? [] : [patch.lo, patch.hi].flatMap((p) => hooks(p).map((l) => ({ p, l })));
+          const face = bits.length ? keep.add(CrossSection.union(bits.map(({ l }) => keep.add(new CrossSection(l.face, 'Positive'))))) : null;
+          const on = face ? keep.add(patch.cs.intersect(face)) : null;
+          if (!on || on.area() < MIN_PATCH) {
+            parted.push(patch);
+            continue;
+          }
+          const { p } = bits[0];
+          // one that goes on last along its pins takes them, but has no say in their size; one that cannot is glued
+          const glue = bits.every(({ l }) => l.pins) ? 'last' : { piece: p.index, across: (p === patch.lo ? patch.hi : patch.lo).index, blocked: null };
+          for (const [region, hooked] of [[keep.add(patch.cs.subtract(face)), null], [on, glue]]) {
+            for (const cs of region.decompose()) {
+              keep.add(cs);
+              const area = cs.area();
+              if (area < MIN_PATCH) continue;
+              const polygons = polygonsOf(cs);
+              const centroid = polygonsCentroid(polygons);
+              parted.push({ cs, area, polygons, centroid, uv: insidePoint(polygons, centroid), lo: patch.lo, hi: patch.hi, cells: patch.cells, ...(hooked === 'last' ? { last: true } : { hooked }) });
+            }
+          }
+        }
+        patches.splice(0, patches.length, ...parted);
+      }
+      for (const patch of patches) {
+        const [u, v] = patch.uv;
+        // a face that is one piece on both sides (a bit given to it across the cut) takes nothing
+        patch.skip = !patch.lo || !patch.hi || patch.lo === patch.hi;
+        // a piece printed apart that cannot come away from the rest of its box along the cut takes no pins or pegs
+        // there: they would go in along it. Its face is glued
+        patch.glue = patch.skip ? null : patch.hooked ?? null;
+        if (patch.glue && !glued.some((g) => g.cutId === cut.id && g.piece === patch.glue.piece && g.across === patch.glue.across)) {
+          glued.push({ cutId: cut.id, letter: cut.letter, ...patch.glue });
+        }
+        // two pieces that meet here by a bit one took across another cut, one whose boxes lie apart along a later axis,
+        // only come together when the rows or layers do, moving along that axis: pins along this cut could not go in
+        if (!patch.skip && !patch.glue && (joint === 'dowels' || joint === 'pegs') && [0, 1, 2].some((b) => b > a && patch.lo.cell[b] !== patch.hi.cell[b])) {
+          patch.glue = { piece: patch.lo.index, across: patch.hi.index, blocked: null, cross: true };
+        }
+        if (!patch.skip && !patch.glue && solids && (joint === 'dowels' || joint === 'pegs')) {
+          [patch.lo, patch.hi].forEach((p, k) => {
+            const key = patch.cells[k];
+            if (patch.glue || !inCell.get(key)?.includes(p) || inCell.get(key).length < 2 || bodyOf(key) === p) return;
+            const away = awayOf(p, cut, k === 0 ? -1 : 1);
+            if (away.free) return;
+            // hooked round the rest of its box towards the cut, it may still be pushed onto its pins last, from beyond it
+            if (lastOf(p, cut, k === 0 ? -1 : 1).free) {
+              // its face takes what pins fit it, but has no say in their size: a ribbon's thin end would make every
+              // pin of the model a small one
+              patch.last = true;
+              if (!last.some((g) => g.cutId === cut.id && g.piece === p.index)) {
+                last.push({ cutId: cut.id, letter: cut.letter, axis: a, side: k === 0 ? -1 : 1, piece: p.index, across: (k === 0 ? patch.hi : patch.lo).index });
+              }
+              return;
+            }
+            const across = (k === 0 ? patch.hi : patch.lo).index;
+            patch.glue = { piece: p.index, across, blocked: away.blocked };
+            if (!glued.some((g) => g.cutId === cut.id && g.piece === p.index && g.across === across)) {
+              glued.push({ cutId: cut.id, letter: cut.letter, piece: p.index, across, blocked: away.blocked });
+            }
+          });
+        }
         patch.apex = patch.skip ? [null, null] : [teardropApex(patch.lo.up ?? '+z', a), teardropApex(patch.hi.up ?? '+z', a)];
         patch.dowels = [];
         patch.pegs = [];
@@ -4403,7 +5245,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     const shortest = depth > 0 ? Math.min(depth, minDepth) : minDepth;
     for (const ctx of pegged) {
       for (const patch of ctx.patches) {
-        if (patch.skip) continue;
+        if (patch.skip || patch.glue) continue;
         const t = scope();
         try {
           patch.sockets = [0, 1].map((k) => {
@@ -4422,7 +5264,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     const sizesOn = pegManual ? [pegManual, ...AUTO_PEGS.filter((x) => x < pegManual)] : AUTO_PEGS;
     for (const ctx of pegged) {
       for (const patch of ctx.patches) {
-        if (patch.skip || patch.area < SIZING_PATCH || (pegManual && !patch.sockets.every(Boolean))) continue;
+        if (patch.skip || patch.glue || patch.last || patch.area < SIZING_PATCH || (pegManual && !patch.sockets.every(Boolean))) continue;
         const t = scope();
         try {
           patch.fit = [0, 1].map((k) => (patch.sockets[k] ? sizeOn(ctx, patch, pegsInto(ctx, k), sizesOn, (s) => socketReach(s, k), ctx.rooms[k], t) : null));
@@ -4442,7 +5284,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     const pairs = new Map();
     for (const ctx of pegged) {
       for (const patch of ctx.patches) {
-        if (patch.skip) continue;
+        if (patch.skip || patch.glue) continue;
         const key = `${ctx.cut.id}|${patch.lo.index}|${patch.hi.index}`;
         if (!pairs.has(key)) pairs.set(key, { pair: { axis: ctx.cut.axis, lo: patch.lo.index, hi: patch.hi.index, sockets: [false, false], prefer: null }, ctx, patches: [] });
         pairs.get(key).patches.push(patch);
@@ -4470,7 +5312,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     // whether a piece still fits carrying them is judged at their length at the size of the better side of each face:
     // the size they get is no larger
     const fitOf = (patch, k) => patch.fit[k]?.d ?? null;
-    const faces = pegged.flatMap((ctx) => ctx.patches.filter((patch) => !patch.skip));
+    const faces = pegged.flatMap((ctx) => ctx.patches.filter((patch) => !patch.skip && !patch.glue));
     const better = faces.map((patch) => Math.max(fitOf(patch, 0) ?? 0, fitOf(patch, 1) ?? 0)).filter((x) => x > 0);
     const longest = PEG.full(pegManual || (better.length ? Math.min(...better) : AUTO_PEGS[AUTO_PEGS.length - 1]), depth).length;
     const list = [...pairs.values()].map((x) => x.pair);
@@ -4479,7 +5321,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
       : list.map((pair) => (!pair.sockets[1] ? (pair.sockets[0] ? 1 : null) : !pair.sockets[0] ? 0 : pair.prefer ?? 0));
     const maleOf = new Map([...pairs.keys()].map((key, i) => [key, males[i]]));
     for (const ctx of pegged) {
-      for (const patch of ctx.patches) if (!patch.skip) patch.male = maleOf.get(`${ctx.cut.id}|${patch.lo.index}|${patch.hi.index}`);
+      for (const patch of ctx.patches) if (!patch.skip && !patch.glue) patch.male = maleOf.get(`${ctx.cut.id}|${patch.lo.index}|${patch.hi.index}`);
     }
 
     // ---- one peg size for the whole model: the smallest that a face's sockets take on the side they go into ----
@@ -4487,7 +5329,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     const P = pegged.length ? pegManual || (found.length ? Math.min(...found) : AUTO_PEGS[AUTO_PEGS.length - 1]) : null;
 
     // ---- at most 48 pins or pegs: every patch its first two, larger patches first, then the rest the same way ----
-    const asks = connected.flatMap((ctx) => ctx.patches.filter((p) => !p.skip).map((patch) => ({ patch, n: wanted || clamp(1 + Math.round(patch.area / 1500), 2, 6) })));
+    const asks = connected.flatMap((ctx) => ctx.patches.filter((p) => !p.skip && !p.glue).map((patch) => ({ patch, n: wanted || clamp(1 + Math.round(patch.area / 1500), 2, 6) })));
     asks.sort((p, q) => q.patch.area - p.patch.area);
     let left = SPLIT_LIMITS.dowels;
     let capped = 0;
@@ -4617,7 +5459,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     }
     return {
       diameter: D, pegSize: P, dowels, pegs, labels, lips, ...(locks.length ? { locks, fallbacks } : {}), seams, notes,
-      pinnable: pegged.filter((ctx) => ctx.pinnable).map((ctx) => ctx.cut.id),
+      pinnable: pegged.filter((ctx) => ctx.pinnable).map((ctx) => ctx.cut.id), ...(glued.length ? { glued } : {}), ...(last.length ? { last } : {}),
     };
   } finally {
     keep.dispose();

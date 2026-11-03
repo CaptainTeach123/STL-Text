@@ -54,6 +54,7 @@ html:not([data-theme='classic']) {
   --ok: #45f59d; /* green, so it no longer shares the teal of a cut that comes apart */
   --err: #ff4d6d; /* lighter than the view's red, to read as text on the panel */
   --warn: #ffb020;
+  --warn-text: var(--warn);
 
   /* the view's own colours (viewer.js, split.js), unchanged */
   --cut: #8b5cf6;
@@ -313,6 +314,14 @@ html:not([data-theme='classic']) {
   #cutList .cut-place[aria-pressed='true'] {
     color: var(--ink);
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--apart-glow) 40%, transparent);
+  }
+  #keepWholeBtn[aria-pressed='true'] {
+    color: var(--ink);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--keep) 40%, transparent);
+  }
+  #keepList .keep-swatch {
+    border-radius: 0;
+    box-shadow: 0 0 6px color-mix(in srgb, var(--keep) 60%, transparent);
   }
 
   /* ---------- links ----------

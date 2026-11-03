@@ -5,16 +5,17 @@ import {
   SPLIT_NOTE_CODES, SplitError, TO_PLANE, TO_WORLD, YAW90, applyMat4, applyToSoup, assemblySteps, axisCuts, bedSize, cellOf,
   cellFits, cellOfPoint, cellSizes, chooseCentres, chooseOffsets, chooseOrientation, clipSoupByPlane, clippedArea, cutPlane, dirAxis, dirOf,
   dovetailSize, evenCell, explodeOffset, fitsBed, footprintYaw, formatSize, glueFileName, gridCandidates, gridCounts, gridPoints,
-  howToGlueText, invertRigid, isSymmetric, letterFor, localFrame, maxCellLength, mulMat4, nextCut, noSeatWords, normaliseSplit, offsetAlongRay,
-  oppositeDir, orientationStats, partFileName, pieceColorIndex, pieceFileName, pinsFileName, planAllowance, planCost, planGrid, sheetName,
+  howToGlueText, invertRigid, isSymmetric, keptBits, cellPiece, letterFor, localFrame, maxCellLength, mulMat4, nextCut, noSeatWords, normaliseSplit, offsetAlongRay,
+  oppositeDir, orientationStats, partFileName, pieceColorIndex, pieceColors, pieceFileName, pinsFileName, planAllowance, planCost, planGrid, sheetName,
   planSamples, plateAxis, polygonsArea, polygonsCentroid, printTransform, safeFileName, cellSupport, fitPieces, flatProbes, liesFlat, statsWithSoup,
   sizesFor, sizesForRoom, soupCells, splitActive, splitNote, teardropApex, usableBed, yawMat4, zipFileName, triangleInBox, baseAxis,
   outlineColumns, pieceHolding, textNotes, AUTO_PEGS, SMALLEST_PEG, layPegged, pegAllowance, pegMales, pegSides, pegSizeOf, pegSizesFor,
   pegSizesForRoom, statsWithPegs, uprightPegNotes, APART_COLOR, APART_HOLDS, CLIP, LIP, LIP_ALLOWANCE, apartMales, catchSizes,
   clipHold, clipPush, clipShape, layGrown, lipReach, lipSides, lipSizesFor, statsWithLip, SPOT, comesOffOf, endBeds, endShape, endsAsWell, keepsTo, lipMale,
   locateBend, locateSeam, pickSpots, profileSeams, seamKind, seamWords, snapTarget, spotScore, spotSide, spotStart, spotWhy, socketsAsWell,
-  printedFace, printedRow, wayAt, waySteps, wayStep,
+  printedFace, printedRow, wayAt, waySteps, wayStep, KEEP_INSIDE, KEEP_LIMIT, keepCrossed, keepName, keepsOf, keepsThrough,
 } from '../src/split.js';
+import { boxHang, columnGraph, columnsOf, looseTable, planeGrid, rasterRings, sampleWidths } from '../src/hang.js';
 
 const U = [210, 210, 249]; // the default printer's usable bed
 const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
@@ -989,6 +990,134 @@ describe('cells', () => {
   });
 });
 
+/**
+ * The outline across `axis` at t of boxes that do not overlap ({ min, max }), in that axis's plane coordinates. Where
+ * two of them touch, their faces are put between the samples: a slice exactly on one would miss both.
+ */
+const boxRings = (boxes, axis, t) => {
+  const [u, v] = [(axis + 1) % 3, (axis + 2) % 3];
+  return boxes.filter((b) => b.min[axis] < t && t < b.max[axis]).map((b) => [[b.min[u], b.min[v]], [b.max[u], b.min[v]], [b.max[u], b.max[v]], [b.min[u], b.max[v]]]);
+};
+
+/** The planner's profile of a model made of boxes: the samples for k cuts, each costing `costOf(axis, t)`, and the outlines. */
+const boxProfile = (boxes, bounds, costOf) => (a, k) => {
+  const samples = planSamples(bounds.min[a], bounds.max[a], k);
+  return { samples, costs: samples.map((t) => costOf(a, t)), tabs: samples.map(() => null), rings: samples.map((t) => boxRings(boxes, a, t)) };
+};
+
+const near = (t, at) => Math.abs(t - at) < 1e-6;
+
+describe('what a plan leaves hanging', () => {
+  // a bar 200 × 40 × 40 with a hook 10 mm thick over it: held up on a 5 mm stem at x 150.5–155.5, reaching out to
+  // x 195.5 (the samples are 1 mm apart, the faces between them)
+  const hookBoxes = [{ min: [0, 0, 0], max: [200, 40, 40] }, { min: [150.5, 0, 40], max: [155.5, 40, 45] }, { min: [150.5, 0, 45], max: [195.5, 40, 55] }];
+  const hookBounds = { min: [0, 0, 0], max: [200, 40, 55] };
+
+  it('chooseOffsets counts what each box between its cuts leaves hanging: the least in all, as every cut tried by hand says', () => {
+    const { samples, costs, rings } = boxProfile(hookBoxes, hookBounds, (a, t) => (near(t, 170) ? 0 : 2))(0, 1);
+    const grid = planeGrid(hookBounds, 0);
+    const [column] = columnsOf(grid, [[], [], []]);
+    const table = looseTable(columnGraph(rings.map((r) => rasterRings(r, grid)), grid, column.rect), sampleWidths(samples, 0, 200));
+    const hang = (p, i) => boxHang([table], samples, p, i);
+    const n = samples.length;
+    const at = (t) => samples.findIndex((s) => near(s, t));
+    const cut = (i) => hang(-1, i) + hang(i, n);
+    // through the hook its end is loose, 10 cm³ of it, a bit of the bar's 48 there: a whole part, 100. At x 141 the
+    // hook holds on over the 15 mm to
+    // the first slice past its stem: 50 × (1 − 15/30), and 25 more as the notes would warn of it; at x 140, over 16 mm,
+    // without; from x 126 on it costs nothing
+    expect(cut(at(170))).toBeCloseTo(100, 6);
+    expect(cut(at(141))).toBeCloseTo(50, 6);
+    expect(cut(at(140))).toBeCloseTo(50 * (1 - 16 / 30), 6);
+    expect(cut(at(126))).toBe(0);
+    // by its samples alone the cut goes through the hook; with what its boxes leave, where every cut by hand says
+    const limits = { lo: 0, hi: 200, k: 1, S: 190 };
+    expect(chooseOffsets(samples, costs, limits).offsets).toEqual([170]);
+    const own = (i, j, k) => costs[i] + (PLAN_WEIGHTS.even * Math.abs(samples[i] - (200 * (j + 1)) / (k + 1))) / (200 / (k + 1));
+    const one = samples.map((_, i) => i).filter((i) => samples[i] <= 190 && 200 - samples[i] <= 190).reduce((b, i) => (own(i, 0, 1) + cut(i) < own(b, 0, 1) + cut(b) - 1e-9 ? i : b));
+    const r = chooseOffsets(samples, costs, { ...limits, hang });
+    expect(r).toMatchObject({ offsets: [samples[one]], cost: expect.closeTo(own(one, 0, 1), 9), hang: expect.closeTo(cut(one), 9) });
+    expect(cut(one)).toBe(0);
+    // two cuts: every pair, the box between them too
+    let best = null;
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        if (samples[i] > 90 || samples[j] - samples[i] > 90 || 200 - samples[j] > 90) continue;
+        const c = own(i, 0, 2) + own(j, 1, 2) + hang(-1, i) + hang(i, j) + hang(j, n);
+        if (!best || c < best.c - 1e-9) best = { c, i, j };
+      }
+    }
+    const two = chooseOffsets(samples, costs, { lo: 0, hi: 200, k: 2, S: 90, hang });
+    expect(two.offsets).toEqual([samples[best.i], samples[best.j]]);
+    expect(two.cost + two.hang).toBeCloseTo(best.c, 9);
+  });
+
+  it('Fit moves a cut off what it would leave loose, and the plan says what it leaves hanging', () => {
+    const profile = boxProfile(hookBoxes, hookBounds, (a, t) => (near(t, 170) ? 0 : 2));
+    const options = { E: [200, 40, 55], U: [190, 190, 190], bounds: hookBounds, profileOf: profile };
+    // as each axis planned again gives it: through the hook, its end loose
+    expect(planGrid([1, 0, 0], { ...options, descent: false })).toMatchObject({ offsets: [[170], [], []], hang: expect.closeTo(100, 6) });
+    const plan = planGrid([1, 0, 0], options);
+    expect(plan.offsets[0][0]).toBeLessThanOrEqual(126);
+    expect(plan.hang).toBe(0);
+    // with no outlines there is no graph: the plan is as it was
+    const bare = (a, k) => ({ ...profile(a, k), rings: undefined });
+    expect(planGrid([1, 0, 0], { ...options, profileOf: bare })).toMatchObject({ offsets: [[170], [], []] });
+    expect(planGrid([1, 0, 0], { ...options, profileOf: bare }).hang).toBeUndefined();
+  });
+
+  it('the descent never makes more boxes that hold model than its start, and the plan never costs more', () => {
+    // a base 300 × 40 × 10 with a tower 100 mm wide on its left end and a narrow one, 160 mm tall, on its right; from
+    // the tall one a hook stands out on a 5 mm stem at z 190.75–195.75, 30 mm tall, reaching x 200 (the samples are
+    // 1.5 mm apart, the faces between them). Z is cheapest through the hook (201), then at 120, which takes the short
+    // tower's top, 40 mm of it, into a box of its own
+    const boxes = [
+      { min: [0, 0, 0], max: [300, 40, 10.75] }, { min: [0, 0, 10.75], max: [100, 40, 300] }, { min: [260, 0, 10.75], max: [300, 40, 160.75] },
+      { min: [100, 0, 190.75], max: [130, 40, 195.75] }, { min: [120.75, 0, 195.75], max: [200, 40, 225.75] },
+    ];
+    const bounds = { min: [0, 0, 0], max: [300, 40, 300] };
+    const mesh = meshOf(boxes.map((b) => boxSoup(b.min, b.max)));
+    const costOf = (a, t) => (a === 0 ? (near(t, 231) ? 0 : 5) : near(t, 201) ? 0 : near(t, 120) ? 1 : 5);
+    const options = { E: [300, 40, 300], U, bounds, profileOf: boxProfile(boxes, bounds, costOf), support: (by) => cellSupport(mesh, by) };
+    const start = planGrid([1, 0, 1], { ...options, descent: false });
+    expect(start).toMatchObject({ offsets: [[231], [], [201]], pieces: { length: 3 } });
+    // the hook's top is loose above Z, a fifth of the tall tower's top: each axis's graph sees it so
+    expect(start.hang).toBeCloseTo(200, 6);
+    // at 120 it would cost less still, but makes the short tower's top a piece: Z goes just over that top instead, more
+    // than 30 mm under the hook's stem, so the hook holds on over all of it – the descent alone finds that, and so it
+    // does with the other starts
+    for (const starts of [0, undefined]) {
+      const plan = planGrid([1, 0, 1], { ...options, starts });
+      expect(plan.pieces.length).toBeLessThanOrEqual(start.pieces.length);
+      expect(plan.cost).toBeLessThan(start.cost);
+      expect(plan.pieces).toHaveLength(3);
+      expect(plan.offsets[2][0]).toBeGreaterThan(160.75);
+      expect(plan.offsets[2][0]).toBeLessThanOrEqual(195.75 - 30);
+      expect(plan.hang).toBe(0);
+    }
+  });
+
+  it('starts from other places too: a cut a little dearer by its samples that leaves the other axis no sliver', () => {
+    // a block 300 × 100.5 × 100 with a plate 3.5 mm thick on the back of its right third. Y may only be cut at 102,
+    // through the plate, so each box behind that cut that holds any of it holds a 2 mm sliver. X costs least at 249,
+    // through the plate, which makes two of them; at 150 it costs a little more by its own samples, and leaves one
+    const boxes = [{ min: [0, 0, 0], max: [300, 100.5, 100] }, { min: [200, 100.5, 0], max: [300, 104, 100] }];
+    const bounds = { min: [0, 0, 0], max: [300, 104, 100] };
+    const costOf = (a, t) => (a === 1 ? (near(t, 102) ? 0 : Infinity) : near(t, 249) ? 0 : near(t, 150) ? 4 : 5);
+    const options = { E: [300, 104, 100], U: [260, 260, 260], bounds, profileOf: boxProfile(boxes, bounds, costOf) };
+    // each axis planned on its own, and again against the other, keeps X where its samples are cheapest
+    const start = planGrid([1, 1, 0], { ...options, descent: false });
+    expect(start.offsets).toEqual([[249], [102], []]);
+    // so does the descent: X's own boxes cannot see the slivers behind Y's cut. A start at 150 finds the plan
+    expect(planGrid([1, 1, 0], { ...options, starts: 0 }).offsets).toEqual(start.offsets);
+    const plan = planGrid([1, 1, 0], options);
+    expect(plan.offsets).toEqual([[150], [102], []]);
+    expect(plan.pieces).toHaveLength(start.pieces.length);
+    expect(start.cost - plan.cost).toBeCloseTo(PLAN_WEIGHTS.sliver + (PLAN_WEIGHTS.even * 99) / 150 - 4, 6);
+    expect([start.hang, plan.hang]).toEqual([0, 0]);
+  });
+});
+
 describe('chooseCentres and symmetry', () => {
   const rect = (w, h, cx = 0, cy = 0) => [[[cx - w / 2, cy - h / 2], [cx + w / 2, cy - h / 2], [cx + w / 2, cy + h / 2], [cx - w / 2, cy + h / 2]]];
   const inside = (polys, [u, v]) => {
@@ -1370,6 +1499,165 @@ describe('assembly', () => {
     expect(steps.map((s) => s.letter)).toEqual(['A', 'A', 'B']);
     expect(steps[0].text).toBe('Cut A: a thin film of glue on the tabs, lay piece 1 flat and lower piece 2 onto it. Hold 1 minute.');
     expect(steps[2].text).toBe('Cut B: a thin film of glue on the faces, press pieces 3 and 4 onto pieces 1 and 2 and line the edges up. Hold until it sets.');
+  });
+});
+
+describe('bits a cut leaves loose', () => {
+  // the ribbon's end cut off at X 10: loose in the right box, printed apart as piece 3, hooked round piece 2
+  const hooked = { cutId: 'c1', letter: 'A', why: 'hooks', across: [0, 0, 0], contact: 184.4, blocked: 1212.8, away: '-y', moveTo: -25 };
+  const ribbonBox = { min: [10, -46.9, 112], max: [72, 0, 150] };
+  const cutOff = [
+    { index: 1, cell: [0, 0, 0], shells: 1 },
+    { index: 2, cell: [1, 0, 0], shells: 2, parts: [{ volume: 536946.2, box: { min: [10, -55, 0], max: [80, 55, 260] } }, { volume: 15398.7, box: ribbonBox, loose: hooked }] },
+  ];
+  const apart = [{ index: 1, from: 1, parts: null }, { index: 2, from: 2, parts: [0] }, { index: 3, from: 2, parts: [1] }];
+  const cuts = [{ id: 'c1', letter: 'A', axis: 0, at: 10 }];
+
+  it('says where each bit is in the pieces as they print: kept on the piece it hangs on, or loose', () => {
+    const { joined, loose } = keptBits(cutOff, apart, cuts);
+    expect(joined).toEqual([]);
+    expect(loose).toEqual([{
+      letter: 'A', cutId: 'c1', axis: 0, at: 10, volume: 15398.7, box: ribbonBox, why: 'hooks', piece: 3, apart: true, around: 2, across: 1, away: '-y', moveTo: -25,
+    }]);
+    // printed in the file with the rest of its box, it is that piece's loose part
+    expect(keptBits(cutOff, [{ index: 1, from: 1, parts: null }, { index: 2, from: 2, parts: null }], cuts).loose[0]).toMatchObject({ piece: 2, apart: false, around: 2, across: 1 });
+    // a crumb given back: out of the right box's piece, on the left one
+    const given = [{ ...cutOff[0], joined: [{ volume: 0.5, fromCell: [1, 0, 0], cutId: 'c1', letter: 'A' }] }, { index: 2, cell: [1, 0, 0], shells: 1 }];
+    expect(keptBits(given, [{ index: 1, from: 1, parts: null }, { index: 2, from: 2, parts: null }], cuts)).toEqual({ joined: [{ letter: 'A', cutId: 'c1', volume: 0.5, from: 2, to: 1 }], loose: [] });
+    // bits of one cut that would move it opposite ways: only the largest one's place is said
+    const two = [cutOff[0], { ...cutOff[1], parts: [...cutOff[1].parts, { volume: 900, box: ribbonBox, loose: { ...hooked, moveTo: 40 } }] }];
+    expect(keptBits(two, [...apart, { index: 4, from: 2, parts: [2] }], cuts).loose.map((l) => l.moveTo)).toEqual([-25, null]);
+  });
+
+  it('notes say what the give-back did, and what to do with a bit kept loose', () => {
+    expect(splitNote('ISLAND_JOINED', { bits: [{ letter: 'A', cutId: 'c1', volume: 120.4, from: 3, to: 1 }] })).toMatchObject({
+      level: 'info', text: 'Cut A would have left a 120.4 mm³ bit loose in piece 3: it stays on piece 1, which it hangs on.',
+    });
+    const three = [{ letter: 'A', volume: 0.3, from: 2, to: 1 }, { letter: 'A', volume: 2.5, from: 1, to: 2 }, { letter: 'C', volume: 64.2, from: 4, to: 2 }];
+    expect(splitNote('ISLAND_JOINED', { bits: three }).text).toBe('Cuts A and C would have left 3 bits loose (67.0 mm³ in all): each stays on the piece it hangs on.');
+    expect(splitNote('ISLAND_JOINED', { bits: [{ letter: 'A', volume: 0.04, from: 1, to: 2 }] }).text).toBe('Cut A would have left a 0.04 mm³ bit loose in piece 1: it stays on piece 2, which it hangs on.');
+    const ribbon = { letter: 'A', cutId: 'c1', at: 10, volume: 15398.7, box: ribbonBox, why: 'hooks', piece: 3, apart: true, around: 2, across: 1, away: '-y', moveTo: -24.5 };
+    expect(splitNote('LOOSE_KEPT', ribbon)).toMatchObject({
+      level: 'warn',
+      text: 'Cut A leaves 15.4 cm³ of the model loose (x 10–72, z 112–150): it wraps round piece 2, so it prints as piece 3, with no pins. '
+        + 'Glue it on last, slid on from the front. Move cut A to −24.5 mm or lower to keep it on.',
+    });
+    // too big for the piece it hangs on: it comes away along the cut, so it goes on that piece first
+    expect(splitNote('LOOSE_KEPT', { ...ribbon, why: 'big', away: '+x', moveTo: null }).text)
+      .toBe('Cut A leaves 15.4 cm³ of the model loose (x 10–72, z 112–150): it would make piece 1 too big for your printer, so it prints as piece 3. '
+        + 'Glue it onto piece 1 first, pushed on from the right, before piece 2.');
+    expect(splitNote('LOOSE_KEPT', { ...ribbon, why: 'big', away: null, moveTo: null, apart: false, piece: 2 }).text)
+      .toBe('Cut A leaves 15.4 cm³ of the model loose (x 10–72, z 112–150): it would make piece 1 too big for your printer, so it prints loose in piece 2\'s file. '
+        + 'Glue it onto piece 1 first, before the rest of piece 2.');
+    // hooked round its box towards the cut, but it goes on last from beyond it, along its pins: none taken from it
+    expect(splitNote('LOOSE_KEPT', { ...ribbon, away: '+x', pins: true }).text)
+      .toBe('Cut A leaves 15.4 cm³ of the model loose (x 10–72, z 112–150): it wraps round piece 2, so it prints as piece 3. '
+        + 'Glue it on last, pushed on from the right. Move cut A to −24.5 mm or lower to keep it on.');
+    // loose in its box's own file, with built-in pegs, free to go on from below; a place higher up the axis
+    expect(splitNote('LOOSE_KEPT', { ...ribbon, volume: 3000, box: { min: [20, 0, 40], max: [45, 30, 74] }, at: 20, apart: false, piece: 4, around: 4, away: '-z', moveTo: 52, pegs: true }).text)
+      .toBe('Cut A leaves 3.0 cm³ of the model loose (x 20–45, z 40–74): it wraps round the rest of piece 4, so it prints loose in piece 4\'s file, with no pegs. '
+        + 'Glue it on last, slid on from below. Move cut A to 52 mm or higher to keep it on.');
+    // free no way at all, and no place for the cut: it goes on with what it wraps round
+    expect(splitNote('LOOSE_KEPT', { ...ribbon, box: { min: [-72, 1, 112], max: [-44, 7, 145] }, away: null, moveTo: null }).text)
+      .toBe('Cut A leaves 15.4 cm³ of the model loose (x −72 to −44, z 112–145): it wraps round piece 2, so it prints as piece 3, with no pins. '
+        + 'Put it in place round piece 2 first, then glue them on together.');
+  });
+
+  it('the glue sheet puts a hooked bit on last, from the way it is free to go, and lists a loose part', () => {
+    const pieces = [{ index: 1, cell: [0, 0, 0] }, { index: 2, cell: [1, 0, 0] }, { index: 3, cell: [1, 0, 0] }];
+    const seams = [
+      { letter: 'A', axis: 0, at: 10, pieces: [1, 3], joint: 'none', dowels: 0, labels: null },
+      { letter: 'A', axis: 0, at: 10, pieces: [1, 2], joint: 'dowels', dowels: 6, labels: ['1A', '2A'] },
+    ];
+    const loose = keptBits(cutOff, apart, cuts).loose;
+    // without it, the loose end would be pushed on with piece 2, along pins it cannot go on by
+    expect(assemblySteps({ pieces, seams }).map((x) => x.text)).toEqual(['Cut A: glue 6 pins into face 1A, a thin film on the faces, push pieces 2 and 3 on together (2A). Hold 1 minute.']);
+    expect(assemblySteps({ pieces, seams, loose })).toEqual([
+      { letter: 'A', axis: 0, pieces: [1], joins: [2], pins: 6, pegs: 0, text: 'Cut A: glue 6 pins into face 1A, a thin film on the face, push piece 2 on (2A). Hold 1 minute.' },
+      {
+        letter: 'A', axis: 0, pieces: [1], joins: [3], pins: 0, pegs: 0, loose: true,
+        text: 'Cut A: glue piece 3 on last – a thin film of glue on its face, then slide it on from the front against piece 1 (it has no pins). Hold until it sets.',
+      },
+    ]);
+    // loose in piece 2's own file: its face stays in cut A's step, and it goes on last all the same
+    const inFile = [{ ...loose[0], piece: 2, apart: false, pegs: true }];
+    const steps = assemblySteps({ pieces: pieces.slice(0, 2), seams: [{ ...seams[1], pieces: [1, 2] }], loose: inFile });
+    expect(steps.map((x) => x.text)).toEqual([
+      'Cut A: glue 6 pins into face 1A, a thin film on the face, push piece 2 on (2A). Hold 1 minute.',
+      'Cut A: glue the loose part of piece 2 on last – a thin film of glue on its face, then slide it on from the front against piece 1 (it has no pegs). Hold until it sets.',
+    ]);
+    // one free no way has no step of its own
+    expect(assemblySteps({ pieces, seams, loose: [{ ...loose[0], away: null }] })).toHaveLength(1);
+    // one that goes on last along its pins takes its pinned seam out of the cut's step, and its pins with it
+    const pinned = [seams[1], { ...seams[0], joint: 'dowels', dowels: 2, labels: ['1A', '3A'] }];
+    expect(assemblySteps({ pieces, seams: pinned, loose: [{ ...loose[0], away: '+x', pins: true }] }).map((x) => [x.joins, x.pins, x.text])).toEqual([
+      [[2], 6, 'Cut A: glue 6 pins into face 1A, a thin film on the face, push piece 2 on (2A). Hold 1 minute.'],
+      [[3], 2, 'Cut A: glue piece 3 on last – glue 2 pins into face 1A, a thin film on the face, then slide it onto them from the right (3A). Hold 1 minute.'],
+    ]);
+    // one too big for the piece it hangs on goes onto it in its cut's step, before the rest of its box
+    expect(assemblySteps({ pieces, seams: pinned, loose: [{ ...loose[0], why: 'big', away: '+x' }] }).map((x) => x.text)).toEqual([
+      'Cut A: glue 8 pins into face 1A, a thin film on the faces, set piece 3 in place on piece 1 first, then push piece 2 on (2A). Hold 1 minute.',
+    ]);
+    expect(assemblySteps({ pieces: pieces.slice(0, 2), seams: [seams[1]], loose: [{ ...loose[0], why: 'big', piece: 2, apart: false }] }).map((x) => x.text)).toEqual([
+      'Cut A: glue 6 pins into face 1A, a thin film on the face, set the loose part of piece 2 in place on piece 1 first, then push piece 2 on (2A). Hold 1 minute.',
+    ]);
+    // a face's label is said once, however many of its seams the step names
+    const twice = [{ ...seams[1], pieces: [1, 2], labels: ['1A', '2A'] }, { ...seams[1], pieces: [3, 2], labels: ['3A', '2A'], dowels: 2 }];
+    expect(assemblySteps({ pieces: [...pieces.slice(0, 2), { index: 3, cell: [0, 0, 0] }], seams: twice })[0].text)
+      .toBe('Cut A: glue 8 pins into faces 1A and 3A, a thin film on the faces, push piece 2 on (2A). Hold 1 minute.');
+    // the print list says which piece has a loose part
+    const text = howToGlueText({
+      name: 'ribbon', pieces: [{ index: 1, cell: [0, 0, 0], size: [90, 110, 260], lies: 'flat as modelled', yaw: 0, fits: true, shells: 1 }, { index: 2, cell: [1, 0, 0], size: [70, 110, 260], lies: 'flat as modelled', yaw: 0, fits: true, shells: 2, loose: 1 }],
+      seams: [{ ...seams[1] }], loose: inFile, bed: [120, 120, 300],
+    });
+    expect(text).toMatch(/piece 2 of 2 .* fits, 2 parts – 1 loose\n/);
+    expect(text).toContain('  2. Cut A: glue the loose part of piece 2 on last');
+  });
+
+  it('a seam a bit taken across another cut makes is glued when the layers come together, with no pins', () => {
+    // a bit of the top layer's left box given to the middle layer's: the middle-left piece meets the top-right one at cut A
+    const pieces = [{ index: 5, cell: [0, 0, 1] }, { index: 6, cell: [1, 0, 1] }, { index: 7, cell: [0, 0, 2] }, { index: 8, cell: [1, 0, 2] }];
+    const seams = [
+      { letter: 'A', axis: 0, at: 50, pieces: [5, 6], joint: 'dowels', dowels: 4, labels: ['5A', '6A'] },
+      { letter: 'A', axis: 0, at: 50, pieces: [5, 8], joint: 'none', dowels: 0, labels: null },
+      { letter: 'A', axis: 0, at: 50, pieces: [7, 8], joint: 'dowels', dowels: 3, labels: ['7A', '8A'] },
+      { letter: 'D', axis: 2, at: 200, pieces: [5, 7], joint: 'dowels', dowels: 2, labels: null },
+      { letter: 'D', axis: 2, at: 200, pieces: [6, 8], joint: 'dowels', dowels: 4, labels: ['6D', '8D'] },
+    ];
+    const steps = assemblySteps({ pieces, seams });
+    expect(steps.map((x) => [x.letter, x.pieces, x.joins, x.pins])).toEqual([['A', [5], [6], 4], ['A', [7], [8], 3], ['D', [5, 6], [7, 8], 6]]);
+  });
+});
+
+describe('parts held on only next to a cut', () => {
+  it('names the piece a box prints as: the one with its largest part', () => {
+    const pieces = [
+      { index: 1, cell: [0, 0, 0], shells: 1 },
+      { index: 2, cell: [1, 0, 0], shells: 2, parts: [{ volume: 15398.7 }, { volume: 536946.2 }] },
+    ];
+    expect(cellPiece(pieces, [{ index: 1, from: 1, parts: null }, { index: 2, from: 2, parts: [0] }, { index: 3, from: 2, parts: [1] }], [1, 0, 0])).toBe(3);
+    expect(cellPiece(pieces, [{ index: 1, from: 1, parts: null }, { index: 2, from: 2, parts: null }], [0, 0, 0])).toBe(1);
+    expect(cellPiece(pieces, [{ index: 1, from: 1, parts: null }], [0, 1, 0])).toBeNull();
+  });
+
+  it('the note says what holds on where, and where the cut would hold it on', () => {
+    // the ribbon fixture cut at X 0: the ribbon's right half holds on over 6 mm of piece 2
+    const half = { letter: 'A', cutId: 'c1', axis: 0, at: 0, volume: 16240, box: { min: [6, -46.6, 111.9], max: [71, 0.9, 150.1] }, w: 6, piece: 2, moveTo: -10, holds: 16 };
+    expect(splitNote('BARELY_HELD', half)).toMatchObject({
+      level: 'warn', code: 'BARELY_HELD', cutId: 'c1', w: 6,
+      text: '16.2 cm³ of piece 2 (x 6–71, z 112–150) holds on only over the 6 mm next to cut A, and may snap off there. Move cut A to −10 mm and it holds over 16 mm.',
+    });
+    // a hold under a millimetre reads 1 mm; a place where nothing on that side comes loose holds it on firmly
+    expect(splitNote('BARELY_HELD', { ...half, w: 0.4, moveTo: 42.36, holds: null }).text)
+      .toBe('16.2 cm³ of piece 2 (x 6–71, z 112–150) holds on only over the 1 mm next to cut A, and may snap off there. Move cut A to 42.4 mm and it holds on firmly.');
+    // nowhere to move it: no move said
+    expect(splitNote('BARELY_HELD', { ...half, volume: 9500, box: { min: [-72, -47, 140], max: [72, 7, 150] }, w: 5, moveTo: null, holds: null }).text)
+      .toBe('9.5 cm³ of piece 2 (x −72 to 72, z 140–150) holds on only over the 5 mm next to cut A, and may snap off there.');
+    // the only place to move it to runs through a detail kept whole: said, and what to do instead
+    expect(splitNote('BARELY_HELD', { ...half, piece: 7, moveTo: null, holds: null, keepId: 'k1', kept: 'Ribbon' }).text)
+      .toBe('16.2 cm³ of piece 7 (x 6–71, z 112–150) holds on only over the 6 mm next to cut A, and may snap off there. '
+        + 'Moving cut A so it holds would run through Ribbon, which you keep whole – glue this joint with care, or print piece 7 with more walls.');
+    expect(SPLIT_NOTE_CODES).toContain('BARELY_HELD');
   });
 });
 
@@ -1857,6 +2145,12 @@ describe('viewer maths', () => {
       }
     }
     expect(new Set(PIECE_COLORS).size).toBe(6);
+    // a box's second piece (a bit printed apart beside the piece it hooks round) is a shade of its own, of the same family
+    const colours = pieceColors([{ index: 3, cell: [1, 0, 0] }, { index: 1, cell: [0, 0, 0] }, { index: 2, cell: [1, 0, 0] }]);
+    expect(colours.get(1)).toBe(pieceColorIndex([0, 0, 0]));
+    expect(colours.get(2)).toBe(pieceColorIndex([1, 0, 0]));
+    expect(colours.get(3)).not.toBe(colours.get(2));
+    expect(colours.get(3) % 2).toBe(colours.get(2) % 2);
     expect(PIECE_COLORS).not.toContain(CUT_COLOR);
     expect(PIECE_COLORS).not.toContain(PIN_COLOR);
     expect(CUT_COLOR).toBe(0x8b5cf6);
@@ -3315,5 +3609,71 @@ describe('placing a cut that comes apart', () => {
     const { spans } = endShape(mesh(corners, faces));
     [[600, 600], [300, 300], [200, 200]].forEach((want, a) => want.forEach((v, k) => expect(spans[a][k]).toBeCloseTo(v, 6)));
     expect(endShape(mesh([[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0], [5, 5, 12]], [[0, 2, 1], [0, 3, 2], [0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]])).spans[2]).toEqual([100, 0]);
+  });
+});
+
+describe('details kept whole', () => {
+  const box = { min: [-72, -47, 112], max: [72, 7, 150] };
+  const ribbon = { id: 'k1', name: 'Ribbon', point: [0, -47, 135], normal: [0, -1, 0], box };
+
+  it('a cut runs through a detail kept whole more than 1 mm inside both sides of its box: one along its edge runs past', () => {
+    expect(KEEP_INSIDE).toBe(1);
+    expect(keepCrossed(box, 0, 0)).toBe(true);
+    expect(keepCrossed(box, 0, 70.9)).toBe(true);
+    expect(keepCrossed(box, 0, 71)).toBe(false);
+    expect(keepCrossed(box, 0, -75)).toBe(false);
+    expect(keepCrossed(box, 2, 113.5)).toBe(true);
+    expect(keepCrossed(box, 2, 112.5)).toBe(false);
+    expect(keepCrossed(box, 1, 6.5)).toBe(false);
+  });
+
+  it('the details as the split reads them: named, boxes clamped to the model, those with no box or off the model left out', () => {
+    const bounds = { min: [-80, -55, 0], max: [80, 55, 260] };
+    const split = {
+      keep: [
+        ribbon,
+        { id: 'k2', name: '  ', point: [0, 0, 0], box: { min: [-100, -60, 250], max: [100, 0, 300] } },
+        { id: 'k3', name: 'none yet', point: [0, 0, 0], box: null },
+        { id: 'k4', name: 'off it', point: [0, 0, 0], box: { min: [200, 0, 0], max: [210, 10, 10] } },
+        { id: 'k5', name: 'flat', point: [0, 0, 0], box: { min: [0, 0, 0], max: [10, 0, 10] } },
+      ],
+    };
+    expect(keepsOf(split, bounds)).toEqual([
+      { id: 'k1', name: 'Ribbon', box },
+      { id: 'k2', name: 'Detail 2', box: { min: [-80, -55, 250], max: [80, 0, 260] } },
+    ]);
+    expect(keepsOf(split).map((k) => k.id)).toEqual(['k1', 'k2', 'k4']); // with no bounds, nothing is off the model
+    expect(keepsOf(null)).toEqual([]);
+    expect(keepsOf({ keep: Array.from({ length: 12 }, (_, i) => ({ ...ribbon, id: `k${i + 1}` })) })).toHaveLength(KEEP_LIMIT);
+    expect(keepName({ name: '' }, 0)).toBe('Detail 1');
+    // normalised, a split keeps them only when it has some: an empty list is none of its output
+    expect(normaliseSplit(split, bounds).keeps).toEqual(keepsOf(split, bounds));
+    expect('keeps' in normaliseSplit({ keep: [] }, bounds)).toBe(false);
+  });
+
+  it('which details a cut runs through: a full cut, stored or normalised; never one that takes out only a part', () => {
+    const keeps = keepsOf({ keep: [ribbon, { id: 'k2', name: 'Top', box: { min: [-20, -20, 240], max: [20, 20, 260] } }] });
+    expect(keepsThrough(keeps, { position: [30, 0, 0], normal: [1, 0, 0] })).toEqual(['k1']);
+    expect(keepsThrough(keeps, { axis: 0, at: 10 })).toEqual(['k1', 'k2']);
+    expect(keepsThrough(keeps, { axis: 2, at: 200 })).toEqual([]);
+    expect(keepsThrough(keeps, { position: [0, 0, 120], normal: [0, 0, 1], joint: 'apart', part: { r: 30, side: 1 } })).toEqual([]);
+    expect(keepsThrough(keeps, { axis: 2, at: 120, centre: [0, 0], r: 30, side: 1 })).toEqual([]);
+    expect(keepsThrough(keeps, { position: [0, 0, 0], normal: [1, 1, 0] })).toEqual([]);
+  });
+
+  it('the notes say what stays whole and where, what runs through it, and what no plan keeps whole', () => {
+    expect(splitNote('KEEP_KEPT', { keepId: 'k1', name: 'Ribbon', piece: 2 })).toMatchObject({ level: 'info', text: 'Ribbon stays whole, on piece 2.' });
+    expect(splitNote('KEEP_KEPT', { keepId: 'k1', name: 'Ribbon' }).text).toBe('Ribbon stays whole.');
+    expect(splitNote('KEEP_CUT', { keepId: 'k1', name: 'Ribbon', letters: ['A'], fits: true, size: [144, 54, 38] })).toMatchObject({
+      level: 'warn', text: 'Cut A runs through Ribbon, which you asked to keep whole. Fit to my printer keeps it whole.',
+    });
+    expect(splitNote('KEEP_CUT', { name: 'Ribbon', letters: ['A', 'C'], fits: false, size: [230, 92, 73] }).text).toBe(
+      'Cuts A and C run through Ribbon, which you asked to keep whole. At 230 × 92 × 73 mm it is too big for your printer in one piece.',
+    );
+    expect(splitNote('KEEP_NOT_KEPT', { name: 'Ribbon', letters: ['A'], size: [230, 92, 73] })).toMatchObject({
+      level: 'warn', text: 'No plan for your printer keeps Ribbon in one piece – cut A runs through it. It needs a piece of at least 230 × 92 × 73 mm.',
+    });
+    expect(splitNote('KEEP_NOT_KEPT', { name: 'Ribbon', letters: ['A', 'B'] }).text).toBe('No plan for your printer keeps Ribbon in one piece – cuts A and B run through it.');
+    expect(SPLIT_NOTE_CODES).toEqual(expect.arrayContaining(['KEEP_KEPT', 'KEEP_CUT', 'KEEP_NOT_KEPT']));
   });
 });

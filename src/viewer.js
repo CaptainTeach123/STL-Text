@@ -6,6 +6,7 @@ import {
   CanvasTexture,
   Color,
   CylinderGeometry,
+  Data3DTexture,
   DataTexture,
   DirectionalLight,
   DoubleSide,
@@ -31,6 +32,7 @@ import {
   Quaternion,
   Ray,
   Raycaster,
+  RedFormat,
   RGBAFormat,
   RingGeometry,
   Scene,
@@ -38,6 +40,7 @@ import {
   SRGBColorSpace,
   Sprite,
   SpriteMaterial,
+  UnsignedByteType,
   Vector2,
   Vector3,
   WebGLRenderer,
@@ -52,7 +55,7 @@ import { SEAT_WORD } from './locks.js';
 import { geometryFromBuffers } from './mesh.js';
 import { clickRadius, surfaceNormalAt } from './surfaceNormal.js';
 import {
-  APART_COLOR, CUT_COLOR, PIECE_COLORS, PIN_COLOR, TOO_BIG_COLOR, axisCuts, cellSizes, cutPlane, explodeOffset, letterFor, offsetAlongRay, pieceColorIndex,
+  APART_COLOR, CUT_COLOR, PIECE_COLORS, PIN_COLOR, TOO_BIG_COLOR, axisCuts, cellSizes, cutPlane, explodeOffset, letterFor, offsetAlongRay, pieceColorIndex, pieceColors,
   printTransform, printedFace, printedRow, snapTarget, triangleInBox, wayAt,
 } from './split.js';
 
@@ -109,6 +112,23 @@ const PART_STATE_COLORS = { lock: APART_COLOR, lift: 0xf59e0b, stuck: COLORS.too
  * colour, with a dark two-headed arrow across it: something to drag, not a hole.
  */
 export const HOVER_COLORS = Object.freeze({ part: 0xf2b705, stays: 0x2563eb, grip: 0x111827 });
+
+/**
+ * A detail kept whole (`setKeeps`): its material tinted green on the model, the box no cut may run through outlined in
+ * the same green – in either look, as it means the same in both.
+ */
+export const KEEP_COLOR = 0x22c55e;
+
+/** A detail's cubes as a 3D texture, 255 where it is (`setKeeps`). */
+function maskTexture(data, dims) {
+  const t = new Data3DTexture(data, dims[0], dims[1], dims[2]);
+  t.format = RedFormat;
+  t.type = UnsignedByteType;
+  t.magFilter = t.minFilter = NearestFilter;
+  t.unpackAlignment = 1;
+  t.needsUpdate = true;
+  return t;
+}
 
 /** What the pointer over a part's ring handle is told. */
 export const GRIP_TITLE = 'Drag to make the circle wider or narrower';
@@ -641,7 +661,18 @@ export class Viewer {
       handleGrow: { value: 0 },
       handleColor: { value: new Color(HOVER_COLORS.stays) },
     };
+    // the details kept whole (setKeeps): their cubes in one texture, on the grid the engine found them on
+    this.keepTint = {
+      on: { value: 0 },
+      mask: { value: maskTexture(new Uint8Array(1), [1, 1, 1]) },
+      from: { value: new Vector3() },
+      size: { value: new Vector3(1, 1, 1) },
+      cell: { value: 1 },
+      color: { value: new Color(KEEP_COLOR) },
+    };
     this.materials.model.onBeforeCompile = (shader) => {
+      const k = this.keepTint;
+      Object.assign(shader.uniforms, { keepOn: k.on, keepMask: k.mask, keepFrom: k.from, keepSize: k.size, keepCell: k.cell, keepColor: k.color });
       shader.uniforms.tintCount = this.tint.count;
       shader.uniforms.tintDisc = this.tint.disc;
       shader.uniforms.tintSpan = this.tint.span;
@@ -659,7 +690,8 @@ export class Viewer {
           '#include <common>',
           `#include <common>\nuniform int tintCount;\nuniform vec3 tintDisc[${TINTS}];\nuniform vec2 tintSpan[${TINTS}];\nuniform vec3 tintColor[${TINTS}];\nvarying vec3 vTintAt;
           uniform int hoverOn;\nuniform vec3 hoverDisc;\nuniform vec2 hoverSpan;\nuniform vec3 hoverColor;
-          uniform int handleOn;\nuniform sampler2D handleBoxes;\nuniform int handleLevels;\nuniform float handleFrom;\nuniform float handleStep;\nuniform float handleGrow;\nuniform vec3 handleColor;`,
+          uniform int handleOn;\nuniform sampler2D handleBoxes;\nuniform int handleLevels;\nuniform float handleFrom;\nuniform float handleStep;\nuniform float handleGrow;\nuniform vec3 handleColor;
+          uniform int keepOn;\nuniform highp sampler3D keepMask;\nuniform vec3 keepFrom;\nuniform vec3 keepSize;\nuniform float keepCell;\nuniform vec3 keepColor;`,
         )
         .replace(
           '#include <color_fragment>',
@@ -667,6 +699,10 @@ export class Viewer {
           for (int i = 0; i < ${TINTS}; i++) {
             if (i >= tintCount) break;
             if (vTintAt.z >= tintSpan[i].x && vTintAt.z <= tintSpan[i].y && distance(vTintAt.xy, tintDisc[i].xy) <= tintDisc[i].z) diffuseColor.rgb = mix(diffuseColor.rgb, tintColor[i], 0.5);
+          }
+          if (keepOn == 1) {
+            vec3 g = (vTintAt - keepFrom) / keepCell;
+            if (all(greaterThanEqual(g, vec3(0.0))) && all(lessThan(g, keepSize)) && texelFetch(keepMask, ivec3(g), 0).r > 0.5) diffuseColor.rgb = mix(diffuseColor.rgb, keepColor, 0.55);
           }
           if (hoverOn == 1 && vTintAt.z >= hoverSpan.x && vTintAt.z <= hoverSpan.y && distance(vTintAt.xy, hoverDisc.xy) <= hoverDisc.z) diffuseColor.rgb = mix(diffuseColor.rgb, hoverColor, 0.7);`,
         )
@@ -756,12 +792,16 @@ export class Viewer {
     // the parts a split takes out: each the circle it takes out, on its face
     this.partGroup = new Group();
     this.partCircles = []; // { group, badge, dispose }
+    this.keepGroup = new Group(); // the boxes of the details kept whole (setKeeps)
+    this.keepsKey = '';
+    this.keepCount = 0; // whether any detail kept whole has its cubes in the tint
+    this.keepPicking = false; // a detail to keep whole is being clicked (setKeepPicking)
     this.partsKey = '';
     this.partHover = null; // the part a click would take out while one is picked on the model (setPartHover)
     this.partHoverKey = '';
     this.partHoverShape = null; // { group, dispose } its circle and walls
     this.partHoverHandle = false; // whether the handle it leaves on is outlined
-    this.scene.add(this.cutGroup, this.cellGroup, this.pieceGroup, this.pieceLabelGroup, this.partGroup);
+    this.scene.add(this.cutGroup, this.cellGroup, this.pieceGroup, this.pieceLabelGroup, this.partGroup, this.keepGroup);
 
     // placing a cut from the view (see setAim): a plane that follows the pointer, the model's section on it, the point
     // under the pointer and ticks where it snaps
@@ -910,7 +950,9 @@ export class Viewer {
     if (this.resultMesh) this.resultMesh.visible = mode === 'result';
     this.pieceGroup.visible = this.pieceLabelGroup.visible = mode === 'pieces';
     this.partGroup.visible = mode === 'model';
+    this.keepGroup.visible = mode === 'model';
     this.tint.count.value = mode === 'model' ? this.tintCount : 0; // the model's material draws the final result too
+    this.keepTint.on.value = mode === 'model' && this.keepCount > 0 ? 1 : 0;
     // the part a click would take out, on the model only
     const hover = mode === 'model' && !!this.partHover;
     this.hoverTint.on.value = hover ? 1 : 0;
@@ -1112,6 +1154,94 @@ export class Viewer {
     });
     this.tintCount = tinted.length;
     this.#applyVisibility();
+  }
+
+  /**
+   * Show the details kept whole on the model (not on the pieces): each one's box outlined in green, seen through the
+   * model, thicker while its row is pointed at or being named (`selected`), and – where its cubes are known (`mask`,
+   * from the engine's finder: `{ origin, cell, dims, data }`, 255 where it is) – its material tinted green. Masks are
+   * drawn together where they share the finder's grid (the first one's); one off it is outlined only. Drawn again only
+   * when the list changes.
+   * @param {{ id: string, box: { min: number[], max: number[] }, mask?: object|null, selected?: boolean }[]} keeps
+   */
+  setKeeps(keeps = []) {
+    const key = JSON.stringify(keeps.map((k) => [k.id, k.box, !!k.selected, k.mask ? [k.mask.origin, k.mask.dims, k.mask.data.length] : null]));
+    if (key === this.keepsKey) return;
+    this.keepsKey = key;
+    for (const child of [...this.keepGroup.children]) {
+      this.keepGroup.remove(child);
+      child.geometry.dispose();
+      child.material.dispose();
+    }
+    for (const k of keeps) {
+      const { min, max } = k.box;
+      const c = (i) => [0, 1, 2].map((a) => ((i >> a) & 1 ? max[a] : min[a]));
+      const points = [];
+      for (let i = 0; i < 8; i++) {
+        for (let a = 0; a < 3; a++) if (!((i >> a) & 1)) points.push(...c(i), ...c(i | (1 << a)));
+      }
+      const line = new BufferGeometry();
+      line.setAttribute('position', new BufferAttribute(new Float32Array(points), 3));
+      const edge = new LineSegments(line, new LineBasicMaterial({ color: KEEP_COLOR, transparent: true, opacity: k.selected ? 1 : 0.75, depthTest: false }));
+      edge.renderOrder = 6;
+      this.keepGroup.add(edge);
+    }
+    // the cubes of every detail on one grid: the union of their masks, in one texture
+    const masks = keeps.map((k) => k.mask).filter(Boolean);
+    const first = masks[0];
+    const on = first ? masks.filter((m) => m.cell === first.cell && m.origin.every((v, a) => Math.abs(((v - first.origin[a]) / m.cell) - Math.round((v - first.origin[a]) / m.cell)) < 1e-3)) : [];
+    this.keepCount = on.length;
+    if (on.length) {
+      const cell = first.cell;
+      const lo = [0, 1, 2].map((a) => Math.min(...on.map((m) => m.origin[a])));
+      const hi = [0, 1, 2].map((a) => Math.max(...on.map((m) => m.origin[a] + m.dims[a] * cell)));
+      const dims = [0, 1, 2].map((a) => Math.max(1, Math.round((hi[a] - lo[a]) / cell)));
+      const data = new Uint8Array(dims[0] * dims[1] * dims[2]);
+      for (const m of on) {
+        const at = [0, 1, 2].map((a) => Math.round((m.origin[a] - lo[a]) / cell));
+        for (let z = 0; z < m.dims[2]; z++) {
+          for (let y = 0; y < m.dims[1]; y++) {
+            const from = (z * m.dims[1] + y) * m.dims[0];
+            const to = ((z + at[2]) * dims[1] + y + at[1]) * dims[0] + at[0];
+            for (let x = 0; x < m.dims[0]; x++) if (m.data[from + x]) data[to + x] = 255;
+          }
+        }
+      }
+      this.keepTint.mask.value.dispose();
+      this.keepTint.mask.value = maskTexture(data, dims);
+      this.keepTint.from.value.set(...lo);
+      this.keepTint.size.value.set(...dims);
+      this.keepTint.cell.value = cell;
+    }
+    this.#applyVisibility();
+  }
+
+  /** The details kept whole tinted green by a material of the live pieces' (`setKeeps`), as the model's own does. */
+  #keepTinted(shader) {
+    const k = this.keepTint;
+    Object.assign(shader.uniforms, { keepOn: k.on, keepMask: k.mask, keepFrom: k.from, keepSize: k.size, keepCell: k.cell, keepColor: k.color });
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vKeepAt;')
+      .replace('#include <project_vertex>', '#include <project_vertex>\nvKeepAt = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        '#include <common>\nvarying vec3 vKeepAt;\nuniform int keepOn;\nuniform highp sampler3D keepMask;\nuniform vec3 keepFrom;\nuniform vec3 keepSize;\nuniform float keepCell;\nuniform vec3 keepColor;',
+      )
+      .replace(
+        '#include <color_fragment>',
+        `#include <color_fragment>
+        if (keepOn == 1) {
+          vec3 g = (vKeepAt - keepFrom) / keepCell;
+          if (all(greaterThanEqual(g, vec3(0.0))) && all(lessThan(g, keepSize)) && texelFetch(keepMask, ivec3(g), 0).r > 0.5) diffuseColor.rgb = mix(diffuseColor.rgb, keepColor, 0.55);
+        }`,
+      );
+  }
+
+  /** While a detail to keep whole is clicked on the model: the pointer is a crosshair, and text on it is not picked. */
+  setKeepPicking(on) {
+    this.keepPicking = !!on;
+    this.renderer.domElement.style.cursor = on ? 'crosshair' : '';
   }
 
   /**
@@ -1848,6 +1978,8 @@ export class Viewer {
         side: DoubleSide, // the open cut shows the inside, in the piece's colour
         clippingPlanes,
       });
+      // a detail kept whole is tinted on the live pieces as on the model
+      material.onBeforeCompile = (shader) => this.#keepTinted(shader);
       const mesh = new Mesh(
         geometry,
         loose ? [material, new MeshStandardMaterial({ color: COLORS.passthrough, roughness: 0.6, metalness: 0.05, side: DoubleSide, clippingPlanes })] : material,
@@ -1998,6 +2130,9 @@ export class Viewer {
 
   #buildPieces(display, pieces, grid, ways) {
     const info = new Map(pieces.map((p) => [p.index, p]));
+    // a cell's second piece (a bit printed apart) a shade of its own
+    const colours = pieceColors(pieces.filter((p) => p.cell));
+    const colourOf = (index, cell) => PIECE_COLORS[colours.get(index) ?? pieceColorIndex(cell)];
     const passthrough = display.passthroughRanges ?? [];
     const marks = display.marks ?? [];
     const shells = new Map(); // piece index -> shells drawn so far
@@ -2023,7 +2158,7 @@ export class Viewer {
 
       const shell = part.kind === 'piece' ? (shells.get(part.index) ?? 0) : 0;
       if (part.kind === 'piece') shells.set(part.index, shell + 1);
-      const color = new Color(part.kind === 'pin' ? PIN_COLOR : part.kind === 'part' ? COLORS.model : PIECE_COLORS[pieceColorIndex(cell)]);
+      const color = new Color(part.kind === 'pin' ? PIN_COLOR : part.kind === 'part' ? COLORS.model : colourOf(part.index, cell));
       if (shell) color.offsetHSL(0, 0, shell % 2 ? 0.1 : -0.1); // the parts of one piece share its colour but stay told apart
       const material = new MeshStandardMaterial({ color, roughness: 0.55, metalness: 0.05, side: FrontSide });
       // each triangle's class: the solid, unrepaired (drawn as in the model view, from both sides), or a lock's
@@ -2069,7 +2204,7 @@ export class Viewer {
     for (const [index, { box, cell, fits }] of boxes) {
       const sprite = labelSprite(String(index), {
         fill: fits ? 'rgba(27, 34, 48, 0.82)' : cssColor(COLORS.tooBig),
-        ring: cssColor(PIECE_COLORS[pieceColorIndex(cell)]),
+        ring: cssColor(colourOf(index, cell)),
         px: 24,
       });
       sprite.scale.setScalar(this.#spriteScale(sprite.userData.px));
@@ -3001,7 +3136,8 @@ export class Viewer {
         return;
       }
       if (!d || Math.hypot(e.clientX - d.x, e.clientY - d.y) > CLICK_PX || performance.now() - d.t > CLICK_MS) return;
-      const itemId = this.#pickOverlay(e); // overlays are only visible, and so only picked, in the model view
+      // overlays are only visible, and so only picked, in the model view; a detail to keep whole is picked through them
+      const itemId = this.keepPicking ? null : this.#pickOverlay(e);
       if (itemId) {
         this.onSelectItem?.(itemId);
         return;

@@ -518,6 +518,89 @@ describe('split for printing', () => {
   });
 });
 
+describe('details kept whole', () => {
+  const box = { min: [-72, -47, 112], max: [72, 7, 150] };
+  const mark = { point: [0, -47, 135], normal: [0, -1, 0], box };
+  // rounded, with -0 turned into 0 so toEqual can compare it
+  const r = (v) => v.map((x) => Math.round(x * 1e6) / 1e6 + 0);
+
+  it('a detail is kept whole in one undo step, named, renamed (typing is one step) and let go; the last one gone, the list goes too', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'ribbon');
+    const v0 = doc.state.baseVersion;
+    // with no split yet one starts, from the settings used last, with no cuts: the model is not split
+    const k1 = doc.addKeep(mark, { defaults: { joint: 'dowels' } });
+    expect(k1).toBe('k1');
+    expect(doc.split).toEqual({ ...SPLIT_DEFAULTS, joint: 'dowels', cuts: [], keep: [{ id: 'k1', name: 'Detail 1', ...mark }] });
+    expect(doc.history).toHaveLength(1);
+    doc.renameKeep(k1, 'R', { coalesce: 'name' });
+    doc.renameKeep(k1, 'Ri', { coalesce: 'name' });
+    doc.renameKeep(k1, 'Ribbon', { coalesce: 'name' });
+    doc.endCoalescing();
+    doc.renameKeep(k1, 'Ribbon'); // the name it has: no step
+    expect(doc.history).toHaveLength(2);
+    expect(doc.split.keep[0].name).toBe('Ribbon');
+    const k2 = doc.addKeep({ point: [60, -2, 125], box }, { limit: 2 });
+    expect(k2).toBe('k2');
+    expect(doc.split.keep[1]).toMatchObject({ name: 'Detail 2', normal: [0, 0, 1] });
+    expect(doc.addKeep(mark, { limit: 2 })).toBeNull(); // as many as the split may keep whole
+    doc.removeKeep(k1);
+    expect(doc.split.keep.map((k) => k.id)).toEqual(['k2']);
+    // a new one never takes the id of one still listed
+    expect(doc.addKeep(mark)).toBe('k3');
+    doc.removeKeep('k2');
+    doc.removeKeep('k3');
+    expect('keep' in doc.split).toBe(false);
+    expect(doc.undo()).toBe(true);
+    expect(doc.split.keep.map((k) => k.id)).toEqual(['k3']);
+    // none of it is a new model version
+    expect(doc.state.baseVersion).toBe(v0);
+    // a new model's split goes, and its details with it
+    doc.setBase('stl', 'other');
+    expect(doc.split).toBeNull();
+  });
+
+  it('an empty list is no part of the split: its JSON and every key stay what they were, and the cut edits keep the details', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'bar');
+    doc.addCut({ position: [0, 0, 0], normal: [1, 0, 0] });
+    const before = JSON.stringify(doc.split);
+    doc.setSplit({ keep: [] });
+    expect(JSON.stringify(doc.split)).toBe(before);
+    expect(doc.history).toHaveLength(1); // the same split: no step
+    doc.addKeep(mark);
+    doc.removeKeep('k1');
+    expect(JSON.stringify(doc.split)).toBe(before);
+    expect(stableKey(doc.split)).toBe(stableKey(JSON.parse(before)));
+    expect('keeps' in normaliseSplit(doc.split)).toBe(false);
+    // Fit's cuts replace the cuts and nothing else; removing a cut leaves them too
+    doc.addKeep(mark);
+    doc.setSplit({ cuts: [{ position: [0, 0, 100], normal: [0, 0, 1] }] });
+    doc.removeCut(doc.split.cuts[0].id);
+    expect(doc.split.keep).toEqual([{ id: 'k1', name: 'Detail 1', ...mark }]);
+    // the history holds its own copies
+    doc.split.keep[0].box.min[0] = 999;
+    doc.undo();
+    expect(doc.split.keep[0].box.min[0]).toBe(-72);
+  });
+
+  it('a detail moves with the model: its click, its normal and its box, and reset brings them back', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'ribbon');
+    doc.addKeep(mark);
+    doc.transformBase(new Matrix4().makeRotationZ(Math.PI / 2));
+    const [k] = doc.split.keep;
+    expect(r(k.point)).toEqual([47, 0, 135]);
+    expect(r(k.normal)).toEqual([1, 0, 0]);
+    expect({ min: r(k.box.min), max: r(k.box.max) }).toEqual({ min: [-7, -72, 112], max: [47, 72, 150] });
+    doc.transformBase(new Matrix4().makeScale(2, 2, 2));
+    expect(r(doc.split.keep[0].box.max)).toEqual([94, 144, 300]);
+    doc.resetBase();
+    expect({ min: r(doc.split.keep[0].box.min), max: r(doc.split.keep[0].box.max) }).toEqual(box);
+    expect(r(doc.split.keep[0].point)).toEqual(mark.point);
+  });
+});
+
 describe('cuts that come apart', () => {
   const Z = [0, 0, 1];
   const X = [1, 0, 0];

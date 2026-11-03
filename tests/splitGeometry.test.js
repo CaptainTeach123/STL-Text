@@ -2,12 +2,15 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
 import {
   AXES, CLIP, FILAMENT, LIP, PIN_DIAMETERS, TO_PLANE, apartMales, applyMat4, chooseOrientation, clipHold, clipShape, endBeds, endsAsWell, isSymmetric,
-  normaliseSplit, pegMales, pegSizesFor, sizesFor,
+  layPieces, normaliseSplit, pegMales, pegSizesFor, sizesFor,
 } from '../src/split.js';
 import {
   bandFor,
   buildSplitDisplay,
   clearSplitCaches,
+  comesAway,
+  goesOnLast,
+  weldedClean,
   cutPieces,
   dovetailCells,
   dovetailTabs,
@@ -24,6 +27,7 @@ import {
   lipRegions,
   lipSolids,
   overFor,
+  partedSolids,
   pegAt,
   pegSolid,
   pinAt,
@@ -39,6 +43,7 @@ import {
 } from '../src/splitGeometry.js';
 import { inter, setup } from './helpers.js';
 import { box as boxAt, gothicSolid, lanternSolid, lift, overhangs, stlCheck } from './lanternFixture.js';
+import { ribbonColumn } from './ribbonFixture.js';
 
 let wasm;
 let font;
@@ -1126,6 +1131,340 @@ describe('odd shapes', () => {
     expect(layout.dowels).toHaveLength(2);
     expect(layout.labels).toEqual([]);
     expect(layout.notes).toEqual([]);
+  });
+});
+
+describe('which piece a face is', () => {
+  /**
+   * The stage chain as the engine runs it where a box's shells print apart: the pieces laid on `bed` (`layPieces`),
+   * each with its own solid (`partedSolids`), which the layout is given.
+   */
+  function laidSplit(solid, list, bed, patch = {}) {
+    const { spec, cuts } = cutsFor(solid, list, patch);
+    const plan = planDovetails(solid, cuts, spec);
+    const cut = cutPieces(solid, cuts, { dove: plan.dove, tabs: plan.tabs });
+    cut.pieces.forEach((p) => own(p.solid));
+    const laid = layPieces(cut.pieces, bed, spec.orient);
+    const solids = new Map();
+    for (const c of cut.pieces) {
+      const mine = laid.filter((p) => p.from === c.index);
+      const parted = mine.length > 1 ? partedSolids(c.solid, c.parts, mine.map((p) => p.parts)).map(own) : [c.solid];
+      mine.forEach((p, k) => solids.set(p.index, parted[k]));
+    }
+    const pieces = laid.map((p) => ({ index: p.index, cell: p.cell, up: p.lying.up, boxes: p.boxes, volume: p.volume }));
+    const layout = layoutSplit(solid, cuts, pieces, spec, { joints: plan.joints, font, solids: (i) => solids.get(i) });
+    return { spec, cuts, laid, pieces, solids, layout };
+  }
+  /** Whether a point (plane coordinates) lies on a piece's own face: the piece sliced 0.02 mm inside its side. */
+  const onFace = (m, axis, at, [u, v]) => {
+    const face = own(own(m.transform(TO_PLANE[axis])).slice(at));
+    const dot = own(own(wasm.CrossSection.square([0.1, 0.1], true)).translate([u, v]));
+    return own(face.intersect(dot)).area() > 0.0099;
+  };
+
+  it('the ribbon fixture is the model the keep-whole numbers were measured on', () => {
+    const r = own(ribbonColumn());
+    expect(r.decompose().map(own)).toHaveLength(1);
+    expect(r.volume() / 1000).toBeCloseTo(1531.07, 1);
+    expect(boxOf(r)).toMatchObject({ min: [-80, -55, 0], max: [80, 55, 260] });
+  });
+
+  it('a bit hooked round the rest of its box cannot come away along the cut; a straight one can', () => {
+    // cut at X 10, the ribbon's right end is loose round the column's right flank: moved along −x it runs into it
+    const r = own(ribbonColumn());
+    const right = own(r.trimByPlane([1, 0, 0], 10));
+    const [column, ribbon] = right.decompose().map(own).sort((p, q) => q.volume() - p.volume());
+    const hooked = comesAway(ribbon, column, 0, 10, 1);
+    expect(hooked.free).toBe(false);
+    expect(hooked.blocked).toBeGreaterThan(1000);
+    // the column itself comes away from the ribbon's end: nothing of it lies behind the ribbon along x
+    expect(comesAway(column, ribbon, 0, 10, 1).free).toBe(true);
+    // a bar beside a block slides past it, and a bit with nothing beside it is free
+    const block = cube([20, 20, 20], [10, 0, 10]);
+    const bar = cube([20, 4, 4], [10, 14, 10]);
+    expect(comesAway(bar, block, 0, 0, 1)).toEqual({ free: true, blocked: 0, at: null });
+    expect(comesAway(bar, null, 0, 0, 1).free).toBe(true);
+    // a hook: a bar whose far end turns down behind the block
+    const hook = own(wasm.Manifold.union([cube([30, 4, 4], [15, 0, 24]), cube([4, 4, 14], [28, 0, 17])]));
+    const behind = cube([20, 20, 20], [10, 0, 10]);
+    const caught = comesAway(hook, behind, 0, 0, 1);
+    expect(caught.free).toBe(false);
+    expect(caught.blocked).toBeCloseTo(40, 0);
+  });
+
+  it('a face is shared out by the pieces\' material: cut at X 10 the column\'s halves take every pin, the ribbon\'s loose end none', () => {
+    const r = own(ribbonColumn());
+    const s = laidSplit(r, [[0, 10]], [120, 120, 300]);
+    // the ribbon's right end is loose in the right box, and prints apart as piece 3
+    expect(s.laid.map((p) => [p.index, p.cell[0], p.from])).toEqual([[1, 0, 1], [2, 1, 2], [3, 1, 2]]);
+    expect(s.laid[2].bbox.min[2]).toBeCloseTo(112, 3);
+    // every pin joins the column's two halves, its centre on both pieces' own faces – none on the ribbon's 185 mm²
+    expect(s.layout.dowels).toHaveLength(6);
+    for (const d of s.layout.dowels) {
+      expect(d.sides.map((x) => x.piece)).toEqual([1, 2]);
+      expect(onFace(s.solids.get(1), 0, 9.98, d.uv)).toBe(true);
+      expect(onFace(s.solids.get(2), 0, 10.02, d.uv)).toBe(true);
+    }
+    // the ribbon's end hooks round the column, so it cannot come away along the cut towards piece 1 – but once the
+    // column is on it goes on last from the right, along the pins: its face is no glue face, and too narrow (6.2 mm) for
+    // a pin of its own
+    expect(s.layout.seams.map((x) => [x.pieces, x.joint, x.dowels.length])).toEqual([[[1, 3], 'none', 0], [[1, 2], 'dowels', 6]]);
+    expect(s.layout).not.toHaveProperty('glued');
+    expect(s.layout.last).toEqual([{ cutId: 'c1', letter: 'A', axis: 0, side: 1, piece: 3, across: 1 }]);
+    expect(s.layout.labels.map((l) => l.sides.map((x) => x.text))).toEqual([['1A', '2A']]);
+    // and so with built-in pegs: the column's halves carry them all
+    const pegged = laidSplit(r, [[0, 10]], [120, 120, 300], { joint: 'pegs' });
+    expect(pegged.layout.pegs.length).toBeGreaterThan(0);
+    for (const p of pegged.layout.pegs) expect(p.sides.map((x) => x.piece)).toEqual([1, 2]);
+    expect(pegged.layout.seams.map((x) => [x.pieces, x.joint])).toEqual([[[1, 3], 'none'], [[1, 2], 'pegs']]);
+  });
+
+  /**
+   * A block left of x 0 with a tall post standing out of its right face, and a C hung off the block round the post's far
+   * side, 4 mm behind it (the right box's two shells: the C prints apart). With `barb`, a tooth on the C's arm sits
+   * behind a bump on the post's side, so it cannot go on from the right either.
+   */
+  const hooked = (barb = false) => own(wasm.Manifold.union([
+    cube([30, 60, 150], [-15, 0, 75]), cube([20, 28, 150], [10, 0, 75]),
+    cube([28, 12, 20], [14, 22, 70]), cube([28, 12, 20], [14, -22, 70]), cube([4, 56, 20], [26, 0, 70]),
+    ...(barb ? [cube([4, 1.5, 20], [4, 15.25, 70]), cube([4, 1.5, 20], [10, 14.75, 70])] : []),
+  ]));
+
+  it('a piece hooked round the rest of its box towards the cut keeps its pins where it goes on last from beyond it', () => {
+    const s = laidSplit(hooked(), [[0, 0]], [300, 300, 300], { diameter: 5, orient: 'model' });
+    expect(s.laid.map((p) => [p.index, p.cell[0]])).toEqual([[1, 0], [2, 1], [3, 1]]);
+    // the C cannot come away towards piece 1 – its back runs into the post – but it is pushed on from the right last
+    const [c] = [s.solids.get(3)];
+    expect(comesAway(c, s.solids.get(2), 0, 0, 1)).toMatchObject({ free: false, blocked: expect.closeTo(560, 0) });
+    expect(goesOnLast(c, s.solids.get(2), 0, 0, 1)).toEqual({ free: true, blocked: 0, at: null });
+    expect(s.layout).not.toHaveProperty('glued');
+    expect(s.layout.last).toEqual([{ cutId: 'c1', letter: 'A', axis: 0, side: 1, piece: 3, across: 1 }]);
+    const pairs = s.layout.seams.map((x) => [x.pieces, x.joint, x.dowels.length > 0]);
+    expect(pairs).toEqual(expect.arrayContaining([[[1, 2], 'dowels', true], [[1, 3], 'dowels', true]]));
+    for (const d of s.layout.dowels.filter((x) => x.sides[1].piece === 3)) expect(onFace(c, 0, 0.02, d.uv)).toBe(true);
+    // with a tooth behind a bump on the post it can go on neither way along the cut: glued, with no pins
+    const barbed = laidSplit(hooked(true), [[0, 0]], [300, 300, 300], { diameter: 5, orient: 'model' });
+    expect(goesOnLast(barbed.solids.get(3), barbed.solids.get(2), 0, 0, 1)).toMatchObject({ free: false, blocked: expect.closeTo(20, 0) });
+    expect(barbed.layout).not.toHaveProperty('last');
+    expect(barbed.layout.glued).toEqual([{ cutId: 'c1', letter: 'A', piece: 3, across: 1, blocked: expect.closeTo(590, 0) }]);
+    expect(barbed.layout.seams.map((x) => [x.pieces, x.joint, x.dowels.length])).toEqual(expect.arrayContaining([[[1, 3], 'none', 0]]));
+  });
+
+  it('a bit printed apart that slides off along the cut keeps its own pins', () => {
+    // a block with a slab on the bed and a bar held over it standing out of its right side: cut at X 0, the bar is a
+    // piece of its own, and it comes away along x
+    const shape = own(wasm.Manifold.union([cube([28, 20, 40], [-16, 0, 20]), cube([32, 20, 12], [14, 0, 6]), cube([32, 20, 10], [14, 0, 30])]));
+    const s = laidSplit(shape, [[0, 0]], BED, { orient: 'model' });
+    expect(s.laid.map((p) => [p.index, p.cell[0]])).toEqual([[1, 0], [2, 1], [3, 1]]);
+    expect(s.layout.glued).toBeUndefined();
+    const pairs = s.layout.seams.map((x) => [x.pieces, x.dowels.length > 0]);
+    expect(pairs).toEqual(expect.arrayContaining([[[1, 2], true], [[1, 3], true]]));
+    for (const d of s.layout.dowels) {
+      const k = d.sides[1].piece;
+      expect(onFace(s.solids.get(k), 0, 0.02, d.uv)).toBe(true);
+    }
+  });
+
+  it('a face that is one piece on both sides takes nothing: a bit given to the piece across the cut', () => {
+    // a block with a fin and a slab standing out of its right side, apart beyond the cut at X 0: the fin's end is given
+    // back to the block (it holds that bit of the right box), the slab is the right box's piece
+    const block = cube([28, 20, 10], [-16, 0, 5]);
+    const fin = cube([7, 3, 10], [1.5, -8.5, 5]);
+    const slab = cube([22, 15, 10], [9, 2.5, 5]);
+    const shape = own(wasm.Manifold.union([block, fin, slab]));
+    const { spec, cuts } = cutsFor(shape, [[0, 0]], { labels: false });
+    const cut = cutPieces(shape, cuts);
+    cut.pieces.forEach((p) => own(p.solid));
+    expect(cut.pieces.map((p) => p.shells)).toEqual([1, 1]);
+    expect(cut.pieces[0].joined).toMatchObject([{ fromCell: [1, 0, 0], cutId: 'c1', letter: 'A' }]);
+    expect(cut.pieces[0].joined[0].volume).toBeCloseTo(150, 3);
+    const pieces = cut.pieces.map((p) => ({ index: p.index, cell: p.cell, up: '+z', ...(p.joined ? { joined: p.joined } : {}) }));
+    const solids = new Map(cut.pieces.map((p) => [p.index, p.solid]));
+    const layout = layoutSplit(shape, cuts, pieces, spec, { solids: (i) => solids.get(i) });
+    // the fin's face is the block's on both sides: no pin and no seam; the slab's face joins 1 and 2
+    expect(layout.seams.map((x) => [x.pieces, x.patches])).toEqual([[[1, 2], 1]]);
+    expect(layout.dowels.length).toBeGreaterThanOrEqual(2);
+    for (const d of layout.dowels) {
+      expect(d.sides.map((x) => x.piece)).toEqual([1, 2]);
+      expect(d.centre[1]).toBeGreaterThan(-5);
+    }
+  });
+});
+
+describe('loose bits given back', () => {
+  /** A slab on the bed right across x 0, a tower on its left half, and `bits` standing out of the tower's right face. */
+  const tower = (...bits) => own(wasm.Manifold.union([cube([60, 20, 5], [0, 0, 2.5]), cube([30, 20, 15], [-15, 0, 12.5]), ...bits]));
+  const sizes = (r) => r.pieces.map((p) => p.shells);
+  const total = (r) => r.pieces.reduce((s, p) => s + p.volume, 0);
+  const dims = (list) => list.map((f) => ({ ...f, dims: f.dims.map((v) => Math.round(v * 10) / 10) }));
+
+  it('a crumb a cut leaves loose stays on the piece it hangs on, in one shell, and the piece is worked out again', () => {
+    // a 1 mm nub on the tower, cut at x 0.3: its 0.5 mm³ tip is loose in the right box, over nothing of it
+    const m = tower(cube([0.8, 1, 1], [0.4, 0, 15.5]));
+    const r = cutPieces(m, cutsFor(m, [[0, 0.3]]).cuts);
+    r.pieces.forEach((p) => own(p.solid));
+    expect(sizes(r)).toEqual([1, 1]);
+    expect(r.pieces[0].joined).toMatchObject([{ fromCell: [1, 0, 0], cutId: 'c1', letter: 'A' }]);
+    expect(r.pieces[0].joined[0].volume).toBeCloseTo(0.5, 6);
+    expect(r.pieces[0].joined[0].contact).toBeCloseTo(1, 3);
+    // the piece reaches past the cut, its box and statistics worked out with the crumb on it
+    expect(r.pieces[0].bbox.max[0]).toBeCloseTo(0.8, 6);
+    expect(r.pieces[0].stats.dims[0]).toBeCloseTo(30.8, 4);
+    expect(r.pieces[1]).toMatchObject({ shells: 1, volume: expect.closeTo(2970, 3), bbox: { max: [30, 10, 5] } });
+    // the plate that joins them is the model's own material: one shell, and nothing added to the model
+    expect(shells(r.pieces[0].solid)).toHaveLength(1);
+    expect(r.pieces[0].solid.volume()).toBeCloseTo(r.pieces[0].volume, 6);
+    expect(total(r)).toBeCloseTo(m.volume(), 3);
+    expect(r.notes).toEqual([]);
+    expect(r).not.toHaveProperty('fits');
+  });
+
+  it('a fin a tenth of its box goes back too, its piece\'s sealed pocket kept; on a bed it may not make the piece too big', () => {
+    // a 10 × 6 × 5 fin cut at x 0.3: 300 mm³ in the right box, a tenth of the slab there
+    const m = own(tower(cube([10.3, 6, 5], [5.15, 0, 14.5])).subtract(cube([4, 4, 4], [-15, 0, 12])));
+    const { cuts } = cutsFor(m, [[0, 0.3]]);
+    const r = cutPieces(m, cuts);
+    r.pieces.forEach((p) => own(p.solid));
+    expect(sizes(r)).toEqual([1, 1]);
+    expect(r.pieces[0].joined).toMatchObject([{ volume: expect.closeTo(300, 6), contact: expect.closeTo(30, 3) }]);
+    expect(r.pieces[0].volume).toBeCloseTo(12275, 3);
+    expect(shells(r.pieces[0].solid).map((x) => Math.round(x.volume()))).toEqual([12339, -64]);
+    expect(total(r)).toBeCloseTo(m.volume(), 3);
+    // the left piece fits a 35 mm bed only without the fin: it stays in its box, which prints it, saying why
+    const small = cutPieces(m, cuts, { bed: [35, 35, 35] });
+    small.pieces.forEach((p) => own(p.solid));
+    expect(sizes(small)).toEqual([1, 2]);
+    expect(small.pieces[0]).not.toHaveProperty('joined');
+    // it comes away along the cut, so it goes onto the left piece first, pushed on from the right
+    expect(small.pieces[1].parts.map((x) => x.loose ?? null)).toEqual([null, expect.objectContaining({ cutId: 'c1', letter: 'A', why: 'big', across: [0, 0, 0], away: '+x', moveTo: null })]);
+    expect(dims(small.fits)).toEqual([{ dims: [40.3, 20, 20], flat: null, fits: false }, { dims: [30.3, 20, 20], flat: null, fits: true }]);
+    expect(total(small)).toBeCloseTo(m.volume(), 3);
+    // a bed that takes the grown piece gives it back; so does one the piece is too big for without it as well
+    for (const [bed, fits] of [[[45, 45, 45], [true]], [[25, 25, 25], [false, false]]]) {
+      const s = cutPieces(m, cuts, { bed });
+      s.pieces.forEach((p) => own(p.solid));
+      expect(sizes(s)).toEqual([1, 1]);
+      expect(s.pieces[0].joined).toHaveLength(1);
+      expect(s.fits.map((f) => f.fits)).toEqual(fits);
+    }
+  });
+
+  it('shells of a size stay in their box, and so does a loose part of the model\'s own: nothing changes', () => {
+    // a U cut through its arms: two equal arms, then a 30 % one beside the other
+    const arms = (w) => own(wasm.Manifold.union([cube([60, 20, 15], [30, 10, 7.5]), cube([10, 20, 35], [5, 10, 32.5]), cube([w, 20, 35], [60 - w / 2, 10, 32.5])]));
+    // a loose cube of the model's own, cut through: each half meets only the other, a bit of its box as well
+    const floating = own(wasm.Manifold.union([cube([60, 20, 5], [0, 0, 2.5]), cube([4, 4, 4], [0, 0, 15])]));
+    for (const [m, list, want] of [[arms(10), [[2, 30]], [1, 2]], [arms(3), [[2, 30]], [1, 2]], [floating, [[0, 0]], [2, 2]]]) {
+      const r = cutPieces(m, cutsFor(m, list).cuts, { bed: BED });
+      r.pieces.forEach((p) => own(p.solid));
+      expect(sizes(r)).toEqual(want);
+      for (const p of r.pieces) {
+        expect(p).not.toHaveProperty('joined');
+        for (const x of p.parts ?? []) expect(x).not.toHaveProperty('loose');
+      }
+      expect(r).not.toHaveProperty('fits');
+      expect(r.notes).toEqual([]);
+    }
+  });
+
+  it('a bit hooked round its box stays, saying which way it goes on and where the cut would keep it on', () => {
+    // cut at X 10, the ribbon's right end hooks round the column: it cannot come away along −x, to piece 1
+    const r = own(ribbonColumn());
+    const { cuts } = cutsFor(r, [[0, 10]]);
+    const made = cutPieces(r, cuts, { bed: [120, 120, 300] });
+    made.pieces.forEach((p) => own(p.solid));
+    expect(sizes(made)).toEqual([1, 2]);
+    const [column, ribbon] = made.pieces[1].parts;
+    expect(column).not.toHaveProperty('loose');
+    expect(ribbon.volume).toBeCloseTo(15398.7, 0);
+    // once the column is on it goes on last from the right, along its cut (it may take pins); the cut moved to X −25
+    // holds it on over 30 mm, and its piece still fits the bed
+    expect(ribbon.loose).toMatchObject({ cutId: 'c1', letter: 'A', why: 'hooks', across: [0, 0, 0], away: '+x', pins: true, moveTo: -25 });
+    expect(ribbon.loose.blocked).toBeGreaterThan(1000);
+    expect(ribbon.loose.contact).toBeCloseTo(184.4, 0);
+    // its own face on the cut: its pins have no say in the model's size of them
+    expect(own(new wasm.CrossSection(ribbon.loose.face, 'Positive')).area()).toBeCloseTo(ribbon.loose.contact, 0);
+    expect(made.fits).toEqual([{ dims: [105, 110, 260], flat: null, fits: true }]);
+    expect(total(made)).toBeCloseTo(r.volume(), 3);
+    // a bed too narrow for the piece the moved cut would make has nowhere to move the cut to
+    const narrow = cutPieces(r, cuts, { bed: [100, 120, 300] });
+    narrow.pieces.forEach((p) => own(p.solid));
+    expect(narrow.pieces[1].parts[1].loose).toMatchObject({ why: 'hooks', away: '+x', moveTo: null });
+  });
+
+  it('a bit that meets only bits goes once they have gone; a crumb that meets only a bit kept loose goes with it', () => {
+    const r = own(ribbonColumn());
+    const bed = [120, 120, 300];
+    // cut at X 0, Y 0 and Z 116: a tail's tip below Z 116 meets only the tail strip above it, a bit itself, which goes
+    // to the front piece across Y 0 – the tip follows it there, round by round. Every piece is one shell
+    const all = cutPieces(r, cutsFor(r, [[0, 0], [1, 0], [2, 116]]).cuts, { bed });
+    all.pieces.forEach((p) => own(p.solid));
+    expect(sizes(all)).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
+    expect(all.pieces.flatMap((p) => (p.joined ?? []).map((j) => Math.round(j.volume)))).toEqual(expect.arrayContaining([5346, 672, 112]));
+    expect(total(all)).toBeCloseTo(r.volume(), 2);
+    // cut at X 10 and Z 116: the ribbon's loose end hooks round the column; its tip below Z 116 meets nothing else, and
+    // goes with it, so no 4 mm crumb prints as a piece of its own
+    const two = cutPieces(r, cutsFor(r, [[0, 10], [2, 116]]).cuts, { bed });
+    two.pieces.forEach((p) => own(p.solid));
+    expect(two.pieces.map((p) => [p.cell.join(''), p.shells])).toEqual([['000', 1], ['100', 1], ['001', 1], ['101', 2]]);
+    const end = two.pieces[3].parts.find((x) => x.loose);
+    expect(end.loose).toMatchObject({ why: 'hooks', away: '+x', pins: true });
+    expect(end.box.min[2]).toBeCloseTo(112, 3);
+    expect(two.pieces[3].joined).toEqual([expect.objectContaining({ fromCell: [1, 0, 0], cutId: 'c2', part: two.pieces[3].parts.indexOf(end) })]);
+    expect(total(two)).toBeCloseTo(r.volume(), 2);
+  });
+
+  it('a piece is clean where a bit joins it, as its file will be: no double wall, no edge of more than two triangles', () => {
+    // two boxes written as one mesh that meet face to face, or edge to edge: as a slicer welds them, edges of four
+    const raw = (dx, dy) => {
+      const a = own(wasm.Manifold.cube([1, 1, 1])).getMesh();
+      const n = a.vertProperties.length / 3;
+      const v = new Float32Array(6 * n);
+      v.set(a.vertProperties);
+      for (let i = 0; i < n; i++) [dx, dy, 0].forEach((d, k) => { v[3 * (n + i) + k] = a.vertProperties[3 * i + k] + d; });
+      const t = new Uint32Array(2 * a.triVerts.length);
+      t.set(a.triVerts);
+      a.triVerts.forEach((x, i) => { t[a.triVerts.length + i] = x + n; });
+      return own(new wasm.Manifold(new wasm.Mesh({ numProp: 3, vertProperties: v, triVerts: t })));
+    };
+    const all = { min: [-5, -5, -5], max: [5, 5, 5] };
+    expect(weldedClean(raw(1, 0), all)).toBe(false);
+    expect(weldedClean(raw(1, 1), all)).toBe(false);
+    expect(weldedClean(raw(3, 0), all)).toBe(true);
+    expect(weldedClean(raw(1, 0), { min: [3, 3, 3], max: [5, 5, 5] })).toBe(true);
+    // tapered bits on a tower's face, cut 0.1 mm out: each goes back, and its piece is one shell, clean
+    for (const [r0, r1, seg, tilt] of [[1.5, 0.2, 32, 0], [1.2, 0.05, 48, 17], [2, 1.9, 40, 0], [1, 0.3, 7, 21]]) {
+      const cone = own(own(own(own(wasm.Manifold.cylinder(3, r0, r1, seg)).rotate([0, 90, 0])).rotate([tilt, 0, 0])).translate([-0.5, 0.3, 30.2]));
+      const m = own(wasm.Manifold.union([cube([20, 20, 40], [-10, 0, 20]), cube([20, 20, 10], [10, 0, 5]), cone]));
+      const r = cutPieces(m, cutsFor(m, [[0, 0.1]]).cuts, { bed: BED });
+      r.pieces.forEach((p) => own(p.solid));
+      expect(sizes(r)).toEqual([1, 1]);
+      expect(r.pieces[0].joined).toHaveLength(1);
+      expect(weldedClean(r.pieces[0].solid, boxOf(r.pieces[0].solid))).toBe(true);
+      expect(total(r)).toBeCloseTo(m.volume(), 2);
+    }
+  });
+
+  it('a bit that can go on neither way along its cut keeps its own face for glue, and the first way it is free', () => {
+    // the C round a post (as in 'which piece a face is'), with a tooth behind a bump on the post: it hooks both ways
+    const shape = (barb) => own(wasm.Manifold.union([
+      cube([30, 60, 150], [-15, 0, 75]), cube([20, 28, 150], [10, 0, 75]),
+      cube([28, 12, 20], [14, 22, 70]), cube([28, 12, 20], [14, -22, 70]), cube([4, 56, 20], [26, 0, 70]),
+      ...(barb ? [cube([4, 1.5, 20], [4, 15.25, 70]), cube([4, 1.5, 20], [10, 14.75, 70])] : []),
+    ]));
+    const free = shape(false);
+    const a = cutPieces(free, cutsFor(free, [[0, 0]]).cuts, { bed: BED });
+    a.pieces.forEach((p) => own(p.solid));
+    const bitOf = (r) => r.pieces[1].parts.find((x) => x.loose).loose;
+    expect(bitOf(a)).toMatchObject({ why: 'hooks', away: '+x', pins: true, blocked: expect.closeTo(560, 0) });
+    expect(own(new wasm.CrossSection(bitOf(a).face, 'Positive')).area()).toBeCloseTo(bitOf(a).contact, 0);
+    const barbed = shape(true);
+    const b = cutPieces(barbed, cutsFor(barbed, [[0, 0]]).cuts, { bed: BED });
+    b.pieces.forEach((p) => own(p.solid));
+    const loose = bitOf(b);
+    expect(loose).toMatchObject({ why: 'hooks', away: '+z', blocked: expect.closeTo(590, 0) });
+    expect(loose).not.toHaveProperty('pins');
+    expect(own(new wasm.CrossSection(loose.face, 'Positive')).area()).toBeCloseTo(loose.contact, 0);
   });
 });
 

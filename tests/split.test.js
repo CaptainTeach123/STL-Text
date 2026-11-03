@@ -9,12 +9,13 @@ import { manifold } from '../src/manifold.js';
 import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
 import {
-  APART_HOLDS, FILAMENT, SPLIT_DEFAULTS, TO_PLANE, cellSizes, cellSupport, fitPieces, isSymmetric, orientationStats, pegSizesFor, sizesFor,
+  APART_HOLDS, FILAMENT, SPLIT_DEFAULTS, TO_PLANE, cellSizes, cellSupport, cutPlane, fitPieces, isSymmetric, keepCrossed, orientationStats, pegSizesFor, sizesFor,
 } from '../src/split.js';
 import { clearSplitCaches, dowelHole, halfHole, pegAt, pinAt, pinSolid, socketAt } from '../src/splitGeometry.js';
 import { lipLine, lipVerdict } from '../src/aim.js';
 import { setup, soupOf as soupGeometry } from './helpers.js';
 import { box, gothicSolid, lanternSolid, lidBoxSolid, lift, loggiaSolid, roundLanternSolid, slenderTowerSolid, stlCheck, stlFileCheck } from './lanternFixture.js';
+import { ribbonColumn } from './ribbonFixture.js';
 
 const fontBytes = (pkg, file) => {
   const buf = fs.readFileSync(path.resolve('node_modules/@fontsource', pkg, 'files', file));
@@ -941,6 +942,251 @@ describe('planning pieces that really print', () => {
     expect(piecesOf(lettered).map((f) => above(f) > 100)).toEqual([true, false, true, false]);
   });
 
+  it('pins go where the material is: cut at X 10, the column\'s halves take every pin, the ribbon\'s loose end goes on last', async () => {
+    // right of x 10 the fixture's ribbon touches the column nowhere: its end is loose in the right box, prints apart
+    // as piece 3, and hooks round the column, so it cannot come away from it towards piece 1 – it goes on last, from
+    // the right
+    await load(own(ribbonColumn()), 'ribbon');
+    const bed = [120, 120, 300];
+    const split = S({ cuts: [cutAt(0, 10)] });
+    const r = await resultSplit(split, { bed });
+    expect(r.pieces.map((p) => [p.index, p.cell[0], p.dowels])).toEqual([[1, 0, 6], [2, 1, 6], [3, 1, 0]]);
+    expect(r.seams.map((s) => [s.letter, s.pieces, s.joint, s.dowels.length])).toEqual([['A', [1, 3], 'none', 0], ['A', [1, 2], 'dowels', 6]]);
+    for (const d of dowelsOf(r)) {
+      expect(d.sides.map((x) => x.piece)).toEqual([1, 2]);
+      // on the base or the column, not on the ribbon's face (y −45.9…−39.7, z 120–150)
+      expect(d.centre[2] < 15 || Math.abs(d.centre[1]) < 38.7).toBe(true);
+    }
+    // the notes say it is loose, how it goes on and where the cut would keep it on; the sheet glues it on last
+    const loose = r.notes.filter((n) => n.code === 'LOOSE_KEPT');
+    expect(loose).toEqual([expect.objectContaining({ level: 'warn', letter: 'A', piece: 3, apart: true, around: 2, across: 1, away: '+x', pins: true, moveTo: -25 })]);
+    expect(loose[0].text).toBe('Cut A leaves 15.4 cm³ of the model loose (x 10–72, z 112–150): it wraps round piece 2, so it prints as piece 3. '
+      + 'Glue it on last, pushed on from the right. Move cut A to −25 mm or lower to keep it on.');
+    expect(r.notes.map((n) => n.code)).not.toContain('ISLAND_JOINED');
+    // it prints as a piece of its own, so the list says nothing of loose parts
+    expect(r.pieces.map((p) => [p.shells, p.loose ?? 0])).toEqual([[1, 0], [1, 0], [1, 0]]);
+    // each half of every hole is drilled out of its own piece, and none of them comes near the ribbon's end
+    const ex = await exportSplit(split, { name: 'ribbon', bed });
+    const files = piecesOf(ex).map(assembled);
+    expect(files).toHaveLength(3);
+    for (const { m, dowel, side } of holesOf(r)) {
+      expect(overlap(m, files[dowel.sides[side].piece - 1])).toBeLessThan(1e-3);
+      expect(overlap(m, files[2])).toBeLessThan(1e-6);
+    }
+    const steps = ex.files.find((f) => f.kind === 'text').text.split('\n').filter((l) => /^ {2}\d+\. /.test(l));
+    expect(steps).toEqual([
+      '  1. Cut A: glue 6 pins into face 1A, a thin film on the face, push piece 2 on (2A). Hold 1 minute.',
+      '  2. Cut A: glue piece 3 on last – a thin film of glue on its face, then slide it on from the right against piece 1. Hold until it sets.',
+    ]);
+    // an engine that keeps no pieces cuts them again for the layout, and hands them on to the drilling: the same
+    const lean = createEngine({ wasm, splitKeepTriangles: 0 });
+    const c2 = createEngineClient({ createWorker: () => createLocalWorker(Promise.resolve(lean)) });
+    await c2.addFont('inter', fontBytes('inter', 'inter-latin-700-normal.woff'));
+    await c2.loadBase({ kind: 'stl', bytes: stlOf(own(ribbonColumn())), name: 'ribbon', version: 1 });
+    const shown = await c2.result([], 1, { printing, split, bed });
+    expect(shown.seams).toEqual(r.seams);
+    const again = await c2.export([], 1, 'ribbon', { printing, split: S({ cuts: [cutAt(0, 10)], diameter: 5 }), bed });
+    expect(again.seams.map((s) => [s.pieces, s.joint])).toEqual([[[1, 3], 'none'], [[1, 2], 'dowels']]);
+    lean.dispose();
+  });
+
+  it('a part a cut leaves held on only next to it is said, with where the cut would hold it on: the ribbon cut at X 0', async () => {
+    // the ribbon's right half is fused to the column only left of x 5.6: cut at X 0, it holds on over 6 mm of piece 2
+    const ribbon = own(ribbonColumn());
+    await load(ribbon, 'ribbon');
+    const bed = [120, 120, 300];
+    const r = await resultSplit(S({ cuts: [cutAt(0, 0)] }), { bed });
+    const held = r.notes.filter((n) => n.code === 'BARELY_HELD');
+    expect(held).toEqual([expect.objectContaining({ level: 'warn', letter: 'A', cutId: 'c1', axis: 0, at: 0, piece: 2, w: 6, moveTo: -10, holds: 16 })]);
+    expect(held[0].text).toBe('16.2 cm³ of piece 2 (x 6–71, z 112–150) holds on only over the 6 mm next to cut A, and may snap off there. '
+      + 'Move cut A to −10 mm and it holds over 16 mm.');
+    // as the solid says: the box right of the cut less the 5 mm next to it is whole; less 6 mm, the ribbon's half is off
+    const right = (at) => own(ribbon.intersect(cube([200, 200, 400], [at + 100, 0, 0])));
+    const freed = (box, at, w) => own(box.subtract(cube([200, 200, 400], [at + w - 100, 0, 0]))).decompose().map(own).map((m) => m.volume()).sort((p, q) => q - p).slice(1).filter((v) => v >= 5000);
+    expect(freed(right(0), 0, 5)).toEqual([]);
+    expect(freed(right(0), 0, 6)).toEqual([expect.closeTo(held[0].volume, -3)]);
+    // moved where the note says, it holds on over 15 mm: the note goes, and the solid agrees
+    const moved = await resultSplit(S({ cuts: [cutAt(0, -10)] }), { bed });
+    expect(codes(moved)).not.toContain('BARELY_HELD');
+    expect(freed(right(-10), -10, 15)).toEqual([]);
+    // Fit to my printer keeps clear of that where the bed leaves it room (below); 86 mm across it has to cut within
+    // 6 mm of the middle, and its plan says so in the words the pieces will
+    const narrow = [86, 120, 300];
+    const p = await client.planSplit([], version, { printing, split: SPLIT_DEFAULTS, bed: narrow, mode: 'fit' });
+    const at = p.cuts[0].position[0];
+    expect(Math.abs(at)).toBeLessThanOrEqual(6);
+    const words = (notes) => notes.filter((n) => n.code === 'BARELY_HELD').map((n) => n.text);
+    const there = words((await resultSplit(S({ cuts: [cutAt(0, at)] }), { bed: narrow })).notes);
+    expect(there).toHaveLength(1);
+    expect(words(p.notes)).toEqual(there);
+    // a cut that leaves its loose end loose says that, not this: X 10
+    expect(codes(await resultSplit(S({ cuts: [cutAt(0, 10)] }), { bed }))).not.toContain('BARELY_HELD');
+  });
+
+  it('Fit to my printer keeps what hangs on held: on the ribbon fixture every part of 5 cm³ or more holds on over 15 mm', async () => {
+    // the planner weighs what each cut leaves loose or held on only next to it. Across the middle, at X 0, the ribbon's
+    // right half held on over 6 mm; the further left, the longer it holds and the shorter the left tail does: from
+    // X −10 to −19 both hold over 15 mm, and the cut goes nearest the middle
+    const ribbon = own(ribbonColumn());
+    await load(ribbon, 'ribbon');
+    const bed = [120, 120, 300];
+    const p = await client.planSplit([], version, { printing, split: SPLIT_DEFAULTS, bed, mode: 'fit' });
+    expect(p.cuts.map((c) => c.position[0])).toEqual([-10]);
+    expect(p.notes.map((n) => n.code)).not.toContain('BARELY_HELD');
+    // as the solid says: either side, the box less the w mm next to the cut frees no part of 5 cm³ or more, w under 15
+    const X = p.cuts[0].position[0];
+    for (const side of [-1, 1]) {
+      const half = own(ribbon.intersect(cube([200, 200, 400], [X + side * 100, 0, 0])));
+      for (let w = 0.5; w < 15; w += 0.5) {
+        const rest = own(half.subtract(cube([200, 200, 400], [X + side * (w - 100), 0, 0])));
+        const freed = rest.decompose().map(own).map((m) => m.volume()).sort((a, b) => b - a).slice(1).filter((v) => v >= 5000);
+        expect(freed, `${side < 0 ? 'left' : 'right'}, less ${w} mm`).toEqual([]);
+      }
+    }
+    // and the pieces say nothing of it
+    const r = await resultSplit(S({ cuts: [cutAt(0, X)] }), { bed });
+    expect(codes(r)).not.toContain('BARELY_HELD');
+    expect(codes(r)).not.toContain('LOOSE_KEPT');
+    expect(r.pieces.map((x) => x.shells)).toEqual([1, 1]);
+  });
+
+  it('Fit looks past a move another axis refuses: on a 150 mm bed the ribbon fixture is cut off its middle too', async () => {
+    // a Z cut is needed as well: the X cut's own best place, X −49 where nothing hangs, leaves the base left of it a
+    // sliver of the box below Z – refused, it is fenced off with all past it, and so is X 32, which leaves the ribbon's
+    // end loose (27 % of its box: no bit, but loose all the same), until X −10 is found
+    await load(own(ribbonColumn()), 'ribbon');
+    const bed = [150, 150, 150];
+    const p = await client.planSplit([], version, { printing, split: SPLIT_DEFAULTS, bed, mode: 'fit' });
+    expect(p.cuts.map((c) => [c.normal.indexOf(1), +c.position[c.normal.indexOf(1)].toFixed(1)])).toEqual([[0, -10], [2, 110.5]]);
+    expect(p.notes.map((n) => n.code)).not.toContain('BARELY_HELD');
+    const r = await resultSplit(S({ cuts: p.cuts.map((c, i) => ({ ...c, id: `c${i + 1}` })) }), { bed });
+    expect(r.pieces.map((x) => [x.shells, x.fits])).toEqual([[1, true], [1, true], [1, true], [1, true]]);
+    expect(codes(r).filter((c) => ['BARELY_HELD', 'LOOSE_KEPT'].includes(c))).toEqual([]);
+  });
+
+  it('a bit a cut leaves loose stays on the piece it hangs on: cut at Z 116, the ribbon\'s tails keep their tips', async () => {
+    // the tails droop to z 112, beside the column: cut at Z 116 their 4 mm tips would be loose in the boxes below
+    await load(own(ribbonColumn()), 'ribbon');
+    const bed = [120, 120, 300];
+    const split = S({ cuts: [cutAt(0, 0), cutAt(2, 116, 'c2')] });
+    const r = await resultSplit(split, { bed });
+    expect(r.pieces.map((p) => [p.index, p.cell.join(''), p.shells])).toEqual([[1, '000', 1], [2, '100', 1], [3, '001', 1], [4, '101', 1]]);
+    expect(r.pieces.some((p) => 'loose' in p)).toBe(false);
+    const joined = r.notes.filter((n) => n.code === 'ISLAND_JOINED');
+    expect(joined).toEqual([expect.objectContaining({ level: 'info', bits: [expect.objectContaining({ letter: 'B', from: 1, to: 3 }), expect.objectContaining({ letter: 'B', from: 2, to: 4 })] })]);
+    expect(joined[0].text).toBe('Cut B would have left 2 bits loose (1.3 cm³ in all): each stays on the piece it hangs on.');
+    expect(r.notes.map((n) => n.code)).not.toContain('LOOSE_KEPT');
+    // the tips' faces are the upper pieces' own on both sides: every pin of cut B is on the base or the column
+    const onB = r.seams.filter((x) => x.letter === 'B').flatMap((x) => x.dowels);
+    expect(onB.length).toBeGreaterThan(0);
+    for (const d of onB) expect(Math.hypot(d.centre[0], d.centre[1])).toBeLessThan(40);
+    // each upper piece's file holds its tail's tip, down to z 112, in one shell
+    const ex = await exportSplit(split, { name: 'ribbon', bed });
+    const files = piecesOf(ex).map(assembled);
+    expect(files.map((m) => m.decompose().map(own).length)).toEqual([1, 1, 1, 1]);
+    expect(files.map((m) => Math.round(m.boundingBox().min[2]))).toEqual([0, 0, 112, 112]);
+  });
+
+  it('Keep whole: a click on the ribbon finds it, Fit cuts round it and says it stays whole, and a cut by hand through it says so', async () => {
+    await load(own(ribbonColumn()), 'ribbon');
+    const bed = [120, 120, 300];
+    const band = { min: [-72, -47, 112], max: [72, 7, 150] };
+    // the engine's finder: the band from a click on its front, the body from one on the column
+    const found = await client.planSplit([], version, { printing, split: null, mode: 'keep', point: [0, -47, 135] });
+    expect(found.point).toEqual([0, -47, 135]);
+    for (let a = 0; a < 3; a++) {
+      expect(Math.abs(found.box.min[a] - band.min[a])).toBeLessThanOrEqual(2);
+      expect(Math.abs(found.box.max[a] - band.max[a])).toBeLessThanOrEqual(2);
+    }
+    expect(found.mask.data).toBeInstanceOf(Uint8Array);
+    expect(await client.planSplit([], version, { printing, split: null, mode: 'keep', point: [0, -40, 200] })).toEqual({ point: [0, -40, 200], box: null, why: 'body' });
+    const keep = [{ id: 'k1', name: 'Ribbon', point: found.point, normal: [0, -1, 0], box: found.box }];
+    // Fit cuts round it – across X it could only cut through it – and says it stays whole, on the piece it is on
+    const p = await plan([], bed, { ...SPLIT_DEFAULTS, keep });
+    const planes = p.cuts.map(cutPlane);
+    expect(planes.length).toBeGreaterThan(0);
+    for (const c of planes) expect(keepCrossed(found.box, c.axis, c.at), JSON.stringify(c)).toBe(false);
+    const kept = p.notes.filter((n) => n.code.startsWith('KEEP'));
+    expect(kept).toEqual([expect.objectContaining({ code: 'KEEP_KEPT', level: 'info', keepId: 'k1', piece: 2 })]);
+    expect(kept[0].text).toBe('Ribbon stays whole, on piece 2.');
+    // named again, it is the same plan, not planned again: the notes take the name it has now
+    stages.length = 0;
+    const renamed = await plan([], bed, { ...SPLIT_DEFAULTS, keep: [{ ...keep[0], name: 'Bow' }] });
+    expect(stages).not.toContain('Planning cuts…');
+    expect(renamed.cuts).toEqual(p.cuts);
+    expect(renamed.notes.filter((n) => n.code.startsWith('KEEP')).map((n) => n.text)).toEqual(['Bow stays whole, on piece 2.']);
+    // the pieces say the same, and the ribbon is whole on its piece, which is one part
+    const cuts = p.cuts.map((c, i) => ({ ...c, id: `c${i + 1}` }));
+    const r = await resultSplit({ ...SPLIT_DEFAULTS, keep, cuts }, { bed });
+    expect(r.notes.filter((n) => n.code.startsWith('KEEP')).map((n) => n.text)).toEqual(['Ribbon stays whole, on piece 2.']);
+    expect(codes(r)).not.toContain('LOOSE_KEPT');
+    expect(r.pieces.map((x) => x.shells)).toEqual(r.pieces.map(() => 1));
+    const piece = r.pieces.find((x) => x.index === 2);
+    expect(piece.size.slice().sort((a, b) => b - a)[0]).toBeGreaterThanOrEqual(144);
+    // a cut by hand through it: the measure names it, and the pieces say Fit would keep it whole
+    const across = { ...SPLIT_DEFAULTS, keep, cuts: [cutAt(0, 0)] };
+    const m = await client.planSplit([], version, { printing, split: across, bed, mode: 'measure' });
+    expect(m.cuts.map((c) => [c.letter, c.keeps])).toEqual([['A', ['k1']]]);
+    const through = (await resultSplit(across, { bed })).notes.filter((n) => n.code.startsWith('KEEP'));
+    expect(through).toEqual([expect.objectContaining({ code: 'KEEP_CUT', level: 'warn', keepId: 'k1', cutIds: ['c1'], letters: ['A'], fits: true })]);
+    expect(through[0].text).toBe('Cut A runs through Ribbon, which you asked to keep whole. Fit to my printer keeps it whole.');
+    // and no note says to move a cut into it: the ribbon's right half held on over 6 mm at X 0 says why it cannot be
+    // moved, and what to do; its end cut off at X 10 has nowhere to move the cut to
+    const zero = await resultSplit(across, { bed });
+    expect(noteOf(zero, 'BARELY_HELD')).toMatchObject({ moveTo: null, keepId: 'k1', kept: 'Ribbon' });
+    expect(noteOf(zero, 'BARELY_HELD').text).toMatch(/Moving cut A so it holds would run through Ribbon, which you keep whole – glue this joint with care, or print piece 2 with more walls\.$/);
+    const ten = await resultSplit({ ...SPLIT_DEFAULTS, keep, cuts: [cutAt(0, 10)] }, { bed });
+    expect(noteOf(ten, 'LOOSE_KEPT')).toMatchObject({ moveTo: null });
+    expect(noteOf(ten, 'LOOSE_KEPT').text).not.toMatch(/Move cut/);
+    // with no details kept whole, the plan is the one Fit always made: an empty list is the same plan, not planned again
+    const plain = await plan([], bed);
+    stages.length = 0;
+    expect(await plan([], bed, { ...SPLIT_DEFAULTS, keep: [] })).toEqual(plain);
+    expect(stages).not.toContain('Planning cuts…');
+    expect(plain.notes.map((n) => n.code)).not.toContain('KEEP_KEPT');
+  });
+
+  it('Fit never cuts through a detail kept whole while a plan for the printer keeps it whole; when none does, it says which cuts run through it', async () => {
+    await load(cube([400, 40, 20]), 'bar');
+    const mark = (min, max) => ({ ...SPLIT_DEFAULTS, keep: [{ id: 'k1', name: 'Middle', point: [0, 20, 0], normal: [0, 1, 0], box: { min: [min, -20, -10], max: [max, 20, 10] } }] });
+    // today: one cut, across the middle
+    const today = await plan();
+    expect(today.cuts.map((c) => Math.round(c.position[0]))).toEqual([0]);
+    // the middle 100 mm kept whole: the cut goes to its end, where the longer piece still fits (lying across the bed)
+    const round = await plan([], BED, mark(-50, 50));
+    const at = round.cuts.map((c) => c.position[0]);
+    expect(at).toHaveLength(1);
+    expect(Math.abs(at[0])).toBeGreaterThanOrEqual(49);
+    expect(round.pieces.every((x) => x.fits)).toBe(true);
+    expect(round.notes.filter((n) => n.code.startsWith('KEEP')).map((n) => n.text)).toEqual([`Middle stays whole, on piece ${at[0] < 0 ? 2 : 1}.`]);
+    // 300 mm of it kept whole is longer than the printer: no plan keeps it, so Fit cuts as it did and says so
+    const none = await plan([], BED, mark(-150, 150));
+    expect(none.cuts.map((c) => Math.round(c.position[0]))).toEqual([0]);
+    expect(none.notes.filter((n) => n.code.startsWith('KEEP'))).toEqual([expect.objectContaining({ code: 'KEEP_NOT_KEPT', level: 'warn', keepId: 'k1', letters: ['A'], size: [300, 40, 20] })]);
+    expect(noteOf(none, 'KEEP_NOT_KEPT').text).toBe('No plan for your printer keeps Middle in one piece – cut A runs through it. It needs a piece of at least 300 × 40 × 20 mm.');
+    // two marks, one too long for the printer: the other is still kept whole, and only the long one is said not to be;
+    // a hand cut through both promises Fit only for the one it keeps
+    const two = { ...SPLIT_DEFAULTS, keep: [mark(-50, 50).keep[0], { id: 'k2', name: 'Long', point: [0, 20, 0], normal: [0, 1, 0], box: { min: [-160, -5, -10], max: [160, 5, 10] } }] };
+    const both = await plan([], BED, two);
+    expect(Math.abs(both.cuts[0].position[0])).toBeGreaterThanOrEqual(49);
+    expect(both.notes.filter((n) => n.code.startsWith('KEEP')).map((n) => [n.code, n.keepId])).toEqual([['KEEP_KEPT', 'k1'], ['KEEP_NOT_KEPT', 'k2']]);
+    const byHand = await resultSplit({ ...two, cuts: [cutAt(0, 0)] }, { bed: BED });
+    expect(byHand.notes.filter((n) => n.code === 'KEEP_CUT').map((n) => [n.keepId, n.fits])).toEqual([['k1', true], ['k2', false]]);
+    // a plate's pieces lie flat: 220 mm square of it kept whole would fit the printer on its edge, but no piece lying
+    // flat does, so no plan keeps it – Fit plans the plate as ever and names the cuts through it
+    await load(cube([400, 300, 5]), 'plate');
+    const flat = await plan();
+    const square = await plan([], BED, { ...SPLIT_DEFAULTS, keep: [{ id: 'k1', name: 'Square', point: [0, 0, 2.5], normal: [0, 0, 1], box: { min: [-110, -110, -2.5], max: [110, 110, 2.5] } }] });
+    expect(square.cuts).toEqual(flat.cuts);
+    const unkept = noteOf(square, 'KEEP_NOT_KEPT');
+    const letters = square.cuts.map((c, i) => [c, String.fromCharCode(65 + i)]).filter(([c]) => keepCrossed({ min: [-110, -110, -2.5], max: [110, 110, 2.5] }, cutPlane(c).axis, cutPlane(c).at)).map(([, l]) => l);
+    expect(letters.length).toBeGreaterThan(0);
+    expect(unkept).toMatchObject({ keepId: 'k1', letters, size: [220, 220, 5] });
+    // and a hand cut through it does not promise that Fit keeps it whole
+    const cutThrough = await resultSplit({ ...SPLIT_DEFAULTS, keep: [{ id: 'k1', name: 'Square', point: [0, 0, 2.5], normal: [0, 0, 1], box: { min: [-110, -110, -2.5], max: [110, 110, 2.5] } }], cuts: [cutAt(0, 0)] }, { bed: BED });
+    expect(noteOf(cutThrough, 'KEEP_CUT')).toMatchObject({ fits: false, text: 'Cut A runs through Square, which you asked to keep whole. At 220 × 220 × 5 mm it is too big for your printer in one piece.' });
+  });
+
   it('a box with its lid laid beside it is cut through the gap: four pieces, the lid in two', async () => {
     const body = own(cube([300, 200, 150], [150, 100, 75]).subtract(cube([294, 194, 150], [150, 100, 78])));
     const lid = own(own(cube([300, 200, 3], [150, 320, 1.5]).add(cube([293.2, 193.2, 8], [150, 320, 7]))).subtract(cube([287.2, 187.2, 10], [150, 320, 7])));
@@ -1202,6 +1448,31 @@ describe('the engine around a split', () => {
         await exportSplit(shelf(i), { archive: 'zip' });
       }
       expect(watch.live()).toBeLessThanOrEqual(shelves);
+      // nor where a loose bit of a box is told by its material, and glued as it cannot come away along the cut
+      await load(own(ribbonColumn()), 'ribbon');
+      const ribbon = (i) => S({ cuts: [cutAt(0, 10 + i)] });
+      const bed = [120, 120, 300];
+      await resultSplit(ribbon(0), { bed });
+      await exportSplit(ribbon(0), { bed, archive: 'zip' });
+      const loose = watch.live();
+      for (let i = 1; i < 4; i++) {
+        expect((await resultSplit(ribbon(i), { bed })).pieces).toHaveLength(3);
+        await exportSplit(ribbon(i), { bed, archive: 'zip' });
+      }
+      expect(watch.live()).toBeLessThanOrEqual(loose);
+      // nor where bits a cut leaves loose are given back, each joined to the piece it hangs on: the tails' tips
+      const tips = (i) => S({ cuts: [cutAt(0, i), cutAt(2, 116 + i / 2, 'c2')] });
+      await resultSplit(tips(0), { bed });
+      await exportSplit(tips(0), { bed, archive: 'zip' });
+      const given = watch.live();
+      for (let i = 1; i < 4; i++) {
+        const r = await resultSplit(tips(i), { bed });
+        expect(r.pieces.map((p) => p.shells)).toEqual([1, 1, 1, 1]);
+        // and the ribbon's right half held on only next to cut A, as the slice graph finds, which makes no solids
+        expect(r.notes.map((n) => n.code)).toEqual(expect.arrayContaining(['ISLAND_JOINED', 'BARELY_HELD']));
+        await exportSplit(tips(i), { bed, archive: 'zip' });
+      }
+      expect(watch.live()).toBeLessThanOrEqual(given);
     } finally {
       watch.stop();
     }

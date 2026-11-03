@@ -294,6 +294,15 @@ export function createEngineClient({ createWorker, onProgress = () => {}, onStat
     },
 
     /**
+     * The thin detail a click on the model lies on, to keep whole (`{ point, printing }`, `split.plan` mode 'keep'): its
+     * box and its cubes, or `why: 'body'` for a click on the body. On a channel of its own, so a newer click replaces
+     * one still waiting (which resolves to undefined).
+     */
+    findKeep(items, baseVersion, options = {}) {
+      return request('split.keep', 'split.plan', { items, baseVersion, ...options, mode: 'keep' });
+    },
+
+    /**
      * The seams along an axis (`{ axis }`, mode 'targets'), for snapping a
      * cut being placed and the ticks beside it: quick once the axis has been
      * read. On a channel of its own.

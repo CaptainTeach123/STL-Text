@@ -21,6 +21,7 @@
   --font-ui: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   --line: #d8dde6; /* the plan lists' edges and separators */
   --warn: #c77700;
+  --warn-text: #9a5a00; /* small amber words on a light card: dark enough to read (4.7:1 and more) */
   /* the view's own colours (viewer.js, split.js), so the legend's chips are what is drawn. The raised and cut text are
      this look's; cyber.css gives its own */
   --model: #8aa4c8;
@@ -28,6 +29,7 @@
   --engrave: #ff3b6b;
   --pass: #e0a93a;
   --spot: #22d3a6;
+  --keep: #22c55e; /* a detail kept whole: its tint and box in the view (viewer.js KEEP_COLOR) */
   --lug: #ffd60a;
   --seat: #8b5cf6;
   --over: #e11d48;
@@ -45,6 +47,7 @@
     --muted: #94a0b8;
     --accent-soft: #3a2616;
     --lock-text: #fb923c;
+    --warn-text: var(--warn);
     --stage-top: #243049;
     --stage-bottom: #121827;
     --line: var(--border); /* the light edge of the light scheme stood out on the dark panel */
@@ -999,6 +1002,59 @@ ul.plan li select {
   font-weight: 700;
 }
 
+/* "Keep whole…" while a detail to keep whole is picked on the model: pressed, in the green of a detail kept whole */
+#keepWholeBtn[aria-pressed='true'] {
+  background: var(--keep);
+  border-color: var(--keep);
+  color: #fff;
+}
+/* one row per detail kept whole: a green swatch as its tint, its name to type over, its size, ×; what cuts it below */
+#keepList li {
+  grid-template-columns: auto minmax(4.5rem, 1fr) auto auto;
+}
+#keepList .keep-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  background: var(--keep);
+}
+#keepList .keep-name {
+  min-width: 0;
+  width: 100%;
+  padding: 3px 6px;
+  font: inherit;
+}
+#keepList .keep-size {
+  color: var(--muted);
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+#keepList .keep-remove {
+  width: 28px;
+  padding: 2px 0;
+}
+#keepList li .meta {
+  grid-column: 2 / -1;
+}
+#keepList li .meta .warn {
+  color: var(--warn-text);
+}
+/* a detail clicked again that is kept whole already: its row says so */
+#keepList li.flash {
+  outline: 2px solid var(--keep);
+  outline-offset: 1px;
+}
+/* a phone's panel: the size goes under the name rather than squeeze it */
+@media (max-width: 400px) {
+  #keepList .keep-size {
+    grid-column: 2 / -1;
+    grid-row: 2;
+  }
+  #keepList li .meta {
+    grid-row: 3;
+  }
+}
+
 /* the cuts' own box holds a lid's row and a base's whole, with its tea-light seat, before it scrolls */
 ul.plan#cutList {
   max-height: 22rem;
@@ -1040,6 +1096,10 @@ ul.plan#cutList {
 }
 #cutList li .meta {
   grid-column: 2 / -1;
+}
+/* what a cut leaves loose, or held on only next to it */
+#cutList li .meta .warn {
+  color: var(--warn-text);
 }
 /* a cut that comes apart: the box on a line of its own, how the top holds beside it (below it where there is no room),
    the row and its badge teal as its plane is */
@@ -1347,6 +1407,9 @@ ul.plan#cutList {
 }
 .dot.apart {
   background: var(--apart);
+}
+.dot.keep {
+  background: var(--keep);
 }
 .dot.pieces {
   background: conic-gradient(#4f8fe6 0 33%, #e88d67 0 66%, #5aa469 0);

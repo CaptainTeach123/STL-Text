@@ -70,6 +70,9 @@ export const ITEM_DEFAULTS = Object.freeze({
 export const SPLIT_DEFAULTS = Object.freeze({
   // [{ id: 'c1', position: [x, y, z], normal: [1, 0, 0], joint?: 'apart', hold?: 'lock', part?: { r, side, auto, seat? } }], model mm
   cuts: Object.freeze([]),
+  // the details kept whole, `keep: [{ id: 'k1', name, point, normal, box: { min, max } | null }]` (model mm: the click
+  // and the box round the detail no cut may run through), is there only while it has one: an empty list is no part of
+  // any key, so a split without one is the split it always was
   joint: 'auto', // 'auto' | 'dowels' | 'dovetail' | 'none'
   diameter: 0, // mm: 0 = automatic | 1.75 (filament) | 3 | 4 | 5 | 6 | 8 | 10
   depth: 0, // mm into each piece: 0 = automatic | 3–30
@@ -278,10 +281,25 @@ const copyCut = ({ id, position, normal, joint, hold, part }) => {
   return { id, position: [...position], normal: [...normal], ...(apart ? { joint, hold: held } : {}), ...(kept ? { part: kept } : {}) };
 };
 
+/** A detail kept whole as the document keeps it: its own arrays, and its box (null while it has none). */
+const copyKeep = ({ id, name, point, normal, box }) => ({
+  id,
+  name: String(name ?? ''),
+  point: [...point],
+  normal: [...(normal ?? [0, 0, 1])],
+  box: box ? { min: [...box.min], max: [...box.max] } : null,
+});
+
+const keepNumber = (id) => Number(/^k(\d+)$/.exec(String(id))?.[1] ?? 0);
+
+/** One past the highest keep mark id in use. */
+const nextKeepId = (keep) => `k${1 + Math.max(0, ...keep.map((k) => keepNumber(k.id)))}`;
+
 /**
  * The split after `patch` (null switches it off): settings merged over the
  * current ones and the defaults, each cut copied, and a fresh id for any cut
- * without its own (a planned split arrives without ids).
+ * without its own (a planned split arrives without ids). The details kept
+ * whole are copied the same way, and an empty list of them is left out.
  */
 function mergeSplit(current, patch) {
   if (!patch) return null;
@@ -294,8 +312,47 @@ function mergeSplit(current, patch) {
     seen.add(id);
     return copyCut({ ...cut, id });
   });
+  const marks = Array.isArray(next.keep) ? next.keep : [];
+  delete next.keep;
+  if (marks.length) {
+    let last = Math.max(0, ...marks.map((k) => keepNumber(k.id)));
+    const ids = new Set();
+    next.keep = marks.map((mark) => {
+      const id = mark.id != null && !ids.has(mark.id) ? mark.id : `k${++last}`;
+      ids.add(id);
+      return copyKeep({ ...mark, id });
+    });
+  }
   return next;
 }
+
+/**
+ * Move details kept whole with the model: the click and its normal as an item's, and the box by its eight corners –
+ * exact for what the app does to a model (Scale, quarter turns, centring), which keep a box square to the axes.
+ */
+function transformKeeps(marks, matrix) {
+  const m = matrix instanceof Matrix4 ? matrix : new Matrix4().fromArray(matrix);
+  return transformItems(marks.map((k) => ({ ...k, position: k.point })), m).map(({ position, ...k }) => {
+    if (!k.box) return { ...k, point: position };
+    const min = [Infinity, Infinity, Infinity];
+    const max = [-Infinity, -Infinity, -Infinity];
+    for (let c = 0; c < 8; c++) {
+      const p = new Vector3(...[0, 1, 2].map((a) => ((c >> a) & 1 ? k.box.max[a] : k.box.min[a]))).applyMatrix4(m).toArray();
+      for (let a = 0; a < 3; a++) {
+        min[a] = Math.min(min[a], p[a]);
+        max[a] = Math.max(max[a], p[a]);
+      }
+    }
+    return { ...k, point: position, box: { min, max } };
+  });
+}
+
+/** The split moved with the model: its cuts and the details it keeps whole. */
+const transformSplit = (split, matrix) => ({
+  ...split,
+  cuts: transformItems(split.cuts, matrix),
+  ...(split.keep ? { keep: transformKeeps(split.keep, matrix) } : {}),
+});
 
 const clone = (state) => ({
   ...state,
@@ -305,6 +362,7 @@ const clone = (state) => ({
   split: state.split && {
     ...state.split,
     cuts: state.split.cuts.map((c) => ({ ...c, position: [...c.position], normal: [...c.normal], ...(c.part ? { part: { ...c.part } } : {}) })),
+    ...(state.split.keep ? { keep: state.split.keep.map(copyKeep) } : {}),
   },
 });
 
@@ -430,7 +488,7 @@ export class Document {
         if (units !== 1) s.base.units = (s.base.units ?? 1) * units;
         s.baseVersion += 1;
         s.items = transformItems(s.items, array);
-        if (s.split) s.split = { ...s.split, cuts: transformItems(s.split.cuts, array) };
+        if (s.split) s.split = transformSplit(s.split, array);
       },
       { coalesce: step },
     );
@@ -483,7 +541,7 @@ export class Document {
         s.base.enhance = null;
         s.baseVersion += 1;
         s.items = transformItems(s.items, inverse);
-        if (s.split) s.split = { ...s.split, cuts: transformItems(s.split.cuts, inverse) };
+        if (s.split) s.split = transformSplit(s.split, inverse);
       },
       { coalesce: step },
     );
@@ -621,6 +679,45 @@ export class Document {
     if (!this.state.split?.cuts.some((c) => c.id === id)) return;
     this.commit((s) => {
       s.split.cuts = s.split.cuts.filter((c) => c.id !== id);
+    });
+  }
+
+  /**
+   * Keep a detail whole: `point` (and `normal`) where it was clicked, `box` the box round it that no cut may run
+   * through, `name` what it is called ("Detail 1" when none is given). With no split yet, one starts from `defaults`
+   * (the last-used settings) with no cuts. One undo step; returns the mark's id, or null when the split keeps as many
+   * details whole as it may (`limit`).
+   */
+  addKeep({ name = null, point, normal = [0, 0, 1], box = null }, { defaults = null, limit = Infinity } = {}) {
+    const marks = this.state.split?.keep ?? [];
+    if (marks.length >= limit) return null;
+    const id = nextKeepId(marks);
+    this.commit((s) => {
+      s.split ??= mergeSplit(null, { ...defaults, cuts: [] });
+      s.split.keep = [...(s.split.keep ?? []), copyKeep({ id, name: name ?? `Detail ${keepNumber(id)}`, point, normal, box })];
+    });
+    return id;
+  }
+
+  /** Rename a detail kept whole (typing coalesces into one undo step); nothing when it has that name already. */
+  renameKeep(id, name, { coalesce = null } = {}) {
+    const mark = this.state.split?.keep?.find((k) => k.id === id);
+    if (!mark || mark.name === String(name ?? '')) return;
+    this.commit(
+      (s) => {
+        s.split.keep = s.split.keep.map((k) => (k.id === id ? copyKeep({ ...k, name }) : k));
+      },
+      { coalesce },
+    );
+  }
+
+  /** Stop keeping a detail whole: one undo step. The last one gone, the split has no list of them. */
+  removeKeep(id) {
+    if (!this.state.split?.keep?.some((k) => k.id === id)) return;
+    this.commit((s) => {
+      const keep = s.split.keep.filter((k) => k.id !== id);
+      if (keep.length) s.split.keep = keep;
+      else delete s.split.keep;
     });
   }
 

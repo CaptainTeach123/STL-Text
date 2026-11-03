@@ -11,6 +11,7 @@ import { initManifold, manifold } from '../src/manifold.js';
 import { parseSTL, triangleSoup, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold, manifoldToSoup } from '../src/mesh.js';
 import { batLanternSolid, box as boxAt, lanternSolid, lidBoxSolid, roundLanternSolid } from '../tests/lanternFixture.js';
+import { ribbonColumn } from '../tests/ribbonFixture.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const out = path.join(root, 'e2e', 'out');
@@ -1307,6 +1308,173 @@ try {
       'a cube cut in three every way counts its middle box too: 27 pieces',
       `${await page.locator('#downloadBtn').innerText()} / ${cubeRows} boxes`,
     );
+    await page.click('#splitClearBtn');
+    await idle();
+
+    // a column with a ribbon wrapped round it, cut by hand at X 0: once the pieces are shown, the cut's row says in the
+    // warning colour that the ribbon's right half holds on only over 6 mm, and the notes say so with where to move it
+    const ribbon = ribbonColumn();
+    const ribbonFile = writeFixture('ribbon.stl', soupOf(ribbon));
+    ribbon.delete();
+    await openStl(ribbonFile, 'ribbon');
+    await page.click('#addCutBtn');
+    await idle();
+    await page.click('#cutList li:first-child .seg label:has-text("X")');
+    await idle();
+    await page.fill('#cutList input[data-cut-at]', '0');
+    await page.dispatchEvent('#cutList input[data-cut-at]', 'change');
+    await measured();
+    const unheld = await page.locator('#cutList .meta').innerText();
+    await page.check('#resultToggle');
+    await page.waitForFunction(() => /held over only/.test(document.querySelector('#cutList .meta')?.innerText ?? ''), null, { timeout: 60000 }).catch(() => null);
+    const heldRow = await page.evaluate(() => {
+      const meta = document.querySelector('#cutList .meta');
+      const warn = meta.querySelector('.warn');
+      return { text: meta.innerText, warn: warn?.textContent ?? null, colour: warn ? getComputedStyle(warn).color : null, plain: getComputedStyle(meta).color };
+    });
+    check(
+      !/held over/.test(unheld) && heldRow.warn === '16 cm³ held over only 6 mm' && /mm² · pins · 16 cm³ held over only 6 mm$/.test(heldRow.text) && heldRow.colour !== heldRow.plain,
+      "a cut by hand that leaves a part held on only next to it says so in its row, in the warning colour, once the pieces are shown",
+      JSON.stringify({ unheld, ...heldRow }),
+    );
+    check(/16\.2 cm³ of piece 2 \(x 6–71, z 112–150\) holds on only over the 6 mm next to cut A, and may snap off there\./.test(await splitNotes()), 'and the notes say what holds on where', await splitNotes());
+    await page.screenshot({ path: path.join(out, '8-split-held.png') });
+    await page.uncheck('#resultToggle');
+    await page.click('#splitClearBtn');
+    await idle();
+
+    // Keep whole…: a click on the ribbon marks it as a detail no cut may run through – tinted green with its box drawn
+    // round it, and a row under the buttons – and Fit to my printer then cuts round it, which the notes say
+    const greenPixels = () =>
+      page.evaluate(() => {
+        const c = document.querySelector('#stage canvas');
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        let n = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          const [r, g, b] = [d[i], d[i + 1], d[i + 2]];
+          const max = Math.max(r, g, b);
+          const span = max - Math.min(r, g, b);
+          if (max < 70 || span < 0.3 * max || max !== g) continue;
+          const h = ((b - r) / span + 2) * 60;
+          if (h >= 115 && h <= 170 && g > r + 50) n++;
+        }
+        return n;
+      });
+    const keepPressed = () => page.getAttribute('#keepWholeBtn', 'aria-pressed');
+    const greenBefore = await greenPixels();
+    const keepTitle = await page.getAttribute('#keepWholeBtn', 'title');
+    await page.click('#keepWholeBtn');
+    const keepHintText = await status();
+    const pressedOn = await keepPressed();
+    await page.keyboard.press('Escape');
+    const pressedOff = await keepPressed();
+    const hintGone = await status();
+    check(
+      keepTitle === 'Click a detail – a ribbon, a handle, a tail – that no cut may go through' && keepHintText === 'Click the detail to keep whole · Esc to stop' &&
+        pressedOn === 'true' && pressedOff === 'false' && hintGone !== keepHintText,
+      'Keep whole… says what it is for, what to do while picking, and Esc stops it',
+      JSON.stringify({ keepTitle, keepHintText, pressedOn, pressedOff, hintGone }),
+    );
+    // down the middle of the view, a click at a time, from the column's top to the ribbon: the column is the body
+    await page.click('#keepWholeBtn');
+    const stageBox = await page.locator('#stage canvas').boundingBox();
+    let bodySaid = '';
+    for (let f = 0.15; f < 0.85 && !(await page.locator('#keepList li').count()); f += 0.025) {
+      await page.mouse.click(stageBox.x + stageBox.width / 2, stageBox.y + stageBox.height * f);
+      await idle();
+      const said = await status();
+      if (/^That is the body/.test(said)) bodySaid = said;
+    }
+    const keepRow = await page.evaluate(() => {
+      const li = document.querySelector('#keepList li');
+      return li ? { name: li.querySelector('.keep-name').value, size: li.querySelector('.keep-size').textContent, pressed: document.querySelector('#keepWholeBtn').getAttribute('aria-pressed') } : null;
+    });
+    await page.mouse.move(stageBox.x + 5, stageBox.y + 5); // nothing under the pointer: the view as drawn
+    await page.waitForTimeout(200);
+    const greenAfter = await greenPixels();
+    await page.screenshot({ path: path.join(out, '8-keep-whole.png') });
+    check(
+      bodySaid === 'That is the body, not a detail – click a thinner part that stands off it: a ribbon, a handle, a tail.' && keepRow?.name === 'Detail 1' &&
+        keepRow.size === '· 148 × 58 × 42 mm' && keepRow.pressed === 'false' && greenAfter > greenBefore + 2000,
+      'a click on the column says it is the body; one on the ribbon keeps it whole: "Detail 1 · 148 × 58 × 42 mm", tinted green on the model',
+      JSON.stringify({ bodySaid, keepRow, greenBefore, greenAfter }),
+    );
+    // named, and a cut by hand through it says so in its row, in the warning colour
+    await page.fill('#keepList .keep-name', 'Ribbon');
+    await page.dispatchEvent('#keepList .keep-name', 'change');
+    await page.click('#addCutBtn');
+    await idle();
+    await page.click('#cutList li:first-child .seg label:has-text("X")');
+    await idle();
+    await page.fill('#cutList input[data-cut-at]', '0');
+    await page.dispatchEvent('#cutList input[data-cut-at]', 'change');
+    await measured();
+    const throughRow = await page.evaluate(() => {
+      const meta = document.querySelector('#cutList .meta');
+      const warn = [...meta.querySelectorAll('.warn')].map((w) => w.textContent);
+      return { text: meta.innerText, warn, colour: meta.querySelector('.warn') ? getComputedStyle(meta.querySelector('.warn')).color : null, plain: getComputedStyle(meta).color, keepMeta: document.querySelector('#keepList .meta')?.innerText ?? '' };
+    });
+    check(
+      throughRow.warn.includes('through Ribbon – asked to keep whole') && throughRow.colour !== throughRow.plain && throughRow.keepMeta === 'cut A runs through it',
+      "a cut by hand through the ribbon says in its row that it runs through what is kept whole, and the ribbon's row says which cut",
+      JSON.stringify(throughRow),
+    );
+    // Fit to my printer cuts round it: the pieces are whole, none loose, and the notes say the ribbon stays whole
+    await page.click('#splitFitBtn');
+    await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 120000 });
+    await idle();
+    const keptPieces = await page.locator('#pieceList').innerText();
+    const keptNotes = await splitNotes();
+    const keptCuts = await page.locator('#cutList .meta').allInnerTexts();
+    check(
+      !/loose/.test(keptPieces) && /Ribbon stays whole, on piece \d+\./.test(keptNotes) && keptCuts.every((t) => !/kept whole/.test(t)),
+      'Fit to my printer keeps the ribbon whole: no piece has a loose part, and the notes say it stays whole',
+      JSON.stringify({ keptPieces, keptNotes, keptCuts }),
+    );
+    await page.screenshot({ path: path.join(out, '8-keep-fit.png') });
+    // the row in either look, and on a 320 px phone: nothing sticks out of it, and the page never scrolls sideways
+    await page.uncheck('#resultToggle');
+    await idle();
+    const keepLayout = () =>
+      page.evaluate(() => {
+        const li = document.querySelector('#keepList li');
+        const row = li.getBoundingClientRect();
+        const out = [...li.children].filter((c) => !c.hidden && c.getBoundingClientRect().right > row.right + 0.5).length;
+        return { out, scroll: document.scrollingElement.scrollWidth - document.scrollingElement.clientWidth, swatch: getComputedStyle(li.querySelector('.keep-swatch')).backgroundColor };
+      });
+    const wideCyber = await keepLayout();
+    await page.setViewportSize({ width: 320, height: 640 });
+    await page.waitForTimeout(300);
+    const phoneCyber = await keepLayout();
+    await page.locator('#keepList').scrollIntoViewIfNeeded();
+    await page.screenshot({ path: path.join(out, '8-keep-phone.png') });
+    await page.click('#classicLook');
+    await page.waitForTimeout(200);
+    const phoneClassic = await keepLayout();
+    await page.screenshot({ path: path.join(out, '8-keep-phone-classic.png') });
+    await page.setViewportSize({ width: 1400, height: 850 });
+    await page.waitForTimeout(300);
+    const wideClassic = await keepLayout();
+    await page.click('#classicLook');
+    await page.waitForTimeout(200);
+    check(
+      [wideCyber, phoneCyber, phoneClassic, wideClassic].every((l) => l.out === 0 && l.scroll === 0 && l.swatch === 'rgb(34, 197, 94)'),
+      "a detail kept whole's row fits in either look, on a wide screen and a 320 px phone, its swatch the view's green",
+      JSON.stringify({ wideCyber, phoneCyber, phoneClassic, wideClassic }),
+    );
+    // the row's × lets it go: undone, it comes back
+    await page.click('#keepList .keep-remove');
+    await idle();
+    const keepGone = await page.locator('#keepList li').count();
+    await page.keyboard.press('Control+z');
+    await idle();
+    const keepBack = await page.locator('#keepList li').count();
+    check(keepGone === 0 && keepBack === 1, "a detail kept whole's × lets it go, and Undo brings it back", `${keepGone}, then ${keepBack}`);
     await page.click('#splitClearBtn');
     await idle();
 

@@ -14,8 +14,8 @@ import { TEA_LIGHT, gminOf, offerPercent, roundZ } from './locks.js';
 import { SIDES, placementMatrix, snapPartTo } from './placement.js';
 import { BUNDLED_FONTS, canQueryLocalFonts, fetchBundledFont, listLocalFonts, localFontBytes } from './fontCatalog.js';
 import {
-  BED_DEFAULTS, BED_PRESETS, FILAMENT, PIECE_COLORS, SPLIT_LIMITS, SPLIT_NOTE_CODES, axisCuts, bedSize, cellFits, cellSizes, cutPlane, fitPieces, formatSize,
-  letterFor, nextCut, noSeatWords, pegSizeOf, pieceColorIndex, sheetName, splitActive, splitNote, usableBed, wayStep,
+  BED_DEFAULTS, BED_PRESETS, FILAMENT, KEEP_LIMIT, PIECE_COLORS, SPLIT_LIMITS, SPLIT_NOTE_CODES, axisCuts, bedSize, cellFits, cellSizes, cutPlane, fitPieces, formatSize,
+  keepName, keepsOf, keepsThrough, letterFor, nextCut, noSeatWords, pegSizeOf, pieceColorIndex, pieceColors, sheetName, splitActive, splitNote, usableBed, wayStep,
 } from './split.js';
 
 const $ = (id) => document.getElementById(id);
@@ -78,6 +78,13 @@ let splitBounds = null; // { version, key, bounds } of the model and its text fr
 let planNotes = null; // { key, content, notes } of a Fit to my printer that cut nothing
 let offerPlan = null; // { key, plan } of the last Fit to my printer planned, ahead or on a click: the count the Model card offers
 let loads = 0; // models opened so far: a fit planned for one is never applied to the next
+// details kept whole: view state, never in the document
+let keeping = null; // { busy } while a detail to keep whole is clicked on the model ("Keep whole…")
+let keepHintShown = ''; // what the status line said to do meanwhile: it goes when that stops
+let keepPointed = null; // the detail whose row is pointed at or being named: its box drawn brighter
+const keepMasks = new Map(); // `${id}|${model version}` -> the detail's cubes as the engine found them, for the tint
+const keepAsked = new Set(); // the same keys, asked of the engine already
+let keepFound = null; // { point, mask } of the detail just found, for the render its mark makes as it is added
 
 const client = createEngineClient({
   createWorker: () => new Worker(new URL('./worker.js', import.meta.url), { type: 'module' }),
@@ -415,6 +422,7 @@ function onBase(result, { frame = false } = {}) {
 
 async function loadModel(kind, { bytes = null, name = 'model' } = {}) {
   endAim(); // a place picked on this model means nothing on the next
+  endKeep();
   showProgress('Reading the file…');
   // setBase() bumps the version and re-renders synchronously; claim that
   // version first so syncBase() does not post a pointless update of the
@@ -981,6 +989,10 @@ function nudge(direction, step) {
 }
 
 viewer.onPick = ({ point, normal }) => {
+  if (keeping) {
+    keepAt(point, normal);
+    return;
+  }
   if (selectedCutId) {
     selectCut(null); // a click on the model lets go of the cut; the next one places text
     return;
@@ -1147,7 +1159,10 @@ async function showResult(on, { keep = false } = {}) {
     if (r.pieces && entering) viewer.frame();
     renderSplit();
     // the split's own notes are in its card; the status line keeps the summary and anything to act on
-    const notes = r.pieces ? r.notes.filter((n) => !isSplitNote(n) || n.code === 'SPLIT' || n.level === 'warn') : r.notes;
+    // as the card does: a detail Fit to my printer could not keep whole says that, not only that a cut runs through it
+    const unkept = planNotes?.key === lastSplitKey && planNotes.content === lastContentKey ? new Set(planNotes.notes.filter((n) => n.code === 'KEEP_NOT_KEPT').map((n) => n.keepId)) : null;
+    const notes = (r.pieces ? r.notes.filter((n) => !isSplitNote(n) || n.code === 'SPLIT' || n.level === 'warn') : r.notes)
+      .filter((n) => !(unkept && n.code === 'KEEP_CUT' && unkept.has(n.keepId)));
     if (notes.length) {
       setStatus(notes.map((n) => n.text).join('\n'), notes.some((n) => n.level === 'warn') ? 'error' : '');
       piecesStatus = split ? { text: $('status').textContent, key: splitFor, content: requestedFor } : null;
@@ -1451,6 +1466,7 @@ function scheduleOffer() {
 async function autoSplit() {
   if (!canSplit()) return;
   endAim();
+  endKeep();
   let again = false;
   setSplitPending(true);
   try {
@@ -1502,6 +1518,264 @@ async function addCut() {
   const next = roomForAnyCut() ? nextCut(bounds, planeCuts()) : null;
   if (!next) return setStatus(`A split can have up to ${SPLIT_LIMITS.cuts} cuts and ${SPLIT_LIMITS.cells} pieces.`, 'error');
   selectCut(doc.addCut(next, { defaults: splitDefaults }));
+}
+
+/** What "Keep whole…" says it is for. */
+const KEEP_TITLE = 'Click a detail – a ribbon, a handle, a tail – that no cut may go through';
+
+/** What to do while a detail to keep whole is picked on the model. */
+const keepHint = () => (touchOnly() ? 'Touch the detail to keep whole · press Keep whole… again to stop' : 'Click the detail to keep whole · Esc to stop');
+
+/** A box's size, to the millimetre: "226 × 90 × 72 mm". */
+const keepSize = (box) => `${box.max.map((v, a) => Math.round(v - box.min[a])).join(' × ')} mm`;
+
+/**
+ * "Keep whole…": the next click on the model marks the detail it lands on – a ribbon round a column, a handle, a tail –
+ * as one no cut may run through (the engine finds it, `findKeep`). The same button again, Escape, or anything else
+ * taken up stops it. The model is shown as it is, where the click lands.
+ */
+function startKeep() {
+  if (keeping) return endKeep(); // the button pressed again
+  if (!modelInfo?.hasModel || !canSplit()) return;
+  if ((doc.split?.keep?.length ?? 0) >= KEEP_LIMIT) return setStatus(`A split keeps up to ${KEEP_LIMIT} details whole – remove one first.`, 'error');
+  endAim();
+  if ($('resultToggle').checked) {
+    $('resultToggle').checked = false;
+    showResult(false);
+  }
+  if (doc.selected) doc.select(null);
+  if (selectedCutId) selectCut(null);
+  keeping = { busy: false };
+  viewer.setKeepPicking(true);
+  keepHintShown = keepHint();
+  setStatus(keepHintShown);
+  renderSplit();
+}
+
+/** Stop picking a detail to keep whole. */
+function endKeep() {
+  if (!keeping) return;
+  keeping = null;
+  viewer.setKeepPicking(false);
+  if ($('status').textContent === keepHintShown) setStatus('');
+  keepHintShown = '';
+  renderSplit();
+}
+
+/**
+ * A click while picking: the engine finds the thin detail there, which is kept whole as one undo step (named "Detail
+ * 1", "Detail 2"…), tinted on the model with its box outlined. A click on the body finds none, and the page says so;
+ * picking goes on.
+ */
+async function keepAt(point, normal) {
+  const k = keeping;
+  if (!k || k.busy) return;
+  k.busy = true;
+  setStatus('Finding the detail…');
+  try {
+    if (!(await syncBase())) return;
+    const v = version();
+    const r = await client.findKeep(doc.items, v, { printing, point, normal });
+    if (!r || keeping !== k || version() !== v) return; // a newer click, picking stopped, or another model meanwhile
+    if (!r.box) {
+      keepHintShown = r.why === 'body'
+        ? 'That is the body, not a detail – click a thinner part that stands off it: a ribbon, a handle, a tail.'
+        : 'Nothing there to keep whole – click the detail on the model.';
+      setStatus(keepHintShown, 'error');
+      return;
+    }
+    // a detail already kept whole is not kept twice: its row says it
+    const marks = doc.split?.keep ?? [];
+    const same = marks.findIndex((x) => x.box && [0, 1, 2].every((a) => Math.abs(x.box.min[a] - r.box.min[a]) <= 1 && Math.abs(x.box.max[a] - r.box.max[a]) <= 1));
+    if (same >= 0) {
+      endKeep();
+      keepSaid(marks[same].id, (name) => `${name} is already kept whole.`);
+      const row = document.querySelector(`#keepList li[data-id="${marks[same].id}"]`);
+      row?.classList.add('flash');
+      setTimeout(() => row?.classList.remove('flash'), 1200);
+      row?.querySelector('input')?.focus();
+      return;
+    }
+    keepFound = { point, mask: r.mask ?? null };
+    let id;
+    try {
+      id = doc.addKeep({ point, normal, box: r.box }, { defaults: splitDefaults, limit: KEEP_LIMIT });
+    } finally {
+      keepFound = null;
+    }
+    if (!id) return;
+    endKeep();
+    const size = keepSize(r.box);
+    keepSaid(id, r.partial
+      ? (name) => `${name} is kept whole (${size}), but only part of the detail was found – click its other end too.`
+      : (name) => `${name} is kept whole (${size}): Fit to my printer cuts round it.`);
+  } catch (err) {
+    setStatus(friendly(err), 'error');
+  } finally {
+    k.busy = false;
+  }
+}
+
+let keepStatus = null; // { id, words, text } of what the status line says of a detail kept whole, by its name then
+/** Say of a detail kept whole, by the name it has: the status line follows its renaming, and clears once it goes. */
+function keepSaid(id, words) {
+  const marks = doc.split?.keep ?? [];
+  const i = marks.findIndex((x) => x.id === id);
+  if (i < 0) return;
+  setStatus(words(keepName(marks[i], i)));
+  keepStatus = { id, words, text: $('status').textContent };
+}
+/** What the status line says of a detail kept whole, as it now is: its new name, or nothing once it is gone. */
+function keepStatusNow() {
+  if (!keepStatus) return;
+  if ($('status').textContent !== keepStatus.text) {
+    keepStatus = null;
+    return;
+  }
+  const marks = doc.split?.keep ?? [];
+  const i = marks.findIndex((x) => x.id === keepStatus.id);
+  if (i < 0) {
+    setStatus('');
+    keepStatus = null;
+    return;
+  }
+  const text = keepStatus.words(keepName(marks[i], i));
+  if (text !== keepStatus.text) {
+    setStatus(text);
+    keepStatus.text = $('status').textContent;
+  }
+}
+
+/**
+ * The cubes of the details kept whole that the view has none for – the model moved or scaled since, or the marks
+ * came back with an undo after another model version – asked of the engine again, from each one's click: the tint
+ * follows once they are in. Asked once each.
+ */
+function askKeepMasks() {
+  const v = version();
+  for (const mark of doc.split?.keep ?? []) {
+    const key = `${mark.id}|${v}`;
+    if (!mark.box || keepAsked.has(key) || !modelInfo?.hasModel) continue;
+    keepAsked.add(key);
+    // the one being added has its cubes from the click that found it
+    if (keepFound && mark.point.every((x, a) => x === keepFound.point[a])) {
+      if (keepFound.mask) keepMasks.set(key, keepFound.mask);
+      continue;
+    }
+    client
+      .findKeep(doc.items, v, { printing, point: mark.point, normal: mark.normal })
+      .then((r) => {
+        if (r?.mask && version() === v) {
+          keepMasks.set(key, r.mask);
+          renderKeeps();
+        }
+      })
+      .catch(() => {}); // outlined only
+  }
+}
+
+/** Stop keeping a detail whole: one undo step. */
+function removeKeep(id) {
+  if (keepPointed === id) keepPointed = null;
+  doc.removeKeep(id);
+}
+
+/** One detail kept whole's row: a green swatch, its name to type over, its size and ×; on a line below, what cuts it. */
+function keepRow(id) {
+  const li = document.createElement('li');
+  li.dataset.id = id;
+  li.className = 'keep';
+  const swatch = document.createElement('span');
+  swatch.className = 'keep-swatch';
+  swatch.setAttribute('aria-hidden', 'true');
+  const name = document.createElement('input');
+  name.type = 'text';
+  name.className = 'keep-name';
+  name.maxLength = 40;
+  name.dataset.keepName = id;
+  name.addEventListener('input', () => doc.renameKeep(id, name.value, { coalesce: `keep-name:${id}` }));
+  name.addEventListener('change', () => doc.endCoalescing());
+  name.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === 'Escape') name.blur();
+  });
+  const size = document.createElement('span');
+  size.className = 'keep-size';
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'btn small ghost keep-remove';
+  remove.textContent = '×';
+  remove.title = 'Stop keeping it whole: cuts may run through it again';
+  remove.addEventListener('click', () => removeKeep(id));
+  const meta = document.createElement('span');
+  meta.className = 'meta';
+  // pointed at, or named: its box drawn brighter on the model
+  const point = (on) => {
+    keepPointed = on ? id : keepPointed === id ? null : keepPointed;
+    drawKeeps();
+  };
+  li.addEventListener('pointerenter', () => point(true));
+  li.addEventListener('pointerleave', () => point(document.activeElement === name));
+  name.addEventListener('focus', () => point(true));
+  name.addEventListener('blur', () => point(false));
+  li.append(swatch, name, size, remove, meta);
+  return li;
+}
+
+let keepsSignature = '';
+/** The rows of the details kept whole, rebuilt only when one comes or goes, and their boxes and tint on the model. */
+function renderKeeps() {
+  const list = $('keepList');
+  const marks = doc.split?.keep ?? [];
+  const signature = marks.map((k) => k.id).join(',');
+  if (signature !== keepsSignature) {
+    keepsSignature = signature;
+    const focused = document.activeElement?.dataset?.keepName;
+    list.replaceChildren(...marks.map((k) => keepRow(k.id)));
+    if (focused) list.querySelector(`[data-keep-name="${CSS.escape(focused)}"]`)?.focus();
+  }
+  const keeps = keepsOf(doc.split, cutBounds());
+  const usable = canSplit();
+  list.querySelectorAll(':scope > li').forEach((li, i) => {
+    const mark = marks[i];
+    const name = li.querySelector('.keep-name');
+    const called = keepName(mark, i);
+    if (name !== document.activeElement && name.value !== mark.name) name.value = mark.name;
+    name.placeholder = `Detail ${i + 1}`;
+    name.disabled = !usable;
+    name.setAttribute('aria-label', `Name of the detail kept whole, ${called}`);
+    li.querySelector('.keep-size').textContent = mark.box ? `· ${keepSize(mark.box)}` : '';
+    li.querySelector('.keep-remove').setAttribute('aria-label', `Stop keeping ${called} whole`);
+    // the cuts that run through it, in the warning colour: Fit to my printer would cut round it
+    const through = planeCuts().filter((c) => keepsThrough(keeps.filter((x) => x.id === mark.id), c).length).map((c) => cutLetter(c.id)).filter(Boolean);
+    const meta = li.querySelector('.meta');
+    meta.replaceChildren();
+    if (through.length) {
+      const warn = document.createElement('span');
+      warn.className = 'warn';
+      warn.textContent = `${through.length > 1 ? `cuts ${through.join(', ')} run` : `cut ${through[0]} runs`} through it`;
+      meta.append(warn);
+    }
+    meta.hidden = !through.length;
+  });
+  askKeepMasks();
+  drawKeeps();
+}
+
+/** The details kept whole on the model: each box outlined, the one pointed at brighter, and their cubes tinted. */
+function drawKeeps() {
+  const v = version();
+  viewer.setKeeps(
+    (doc.split?.keep ?? []).filter((k) => k.box).map((k) => ({ id: k.id, box: k.box, mask: keepMasks.get(`${k.id}|${v}`) ?? null, selected: k.id === keepPointed })),
+  );
+}
+
+/** The details asked to be kept whole that a cut runs through, for its row: "through Ribbon – asked to keep whole". */
+function keepWords(cut) {
+  const marks = doc.split?.keep ?? [];
+  if (!marks.length || cut.part) return [];
+  const ids = keepsThrough(keepsOf(doc.split, cutBounds()), cut);
+  const names = marks.map((k, i) => (ids.includes(k.id) ? keepName(k, i) : null)).filter(Boolean);
+  return names.length ? [`through ${names.join(', ')} – asked to keep whole`] : [];
 }
 
 /** The box of the model and its text, from the engine (for a first cut before anything was measured). */
@@ -1896,6 +2170,7 @@ function syncLegend() {
   $('legendModel').hidden = pieces || !modelInfo?.hasModel;
   $('legendRaised').hidden = pieces || !texts.some((i) => baseMode(i) !== 'engrave');
   $('legendEngraved').hidden = pieces || !texts.some((i) => baseMode(i) === 'engrave');
+  $('legendKeep').hidden = pieces || !doc.split?.keep?.some((k) => k.box);
 }
 
 /** The split's share of the page and the view: its card, the cut planes and their live colours, the download button. */
@@ -2005,6 +2280,10 @@ function fillSplit() {
   $('addApartBtn').setAttribute('aria-pressed', String(picking));
   $('splitClearBtn').hidden = !active;
   $('splitSettings').hidden = !active;
+  // a detail to keep whole is picked on the model: the button stays pressed while it is
+  $('keepWholeBtn').disabled = !usable || !modelInfo?.hasModel;
+  $('keepWholeBtn').setAttribute('aria-pressed', String(!!keeping));
+  renderKeeps();
   renderCuts();
   renderPartsCard();
   renderSpots();
@@ -2071,7 +2350,17 @@ function renderCuts() {
       }
       if (at !== document.activeElement && Number.parseFloat(at.value) !== round(plane.at)) at.value = round(plane.at);
     }
-    li.querySelector('.meta').textContent = [cutMeta(cut, plane), missing ? 'no lock fits here' : ''].filter(Boolean).join(' · ');
+    // what the pieces say the cut leaves loose, or held on only next to it, in the warning colour
+    const words = [cutMeta(cut, plane), missing ? 'no lock fits here' : ''].filter(Boolean).join(' · ');
+    const meta = li.querySelector('.meta');
+    meta.replaceChildren(words);
+    [...cutHoldWords(cut.id), ...keepWords(cut)].forEach((text, k) => {
+      if (words || k) meta.append(' · ');
+      const warn = document.createElement('span');
+      warn.className = 'warn';
+      warn.textContent = text;
+      meta.append(warn);
+    });
   });
   // a part just taken out: its row, which opens at the foot of the cuts' own box, shown whole – with the card where the
   // two fit, its other parts' offers what may be pressed next, taken from the card or picked on the model
@@ -2474,6 +2763,25 @@ function cutMeta(cut, plane) {
   return parts.join(' · ');
 }
 
+/** A volume for a cut's row, rounded: "15 cm³", "120 mm³". */
+const roughVolume = (v) => (v >= 999.5 ? `${Math.round(v / 1000).toLocaleString()} cm³` : `${Math.max(1, Math.round(v))} mm³`);
+
+/**
+ * What the pieces as worked out say a cut leaves, for its row: what of the model it leaves loose (LOOSE_KEPT) –
+ * "leaves 15 cm³ loose" – and the part it leaves held on over the least next to it (BARELY_HELD) – "16 cm³ held over
+ * only 6 mm"; nothing until the pieces for the cuts as they are now are worked out.
+ */
+function cutHoldWords(id) {
+  if (!piecesCurrent()) return [];
+  const notes = lastPieces.notes.filter((n) => n.cutId === id);
+  const loose = notes.filter((n) => n.code === 'LOOSE_KEPT').reduce((sum, n) => sum + (n.volume ?? 0), 0);
+  const held = notes.filter((n) => n.code === 'BARELY_HELD').sort((p, q) => p.w - q.w)[0];
+  return [
+    loose > 0 ? `leaves ${roughVolume(loose)} loose` : '',
+    held ? `${roughVolume(held.volume)} held over only ${Math.max(1, Math.round(held.w))} mm` : '',
+  ].filter(Boolean);
+}
+
 let piecesSignature = '';
 /**
  * The pieces: as computed (hovering one picks it out in the view), or until
@@ -2512,7 +2820,8 @@ function renderPieces() {
       fits: p.fits,
       lies: `lies ${p.lies}${p.yaw ? `, turned ${p.yaw}°` : ''}`,
       extra: [
-        p.shells > 1 ? `${p.shells} parts` : '',
+        // a bit a cut leaves loose that prints in the file with the rest of its box: the notes say how it goes on
+        p.shells > 1 ? `${p.shells} parts${p.loose ? ` – ${p.loose} loose` : ''}` : '',
         p.dowels ? `${p.dowels} ${p.dowels === 1 ? 'pin' : 'pins'}` : '',
         // which piece carries a face's built-in pegs, and which has their sockets
         p.pegs ? `${p.pegs} ${p.pegs === 1 ? 'peg' : 'pegs'}` : '',
@@ -2543,13 +2852,15 @@ function renderPieces() {
   if (signature === piecesSignature) return;
   piecesSignature = signature;
   viewer.setPieceHighlight(null);
+  // as the view colours them: a box's second piece (a bit printed apart) a shade of its own
+  const colours = pieceColors(rows);
   list.replaceChildren(
     ...rows.map((row) => {
       const li = document.createElement('li');
       li.classList.toggle('predicted', !!row.predicted);
       const swatch = document.createElement('span');
       swatch.className = 'swatch';
-      swatch.style.background = `#${PIECE_COLORS[pieceColorIndex(row.cell)].toString(16).padStart(6, '0')}`;
+      swatch.style.background = `#${PIECE_COLORS[colours.get(row.index) ?? pieceColorIndex(row.cell)].toString(16).padStart(6, '0')}`;
       const text = document.createElement('span');
       const fit = document.createElement('span');
       fit.className = row.fits ? '' : 'err';
@@ -2611,6 +2922,8 @@ const splitNoteActions = (() => {
     APART_FLAT: moveTo,
     APART_HEAVY: firmer,
     PIECE_TOO_BIG: () => canSplit() && { label: 'Fit to my printer', run: autoSplit },
+    KEEP_CUT: (n) => n.fits && canSplit() && { label: 'Fit to my printer', run: autoSplit },
+    KEEP_NOT_KEPT: () => ({ label: 'Choose a printer', run: openPrinting }),
     SMALL_PIECE: select,
     CUT_THROUGH_TEXT: select,
     CUT_MISSES: remove,
@@ -2627,9 +2940,17 @@ let splitNotesShown = '';
 function renderSplitNotes() {
   const active = splitActive(doc.split);
   let notes = [];
-  if (active && lastPieces && (piecesCurrent() || $('resultToggle').checked)) notes = lastPieces.notes;
+  const pieced = active && lastPieces && (piecesCurrent() || $('resultToggle').checked);
+  if (pieced) notes = lastPieces.notes;
   else if (active && measured) notes = measured.notes;
-  if (planNotes?.key === lastSplitKey && planNotes.content === lastContentKey) notes = [...planNotes.notes, ...notes];
+  // what Fit to my printer said of how its cuts hold on, the pieces say again once they are worked out
+  // and of the details kept whole, but for one no plan keeps whole: that it could not says more than that a cut runs
+  // through it
+  if (planNotes?.key === lastSplitKey && planNotes.content === lastContentKey) {
+    const unkept = new Set(planNotes.notes.filter((n) => n.code === 'KEEP_NOT_KEPT').map((n) => n.keepId));
+    const own = notes.filter((n) => !(n.code === 'KEEP_CUT' && unkept.has(n.keepId)));
+    notes = [...planNotes.notes.filter((n) => !pieced || (n.code !== 'BARELY_HELD' && n.code !== 'KEEP_KEPT')), ...own];
+  }
   const shown = JSON.stringify(notes.map((n) => [n.code, n.text]));
   if (shown === splitNotesShown) return;
   splitNotesShown = shown;
@@ -3130,6 +3451,7 @@ function startAim(cutId = null) {
   if (axis == null || !modelInfo?.hasModel || !canSplit()) return;
   if (!cutId && !roomForCut(axis)) return setStatus(`A split can have up to ${SPLIT_LIMITS.cuts} cuts and ${SPLIT_LIMITS.cells} pieces.`, 'error');
   endAim();
+  endKeep();
   // the model as it is, where the pointer lands on it, and no item to move instead
   if ($('resultToggle').checked) {
     $('resultToggle').checked = false;
@@ -4226,6 +4548,8 @@ function bindSplit() {
   $('splitFitBtn').addEventListener('click', autoSplit);
   $('addCutBtn').addEventListener('click', addCut);
   $('addApartBtn').addEventListener('click', () => startAim(null));
+  $('keepWholeBtn').addEventListener('click', startKeep);
+  $('keepWholeBtn').title = KEEP_TITLE;
   $('suggestSpotsBtn').addEventListener('click', () => {
     askReveal();
     findPartsCard();
@@ -4663,6 +4987,8 @@ function render() {
   dropStaleToast();
   // undone, removed, moved or retyped: the summary of the pieces describes a split no longer in force (new pieces bring theirs)
   if (piecesStatus && (piecesStatus.key !== splitKey || piecesStatus.content !== contentKey)) dropPiecesStatus();
+  // renamed or taken away (an undo, ×): what the status line says of a detail kept whole follows
+  keepStatusNow();
 
   renderItems();
   fillPanel(sel);
@@ -4959,6 +5285,10 @@ function bindControls() {
     if (e.key === 'Escape' && viewer.cancelCutDrag()) return;
     if (e.key === 'Escape' && aiming) {
       endAim();
+      return;
+    }
+    if (e.key === 'Escape' && keeping) {
+      endKeep();
       return;
     }
     if (typing || mod) return;

@@ -94,9 +94,9 @@ const LABEL_REACH = 2.2;
 const LABEL_LARGEST = 8;
 const LABEL_SMALLEST = 3;
 /**
- * The gap between pins on a sheet (mm), along a row and between rows: wide enough that a slicer's usual 5 mm brim
- * round each pin (Bambu Studio's, 0.1 mm off the pin) stays clear of its neighbour's, that a string pulled across it
- * breaks off instead of webbing two pins together, and that the part fan's air gets between them.
+ * The gap between pins on a sheet (mm), along a row and between rows: wide enough that a 5 mm brim round each pin
+ * (Bambu Studio's "Outer brim only": 5 mm, 0.1 mm off the part) stays clear of its neighbour's, that a string pulled
+ * across it breaks off instead of webbing two pins together, and that the part fan's air gets between them.
  */
 const PIN_GAP = 12;
 /** The gap between the parts of the fit test (mm). */

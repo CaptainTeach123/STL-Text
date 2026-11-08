@@ -185,7 +185,7 @@ describe('holes and pins', () => {
   });
 
   it('a pins file holds no more pins than the bed takes lying as they are laid out', () => {
-    // 60 Ø8 pins on a 110 mm bed (a 120 mm printer): rows of three, as many rows as the depth takes, 12 mm apart
+    // Ø8 pins on a 110 mm bed (a 120 mm printer), 12 mm apart: rows of three, as many rows as the depth takes (six)
     const U = [110, 110, 119];
     const { perSheet, size } = pinsPerSheet({ d: 8, length: 26 }, U);
     expect(size.map((v) => +v.toFixed(3))).toEqual([26, 7.391, 7.391]);

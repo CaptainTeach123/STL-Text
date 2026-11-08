@@ -5115,11 +5115,12 @@ const NOTE_TEXT = {
     if (apart.length) s += ` ${apart.length > 1 ? `Cuts ${listOf(apart)} come apart – don't glue them.` : `Cut ${apart[0]} comes apart – don't glue it.`}`;
     return s;
   },
-  PINS: ({ count, spares = 0, diameter, length, own = false }) => {
+  PINS: ({ count, spares = 0, diameter, length, own = false, sheets = 1 }) => {
     if (diameter === FILAMENT) return `No pins file – cut ${plural(count, 'piece')} of 1.75 mm filament ${mm(length)} mm long.`;
     if (own) return `No pins file – cut ${count} Ø${mm(diameter)} mm dowels to ${mm(length)} mm.`;
     const spare = spares ? `, ${spares === 1 ? 'one spare' : `${spares} spares`}` : '';
-    return `Print the pins file (${plural(count + spares, 'pin')}${spare}) lying flat – or use Ø${mm(diameter)} mm wooden dowels cut to ${mm(length)} mm.`;
+    const files = sheets > 1 ? `the ${sheets} pins files` : 'the pins file';
+    return `Print ${files} (${plural(count + spares, 'pin')}${spare}) lying flat – or use Ø${mm(diameter)} mm wooden dowels cut to ${mm(length)} mm.`;
   },
   DOVETAIL: ({ letter, tabs, pieces = [], pegs = false, apart = false }) => {
     const [lower, upper] = [pieces[0] ?? 1, pieces[1] ?? 2];
@@ -5481,7 +5482,7 @@ const NOTE_TEXT = {
  * pegSize, pegSizes: [{ size, count }] (when the built-in pegs come in more than one size), dovetails,
  * pairs: ['1A ↔ 2A'], apart: ['A'] }` (`dowels` counts every pin, `diameter` and `length` are the main size's; `pegs`
  * every peg; `apart` the letters of the cuts that come apart);
- * PINS `{ count, spares, diameter, length, own }`; DOVETAIL `{ letter, tabs, pieces, pegs, apart }` (`pegs`: the joints are
+ * PINS `{ count, spares, diameter, length, own, sheets }` (`sheets`: how many pins files the bed needs); DOVETAIL `{ letter, tabs, pieces, pegs, apart }` (`pegs`: the joints are
  * built-in pegs; `apart`: the cut comes apart, its tabs unglued);
  * APART `{ letter, cutId, axis, above, male, female, hold, clips, height, faces, flat, lying }` (a cut that comes
  * apart: `male` the pieces its lip stands out of, `female` those with its groove, `above` that the male is the piece
@@ -5866,11 +5867,11 @@ function fitWords(fit) {
  * them (or that nothing is glued, when no other cut is).
  * @param {{ name: string, pieces: { index: number, cell: number[], size: number[], lies: string, yaw?: number, fits?: boolean, shells?: number,
  *   part?: string, name?: string, lids?: string[] }[],
- *   seams: object[], pins?: { d: number, length: number, count: number, spares?: number, own?: boolean }[],
+ *   seams: object[], pins?: { d: number, length: number, count: number, spares?: number, own?: boolean, sheets?: number }[],
  *   parts?: { name: string }[], clearance?: number, bed?: number[], printer?: { size: number[], margin: number, corner?: number[]|null }|null, steps?: object[],
  *   bridges?: number[], fit?: object|null }} plan
  *   `seams` as for `assemblySteps`; a piece that is a part taken out has its cut's id (`part`), its `name` and the
- *   cut's letter (`lids`); `pins` one group per pin size (count without spares); `bed` the usable bed (with the
+ *   cut's letter (`lids`); `pins` one group per pin size (count without spares, `sheets` its pins files); `bed` the usable bed (with the
  *   corner it keeps clear, the pieces that must be moved clear of it are told so); `printer` the printer itself, when
  *   known, for the heading (`corner` the sides of the corner it keeps clear); `bridges` the clips' bridges' lengths as built (each
  *   hold's own on a 1.6 mm tongue when not given); `fit` the PART_FIT note's fields, for what the fit test holds
@@ -5945,7 +5946,8 @@ export function howToGlueText(plan) {
     else if (g.own) out.push(`  ${pad('pins', 12)}not printed – cut ${g.count} Ø${mm(g.d)} mm dowels to ${mm(g.length)} mm (wood or steel)`);
     else {
       const spare = spares ? ` (${spares === 1 ? 'one spare' : `${spares} spares`})` : '';
-      out.push(`  ${pad('pins', 12)}${g.count + spares} × Ø${mm(g.d)} × ${mm(g.length)} mm${spare}, lying on a flat side, solid (4+ walls)`);
+      const files = g.sheets > 1 ? `, in ${g.sheets} pins files` : '';
+      out.push(`  ${pad('pins', 12)}${g.count + spares} × Ø${mm(g.d)} × ${mm(g.length)} mm${spare}${files}, lying on a flat side, solid (4+ walls)`);
       out.push(`${indent}or Ø${mm(g.d)} mm wooden dowels cut to ${mm(g.length)} mm`);
     }
   }

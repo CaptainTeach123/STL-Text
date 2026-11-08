@@ -3378,7 +3378,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       .sort((p, q) => (p.d === layout.diameter ? 0 : 1) - (q.d === layout.diameter ? 0 : 1) || q.count - p.count || q.d - p.d || q.depth - p.depth)
       .map((g) => {
         const own = spec.pins === 'own' || g.d === FILAMENT;
-        return { ...g, own, spares: own ? 0 : pinSpares(g.count) };
+        const spares = own ? 0 : pinSpares(g.count);
+        // as many pins files as the bed takes them, as the download lays them out (`splitExport`)
+        return { ...g, own, spares, sheets: own ? 0 : Math.ceil((g.count + spares) / pinsPerSheet(g, U).perSheet) };
       });
     const notes = [];
     const main = pins[0];
@@ -3401,7 +3403,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     for (const g of pins) {
       // pins that fell back to filament on some faces are told of by that cut's own note
       if (g.d === FILAMENT && layout.diameter !== FILAMENT) continue;
-      notes.push(splitNote('PINS', { count: g.count, spares: g.spares, diameter: g.d, length: g.length, own: g.own }));
+      notes.push(splitNote('PINS', { count: g.count, spares: g.spares, diameter: g.d, length: g.length, own: g.own, sheets: g.sheets }));
     }
     for (const x of cut.dovetails) {
       const seam = seams.find((s) => s.cutId === x.cutId && s.joint === 'dovetail');
@@ -3581,7 +3583,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
 
   /**
    * The `export` reply with a split: every piece turned the way it prints,
-   * a pins file per pin size, the separately printed parts and the glue
+   * the pins files of each pin size (as many as the bed needs), the separately printed parts and the glue
    * sheet, packed in one zip (`archive: 'zip'`) or sent as separate files.
    */
   function splitExport(final, split, { name, printer, archive }, progress) {

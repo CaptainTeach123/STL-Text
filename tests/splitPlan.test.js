@@ -2266,6 +2266,9 @@ describe('notes', () => {
     expect(splitNote('SPLIT', { pieces: 5, dowels: 8, diameter: 5, length: 16, sizes }).text).toBe('Cut into 5 pieces with 8 pins (2 × Ø5 × 16 mm, 6 × Ø1.75 × 8 mm).');
     expect(splitNote('DOVETAIL_NOT_PLATE', { letter: 'A', lying: true }).text).toBe('Cut A goes through a plate that its pieces can\'t lie flat on, so it uses pins.');
     expect(splitNote('PINS', { count: 4, spares: 1, diameter: 6, length: 19 }).text).toBe('Print the pins file (5 pins, one spare) lying flat – or use Ø6 mm wooden dowels cut to 19 mm.');
+    // more pins than one plate takes go in several files, and the note says how many
+    expect(splitNote('PINS', { count: 48, spares: 12, diameter: 6, length: 19, sheets: 2 }).text).toBe('Print the 2 pins files (60 pins, 12 spares) lying flat – or use Ø6 mm wooden dowels cut to 19 mm.');
+    expect(splitNote('PINS', { count: 4, spares: 1, diameter: 6, length: 19, sheets: 1 }).text).toMatch(/^Print the pins file \(/);
     expect(splitNote('PINS', { count: 4, diameter: 5, length: 16, own: true }).text).toMatch(/cut 4 Ø5 mm dowels to 16 mm/);
     expect(splitNote('CONNECTORS_SHORTER', { letter: 'B', depth: 3.5 }).text).toBe('Cut B uses 3.5 mm-deep holes – deeper ones would break through the side.');
     expect(splitNote('CONNECTORS_FILAMENT', { letter: 'C', count: 4, diameter: 6, length: 8 }).text).toBe('Cut C is too narrow for Ø6 pins: its holes take 1.75 mm filament – cut 4 pieces 8 mm long.');

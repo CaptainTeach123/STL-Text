@@ -763,10 +763,17 @@ describe('checking and planning cuts', () => {
     const pins = ex.files.filter((f) => f.kind === 'pins');
     expect(pins.map((f) => [f.name, f.count, f.fits])).toEqual([['box-pins-2x-5x16mm-1-of-2', 2, true], ['box-pins-1x-5x16mm-2-of-2', 1, true]]);
     expect(codes(ex)).not.toContain('PART_TOO_BIG');
+    // the note and the glue sheet say there are two files to print, not "the pins file"
+    expect(noteOf(ex, 'PINS')).toMatchObject({ sheets: 2 });
+    expect(noteOf(ex, 'PINS').text).toMatch(/^Print the 2 pins files \(3 pins, one spare\) lying flat/);
+    expect(ex.files.find((f) => f.kind === 'text').text).toContain('3 × Ø5 × 16 mm (one spare), in 2 pins files, lying on a flat side');
     // with room for one row of many, one file as before
     expect(ex.files.filter((f) => f.kind === 'pins')).toHaveLength(2);
     const roomy = await exportSplit(S({ diameter: 5, depth: 8, count: 2, labels: false }));
     expect(roomy.files.filter((f) => f.kind === 'pins').map((f) => [f.name, f.count])).toEqual([['box-pins-3x-5x16mm', 3]]);
+    expect(noteOf(roomy, 'PINS')).toMatchObject({ sheets: 1 });
+    expect(noteOf(roomy, 'PINS').text).toMatch(/^Print the pins file \(3 pins, one spare\) lying flat/);
+    expect(roomy.files.find((f) => f.kind === 'text').text).not.toContain('pins files');
   });
 });
 

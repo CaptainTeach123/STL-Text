@@ -93,8 +93,13 @@ const LABEL_REACH = 2.2;
 /** Label sizes tried (cap height, mm), largest first in 1 mm steps. */
 const LABEL_LARGEST = 8;
 const LABEL_SMALLEST = 3;
-/** The gap between pins on a sheet and between the parts of the fit test (mm). */
-const PIN_GAP = 3;
+/**
+ * The gap between pins on a sheet (mm), along a row and between rows: wide enough that a slicer's usual 5 mm brim
+ * round each pin (Bambu Studio's, 0.1 mm off the pin) stays clear of its neighbour's, that a string pulled across it
+ * breaks off instead of webbing two pins together, and that the part fan's air gets between them.
+ */
+const PIN_GAP = 12;
+/** The gap between the parts of the fit test (mm). */
 const COUPON_GAP = 5;
 /** A dovetail tab's root on its own side, the room it needs inside the plate, and the rounding of every corner (mm). */
 const TAB_ROOT = 2;
@@ -516,8 +521,9 @@ export function pinsPerSheet({ d, length }, U) {
 
 /**
  * The pins file: `count` pins of Ø d × length, each lying on a flat (no
- * supports, strongest across the layers), end to end along x with 3 mm
- * gaps, in rows wrapped to the bed's width. Centred on x = y = 0, standing
+ * supports, strongest across the layers), end to end along x in rows
+ * wrapped to the bed's width, `PIN_GAP` apart along a row and between rows
+ * so each prints clean on its own. Centred on x = y = 0, standing
  * on z = 0. Put spares in `count` (`pinSpares`); more than the bed takes
  * (`pinsPerSheet`) go in more than one file.
  * @param {{ d: number, length: number, count: number }} group

@@ -1,5 +1,5 @@
 {
- "commit": "f031319 with changes to src",
+ "commit": "2ef4c8a with changes to src",
  "cases": {
   "lantern/lock-190": {
    "files": {
@@ -98,7 +98,7 @@
    "files": {
     "gothic-piece-1-of-2.stl": "c11e963b40d708fd",
     "gothic-piece-2-of-2.stl": "787d20a0cf76e1d6",
-    "gothic-pins-7x-5x16mm.stl": "ea26105f493c98ce",
+    "gothic-pins-7x-5x16mm.stl": "7e7066028fdb1e00",
     "gothic-how-to-glue.txt": "d5c89a9b75e191d7"
    },
    "notes": "dfca4992dcffb490",
@@ -171,7 +171,7 @@
    "files": {
     "loggia-piece-1-of-2.stl": "6cf147ab148c21f8",
     "loggia-piece-2-of-2.stl": "03300d06c5528983",
-    "loggia-pins-10x-3x10mm.stl": "cc0ccb89e5393e89",
+    "loggia-pins-10x-3x10mm.stl": "afc4b634d8f60489",
     "loggia-how-to-glue.txt": "fe4631236969efe2"
    },
    "notes": "1dc5bae807fe9713",

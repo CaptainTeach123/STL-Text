@@ -758,8 +758,8 @@ describe('checking and planning cuts', () => {
 
   it('pins go in as many files as the bed needs, each fitting lying as it is laid out', async () => {
     await load(cube([120, 40, 30]));
-    // three Ø5 × 16 pins (one spare) on a bed with room for two side by side and one row
-    const ex = await exportSplit(S({ diameter: 5, depth: 8, count: 2, labels: false }), { bed: [40, 12, 100] });
+    // three Ø5 × 16 pins (one spare) on a bed with room for two side by side (12 mm apart) and one row
+    const ex = await exportSplit(S({ diameter: 5, depth: 8, count: 2, labels: false }), { bed: [46, 12, 100] });
     const pins = ex.files.filter((f) => f.kind === 'pins');
     expect(pins.map((f) => [f.name, f.count, f.fits])).toEqual([['box-pins-2x-5x16mm-1-of-2', 2, true], ['box-pins-1x-5x16mm-2-of-2', 1, true]]);
     expect(codes(ex)).not.toContain('PART_TOO_BIG');

@@ -167,18 +167,29 @@ describe('holes and pins', () => {
     expect(b.min[2]).toBeCloseTo(0, 6);
     expect(b.min[0] + b.max[0]).toBeCloseTo(0, 6);
     // a long run wraps to the bed's width
-    const many = boxOf(own(pinSheet({ d: 5, length: 16, count: 30 }, BED)));
+    const long = own(pinSheet({ d: 5, length: 16, count: 30 }, BED));
+    const many = boxOf(long);
     expect(many.size[0]).toBeLessThanOrEqual(BED[0]);
     expect(many.size[1]).toBeGreaterThan(3 * 4.619);
+    // every pin keeps 12 mm clear of the next, along its row and across to the next row, so the slicer's 5 mm brims
+    // round them never join and a string across a gap breaks off: no two pins print as one
+    const boxes = shells(long).map(boxOf);
+    expect(boxes).toHaveLength(30);
+    const apart = (a, c) => Math.max(...[0, 1].map((k) => Math.max(c.min[k] - a.max[k], a.min[k] - c.max[k])));
+    const gaps = boxes.flatMap((a, i) => boxes.slice(i + 1).map((c) => apart(a, c)));
+    expect(Math.min(...gaps)).toBeCloseTo(12, 6);
+    // ...and that gap is between rows too, not only end to end
+    const rowGaps = boxes.flatMap((a, i) => boxes.slice(i + 1).filter((c) => c.min[1] > a.max[1] || a.min[1] > c.max[1]).map((c) => apart(a, c)));
+    expect(Math.min(...rowGaps)).toBeCloseTo(12, 6);
     expect([1, 2, 4, 5, 8, 9].map(pinSpares)).toEqual([1, 1, 1, 2, 2, 3]);
   });
 
   it('a pins file holds no more pins than the bed takes lying as they are laid out', () => {
-    // 60 Ø8 pins on a 110 mm bed (a 120 mm printer): rows of three, as many rows as the depth takes
+    // 60 Ø8 pins on a 110 mm bed (a 120 mm printer): rows of three, as many rows as the depth takes, 12 mm apart
     const U = [110, 110, 119];
     const { perSheet, size } = pinsPerSheet({ d: 8, length: 26 }, U);
     expect(size.map((v) => +v.toFixed(3))).toEqual([26, 7.391, 7.391]);
-    expect(perSheet).toBe(3 * 10);
+    expect(perSheet).toBe(3 * 6);
     const full = boxOf(own(pinSheet({ d: 8, length: 26, count: perSheet }, U)));
     expect(full.size[0]).toBeLessThanOrEqual(U[0]);
     expect(full.size[1]).toBeLessThanOrEqual(U[1]);

@@ -2477,8 +2477,9 @@ export function flatProbes(at, lo, hi) {
 }
 
 /**
- * Each triangle's box and, for one facing within 45° of an axis, which way, whether it faces that way squarely
- * (`FLAT`), its area and where its corner furthest from that end lies, worked out once per mesh.
+ * Each triangle's box and, for one facing within 45° of an axis (less the print check's 1.5°), which way, whether
+ * it faces that way squarely (`FLAT`), its area and where its corner furthest from that end lies, worked out once
+ * per mesh.
  */
 const meshFacts = new WeakMap();
 function factsOf(mesh) {
@@ -2513,8 +2514,10 @@ function factsOf(mesh) {
     if (!(len > 0)) continue;
     const axis = Math.abs(nx) >= Math.abs(ny) && Math.abs(nx) >= Math.abs(nz) ? 0 : Math.abs(ny) >= Math.abs(nz) ? 1 : 2;
     const along = axis === 0 ? nx : axis === 1 ? ny : nz;
-    // facing within 45° of the axis: what would need support lying that way, or the bed when it faces it squarely
-    if (!(Math.abs(along) / len > COS45)) continue;
+    // facing within 45° of the axis, less the print check's tolerance, so that a face drawn at exactly 45° – a
+    // chamfer – never counts whichever way its numbers round: what would need support lying that way, or the bed
+    // when it faces it squarely
+    if (!(Math.abs(along) / len > -OVERHANG_NZ)) continue;
     face[t] = axis * 2 + (along < 0 ? 0 : 1);
     square[t] = Math.abs(along) / len > FLAT ? 1 : 0;
     area[t] = len / 2;
@@ -3222,7 +3225,9 @@ function plateOf(faces, w) {
  * the six directions d, its extent along d, the area that would rest on the
  * bed (facets facing d within 0.1 mm of the piece's extreme along d) and the
  * area of the box that bed spans, the area that would need support (facets
- * facing within 45° of d, not on the bed) and the area of its own cut faces
+ * facing within 45° of d, not on the bed – less the print check's 1.5°, so
+ * that a chamfer drawn at exactly 45° counts for nothing however its numbers
+ * round) and the area of its own cut faces
  * facing d; and for each axis, how far it spreads across the other two in
  * each of 16 slices along it (`bands`) and the thin plate across it, if it
  * holds one (`plates`), for how slender it stands.
@@ -3305,7 +3310,7 @@ export function orientationStats(vertProperties, numProp, triVerts, cutsOnPiece 
         box[i] = Math.min(box[i], P[a + k], P[b + k], P[c + k]);
         box[2 + i] = Math.max(box[2 + i], P[a + k], P[b + k], P[c + k]);
       });
-    } else s.support += area;
+    } else if (nd > -OVERHANG_NZ) s.support += area; // a face drawn at exactly 45° needs none, however it rounds
     if (nd > FLAT && planes.some((p) => p.axis === axis && Math.max(Math.abs(pa - p.at), Math.abs(pb - p.at), Math.abs(pc - p.at)) <= 0.01)) s.cutArea += area;
     binFace(faces, P, a, b, c, axis, plus, area);
   }

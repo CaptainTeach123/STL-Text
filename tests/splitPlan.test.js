@@ -1688,6 +1688,49 @@ describe('orientationStats', () => {
     expect(orientationStats(wide, 4, tris, [{ axis: 0, at: 10 }]).dirs['+x'].cutArea).toBeCloseTo(50, 6);
   });
 
+  /**
+   * A bar 20 mm long with the cross-section given (convex, in x and z), turned `yaw` degrees about z: a soup, its
+   * numbers rounded as a file's are.
+   */
+  const barSoup = (section, yaw) => {
+    const n = section.length;
+    const at = (i, y) => [section[i % n][0], y, section[i % n][1]];
+    const tris = [];
+    for (let i = 0; i < n; i++) {
+      tris.push([at(i, -10), at(i + 1, -10), at(i + 1, 10)], [at(i, -10), at(i + 1, 10), at(i, 10)]);
+      if (i > 0 && i < n - 1) tris.push([at(0, -10), at(i, -10), at(i + 1, -10)], [at(0, 10), at(i, 10), at(i + 1, 10)]);
+    }
+    const mid = [section.reduce((t, p) => t + p[0], 0) / n, 0, section.reduce((t, p) => t + p[1], 0) / n];
+    const c = Math.cos((yaw * Math.PI) / 180);
+    const sn = Math.sin((yaw * Math.PI) / 180);
+    return tris.flatMap(([p, q, r]) => {
+      const u = q.map((v, k) => v - p[k]);
+      const w = r.map((v, k) => v - p[k]);
+      const normal = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+      const out = normal.reduce((t, v, k) => t + v * (p[k] - mid[k]), 0) > 0;
+      return (out ? [p, q, r] : [p, r, q]).flatMap(([x, y, z]) => [x * c - y * sn, x * sn + y * c, z]);
+    });
+  };
+
+  it('a face drawn at exactly 45° needs no support however its numbers round; one a little flatter needs it all', () => {
+    // 6 mm chamfers along both bottom edges of a bar 40 × 60: 2 × 8.49 × 20 = 339.4 mm² of them
+    const chamfered = [[-14, 0], [14, 0], [20, 6], [20, 60], [-20, 60], [-20, 6]];
+    // the same 40° from level: 7.15 mm out for 6 mm up
+    const out = 6 / Math.tan((40 * Math.PI) / 180);
+    const flatter = [[-20 + out, 0], [20 - out, 0], [20, 6], [20, 60], [-20, 60], [-20, 6]];
+    for (const yaw of [0, 17, 33, 45, 71]) {
+      const m = meshOf([barSoup(chamfered, yaw)]);
+      const s = orientationStats(m.vertProperties, m.numProp, m.triVerts);
+      expect(s.dirs['-z'].support, `yaw ${yaw}`).toBe(0);
+      expect(s.dirs['-z'].bed, `yaw ${yaw}`).toBeCloseTo(28 * 20, 2);
+      expect(cellSupport(m, [[], [], []]).get('0,0,0').lying['-z'].support, `yaw ${yaw}`).toBe(0);
+      const f = meshOf([barSoup(flatter, yaw)]);
+      const full = 2 * Math.hypot(out, 6) * 20;
+      expect(orientationStats(f.vertProperties, f.numProp, f.triVerts).dirs['-z'].support, `yaw ${yaw}`).toBeCloseTo(full, 1);
+      expect(cellSupport(f, [[], [], []]).get('0,0,0').lying['-z'].support, `yaw ${yaw}`).toBeCloseTo(full, 1);
+    }
+  });
+
   it('finds a model\'s base plate: one at its end with only towers on it, not one with another plate over it', () => {
     const stats = (soups) => {
       const m = meshOf(soups);

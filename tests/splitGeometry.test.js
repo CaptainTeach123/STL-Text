@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
 import {
-  AXES, CLIP, FILAMENT, LIP, PIN_DIAMETERS, TO_PLANE, apartMales, applyMat4, chooseOrientation, clipHold, clipShape, endBeds, endsAsWell, fitsBed, isSymmetric,
+  AXES, CLIP, FILAMENT, LIP, PIN_DIAMETERS, POLYGON_K, TO_PLANE, apartMales, applyMat4, chooseOrientation, clipHold, clipShape, endBeds, endsAsWell, fitsBed, isSymmetric,
   layPieces, normaliseSplit, pegMales, pegSizesFor, reachesCorner, sizesFor,
 } from '../src/split.js';
 import {
@@ -89,7 +89,7 @@ function cutsFor(solid, list, patch = {}) {
 }
 
 /** The whole stage chain on a solid: plate test, pieces, each piece's way up on BED, pins and labels, drilling. */
-function split(solid, list, patch = {}, { passthrough = false } = {}) {
+function split(solid, list, patch = {}, { passthrough = false, hl = 0.2 } = {}) {
   const { spec, cuts } = cutsFor(solid, list, patch);
   const plan = planDovetails(solid, cuts, spec, { passthrough });
   const cut = cutPieces(solid, cuts, { dove: plan.dove, tabs: plan.tabs });
@@ -99,7 +99,7 @@ function split(solid, list, patch = {}, { passthrough = false } = {}) {
     return { ...p, lying, up: lying.up };
   });
   const males = spec.joint === 'pegs' ? pegMales(pieces, BED, spec.orient) : null;
-  const layout = layoutSplit(solid, cuts, pieces, spec, { joints: plan.joints, tabs: plan.tabs, font, pegMales: males });
+  const layout = layoutSplit(solid, cuts, pieces, spec, { joints: plan.joints, tabs: plan.tabs, font, pegMales: males, hl });
   const drilled = pieces.map((p) => own(drillPiece(p.solid, layout, p.index, { font })));
   return { spec, cuts, plan, cut, pieces, layout, drilled };
 }
@@ -218,12 +218,14 @@ describe('holes and pins', () => {
     }
   });
 
-  for (const tear of [false, true]) {
-    it(`an octagonal pin keeps the clearance in a ${tear ? 'teardrop' : 'round'} hole at any turn, and never touches`, () => {
+  for (const shape of ['round', 'teardrop', 'flat-topped teardrop']) {
+    it(`an octagonal pin keeps the clearance in a ${shape} hole at any turn, and never touches`, () => {
       const s = sizesFor(6);
+      const tear = shape !== 'round';
       const dowel = {
         axis: 2, centre: [0, 0, 0], d: 6, depth: s.depth, R: s.R, h: s.h, ch: s.ch,
         sides: [{ piece: 1, tear, apex: tear ? [0, 1, 0] : null }, { piece: 2, tear, apex: tear ? [0, 1, 0] : null }],
+        ...(shape === 'flat-topped teardrop' ? { flat: true, lift: 0.2 } : {}),
       };
       const layout = { dowels: [dowel], labels: [] };
       const lower = own(drillPiece(cube([40, 40, 30], [0, 0, -15]), layout, 1));
@@ -244,6 +246,58 @@ describe('holes and pins', () => {
       expect(worst).toBe(0);
     });
   }
+
+  it('a flat-topped teardrop holds the round hole, lies inside the pointed one, and its roof is a short level bridge on 45° sides', () => {
+    for (const D of PIN_DIAMETERS) {
+      for (const lift of [0.2, 0.28]) {
+        const s = sizesFor(D);
+        const sizes = { R: s.R, h: s.h, ch: s.ch };
+        const [round, pointed, flat] = [{}, { tear: true }, { tear: true, flat: lift }].map((x) => own(halfHole({ ...sizes, ...x })));
+        const name = `Ø${D} lifted ${lift}`;
+        // the pin's own hole is all there, so the pin fits as it does a round one; and nothing is cut that a pointed
+        // teardrop would not cut
+        expect(own(round.subtract(flat)).volume(), name).toBeLessThan(1e-9);
+        expect(own(flat.subtract(pointed)).volume(), name).toBeLessThan(1e-9);
+        expect(flat.volume()).toBeGreaterThan(round.volume());
+        expect(flat.volume()).toBeLessThan(pointed.volume());
+        // its mouth is the same chamfer: as wide as a round hole's, and as far out sideways and down
+        const [bf, br, bp] = [flat, round, pointed].map(boxOf);
+        expect([bf.min[0], bf.max[0], bf.min[1]].map((v) => +v.toFixed(6))).toEqual([br.min[0], br.max[0], br.min[1]].map((v) => +v.toFixed(6)));
+        // the roof: `lift` over the mouth's own top, far under where the point would be
+        expect(bf.max[1]).toBeCloseTo(br.max[1] + lift, 6);
+        expect(bf.max[1]).toBeLessThan(bp.max[1] - 0.2);
+        // across the bore: every edge that faces up is level (the bridge) or at 45° or steeper
+        const ring = own(flat.slice(s.h / 2)).toPolygons();
+        expect(ring).toHaveLength(1);
+        const top = s.R * POLYGON_K + lift;
+        let bridge = 0;
+        ring[0].forEach(([x0, y0], i) => {
+          const [x1, y1] = ring[0][(i + 1) % ring[0].length];
+          const [dx, dy] = [x1 - x0, y1 - y0];
+          const up = -dx / Math.hypot(dx, dy); // the outward normal's y: the ring runs anticlockwise
+          if (up <= 1e-9) return;
+          if (Math.abs(dy) < 1e-9) {
+            expect(y0).toBeCloseTo(top, 6);
+            bridge += Math.abs(dx);
+          } else expect(Math.abs(dy) / Math.abs(dx), name).toBeGreaterThanOrEqual(1 - 1e-6);
+        });
+        expect(bridge).toBeCloseTo(2 * (Math.SQRT2 * s.R * POLYGON_K - top), 6);
+        expect(bridge).toBeGreaterThan(0.2);
+        expect(bridge).toBeLessThan(4);
+        // drilled, the block is one whole solid
+        const drilled = own(cube([40, 40, 30], [0, 0, 15]).subtract(flat));
+        expect(drilled.status()).toBe('NoError');
+        expect(drilled.genus()).toBe(0);
+        expect(shells(drilled)).toHaveLength(1);
+      }
+    }
+    // a pointed hole asked for after a flat-topped one of the same sizes is still pointed, and the other way round
+    const s = sizesFor(5);
+    const above = cube([100, 100, 100], [0, 0, 50]);
+    expect(overlap(own(halfHole({ R: s.R, h: s.h, ch: s.ch, tear: true, flat: 0.2 })), above)).toBeCloseTo(216.918, 2);
+    expect(overlap(own(halfHole({ R: s.R, h: s.h, ch: s.ch, tear: true })), above)).toBeCloseTo(224.6701, 3);
+    expect(overlap(own(halfHole({ R: s.R, h: s.h, ch: s.ch, flat: 0.2 })), above)).toBeCloseTo(209.9005, 3); // upright: round, whatever
+  });
 
   it('a face printed on the bed with two round Ø5 holes slices to the verified areas', () => {
     const s = sizesFor(5);
@@ -993,6 +1047,65 @@ describe('pins on the cut faces', () => {
     expect(s.layout.notes).toEqual([]);
   });
 
+  it('a bar a little too thin for pointed teardrops keeps its pins on flat-topped ones, the wall round them whole', () => {
+    const bar = (T) => own(wasm.Manifold.cube([300, 40, T], true));
+    const codes = (s) => s.layout.notes.map((n) => n.code);
+    // 13 mm takes two Ø5 pins with pointed teardrops, as ever
+    let s = split(bar(13), [[0, 0]], { diameter: 5, labels: false });
+    expect(s.pieces.map((p) => p.up)).toEqual(['+z', '+z']);
+    expect(s.layout.dowels.map((d) => [d.d, d.flat ?? false])).toEqual([[5, false], [5, false]]);
+    expect(codes(s)).toEqual([]);
+    for (const piece of s.drilled) expect(piece.volume()).toBeCloseTo(150 * 40 * 13 - 2 * 224.6701, 2);
+    // 12.9 mm used to drop to 1.75 mm filament: now the same pins, their teardrops cut off flat
+    const s5 = sizesFor(5);
+    const flatHole = overlap(own(halfHole({ R: s5.R, h: s5.h, ch: s5.ch, tear: true, flat: 0.2 })), cube([100, 100, 100], [0, 0, 50]));
+    expect(flatHole).toBeCloseTo(216.918, 2);
+    for (const T of [12.9, 12, 11.2]) {
+      s = split(bar(T), [[0, 0]], { diameter: 5, labels: false });
+      expect(s.layout.dowels.map((d) => [d.d, d.depth, d.flat, d.lift]), `${T} mm`).toEqual([[5, 8, true, 0.2], [5, 8, true, 0.2]]);
+      for (const d of s.layout.dowels) expect(d.sides).toEqual([{ piece: 1, tear: true, apex: [0, 0, 1] }, { piece: 2, tear: true, apex: [0, 0, 1] }]);
+      expect(codes(s)).toEqual(['HOLES_FLAT_TOP']);
+      expect(s.layout.notes[0]).toMatchObject({ level: 'info', letter: 'A', cutId: 'c1', count: 2 });
+      expectHolesInside(bar(T), s.layout);
+      for (const piece of s.drilled) {
+        expect(piece.volume()).toBeCloseTo(150 * 40 * T - 2 * flatHole, 2);
+        expect(piece.status()).toBe('NoError');
+        expect(piece.genus()).toBe(0);
+      }
+      // the roofs point up as the pieces print: nothing of a hole is higher over its centre than the flat top
+      for (const { dowel, m } of holesOf(s.layout)) expect(boxOf(m).max[2] - dowel.centre[2]).toBeCloseTo((2.65 + 0.5) * POLYGON_K + 0.2, 6);
+    }
+    // at 0.28 mm layers the roof is a layer over the hole, and the wall is kept all the same
+    s = split(bar(12), [[0, 0]], { diameter: 5, labels: false }, { hl: 0.28 });
+    expect(s.layout.dowels.map((d) => [d.d, d.flat, d.lift])).toEqual([[5, true, 0.28], [5, true, 0.28]]);
+    expectHolesInside(bar(12), s.layout);
+    for (const { dowel, m } of holesOf(s.layout)) expect(boxOf(m).max[2] - dowel.centre[2]).toBeCloseTo((2.65 + 0.5) * POLYGON_K + 0.28, 6);
+    // 11 mm is too thin for either: filament, as before, and the note says so
+    s = split(bar(11), [[0, 0]], { diameter: 5, labels: false });
+    expect(s.layout.dowels.map((d) => [d.d, d.flat ?? false])).toEqual([[1.75, false], [1.75, false]]);
+    expect(codes(s)).toEqual(['CONNECTORS_FILAMENT']);
+    expectHolesInside(bar(11), s.layout);
+    // and filament itself goes flat-topped before a face is left with glue only
+    s = split(bar(5.8), [[0, 0]], { diameter: 1.75, labels: false, joint: 'dowels' });
+    const thin = s.layout.dowels.map((d) => [d.d, d.flat ?? false]);
+    expect(thin.length).toBeGreaterThan(0);
+    for (const x of thin) expect(x).toEqual([1.75, true]);
+    expectHolesInside(bar(5.8), s.layout);
+    // the pieces standing on their cut faces print the holes upright: round, and no flat top however thin
+    s = split(own(wasm.Manifold.cube([60, 40, 12], true)), [[0, 0]], { diameter: 5, labels: false, orient: 'cut' });
+    expect(s.pieces.map((p) => p.up)).toEqual(['-x', '+x']);
+    for (const d of s.layout.dowels) expect([d.flat ?? false, d.sides.map((x) => x.tear)]).toEqual([false, [false, false]]);
+    expect(codes(s)).not.toContain('HOLES_FLAT_TOP');
+  });
+
+  it('Auto sizes pins by the pointed teardrop still: a bar\'s size is what it was', () => {
+    // 12.9 mm: Auto takes Ø4 with pointed teardrops, though Ø5 would fit flat-topped
+    const s = split(own(wasm.Manifold.cube([300, 40, 12.9], true)), [[0, 0]], { labels: false });
+    expect(s.layout.diameter).toBe(4);
+    expect(s.layout.dowels.map((d) => [d.d, d.flat ?? false])).toEqual([[4, false], [4, false]]);
+    expect(s.layout.notes).toEqual([]);
+  });
+
   it('holes never break out of a tube, falling back to filament, a smaller size or glue as the walls get thinner', () => {
     const tube = (w) => own(cube([60, 60, 200]).subtract(cube([60 - 2 * w, 60 - 2 * w, 210])));
     let s = split(tube(10), [[2, 0]], { diameter: 5 });
@@ -1015,17 +1128,24 @@ describe('pins on the cut faces', () => {
     for (const piece of s.drilled) expect(piece.status()).toBe('NoError');
   });
 
-  it('says how thick walls must be for filament: 6.2 mm where the holes lie on their side', () => {
-    // bar halves lying flat take horizontal (teardrop) holes: filament needs 2 × 3.08 mm round each
+  it('says how thick walls must be for filament: 5.6 mm where the holes lie on their side', () => {
+    // bar halves lying flat take horizontal (teardrop) holes: filament needs 2 × 3.08 mm round each with a pointed
+    // teardrop, and 2 × 2.77 mm with a flat-topped one, which is what a thinner bar gets before it is left to glue
     const bar = (t) => split(cube([300, 40, t]), [[0, 0]], { joint: 'dowels', labels: false });
-    for (const t of [6, 6.1]) {
+    for (const t of [5.4, 5.5]) {
       const s = bar(t);
       expect(s.layout.dowels).toHaveLength(0);
-      expect(s.layout.notes).toEqual([expect.objectContaining({ code: 'CONNECTORS_DROPPED', wall: 6.2 })]);
-      expect(s.layout.notes[0].text).toContain('(walls under 6.2 mm)');
+      expect(s.layout.notes).toEqual([expect.objectContaining({ code: 'CONNECTORS_DROPPED', wall: 5.6 })]);
+      expect(s.layout.notes[0].text).toContain('(walls under 5.6 mm)');
+    }
+    for (const t of [5.6, 6, 6.1]) {
+      const s = bar(t);
+      expect(s.layout.dowels.map((d) => [d.d, d.flat ?? false]), `${t} mm`).toEqual([[1.75, true], [1.75, true]]);
+      expect(s.layout.notes.map((n) => n.code)).toEqual(['HOLES_FLAT_TOP', 'CONNECTORS_FILAMENT']);
+      expectHolesInside(cube([300, 40, t]), s.layout);
     }
     const thick = bar(6.3);
-    expect(thick.layout.dowels.map((d) => d.d)).toEqual([1.75, 1.75]);
+    expect(thick.layout.dowels.map((d) => [d.d, d.flat ?? false])).toEqual([[1.75, false], [1.75, false]]);
     expect(thick.layout.notes.map((n) => n.code)).toEqual(['CONNECTORS_FILAMENT']);
   });
 

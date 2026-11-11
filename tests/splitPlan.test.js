@@ -16,6 +16,7 @@ import {
   printedFace, printedRow, wayAt, waySteps, wayStep, KEEP_INSIDE, KEEP_LIMIT, keepCrossed, keepName, keepsOf, keepsThrough,
   PRESET_ALIASES, bedCorner, cornerPlaceNote, fitReachesCorner, presetOf, reachesCorner, roomWords, turnedFootprint,
   GUARD, LARGEST_MIN, capOf, clampLargest, detailClean, pickGroup, planEnds, slabCap, wideKeeps, withinCap,
+  FLAT_TOP_LIFT, flatInset, flatLift, flatTop, holeSummary,
 } from '../src/split.js';
 import { boxHang, columnGraph, columnsOf, looseTable, planeGrid, rasterRings, sampleWidths } from '../src/hang.js';
 
@@ -441,6 +442,67 @@ describe('sizesFor', () => {
     expect(teardropApex('+z', 0)).toEqual([0, 0, 1]);
     expect(teardropApex('-y', 2)).toEqual([0, -1, 0]);
     expect(teardropApex('+x', 0)).toBeNull();
+  });
+
+  it('a flat-topped teardrop needs less room to an edge than a pointed one, and more than a round hole', () => {
+    // the inset is to the roof's two corners, which stand further out than the roof is high
+    const table = { 10: 10.26, 8: 8.37, 6: 6.49, 5: 5.54, 4: 4.6, 3: 3.66, 1.75: 2.77 };
+    for (const D of PIN_DIAMETERS) {
+      const s = sizesFor(D);
+      expect(s.rhoFlat, `Ø${D}`).toBeCloseTo(table[D], 2);
+      expect(s.rho).toBeLessThan(s.rhoFlat);
+      expect(s.rhoFlat).toBeLessThan(s.rhoTear);
+      expect(flatInset(s)).toBe(s.rhoFlat);
+      const { top, half, corner } = flatTop(s.a);
+      expect(top).toBeCloseTo(s.a + FLAT_TOP_LIFT, 9);
+      expect(corner).toBeGreaterThan(top);
+      expect(s.rhoFlat).toBeCloseTo(corner + s.wall, 9);
+      // the corners sit on the 45° lines a pointed teardrop's sides follow: as far under the point as they are from the middle
+      expect(Math.SQRT2 * s.a - top).toBeCloseTo(half, 9);
+      // two flat-topped mouths side by side still keep a wall between them
+      expect(s.sMin).toBeGreaterThanOrEqual(2 * s.rhoFlat - s.wall);
+    }
+    // the bridge over the hole itself is a few millimetres at most: 1.8 mm on a Ø5 pin's hole, 3 mm on a Ø8's
+    const bridge = (D) => 2 * flatTop(sizesFor(D).R * POLYGON_K).half;
+    expect(bridge(5)).toBeCloseTo(1.81, 2);
+    expect(bridge(8)).toBeCloseTo(3.05, 2);
+    expect(bridge(FILAMENT)).toBeCloseTo(0.45, 2);
+  });
+
+  it('the flat roof sits one layer over the hole, 0.2 mm at least, and never over where the point would be', () => {
+    expect(FLAT_TOP_LIFT).toBe(0.2);
+    expect([undefined, 0.08, 0.12, 0.2, 0.24, 0.28, 0.3, 0, NaN].map((layer) => flatLift(layer))).toEqual([0.2, 0.2, 0.2, 0.2, 0.24, 0.28, 0.3, 0.2, 0.2]);
+    // a thicker layer lifts the roof, which narrows the bridge and needs a little more room
+    const s = sizesFor(5);
+    expect(flatTop(s.a, 0.28).top).toBeCloseTo(s.a + 0.28, 9);
+    expect(flatTop(s.a, 0.28).half).toBeLessThan(flatTop(s.a, 0.2).half);
+    expect(flatInset(s, 0.28)).toBeGreaterThan(s.rhoFlat);
+    expect(flatInset(s, 0.28)).toBeLessThan(s.rhoTear);
+    // lifted as far as the point, it is the point: no higher, and no wider than nothing
+    const high = flatTop(1, 5);
+    expect(high.top).toBeCloseTo(Math.SQRT2, 9);
+    expect(high.half).toBeCloseTo(0, 9);
+    expect(high.corner).toBeCloseTo(Math.SQRT2, 9);
+  });
+
+  it('holeSummary counts each piece\'s holes by how they print, and finds one lying on its side left round', () => {
+    const side = (piece, tear) => ({ piece, tear, apex: tear ? [0, 0, 1] : null });
+    const pieces = [{ index: 1, up: '+z' }, { index: 2, up: '+x' }, { index: 3, up: '-z' }];
+    const seams = [
+      // across X between 1 (lying: teardrops) and 2 (standing on the cut face: round)
+      { axis: 0, dowels: [{ axis: 0, sides: [side(1, true), side(2, false)] }, { axis: 0, flat: true, lift: 0.2, sides: [side(1, true), side(2, false)] }] },
+      // across Z between 1 and 3: both print them standing up
+      { axis: 2, dowels: [{ axis: 2, sides: [side(1, false), side(3, false)] }] },
+      { axis: 1, dowels: 2 }, // a seam told only how many pins it has is skipped
+    ];
+    expect(holeSummary(pieces, seams)).toEqual([
+      { index: 1, upright: 1, pointed: 1, flat: 1, round: 0 },
+      { index: 2, upright: 2, pointed: 0, flat: 0, round: 0 },
+      { index: 3, upright: 1, pointed: 0, flat: 0, round: 0 },
+    ]);
+    // piece 2 turned to lie as modelled: its two round holes across X now lie on their side
+    expect(holeSummary([pieces[0], { index: 2, up: '+z' }, pieces[2]], seams)[1]).toEqual({ index: 2, upright: 0, pointed: 0, flat: 0, round: 2 });
+    expect(holeSummary(pieces, [])).toEqual(pieces.map((p) => ({ index: p.index, upright: 0, pointed: 0, flat: 0, round: 0 })));
   });
 });
 
@@ -2272,6 +2334,11 @@ describe('notes', () => {
     expect(splitNote('PINS', { count: 4, diameter: 5, length: 16, own: true }).text).toMatch(/cut 4 Ø5 mm dowels to 16 mm/);
     expect(splitNote('CONNECTORS_SHORTER', { letter: 'B', depth: 3.5 }).text).toBe('Cut B uses 3.5 mm-deep holes – deeper ones would break through the side.');
     expect(splitNote('CONNECTORS_FILAMENT', { letter: 'C', count: 4, diameter: 6, length: 8 }).text).toBe('Cut C is too narrow for Ø6 pins: its holes take 1.75 mm filament – cut 4 pieces 8 mm long.');
+    expect(splitNote('HOLES_FLAT_TOP', { letter: 'B', count: 2 })).toMatchObject({
+      level: 'info',
+      text: '2 pins on cut B sit close to an edge: their holes have a flat top instead of a point, to keep the wall round them thick. They still print without supports.',
+    });
+    expect(splitNote('HOLES_FLAT_TOP', { letter: 'B', count: 1 }).text).toBe('1 pin on cut B sits close to an edge: its holes have a flat top instead of a point, to keep the wall round them thick. They still print without supports.');
     expect(splitNote('CONNECTORS_DROPPED', { letter: 'B', count: 1, total: 3, wall: 6, suggestedDiameter: 4 })).toMatchObject({
       level: 'warn', suggestedDiameter: 4,
       text: 'No pin fits on 1 of 3 faces at cut B (walls under 6 mm) – it is a flat glue joint. A strip glued inside makes it stronger. Ø4 mm pins would fit.',
@@ -3290,6 +3357,18 @@ describe('cuts that come apart', () => {
     const onSide = layGrown(across, { lips: [], locks: [{ ...lock, down: '-x' }] }, U, 'model')[1];
     expect(onSide).toMatchObject({ down: '-x', lies: 'on a cut face' });
     expect(onSide.notes).toEqual([]);
+    // the lock not built after all: the piece whose socket it was lies as it would have for it where it has pin holes
+    // (they were shaped for that way: round, across X), and as it likes where it has none
+    const lays = [{ piece: 1, down: '-x' }, { piece: 2, down: '-x' }];
+    const dowels = [{ sides: [{ piece: 2, tear: false }, { piece: 3, tear: true }] }];
+    const modelled = laidOf([{ index: 1, stats: boxStats([100, 100, 100], ['+x']) }, { index: 2, cell: [1, 0, 0], stats: boxStats([60, 100, 100], ['-x']) }], U, 'model');
+    expect(modelled[1].lying.down).toBe('-z');
+    const kept = layGrown(modelled, { lips: [], locks: [], lays, dowels }, U, 'model')[1];
+    expect(kept).toMatchObject({ down: '-x', lies: 'on a cut face' });
+    expect(kept.notes).toEqual([]);
+    expect(layGrown(modelled, { lips: [], locks: [], lays, dowels }, U, 'model')[0]).toBe(modelled[0].lying);
+    expect(layGrown(modelled, { lips: [], locks: [], lays, dowels: [] }, U, 'model')[1]).toBe(modelled[1].lying);
+    expect(layGrown(modelled, { lips: [], locks: [], dowels }, U, 'model')[1]).toBe(modelled[1].lying);
   });
 
   it('says how a twist-lock in place of clips goes on and comes off: the note, the glue step and the sheet', () => {

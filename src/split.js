@@ -606,10 +606,12 @@ export const POLYGON_K = 1 / Math.cos(Math.PI / HOLE_SEGMENTS);
  * @param {number} nozzle nozzle width (mm): walls are at least three lines
  * @param {number} depth hole depth per side (mm); 0 = automatic
  * @returns {{ d: number, r: number, R: number, c: number, ch: number, wall: number, depth: number, h: number,
- *   reach: number, a: number, rho: number, rhoTear: number, sMin: number, minDepth: number, pinLength: number, pinChamfer: number }}
+ *   reach: number, a: number, rho: number, rhoTear: number, rhoFlat: number, sMin: number, minDepth: number, pinLength: number,
+ *   pinChamfer: number }}
  *   r pin radius, R hole radius, ch mouth chamfer, h bore before the cone end, reach how far the hole and its wall
- *   go into the piece, a the mouth's outer radius, rho / rhoTear the inset from a face's edge to a hole centre
- *   (round / teardrop), sMin the closest two centres may be, pinLength and pinChamfer the pin's.
+ *   go into the piece, a the mouth's outer radius, rho / rhoTear / rhoFlat the inset from a face's edge to a hole
+ *   centre (round / teardrop / teardrop with a flat top at the least lift, `flatInset` for another), sMin the closest
+ *   two centres may be, pinLength and pinChamfer the pin's.
  */
 export function sizesFor(D, c = SPLIT_DEFAULTS.clearance, nozzle = 0.4, depth = 0) {
   const filament = Math.abs(D - FILAMENT) < 1e-9;
@@ -627,7 +629,8 @@ export function sizesFor(D, c = SPLIT_DEFAULTS.clearance, nozzle = 0.4, depth = 
   // spaced so that a wall stands between two mouths even when both are teardrops, and three diameters apart
   // so that two pins stop the pieces turning
   const sMin = Math.max(2 * rhoTear - wall, 3 * D);
-  return { d: D, r, R, c, ch, wall, depth: d, h, reach, a, rho, rhoTear, sMin, minDepth: Math.max(3, 0.6 * D), pinLength: 2 * d, pinChamfer: Math.min(0.4, 0.1 * D) };
+  const rhoFlat = flatTop(a).corner + wall;
+  return { d: D, r, R, c, ch, wall, depth: d, h, reach, a, rho, rhoTear, rhoFlat, sMin, minDepth: Math.max(3, 0.6 * D), pinLength: 2 * d, pinChamfer: Math.min(0.4, 0.1 * D) };
 }
 
 /**
@@ -642,9 +645,72 @@ export function sizesForRoom(D, c, nozzle, depth, room) {
   return capped >= s.minDepth ? sizesFor(D, c, nozzle, capped) : null;
 }
 
+/** The least a flat-topped teardrop's roof is lifted over the hole's own top (mm). */
+export const FLAT_TOP_LIFT = 0.2;
+
+/**
+ * How far over a hole's own top the flat roof of a flat-topped teardrop sits (mm): one layer, and at least
+ * `FLAT_TOP_LIFT`. The roof's first layer is a bridge, which sags by about a layer, and the pin must still slide in
+ * under it.
+ * @param {number} layer the layer height (mm)
+ */
+export function flatLift(layer = FLAT_TOP_LIFT) {
+  return Math.round(Math.max(FLAT_TOP_LIFT, Number(layer) > 0 ? Number(layer) : 0) * 1e6) / 1e6;
+}
+
+/**
+ * A teardrop whose point is cut off flat: the roof of a hole of outer radius `a` that prints lying down, where a
+ * pointed one would come too near an edge. Its sides rise at 45° from the circle, as a pointed teardrop's do, to a
+ * level roof `lift` over the circle's top, which the printer bridges. Never higher than the point would be.
+ * @param {number} a the circle's outer radius (the polygon's corners)
+ * @param {number} lift how far over the circle's top the roof is (`flatLift`)
+ * @returns {{ top: number, half: number, corner: number }} the roof's height over the centre, half its width (the
+ *   bridge is twice that) and how far its two corners are from the centre: further than `top`, and what a wall is
+ *   kept from
+ */
+export function flatTop(a, lift = FLAT_TOP_LIFT) {
+  const top = Math.min(a + lift, Math.SQRT2 * a);
+  const half = Math.SQRT2 * a - top;
+  return { top, half, corner: Math.hypot(half, top) };
+}
+
+/** The inset from a face's edge to the centre of a flat-topped teardrop of these sizes (`sizesFor`), its roof `lift` over the hole. */
+export function flatInset(s, lift = FLAT_TOP_LIFT) {
+  return flatTop(s.a, lift).corner + s.wall;
+}
+
 /** The world direction of a horizontal hole's teardrop point (the piece's up), or null when its piece prints the hole upright. */
 export function teardropApex(up, axis) {
   return dirAxis(up) === axis ? null : [...DIRECTIONS[up]];
+}
+
+/**
+ * How each piece's pin holes print, from the way the pieces lie in their files and the seams' pins: a hole whose
+ * piece prints it standing up is round; one that lies on its side needs a teardrop roof, pointed or cut off flat, to
+ * print without supports. `round` counts the holes that lie on their side and were left round all the same – there
+ * should never be one.
+ * @param {{ index: number, up: string }[]} pieces as they print (`up`: the side of the piece that faces up)
+ * @param {{ axis: number, dowels?: { flat?: boolean, sides: { piece: number, tear: boolean }[] }[] }[]} seams
+ * @returns {{ index: number, upright: number, pointed: number, flat: number, round: number }[]} per piece, in the
+ *   order given
+ */
+export function holeSummary(pieces, seams) {
+  const rows = new Map(pieces.map((p) => [p.index, { index: p.index, upright: 0, pointed: 0, flat: 0, round: 0 }]));
+  const ups = new Map(pieces.map((p) => [p.index, p.up]));
+  for (const seam of seams ?? []) {
+    for (const dowel of Array.isArray(seam.dowels) ? seam.dowels : []) {
+      for (const side of dowel.sides ?? []) {
+        const row = rows.get(side.piece);
+        if (!row) continue;
+        const lying = dirAxis(ups.get(side.piece) ?? '+z') !== (dowel.axis ?? seam.axis);
+        if (!lying) row.upright++;
+        else if (!side.tear) row.round++;
+        else if (dowel.flat) row.flat++;
+        else row.pointed++;
+      }
+    }
+  }
+  return [...rows.values()];
 }
 
 // ---------- built-in square pegs ----------
@@ -4656,9 +4722,13 @@ export function lipMale(quality, asWell = [true, true]) {
  * (`PIECE_UNSTABLE` with `pegs` or `lip`). A cut with the collar twist-lock
  * in place of its lip (`locks` of kind 'full') has its neck stand out of
  * the piece the lip would, as tall as the neck, and the piece its socket is
- * cut into lies on its cut face, as a lid that comes off does.
+ * cut into lies on its cut face, as a lid that comes off does. A piece the
+ * layout gave a way to lie for a lip or a lock that was then not built
+ * (`lays`) keeps that way when it has pin holes (`dowels`): they were
+ * shaped for it.
  * @param {object[]} laid from `layPieces`
- * @param {{ pegs?: { sides: { piece: number, peg: boolean }[] }[], lips?: { axis: number, dir?: number, down?: string,
+ * @param {{ pegs?: { sides: { piece: number, peg: boolean }[] }[], dowels?: { sides: { piece: number }[] }[],
+ *   lays?: { piece: number, down: string }[], lips?: { axis: number, dir?: number, down?: string,
  *   H?: number, male?: number, sides?: { piece: number, male: boolean }[] }[], locks?: { kind: string, cutId: string,
  *   down: string, S: object, sides: { piece: number, role: string }[] }[] }} layout the lips' male (its number, or
  *   the side with `male`), the way it lies (`down`, or from `dir`: +1 when the male is below the cut) and how far
@@ -4666,7 +4736,7 @@ export function lipMale(quality, asWell = [true, true]) {
  * @returns {object[]} `chooseOrientation`'s answer per piece of `laid`, with `pegged: true` on those laid again with
  *   pegs and `lip: true` on those with a lip
  */
-export function layGrown(laid, { pegs = [], lips = [], locks = [] } = {}, U, orient = 'auto', { flat = null } = {}) {
+export function layGrown(laid, { pegs = [], lips = [], locks = [], dowels = [], lays = [] } = {}, U, orient = 'auto', { flat = null } = {}) {
   const maleOf = (lip) => lip.sides?.find((s) => s.male)?.piece ?? lip.male;
   const faceOf = (lip) => (lip.down ? oppositeDir(lip.down) : `${lip.dir < 0 ? '-' : '+'}${AXES[lip.axis]}`);
   const twisted = (locks ?? []).filter((x) => x.kind === 'full');
@@ -4677,7 +4747,12 @@ export function layGrown(laid, { pegs = [], lips = [], locks = [] } = {}, U, ori
     const own = (pegs ?? []).filter((g) => g.sides.some((s) => s.peg && s.piece === p.index));
     const tongues = standing.filter((l) => maleOf(l) === p.index && (l.H ?? LIP_ALLOWANCE) > 0);
     const sockets = twisted.filter((x) => x.sides.some((s) => s.role === 'part' && s.piece === p.index));
-    if (!own.length && !tongues.length && !sockets.length) return p.lying;
+    // a piece the layout laid one way for a lip or a twist-lock that was not built after all had its pin holes shaped
+    // for that way: it keeps it, or a hole made round to print standing up would print lying on its side
+    const held = (lays ?? []).find((x) => x.piece === p.index)?.down ?? null;
+    const holed = Boolean(held) && held !== p.lying.down && !tongues.length && !sockets.length
+      && (dowels ?? []).some((d) => d.sides.some((s) => s.piece === p.index));
+    if (!own.length && !tongues.length && !sockets.length && !holed) return p.lying;
     // a cut's lip may stand out of a piece on several faces (four posts cut across), all in the one plane: the box
     // takes in the tallest once, not each
     const out = new Map();
@@ -4685,13 +4760,14 @@ export function layGrown(laid, { pegs = [], lips = [], locks = [] } = {}, U, ori
     let stats = p.stats;
     for (const [face, H] of out) stats = { ...lipGrown(stats, face, H), allowed: [oppositeDir(faceOf(tongues[0]))] };
     if (sockets.length) stats = { ...stats, allowed: [sockets[0].down] };
+    else if (holed) stats = { ...stats, allowed: [held] };
     if (own.length) stats = statsWithPegs(stats, own);
     const lip = tongues.length > 0;
     const o = chooseOrientation(restingOnly(stats, p.boxes) ?? stats, U, orient, { pieceIndex: p.index, flat });
     const steady = !p.lying.notes?.some((x) => x.code === 'PIECE_UNSTABLE');
     const why = lip ? { lip: true } : own.length ? { pegs: true } : null;
     const notes = o.notes
-      .filter((x) => !((lip || sockets.length) && x.code === 'ORIENT_FALLBACK'))
+      .filter((x) => !((lip || sockets.length || holed) && x.code === 'ORIENT_FALLBACK'))
       .map((x) => (x.code === 'PIECE_UNSTABLE' && steady && why ? splitNote('PIECE_UNSTABLE', { pieceIndex: p.index, ...why }) : x));
     return { ...o, notes, ...(own.length ? { pegged: true } : {}), ...(lip ? { lip: true } : {}) };
   });
@@ -5038,6 +5114,7 @@ const NOTE_LEVELS = Object.freeze({
   DOVETAIL: 'info',
   CONNECTORS_SHORTER: 'info',
   CONNECTORS_FILAMENT: 'info',
+  HOLES_FLAT_TOP: 'info',
   PEGS_SMALLER: 'info',
   PEGS_UPRIGHT: 'info',
   APART: 'info',
@@ -5136,6 +5213,9 @@ const NOTE_TEXT = {
     const cut = lengths.length > 1 ? listOf(lengths.map((g) => `${plural(g.count, 'piece')} ${mm(g.length)} mm long`)) : `${plural(count, 'piece')} ${mm(length)} mm long`;
     return `Cut ${letter} is too narrow for ${diameter ? `Ø${mm(diameter)} ` : ''}pins: its holes take 1.75 mm filament – cut ${cut}.`;
   },
+  HOLES_FLAT_TOP: ({ letter, count = 0 }) => (count === 1
+    ? `1 pin on cut ${letter} sits close to an edge: its holes have a flat top instead of a point, to keep the wall round them thick. They still print without supports.`
+    : `${count} pins on cut ${letter} sit close to an edge: their holes have a flat top instead of a point, to keep the wall round them thick. They still print without supports.`),
   PEGS_SMALLER: ({ letter, asked = null, pegSizes = [] }) => {
     const count = pegSizes.reduce((n, g) => n + g.count, 0);
     const took = pegSizes.length ? `${listOf(pegSizes.map((g) => `${g.count} × ${mm(g.size)} mm`))} ${count === 1 ? 'peg' : 'pegs'}` : 'smaller pegs';
@@ -5501,7 +5581,8 @@ const NOTE_TEXT = {
  * below a Z cut, `hold` the clips' in N, `firmer` the gentlest firmer hold that would hold it up, where one would); APART_KEPT `{ letters }`;
  * CONNECTORS_SHORTER `{ letter, depth, pegs }` (`pegs`: the cut has built-in pegs, `depth` their length);
  * CONNECTORS_FILAMENT `{ letter, count, diameter, length, lengths: [{ length, count }] }`
- * (`length` the longest; `lengths` when the holes take more than one); PEGS_SMALLER `{ letter, asked, pegSizes: [{ size,
+ * (`length` the longest; `lengths` when the holes take more than one); HOLES_FLAT_TOP `{ letter, cutId, count }` (`count`
+ * of the cut's pins have holes whose teardrop is cut off flat); PEGS_SMALLER `{ letter, asked, pegSizes: [{ size,
  * count }] }` (`asked` the peg size chosen for the model, `pegSizes` the smaller ones the narrow faces took);
  * PEGS_UPRIGHT `{ letter, cutId, pieces, pins }` (`pieces` those carrying the cut's pegs, which all print pointing up;
  * `pins` that pins would fit its faces);

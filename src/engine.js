@@ -21,7 +21,7 @@ import {
   applyMat4, transposeMat4, keepCrossed, keepsOf, keepsThrough, cornerPlaceNote, fitReachesCorner, bedCorner, capOf, slabCap, withinCap, wideKeeps, pickGroup,
   chooseOffsets, planEnds,
   AXES, CLIP, LIP, SPOT, catchSizes, comesOffOf, endShape, endsAsWell, keepsTo, locateBend, locateSeam, pickSpots, profileSeams, seamKind, spotScore, spotSide,
-  spotStart, spotWhy, socketsAsWell,
+  spotStart, spotWhy, socketsAsWell, flatLift, holeSummary,
 } from './split.js';
 import {
   buildSplitDisplay, carveParts, checkPart, clearSplitCaches, couponRow, cutPieces, drillPiece, fitTestCoupon, layoutSplit, lockFaces, lockMatrix, lockPieces, lockPoints, partFrame, partInFrame, partedSolids,
@@ -3009,7 +3009,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       ...(apart.length ? { apart: apart.map((c) => [c.id, c.apart.hold]), U, orient, hl } : {}),
       ...(locks.length ? { locks } : {}),
     };
-    const key = `${cut.key}|drill:${stableKey({ joint, diameter, depth, clearance, count, labels, nozzle, ups, groups, font: font?.key ?? null, ...onBed })}`;
+    // the layer height is in it too, as far as it shapes a hole: the lift of a flat-topped teardrop's roof
+    const key = `${cut.key}|drill:${stableKey({ joint, diameter, depth, clearance, count, labels, nozzle, lift: flatLift(hl), ups, groups, font: font?.key ?? null, ...onBed })}`;
     if (state.drill?.key === key) return state.drill;
     disposeSplitStage(state.drill);
     state.drill = null;
@@ -3266,6 +3267,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     // never moving a cut into a detail kept whole: the note says no place then (its own note offers Fit instead)
     const keepOut = (l) => (Number.isFinite(l.moveTo) && keeps.some((x) => keepCrossed(x.box, l.axis, l.moveTo)) ? { ...l, moveTo: null } : l);
     const bits = { ...kept, loose: kept.loose.map((l) => ({ ...keepOut(l), ...(spec.joint === 'pegs' ? { pegs: true } : {}) })) };
+    // how each piece's pin holes print, the way it lies in its file
+    const holes = new Map(holeSummary(laid.map((p, i) => ({ index: p.index, up: lying[i].up })), layout.seams).map((h) => [h.index, h]));
     const pieces = laid.map((p, i) => {
       const o = lying[i];
       // a cut's lip may stand out of a piece on more than one face: one entry a cut, its clips added up. What comes off
@@ -3308,6 +3311,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         down: o.down,
         up: o.up,
         dowels: layout.dowels.filter((d) => d.sides.some((s) => s.piece === p.index)).length,
+        // its pin holes by how they print: standing up (round), lying with a pointed teardrop or a flat-topped one
+        holes: { upright: holes.get(p.index).upright, pointed: holes.get(p.index).pointed, flat: holes.get(p.index).flat, round: holes.get(p.index).round },
         // the built-in pegs it carries, and the sockets it has for another piece's
         pegs: layout.pegs.filter((g) => g.sides.some((s) => s.peg && s.piece === p.index)).length,
         sockets: layout.pegs.filter((g) => g.sides.some((s) => !s.peg && s.piece === p.index)).length,
@@ -3329,6 +3334,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       ...(s.joint === 'dovetail' ? { tabs: tabs.get(s.cutId) ?? 0 } : {}),
       dowels: s.dowels.map((d) => ({
         centre: d.centre, axis: d.axis, d: d.d, depth: d.depth, R: d.R, h: d.h, ch: d.ch, cell: d.cell, patch: d.patch, tear: d.sides.map((x) => x.tear), sides: d.sides,
+        ...(d.flat ? { flat: true, lift: d.lift } : {}),
       })),
       pegs: s.pegs.map((g) => ({
         centre: g.centre, axis: g.axis, at: g.at, s: g.s, length: g.length, c: g.c, half: g.half, ch: g.ch, e: g.e, h: g.h, tip: g.tip, a: g.a,

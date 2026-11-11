@@ -5936,6 +5936,72 @@ try {
     await blocked.close();
   }
 
+  // --- pin holes near an edge: a flat top in place of the teardrop's point ---
+  {
+    // a bar 12.9 mm thick, lying flat: a pointed teardrop for a Ø5 pin needs 13 mm, so the cut used to fall back to
+    // filament. Now it keeps its pins, their holes get a flat top, and a note says so in plain words
+    const thinBar = Manifold.cube([300, 40, 12.9], true);
+    const thinBarFile = writeFixture('thin-bar.stl', soupOf(thinBar));
+    thinBar.delete();
+    const flatContext = await browser.newContext({ viewport: { width: 1400, height: 850 } });
+    const f = await flatContext.newPage();
+    const flatProblems = [];
+    f.on('pageerror', (e) => flatProblems.push(`pageerror: ${e.message}`));
+    f.on('console', (m) => m.type() === 'error' && flatProblems.push(`console: ${m.text()}`));
+    const settled = async () => {
+      await f.waitForTimeout(80);
+      await f.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+      await f.waitForTimeout(80);
+      await f.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    };
+    const pick = async (value) => {
+      await f.evaluate((v) => {
+        const el = document.querySelector('[data-split="diameter"]');
+        el.value = v;
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }, value);
+      await settled();
+    };
+    const notes = () => f.locator('#splitNotes li .text').allInnerTexts();
+    await f.goto(url);
+    await f.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+    await f.setInputFiles('#stlFile', thinBarFile);
+    await f.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('thin-bar:'));
+    await settled();
+    // the bar alone, without the text it opens with
+    await f.evaluate(() => document.querySelector('#deleteBtn').click());
+    await settled();
+    await f.evaluate(() => document.querySelector('#addCutBtn').click());
+    await settled();
+    await pick('5');
+    await f.evaluate(() => {
+      const toggle = document.querySelector('#resultToggle');
+      if (!toggle.checked) toggle.click();
+    });
+    await f.waitForFunction(() => /flat top/.test(document.querySelector('#splitNotes').innerText), null, { timeout: 60000 });
+    await settled();
+    const flatNotes = await notes();
+    const flatNote = flatNotes.find((t) => /flat top/.test(t)) ?? '';
+    check(
+      flatNote === '2 pins on cut A sit close to an edge: their holes have a flat top instead of a point, to keep the wall round them thick. They still print without supports.',
+      'a bar a little too thin for pointed teardrops says its pin holes have a flat top',
+      flatNote,
+    );
+    check(
+      flatNotes.some((t) => /2 pins Ø5 × 16 mm/.test(t)) && !flatNotes.some((t) => /filament|too narrow/.test(t)),
+      'and it keeps its two Ø5 pins: nothing falls back to filament',
+      flatNotes.join(' | '),
+    );
+    // Auto sizes by the pointed teardrop: Ø4 pins, and no flat tops to tell of
+    await pick('0');
+    await f.waitForFunction(() => /pins Ø4/.test(document.querySelector('#splitNotes').innerText), null, { timeout: 60000 });
+    await settled();
+    const autoNotes = await notes();
+    check(!autoNotes.some((t) => /flat top/.test(t)), 'with Auto the same bar takes smaller pins with pointed teardrops, and the note is gone', autoNotes.join(' | '));
+    check(flatProblems.length === 0, 'no page errors with flat-topped pin holes', flatProblems.join(' | '));
+    await flatContext.close();
+  }
+
   check(problems.length === 0, 'no console errors or exceptions (page or worker)', problems.join(' | '));
 } finally {
   await browser.close();

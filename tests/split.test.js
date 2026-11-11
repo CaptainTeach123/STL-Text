@@ -9,7 +9,7 @@ import { manifold } from '../src/manifold.js';
 import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
 import {
-  APART_HOLDS, FILAMENT, SPLIT_DEFAULTS, TO_PLANE, cellSizes, cellSupport, cutPlane, fitPieces, fitsBed, isSymmetric, keepCrossed, orientationStats, pegSizesFor,
+  APART_HOLDS, DIRECTIONS, FILAMENT, SPLIT_DEFAULTS, dirAxis, TO_PLANE, cellSizes, cellSupport, cutPlane, fitPieces, fitsBed, isSymmetric, keepCrossed, orientationStats, pegSizesFor,
   reachesCorner, sizesFor,
 } from '../src/split.js';
 import { clearSplitCaches, dowelHole, halfHole, pegAt, pinAt, pinSolid, socketAt } from '../src/splitGeometry.js';
@@ -387,6 +387,130 @@ describe('where the pins go', () => {
     const fromB = holes.filter((x) => x.dowel.centre[0] > 0);
     for (const a of fromA) for (const b of fromB) expect(a.m.minGap(b.m, 5)).toBeGreaterThanOrEqual(wall - 1e-6);
     expect(ex.notes.filter((n) => n.code === 'CONNECTORS_SHORTER').map((n) => [n.letter, n.depth])).toEqual([['A', 4.8], ['B', 4.8]]);
+  });
+});
+
+describe('how the pin holes print', () => {
+  /**
+   * Every half-hole of a split against the way its piece lies in its file: one that lies on its side has a teardrop
+   * whose roof is up as the piece prints, one that stands up is round. Those that are not, and how many there were.
+   */
+  const holesAgainstLay = (r) => {
+    const up = new Map(r.pieces.map((p) => [p.index, p.up]));
+    const wrong = [];
+    let count = 0;
+    for (const seam of r.seams) {
+      for (const d of seam.dowels ?? []) {
+        d.sides.forEach((side) => {
+          count++;
+          const lying = dirAxis(up.get(side.piece)) !== d.axis;
+          if (side.tear !== lying || (lying && String(side.apex) !== String(DIRECTIONS[up.get(side.piece)]))) wrong.push({ cut: seam.letter, piece: side.piece, up: up.get(side.piece), tear: side.tear, apex: side.apex });
+        });
+      }
+    }
+    return { wrong, count };
+  };
+  /** Every hole keeps its wall from the outside of the model. */
+  const expectWalls = (solid, r) => {
+    const b = boxOf(solid);
+    const air = own(cube(b.size.map((v) => v + 40), b.min.map((v, a) => (v + b.max[a]) / 2)).subtract(solid));
+    for (const { dowel, m } of holesOf(r)) expect(m.minGap(air, sizesFor(dowel.d).wall + 1)).toBeGreaterThanOrEqual(sizesFor(dowel.d).wall - 1e-6);
+  };
+
+  it('a bar a little too thin for pointed teardrops keeps its Ø5 pins, on flat-topped ones, and the split says so', async () => {
+    const bar = cube([300, 40, 12.9]);
+    await load(bar, 'bar');
+    const ex = await exportSplit(S({ diameter: 5, labels: false }), { name: 'bar' });
+    const [seam] = ex.seams;
+    expect(seam.dowels).toHaveLength(2);
+    for (const d of seam.dowels) expect(d).toMatchObject({ d: 5, depth: 8, tear: [true, true], flat: true, lift: 0.2 });
+    expect(codes(ex)).toEqual(['SPLIT', 'PINS', 'HOLES_FLAT_TOP']);
+    expect(noteOf(ex, 'HOLES_FLAT_TOP')).toMatchObject({
+      level: 'info', letter: 'A', count: 2,
+      text: '2 pins on cut A sit close to an edge: their holes have a flat top instead of a point, to keep the wall round them thick. They still print without supports.',
+    });
+    expect(noteOf(ex, 'SPLIT').text).toBe('Cut into 2 pieces with 2 pins Ø5 × 16 mm.');
+    expect(ex.pieces.map((p) => [p.up, p.holes])).toEqual([['+z', { upright: 0, pointed: 0, flat: 2, round: 0 }], ['+z', { upright: 0, pointed: 0, flat: 2, round: 0 }]]);
+    // the pieces' files have the flat-topped holes: 216.918 mm³ each, where a pointed one takes 224.670 and a round one 209.901
+    for (const f of piecesOf(ex)) expect(volumeOfStl(f.stl)).toBeCloseTo(150 * 40 * 12.9 - 2 * 216.918, 0);
+    // rebuilt from the reply they are the same holes, the wall round each kept, the roof up
+    expectWalls(bar, ex);
+    for (const { dowel, m } of holesOf(ex)) expect(boxOf(m).max[2] - dowel.centre[2]).toBeCloseTo(3.365, 2);
+    expect(holesAgainstLay(ex)).toEqual({ wrong: [], count: 4 });
+    // a thicker layer lifts the roof by as much
+    const coarse = await client.result([], version, { printing: { nozzle: 0.4, layerHeight: 0.28 }, split: S({ diameter: 5, labels: false }), bed: BED });
+    expect(dowelsOf(coarse).map((d) => [d.flat, d.lift])).toEqual([[true, 0.28], [true, 0.28]]);
+    expectWalls(bar, coarse);
+    // a bar thick enough has pointed teardrops as it always had, and nothing is said
+    await load(cube([300, 40, 13]), 'bar');
+    const thick = await resultSplit(S({ diameter: 5, labels: false }));
+    expect(dowelsOf(thick).map((d) => [d.d, d.flat ?? false])).toEqual([[5, false], [5, false]]);
+    expect(codes(thick)).toEqual(['SPLIT', 'PINS']);
+    expect(thick.pieces.map((p) => p.holes)).toEqual([{ upright: 0, pointed: 2, flat: 0, round: 0 }, { upright: 0, pointed: 2, flat: 0, round: 0 }]);
+  });
+
+  it('no hole that lies on its side is left round, whatever the shape and however the pieces are laid', async () => {
+    const { Manifold } = wasm;
+    const shapes = {
+      // a block in eight, a thin slab in four, a ball in eight, an L in three and a fork in four
+      block: [() => cube([120, 80, 90], [0, 0, 45]), [cutAt(0, 0, 'c1'), cutAt(1, 0, 'c2'), cutAt(2, 45, 'c3')]],
+      slab: [() => cube([200, 120, 12.5], [0, 0, 6.25]), [cutAt(0, 0, 'c1'), cutAt(1, 0, 'c2')]],
+      ball: [() => own(Manifold.sphere(50, 64)), [cutAt(0, 0, 'c1'), cutAt(1, 0, 'c2'), cutAt(2, 0, 'c3')]],
+      L: [() => own(cube([120, 30, 30], [0, 0, 15]).add(cube([30, 30, 120], [-45, 0, 60]))), [cutAt(0, -20, 'c1'), cutAt(2, 40, 'c2')]],
+      fork: [() => own(Manifold.union([cube([90, 20, 20], [0, 0, 10]), cube([20, 20, 100], [-35, 0, 50]), cube([20, 20, 100], [35, 0, 50])])), [cutAt(2, 30, 'c1'), cutAt(0, 0, 'c2')]],
+    };
+    let total = 0;
+    let lying = 0;
+    let flat = 0;
+    for (const [name, [make, cuts]] of Object.entries(shapes)) {
+      const solid = make();
+      await load(solid, name);
+      for (const orient of ['auto', 'cut', 'model']) {
+        const r = await resultSplit(S({ cuts, orient, labels: false, diameter: name === 'slab' ? 5 : 0 }));
+        const { wrong, count } = holesAgainstLay(r);
+        expect([name, orient, wrong]).toEqual([name, orient, []]);
+        expect(r.pieces.map((p) => p.holes.round)).toEqual(r.pieces.map(() => 0));
+        // each piece's count of holes is its pins'
+        for (const p of r.pieces) expect(p.holes.upright + p.holes.pointed + p.holes.flat).toBe(p.dowels);
+        expectWalls(solid, r);
+        total += count;
+        lying += r.pieces.reduce((n, p) => n + p.holes.pointed + p.holes.flat, 0);
+        flat += r.pieces.reduce((n, p) => n + p.holes.flat, 0);
+      }
+    }
+    // the check has something to check: holes standing up, lying with a point, and lying with a flat top
+    expect(total).toBeGreaterThan(100);
+    expect(lying).toBeGreaterThan(20);
+    expect(lying).toBeLessThan(total);
+    expect(flat).toBeGreaterThan(0);
+  });
+
+  it('a piece laid on its cut face for a twist-lock that is then not built keeps that way: its round holes still print standing up', async () => {
+    // a tube lying along X with a solid end, cut to come apart through a plate with a post on either side of it, each
+    // held to the plate by a rod too thin for the slices to see: the twist-lock is planned, both pieces laid on end
+    // for it and the glued cut's holes made round – and only the drilled piece shows the socket would cut a post off.
+    // Set to lie as modelled, the piece whose socket it was would have gone back to lying along X, its round holes on
+    // their side
+    const { Manifold } = wasm;
+    const cyl = (h, r, z, n = 128) => own(own(Manifold.cylinder(h, r, r, n)).translate([0, 0, z]));
+    const upright = own(Manifold.union([
+      own(cyl(200, 50, 0).subtract(cyl(200, 46, 2))), cyl(40, 50, 200),
+      cyl(2, 47, 100.6), cyl(2, 0.01, 102.5, 8), cyl(45.5, 5, 104.4, 32),
+      cyl(2, 47, 97.4), cyl(2, 0.01, 95.5, 8), cyl(45.5, 5, 50.1, 32),
+    ]));
+    await load(own(upright.rotate([0, 90, 0])), 'tube');
+    const apart = { ...cutAt(0, 100, 'c1'), joint: 'apart', hold: 'lock' };
+    const r = await resultSplit(S({ cuts: [apart, cutAt(0, 220, 'c2')], orient: 'model', labels: false }));
+    const byLetter = Object.fromEntries(r.seams.map((x) => [x.letter, x]));
+    // the lock was not built: cut A has its lip, cut B its pins
+    expect(byLetter.A.apart.mech).toBeUndefined();
+    expect(byLetter.B.dowels.length).toBeGreaterThan(0);
+    for (const d of byLetter.B.dowels) expect(d.sides.map((x) => [x.piece, x.tear])).toEqual([[2, false], [3, true]]);
+    // piece 2, between the cuts, stands on end as its holes need; piece 3 lies as modelled, with teardrops
+    expect(r.pieces.map((p) => [p.index, dirAxis(p.up)])).toEqual([[1, 0], [2, 0], [3, 2]]);
+    expect(holesAgainstLay(r).wrong).toEqual([]);
+    expect(r.pieces.map((p) => p.holes.round)).toEqual([0, 0, 0]);
+    expect(codes(r)).not.toContain('ORIENT_FALLBACK');
   });
 });
 

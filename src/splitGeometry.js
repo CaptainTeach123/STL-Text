@@ -28,6 +28,7 @@ import {
   FILAMENT,
   HOLE_SEGMENTS,
   LIP,
+  FLAT_TOP_LIFT,
   POLYGON_K,
   PLATE_THICKNESS,
   SPLIT_DEFAULTS,
@@ -61,7 +62,10 @@ import {
   polygonsCentroid,
   dovetailSize,
   fitsBed,
+  flatInset,
+  flatLift,
   flatProbes,
+  flatTop,
   sizesFor,
   sizesForRoom,
   smallPieceNotes,
@@ -342,13 +346,19 @@ export function clearSplitCaches() {
 
 // ---------- holes and pins ----------
 
-/** A 32-gon drawn outside a circle (its flats on the circle), with a teardrop point towards +y when asked. */
-function holeProfile(rad, tear) {
+/**
+ * A 32-gon drawn outside a circle (its flats on the circle), with a teardrop point towards +y when asked; with `flat`
+ * (mm) the point is cut off level that far over the circle's top (`flatTop`).
+ */
+function holeProfile(rad, tear, flat = 0) {
   const { CrossSection } = manifold();
   const circle = CrossSection.circle(rad * POLYGON_K, HOLE_SEGMENTS);
   if (!tear) return circle;
-  // the point sits where 45° tangents from the circle meet, so the roof needs no bridge
-  const drop = CrossSection.hull([circle, [[0, Math.SQRT2 * rad * POLYGON_K]]]);
+  // the point sits where 45° tangents from the circle meet, so the roof needs no bridge; a flat top's two corners sit
+  // on those tangents, and the short roof between them is bridged
+  const { top, half } = flatTop(rad * POLYGON_K, flat);
+  const roof = flat > 0 && half > 1e-6 ? [[half, top], [-half, top]] : [[0, Math.SQRT2 * rad * POLYGON_K]];
+  const drop = CrossSection.hull([circle, roof]);
   circle.delete();
   return drop;
 }
@@ -359,13 +369,13 @@ function holeProfile(rad, tear) {
  * z = ch: built from thin slabs, it had corners a few millionths of a millimetre apart that an STL's float32 merges
  * into zero-area triangles.
  */
-function cachedHalfHole(R, h, ch, tear) {
-  return HOLES.get([R, h, ch, tear].join('|'), () => {
+function cachedHalfHole(R, h, ch, tear, flat = 0) {
+  return HOLES.get([R, h, ch, tear, tear ? flat : 0].join('|'), () => {
     const { Manifold } = manifold();
     const t = scope();
     try {
       const ring = (rad) => {
-        const p = holeProfile(rad, tear);
+        const p = holeProfile(rad, tear, flat);
         try {
           return polygonsOf(p).flat();
         } finally {
@@ -389,13 +399,16 @@ function cachedHalfHole(R, h, ch, tear) {
  * face (in the air) so the cut is clean, the mouth has a 45° chamfer of
  * `ch`, and the blind end is a 45° cone, so nothing needs a bridge. With
  * `tear` the profile has a teardrop point towards +y, for a hole the piece
- * prints lying down.
- * @param {{ R: number, h: number, ch: number, tear?: boolean }} sizes R the hole radius (pin radius plus clearance),
- *   h the bore's depth before the cone, ch the chamfer
+ * prints lying down; with `flat` as well the point is cut off level, that
+ * many mm over the hole's own top (`flatLift`), which leaves a short bridge
+ * and needs less room towards an edge. The round hole is inside either, so
+ * the pin fits all three the same.
+ * @param {{ R: number, h: number, ch: number, tear?: boolean, flat?: number }} sizes R the hole radius (pin radius plus
+ *   clearance), h the bore's depth before the cone, ch the chamfer
  * @returns {Manifold}
  */
-export function halfHole({ R, h, ch, tear = false }) {
-  return cachedHalfHole(R, h, ch, Boolean(tear)).translate([0, 0, 0]);
+export function halfHole({ R, h, ch, tear = false, flat = 0 }) {
+  return cachedHalfHole(R, h, ch, Boolean(tear), Number(flat) > 0 ? Number(flat) : 0).translate([0, 0, 0]);
 }
 
 /**
@@ -640,14 +653,15 @@ export function fitTestCoupon(spec = {}, nozzle = 0.4, { dovetail = spec.joint =
 /**
  * One side's half of a dowel's hole, in place (world): into the lower
  * piece (side 0) or the upper one (side 1), with its teardrop point
- * towards that piece's up when it prints the hole lying down.
+ * towards that piece's up when it prints the hole lying down – cut off
+ * flat on a dowel with `flat`, `lift` over the hole's top.
  * @param {object} dowel from `layoutSplit`
  * @param {0|1} side
  * @returns {Manifold}
  */
 export function dowelHole(dowel, side) {
   const s = dowel.sides[side];
-  const local = cachedHalfHole(dowel.R, dowel.h, dowel.ch, Boolean(s.tear));
+  const local = cachedHalfHole(dowel.R, dowel.h, dowel.ch, Boolean(s.tear), dowel.flat ? dowel.lift ?? FLAT_TOP_LIFT : 0);
   return local.transform(localFrame(`${side === 0 ? '-' : '+'}${AXES[dowel.axis]}`, s.tear ? s.apex : null, dowel.centre));
 }
 
@@ -4299,9 +4313,11 @@ export function probeLip(solid, cut, {
  *   the side with the neck, `down` the way both pieces lie and `sides: [{ piece, role: 'body'|'part' }]`), only when
  *   some cut does, and `fallbacks` by cut id what it gets where its lock is not built: `{ notes, apart, joint }`, the
  *   notes and its seam's `apart` and `joint` ('none' where no lip fits either); the lip of such a cut, if it has one,
- *   has `twist: true`
- *   dowel `{ cutId, letter, patch, axis, at, centre, uv, d, depth, R, h, ch, cell, sides: [{ piece, tear, apex }, …] }`
- *   (side 0 the lower piece, `cell` the pin's half-cell for the exploded view);
+ *   has `twist: true`; `lays`, only when some, the way down the cuts that come apart gave each piece they lie
+ *   one way for, `{ piece, down }` – every pin hole of such a piece has its shape for that way (`layGrown` keeps it)
+ *   dowel `{ cutId, letter, patch, axis, at, centre, uv, d, depth, R, h, ch, cell, sides: [{ piece, tear, apex }, …],
+ *   flat?, lift? }` (side 0 the lower piece, `cell` the pin's half-cell for the exploded view; `flat` where the
+ *   teardrops of its holes are cut off flat, `lift` over the hole, to keep the wall to an edge);
  *   peg `{ cutId, letter, patch, axis, at, centre, uv, s, length, c, half, ch, e, h, tip, a, cell, male, dir, sides:
  *   [{ piece, peg }, …] }` (`male` the side that carries it, `dir` the way it points along the axis, ±1, `sides[k].peg`
  *   whether that side's piece carries it, the other having its socket);
@@ -4327,6 +4343,8 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
   const manual = Number(spec.diameter) > 0 ? Number(spec.diameter) : 0;
   const wanted = Number(spec.count) > 0 ? Math.round(Number(spec.count)) : 0;
   const labelsOn = spec.labels !== false && Boolean(font);
+  // how far over a hole the roof of a flat-topped teardrop sits: a layer
+  const lift = flatLift(hl);
   // copies: a piece a lip stands out of is given its way up here, and the caller's stay as they were
   const own = pieces.map((p) => ({ ...p }));
   const inCell = new Map();
@@ -4497,13 +4515,29 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     },
   });
 
-  /** Pin (or peg) centres for a patch at these sizes, their holes (or socket and peg) reaching this far, or none. */
-  const centresFor = (ctx, patch, s, n, withObstacles, t, reach = s.reach) => {
+  /**
+   * Pin (or peg) centres for a patch at these sizes, their holes (or socket and peg) reaching this far, or none. With
+   * `flat`, a patch with a hole that lies on its side keeps its centres from the edge by a flat-topped teardrop's
+   * inset, not a pointed one's.
+   */
+  const centresFor = (ctx, patch, s, n, withObstacles, t, reach = s.reach, flat = false) => {
     const free = t.add(patch.cs.subtract(shadowAt(ctx, reach, withObstacles)));
     const tear = patch.apex.some(Boolean);
-    const safe = t.add(free.offset(-(tear ? s.rhoTear : s.rho), 'Round', 2, 32));
+    const safe = t.add(free.offset(-(tear ? (flat ? flatInset(s, lift) : s.rhoTear) : s.rho), 'Round', 2, 32));
     if (safe.isEmpty()) return [];
     return chooseCentres(polygonsOf(safe), n, s.sMin, patch.centroid, { d: s.d });
+  };
+
+  /**
+   * A patch's pin centres at these sizes, and whether their teardrops have a flat top: pointed where that gives
+   * `need` of them, else with the point cut off flat where the patch has a hole lying on its side and that gives more
+   * – the point is what comes nearest an edge, and a short bridge over the hole costs less than losing the pins.
+   */
+  const pinCentres = (ctx, patch, s, n, need, t) => {
+    const pts = centresFor(ctx, patch, s, n, true, t);
+    if (pts.length >= need || !patch.apex.some(Boolean)) return { pts, flat: false };
+    const more = centresFor(ctx, patch, s, n, true, t, s.reach, true);
+    return more.length > pts.length ? { pts: more, flat: true } : { pts, flat: false };
   };
 
   /**
@@ -4602,8 +4636,10 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     const suggest = (d) => {
       if (d) suggested = Math.max(suggested ?? 0, d);
     };
-    // the thinnest wall filament fits in: twice its inset from the edge, a teardrop's when the holes lie on their side
+    // the thinnest wall filament fits in: twice its inset from the edge, a flat-topped teardrop's when the holes lie
+    // on their side
     let thinWalls = 0;
+    let flats = 0;
     const fil = sizesFor(FILAMENT, c, nozzle);
     ctx.patches.forEach((patch, patchIndex) => {
       if (patch.skip || patch.capped || !patch.alloc) return;
@@ -4618,25 +4654,26 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
           const s = sizesForRoom(d, c, nozzle, dep, ctx.room);
           if (!s || seen.has(`${d}|${s.depth}`)) continue;
           seen.add(`${d}|${s.depth}`);
-          const pts = centresFor(ctx, patch, s, patch.alloc, true, t);
+          const { pts, flat } = pinCentres(ctx, patch, s, patch.alloc, need, t);
           if (pts.length >= need) {
-            chosen = { s, pts };
+            chosen = { s, pts, flat };
             break;
           }
-          if (pts.length === 1 && !single) single = { s, pts };
+          if (pts.length === 1 && !single) single = { s, pts, flat };
         }
         chosen ??= single;
         if (!chosen) {
           dropped++;
           // what to say about it: slivers are glued and need no explaining
           if (patch.area >= SIZING_PATCH) {
-            const need = 2 * (patch.apex.some(Boolean) ? fil.rhoTear : fil.rho);
+            const need = 2 * (patch.apex.some(Boolean) ? flatInset(fil, lift) : fil.rho);
             if (2 * largestInset(patch.cs, need / 2 + 0.05) < need) thinWalls = Math.max(thinWalls, Math.ceil(need * 10 - 1e-6) / 10);
             suggest(smallerFit(ctx, patch, D, need, t));
           }
           return;
         }
-        const { s, pts } = chosen;
+        const { s, pts, flat } = chosen;
+        if (flat) flats += pts.length;
         if (pts.length < need) one = true;
         if (s.d === FILAMENT && D !== FILAMENT) {
           // holes made shallower where air lies behind the face take shorter filament: each length is told apart
@@ -4662,6 +4699,8 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
             ch: s.ch,
             cell,
             sides: [patch.lo, patch.hi].map((piece, k) => ({ piece: piece.index, tear: Boolean(patch.apex[k]), apex: patch.apex[k] })),
+            // the teardrops of its holes that lie on their side have a flat top, this far over the hole
+            ...(flat ? { flat: true, lift } : {}),
           };
           patch.dowels.push(dowel);
           dowels.push(dowel);
@@ -4672,6 +4711,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     });
     const base = { letter: cut.letter, cutId: cut.id };
     if (shorter !== null) notes.push(splitNote('CONNECTORS_SHORTER', { ...base, depth: shorter }));
+    if (flats) notes.push(splitNote('HOLES_FLAT_TOP', { ...base, count: flats }));
     if (filament) {
       const lengths = [...filament].sort((p, q) => q[0] - p[0]).map(([length, count]) => ({ length, count }));
       notes.push(splitNote('CONNECTORS_FILAMENT', {
@@ -4803,7 +4843,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
       if (d >= D) continue;
       for (const dep of [depth, sizesFor(d, c, nozzle).minDepth]) {
         const s = sizesForRoom(d, c, nozzle, dep, ctx.room);
-        if (s && centresFor(ctx, patch, s, need, true, t).length >= need) return d;
+        if (s && pinCentres(ctx, patch, s, need, need, t).pts.length >= need) return d;
       }
     }
     return null;
@@ -5479,6 +5519,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     }
     return {
       diameter: D, pegSize: P, dowels, pegs, labels, lips, ...(locks.length ? { locks, fallbacks } : {}), seams, notes,
+      ...(forced.size ? { lays: [...forced].map(([piece, down]) => ({ piece, down })) } : {}),
       pinnable: pegged.filter((ctx) => ctx.pinnable).map((ctx) => ctx.cut.id), ...(glued.length ? { glued } : {}), ...(last.length ? { last } : {}),
     };
   } finally {

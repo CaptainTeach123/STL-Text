@@ -190,6 +190,111 @@ describe('supports: the faces that may need them', () => {
     expect(cheeks.supports.area).toBeCloseTo(8 * 90, 3);
   });
 
+  it('a span is measured the same however finely the ceiling is meshed', () => {
+    // a tunnel 24 mm wide and 40 mm long under a roof; and a slot 8 mm wide, 10 mm long
+    const tunnel = () => own(block([0, 0, 0], [40, 40, 20]).subtract(block([8, -1, -1], [32, 41, 12])));
+    const slot = () => own(block([0, 0, 0], [30, 10, 20]).subtract(block([11, -1, -1], [19, 11, 12])));
+    const coarse = check(tunnel());
+    expect(coarse.supports).toMatchObject({ area: 0, places: 0, bridged: 0 });
+    expect(coarse.supports.span).toBeCloseTo(24 * 40, 3);
+    expect(check(slot()).supports).toMatchObject({ area: 0, span: 0, bridged: 1 });
+    for (const n of [20, 40, 60]) {
+      const mesh = own(tunnel().refine(n)).getMesh();
+      expect(mesh.triVerts.length / 3).toBeGreaterThan(n * n * 20);
+      const fine = check(own(tunnel().refine(n)));
+      expect(fine.supports).toMatchObject({ area: 0, places: 0, bridged: 0 });
+      expect(fine.supports.span).toBeCloseTo(24 * 40, 2);
+      expect(fine.supports.reach).toBeCloseTo(24, 3);
+      expect(checkWords(checkRow(fine, 0.2))).toEqual(checkWords(checkRow(coarse, 0.2)));
+      expect(check(own(slot().refine(n))).supports).toMatchObject({ area: 0, span: 0, bridged: 1 });
+    }
+    // with next to no work allowed, near faces share a measure: the ceiling is still measured, never counted whole
+    const dense = own(tunnel().refine(40));
+    const spared = check(dense, '-z', { work: 1 });
+    expect(spared.supports).toMatchObject({ area: 0, places: 0, bridged: 0 });
+    expect(spared.supports.span).toBeCloseTo(24 * 40, 2);
+    expect(spared.supports.reach).toBeCloseTo(24, 3);
+    // and a ledge on a fine mesh is still a ledge
+    const ledge = check(own(join(block([0, 0, 0], [20, 60, 40]), block([20, 0, 30], [28, 60, 34])).refine(30)), '-z', { work: 1 });
+    expect(ledge.supports.area).toBeCloseTo(8 * 60, 2);
+    expect(ledge.supports.span).toBe(0);
+    // so is a 34 mm tunnel, too long to bridge, right into the corners of its open ends; askew as well
+    const long = () => own(block([0, 0, 0], [50, 30, 20]).subtract(block([8, -1, 5], [42, 31, 12])));
+    expect(check(own(long().refine(30))).supports.area).toBeCloseTo(34 * 30, 2);
+    expect(check(own(own(long().refine(30)).rotate([0, 0, 20]))).supports.area).toBeCloseTo(34 * 30, 0);
+    // and a small step 1.5 mm proud of its wall is still left out
+    const proud = check(own(join(block([0, 0, 0], [20, 100, 40]), block([20, 10, 20], [21.5, 90, 34])).refine(30)));
+    expect(proud.supports).toMatchObject({ area: 0, places: 0, bridged: 1 });
+  });
+
+  it('a very fine ceiling is measured in good time', () => {
+    const tunnel = own(own(block([0, 0, 0], [40, 40, 20]).subtract(block([8, -1, -1], [32, 41, 12]))).refine(120));
+    expect(tunnel.numTri()).toBeGreaterThan(400000);
+    const from = Date.now();
+    const c = check(tunnel);
+    expect(Date.now() - from).toBeLessThan(5000);
+    expect(c.supports.area).toBe(0);
+    expect(c.supports.span).toBeCloseTo(24 * 40, 1);
+  });
+
+  it('a roof that slopes is no span to bridge, however little it slopes', () => {
+    // a block 50 × 60 × 40 with a tunnel 28 mm wide through it whose roof leans `deg` degrees from wall to wall
+    const sloped = (deg, wide = 28) => {
+      const rise = wide * Math.tan((deg * Math.PI) / 180);
+      const x0 = 25 - wide / 2, x1 = 25 + wide / 2;
+      const hole = hull([[x0, -1, -1], [x1, -1, -1], [x0, 61, -1], [x1, 61, -1], [x0, -1, 15], [x0, 61, 15], [x1, -1, 15 + rise], [x1, 61, 15 + rise]]);
+      return check(own(block([0, 0, 0], [50, 60, 40]).subtract(hole)));
+    };
+    expect(sloped(0).supports).toMatchObject({ area: 0, places: 0 });
+    expect(sloped(0).supports.reach).toBeCloseTo(28, 3);
+    for (const deg of [2, 5, 9, 11]) {
+      const c = sloped(deg);
+      expect(c.supports.area).toBeCloseTo(28 * 60, 2);
+      expect(c.supports).toMatchObject({ places: 1, span: 0, reach: 0, bridged: 0 });
+      expect(checkWords(checkRow(c, 0.2))).toEqual(['may need supports: about 17 cm², standing on the bed']);
+    }
+    // nor is a short one: a 6 mm slot under a 5° roof is not left out
+    expect(sloped(5, 6).supports.area).toBeCloseTo(6 * 60, 2);
+    // a gabled ceiling 26 mm wide, pitched 5°
+    const ridge = 13 * Math.tan((5 * Math.PI) / 180);
+    const gable = hull([[12, -1, -1], [38, -1, -1], [12, 61, -1], [38, 61, -1], [12, -1, 15], [12, 61, 15], [38, -1, 15], [38, 61, 15], [25, -1, 15 + ridge], [25, 61, 15 + ridge]]);
+    const g = check(own(block([0, 0, 0], [50, 60, 40]).subtract(gable)));
+    expect(g.supports.area).toBeCloseTo(26 * 60, 2);
+    expect(g.supports.span).toBe(0);
+    // a ceiling a hair off level – under a degree, and under a layer in all – still is one
+    expect(sloped(0.3, 28).supports).toMatchObject({ area: 0, places: 0 });
+    expect(PRINT_CHECK.level).toBeLessThanOrEqual(1);
+  });
+
+  it('a rounded bottom edge is left out; a wide underside that rises from the bed is not', () => {
+    // boxes rounded all round their edges
+    const rounded = (w, d, h, r, n = 48) => {
+      const ball = own(M.sphere(r, n));
+      return hull([-1, 1].flatMap((i) => [-1, 1].flatMap((j) => [r, h - r].map((z) => own(ball.translate([i * (w / 2 - r), j * (d / 2 - r), z]))))));
+    };
+    for (const [w, d, h, r] of [[200, 150, 30, 3], [80, 60, 30, 3], [80, 60, 30, 6]]) {
+      const c = check(rounded(w, d, h, r));
+      expect(c.supports).toMatchObject({ area: 0, places: 0, bridged: 1 });
+      const row = checkRow(c, 0.2);
+      expect(checkWords(row)).toEqual(['no supports needed']);
+      expect(checkNote(row)).toBe(null);
+    }
+    // coarsely faceted, the same
+    expect(check(rounded(80, 60, 30, 6, 12)).supports).toMatchObject({ area: 0, places: 0 });
+    // a box rounded with a 20 mm radius hangs a good way over the bed
+    expect(check(rounded(120, 100, 60, 20)).supports.area).toBeGreaterThan(1500);
+    // a plate on a low foot: the foot's sloping side rises from the bed, the plate's level underside is 1.5 mm over it
+    const foot = hull([[-10, -10, 0], [10, -10, 0], [-10, 10, 0], [10, 10, 0], [-13, -13, 1.5], [13, -13, 1.5], [-13, 13, 1.5], [13, 13, 1.5]]);
+    const table = check(join(foot, block([-30, -30, 1.5], [30, 30, 6])));
+    expect(table.supports.area).toBeGreaterThan(60 * 60 - 26 * 26 - 1);
+    // a wide shallow slope from the bed, 2 mm up over 12 mm: no rounded edge
+    const keel = hull([[-10, -30, 0], [10, -30, 0], [-10, 30, 0], [10, 30, 0], [-22, -30, 2], [22, -30, 2], [-22, 30, 2], [22, 30, 2], [-22, -30, 10], [22, -30, 10], [-22, 30, 10], [22, 30, 10]]);
+    expect(check(keel).supports.area).toBeGreaterThan(1000);
+    // the same rounded edge well off the bed – under a ledge – is counted with it
+    const high = check(join(block([-10, -10, 0], [10, 10, 20]), own(rounded(80, 60, 20, 3).translate([0, 0, 20]))));
+    expect(high.supports.area).toBeGreaterThan(4000);
+  });
+
   it('a mesh of very many long thin faces is checked without the work running away', () => {
     // a cone of 40,000 slivers on a stem: its rim hangs over the bed, and every sliver of its top crosses the grid
     const cone = join(own(M.cylinder(5, 10, 10, 32)), own(own(M.cylinder(30, 50, 0, 40000)).translate([0, 0, 5])));

@@ -1,5 +1,5 @@
 {
- "commit": "0184de7 with changes to src",
+ "commit": "e9b891f with changes to src",
  "cases": {
   "lantern/lock-190": {
    "files": {
@@ -199,45 +199,45 @@
    "files": {
     "round-piece-1-of-2.stl": "3e1ad28cbc6b1ba8",
     "round-piece-2-of-2.stl": "8d85afb7ab6550e0",
-    "round-how-to-glue.txt": "d1a9f712262b2827"
+    "round-how-to-glue.txt": "a0030c92bdb6f7d5"
    },
-   "notes": "3d27dfc9a1eef5fb",
+   "notes": "f99358219f3a916d",
    "fit": "8da9b41f8729feab e449d8a5b20b8f1e"
   },
   "round/snap-150": {
    "files": {
     "round-piece-1-of-2.stl": "3e1ad28cbc6b1ba8",
     "round-piece-2-of-2.stl": "8d85afb7ab6550e0",
-    "round-how-to-glue.txt": "d1a9f712262b2827"
+    "round-how-to-glue.txt": "a0030c92bdb6f7d5"
    },
-   "notes": "3d27dfc9a1eef5fb",
+   "notes": "f99358219f3a916d",
    "fit": "8da9b41f8729feab e449d8a5b20b8f1e"
   },
   "round/lift-150": {
    "files": {
     "round-piece-1-of-2.stl": "2059732b476ef6d9",
     "round-piece-2-of-2.stl": "dc9059dda9a42fd1",
-    "round-how-to-glue.txt": "31f4850352a7af83"
+    "round-how-to-glue.txt": "6d6c074e8242f98f"
    },
-   "notes": "0de85b302fbf5670",
+   "notes": "f84f1d87cd7e6dff",
    "fit": "- dadeb3d8f82a4c00"
   },
   "round/lock-146.5": {
    "files": {
     "round-piece-1-of-2.stl": "251326a94b35e351",
     "round-piece-2-of-2.stl": "063aad4908100c5d",
-    "round-how-to-glue.txt": "b9fc372890f776b1"
+    "round-how-to-glue.txt": "ea69d2dc770598fd"
    },
-   "notes": "cea7816c76e09906",
+   "notes": "0731e4e2ab10da9f",
    "fit": "3054fcd6a1be5376 7116d322f131e10a"
   },
   "round/lock-142.5": {
    "files": {
     "round-piece-1-of-2.stl": "e75b91527509be60",
     "round-piece-2-of-2.stl": "1405d7224bfd6205",
-    "round-how-to-glue.txt": "95f85495eefe42c2"
+    "round-how-to-glue.txt": "5e928d3d364bc600"
    },
-   "notes": "cea7816c76e09906",
+   "notes": "0731e4e2ab10da9f",
    "fit": "3054fcd6a1be5376 7116d322f131e10a"
   },
   "plate/dovetail-x0": {

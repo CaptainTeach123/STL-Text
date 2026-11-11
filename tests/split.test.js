@@ -3537,6 +3537,29 @@ describe('the print check', () => {
     }
   });
 
+  it('a finely meshed slot is bridged as a coarse one is; a roof that slopes may need supports; a rounded bottom edge needs none', async () => {
+    // a tunnel 24 mm wide and 120 mm long, as 36 triangles and as tens of thousands
+    const tunnel = () => own(cube([60, 120, 30], [0, 0, 15]).subtract(cube([24, 140, 20], [0, 0, 5])));
+    await load(tunnel(), 'tunnel');
+    expect((await client.export([], version, 'tunnel', { printing, bed: BED })).notes).toEqual([]);
+    const fine = own(tunnel().refine(40));
+    expect(fine.numTri()).toBeGreaterThan(40000);
+    await load(fine, 'tunnel');
+    expect((await client.export([], version, 'tunnel', { printing, bed: BED })).notes).toEqual([]);
+    // the same tunnel under a roof that leans 8° from wall to wall
+    const rise = 24 * Math.tan((8 * Math.PI) / 180);
+    const hole = own(wasm.Manifold.hull([-70, 70].flatMap((y) => [[-12, y, -1], [12, y, -1], [-12, y, 15], [12, y, 15 + rise]])));
+    await load(own(cube([60, 120, 30], [0, 0, 15]).subtract(hole)), 'roof');
+    expect((await client.export([], version, 'roof', { printing, bed: BED })).notes.map((n) => n.text)).toEqual([
+      'The model may need supports under about 29 cm² of its faces, standing on the bed. Turned another way it may need less.',
+    ]);
+    // a box 200 × 150 × 30 with its edges rounded, 3 mm
+    const ball = own(wasm.Manifold.sphere(3, 48));
+    const rounded = own(wasm.Manifold.hull([-97, 97].flatMap((x) => [-72, 72].flatMap((y) => [3, 27].map((z) => own(ball.translate([x, y, z])))))));
+    await load(rounded, 'rounded');
+    expect((await client.export([], version, 'rounded', { printing, bed: BED })).notes).toEqual([]);
+  });
+
   it('a little overhang is said on the piece\'s line and not in a note; a piece laid the best side down is not told to lay it another way', async () => {
     // a jack: a block with a bar out of every face, so every way to lay it leaves bars hanging over the bed
     const jack = () => own(wasm.Manifold.union([cube([30, 30, 30]), cube([100, 20, 20]), cube([20, 100, 20]), cube([20, 20, 100])]));

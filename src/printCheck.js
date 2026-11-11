@@ -16,14 +16,20 @@ const RAD = Math.PI / 180;
  * - `firstLayer`: what lies within this much of the bed (mm) is the first layer, and rests on the bed.
  * - `flat`, `onBed`: a face is on the bed when it is level (its normal's z under −`flat`) and within `onBed` mm of it.
  * - `place`: a patch of overhang under this much (mm², seen from below) is left out: the underside of a letter.
- * - `bridge`, `bridgeLong`, `level`: a level ceiling (within `level` degrees) with a wall under it on two opposite
- *   sides is a span the printer bridges: up to `bridge` mm from wall to wall it is left out, up to `bridgeLong` mm
- *   (the span of the app's own clips) it is told of apart, as a span to bridge, and beyond that it may need supports.
- *   A ledge held along one side only is no span, however long it is for its depth.
+ * - `bridge`, `bridgeLong`, `level`: a level ceiling (every face of it within `level` degrees, and the whole of it
+ *   within a first layer's height) with a wall under it on two opposite sides is a span the printer bridges: up to
+ *   `bridge` mm from wall to wall it is left out, up to `bridgeLong` mm (the span of the app's own clips) it is told
+ *   of apart, as a span to bridge, and beyond that it may need supports. A ledge held along one side only is no
+ *   span, however long it is for its depth. Nor is a roof that slopes, however little: each layer of it hangs from
+ *   one side only.
  * - `lip`: but a level ledge that stands no more than this far (mm) out of the wall it is on is left out as well:
  *   the underside of a raised letter, a small step.
- * - `spanTurns`, `spanWork`: a span is measured across the ceiling in this many directions; a ceiling that would
- *   take more than `spanWork` steps to measure is counted in full instead.
+ * - `skirt`, `skirtWide`: a patch that rises straight off the first layer and is steep enough within `skirt` mm of
+ *   the bed, in a band no more than `skirtWide` mm wide, is left out: a rounded bottom edge, which nobody supports.
+ * - `spanTurns`, `spanWork`, `spanCells`: a span is measured at every face of a ceiling, in this many directions.
+ *   Past `spanWork` steps of that for one ceiling, a face takes the span measured for a face near it – in the same
+ *   cell of a grid across the piece, `spanCells` a side – where there is one. However fine the mesh, a ceiling is
+ *   always measured.
  * - `grid`: where supports would stand is told from a grid across the bed, this many cells a side.
  * - `none`: under this much overhang in all (mm²) a piece needs no supports.
  * - `stepMin`, `stepMax`: a face leaning between these many degrees off level prints with step lines that show.
@@ -55,9 +61,12 @@ export const PRINT_CHECK = Object.freeze({
   bridge: 10,
   bridgeLong: 30,
   lip: 2,
-  level: 10,
+  level: 1,
+  skirt: 3,
+  skirtWide: 5,
   spanTurns: 12,
-  spanWork: 3e6,
+  spanWork: 2e7,
+  spanCells: 256,
   grid: 512,
   none: 20,
   stepMin: 0.25,
@@ -87,6 +96,8 @@ export const OVERHANG_NZ = -Math.sin((PRINT_CHECK.angle + PRINT_CHECK.tolerance)
 
 const TILT_BINS = Math.ceil(PRINT_CHECK.stepMax / 0.5);
 const TURN_BINS = 72;
+/** A line meets a wall squarely when it is within 10° of square to it (the sine of the angle between them). */
+const SQUARE = Math.cos(10 * RAD);
 
 /** The union-find's root of `i`, the path to it halved on the way. */
 function rootOf(parent, i) {
@@ -156,42 +167,82 @@ function facesBelow(X, T, up, lo, hi) {
 }
 
 /**
- * How far a level ceiling spans at a point of it, from a wall under it on one side to a wall under it on the other:
- * the shortest such way across, looked for in `spanTurns` directions. Infinity where no direction has a wall at both
- * ends – a ledge, held on one side and free on the other. And how far such a ledge stands out there: the shortest way
- * across from a wall under it to a free edge.
+ * The measure of a level ceiling's spans: `at(x, y)` says how far the ceiling spans at a point of it, from a wall
+ * under it on one side to a wall under it on the other – the shortest such way across, looked for in `spanTurns`
+ * directions; Infinity where no direction has a wall at both ends: a ledge, held on one side and free on the other.
+ * And how far such a ledge stands out there: the shortest way across from a wall under it, square out of the wall,
+ * to a free edge.
+ *
+ * For each direction the rim's edges are sorted into bands that run along it, so a line across the ceiling is tried
+ * against the few edges in its own band and not against all of them: the work grows with the faces plus the edges,
+ * not with one times the other, and a finely meshed ceiling is measured as a coarse one is.
  * @param {number[]} rim the ceiling's rim, five numbers an edge: x, y of each end, and 1 where a wall under it holds it
- * @returns {number[]} the span and the ledge's depth, mm; Infinity for none
+ * @returns {{ at: (x: number, y: number) => number[], spent: () => number }} `at` gives the span and the ledge's
+ *   depth, mm, Infinity for none; `spent` how many edges have been tried so far
  */
-function spanAt(rim, x, y) {
-  let best = Infinity;
-  let ledge = Infinity;
+function spanMeasure(rim) {
+  const edges = rim.length / 5;
+  const bands = Math.max(1, Math.min(4096, Math.ceil(edges / 4)));
+  const turns = [];
   for (let k = 0; k < PRINT_CHECK.spanTurns; k++) {
     const dx = Math.cos((k * Math.PI) / PRINT_CHECK.spanTurns);
     const dy = Math.sin((k * Math.PI) / PRINT_CHECK.spanTurns);
-    // the nearest edge of the rim each way along the line, and whether it is held
-    let ahead = Infinity, back = -Infinity, heldAhead = false, heldBack = false;
-    for (let e = 0; e < rim.length; e += 5) {
-      const ex = rim[e + 2] - rim[e], ey = rim[e + 3] - rim[e + 1];
-      const d = dx * ey - dy * ex;
-      if (Math.abs(d) < 1e-12) continue;
-      const wx = rim[e] - x, wy = rim[e + 1] - y;
-      const s = (wx * dy - wy * dx) / d;
-      if (s < -1e-9 || s > 1 + 1e-9) continue;
-      const t = (wx * ey - wy * ex) / d;
-      const held = rim[e + 4] === 1;
-      // where two edges meet on the line, a free one tells
-      if (t > 0) {
-        if (t < ahead - 1e-9) (ahead = t), (heldAhead = held);
-        else if (t < ahead + 1e-9) heldAhead = heldAhead && held;
-      } else if (t > back + 1e-9) (back = t), (heldBack = held);
-      else if (t > back - 1e-9) heldBack = heldBack && held;
+    // how far to the side of the direction each edge reaches, and so which bands it crosses
+    const side = new Float64Array(edges * 2);
+    let from = Infinity, to = -Infinity;
+    for (let e = 0; e < edges; e++) {
+      const p = rim[5 * e + 1] * dx - rim[5 * e] * dy;
+      const q = rim[5 * e + 3] * dx - rim[5 * e + 2] * dy;
+      side[2 * e] = Math.min(p, q) - 1e-6;
+      side[2 * e + 1] = Math.max(p, q) + 1e-6;
+      from = Math.min(from, side[2 * e]);
+      to = Math.max(to, side[2 * e + 1]);
     }
-    if (!(ahead - back < Infinity)) continue;
-    if (heldAhead && heldBack) best = Math.min(best, ahead - back);
-    else if (heldAhead || heldBack) ledge = Math.min(ledge, ahead - back);
+    const step = Math.max(to - from, 1e-9) / bands;
+    const bandOf = (v) => Math.max(0, Math.min(bands - 1, Math.floor((v - from) / step)));
+    const start = new Int32Array(bands + 1);
+    for (let e = 0; e < edges; e++) for (let j = bandOf(side[2 * e]); j <= bandOf(side[2 * e + 1]); j++) start[j + 1]++;
+    for (let j = 0; j < bands; j++) start[j + 1] += start[j];
+    const list = new Int32Array(start[bands]);
+    const fill = start.slice(0, bands);
+    for (let e = 0; e < edges; e++) for (let j = bandOf(side[2 * e]); j <= bandOf(side[2 * e + 1]); j++) list[fill[j]++] = 5 * e;
+    turns.push({ dx, dy, bandOf, start, list });
   }
-  return [best, ledge];
+  let spent = 0;
+  const at = (x, y) => {
+    let best = Infinity;
+    let ledge = Infinity;
+    for (const { dx, dy, bandOf, start, list } of turns) {
+      // the nearest edge of the rim each way along the line, whether it is held, and how squarely the line meets it
+      let ahead = Infinity, back = -Infinity, heldAhead = false, heldBack = false, squareAhead = 0, squareBack = 0;
+      const band = bandOf(y * dx - x * dy);
+      spent += start[band + 1] - start[band];
+      for (let j = start[band]; j < start[band + 1]; j++) {
+        const e = list[j];
+        const ex = rim[e + 2] - rim[e], ey = rim[e + 3] - rim[e + 1];
+        const d = dx * ey - dy * ex;
+        if (Math.abs(d) < 1e-12) continue;
+        const wx = rim[e] - x, wy = rim[e + 1] - y;
+        const s = (wx * dy - wy * dx) / d;
+        if (s < -1e-9 || s > 1 + 1e-9) continue;
+        const t = (wx * ey - wy * ex) / d;
+        const held = rim[e + 4] === 1;
+        const square = Math.abs(d) / Math.hypot(ex, ey);
+        // where two edges meet on the line, a free one tells
+        if (t > 0) {
+          if (t < ahead - 1e-9) (ahead = t), (heldAhead = held), (squareAhead = square);
+          else if (t < ahead + 1e-9) (heldAhead = heldAhead && held), (squareAhead = Math.min(squareAhead, square));
+        } else if (t > back + 1e-9) (back = t), (heldBack = held), (squareBack = square);
+        else if (t > back - 1e-9) (heldBack = heldBack && held), (squareBack = Math.min(squareBack, square));
+      }
+      if (!(ahead - back < Infinity)) continue;
+      if (heldAhead && heldBack) best = Math.min(best, ahead - back);
+      // a ledge's depth is measured square out of its wall: aslant, a face in its corner would seem to stand out little
+      else if ((heldAhead && squareAhead >= SQUARE) || (heldBack && squareBack >= SQUARE)) ledge = Math.min(ledge, ahead - back);
+    }
+    return [best, ledge];
+  };
+  return { at, spent: () => spent };
 }
 
 /**
@@ -236,11 +287,13 @@ function leaningFaces(bins, least) {
  * @param {Float32Array|number[]} vertProperties the piece's points, `numProp` numbers each (x, y, z first)
  * @param {number} numProp
  * @param {Uint32Array|number[]} triVerts three points a triangle; triangles that meet share their points
- * @param {{ turn?: number[]|null, planes?: { axis: number, at: number }[], made?: ArrayLike<number>|null }} options
+ * @param {{ turn?: number[]|null, planes?: { axis: number, at: number }[], made?: ArrayLike<number>|null,
+ *   work?: number }} options
  *   `turn` the 4 × 4 matrix (column-major) that turns the piece the way it prints, +z up – only its turn is used, the
  *   piece's lowest point is the bed; `planes` the cuts the piece touches, as it is in the model: a face on one is a
  *   glue face; `made` one number a triangle, not 0 for a face the app made for a joint (a hole, a socket, a lip, a
- *   lock, a label): those print without supports by design and are counted apart
+ *   lock, a label): those print without supports by design and are counted apart; `work` how many steps
+ *   one ceiling's spans may take before near faces share a measure (`PRINT_CHECK.spanWork`)
  * @returns {{ height: number, box: number[],
  *   supports: { area: number, skin: number, seam: number, bed: number, piece: number, shallow: number, places: number,
  *   bridged: number, span: number, reach: number, joints: number },
@@ -250,7 +303,7 @@ function leaningFaces(bins, least) {
  *   `height` and `box` (its two sides on the bed) as it lies. `supports`, all mm² as seen from below: `area` what may
  *   need supports, of which `skin` on the model's own faces and `seam` on glue faces; of which `bed` where a support
  *   would stand on the bed and `piece` where it would stand on the piece itself; `shallow` the part under 30° from
- *   level; `places` how many patches it is in; `bridged` the short level spans and small ledges left out; `span` the
+ *   level; `places` how many patches it is in; `bridged` the short level spans, small ledges and rounded bottom edges left out; `span` the
  *   area of the longer level spans the printer is left to bridge (not in `area`) and `reach` the longest of them, mm;
  *   `joints` the area of the joints' own faces left out. A glue face among them (`seam`) is a safeguard: a straight
  *   cut's face that looks down is what its piece lies on, so the pieces of a split do not normally have one.
@@ -260,7 +313,7 @@ function leaningFaces(bins, least) {
  *   all, `tip` whether it may tip, `small` whether its foot is small, `strip` whether it is a narrow strip under a
  *   wider piece (a round bar lying down), `off` whether its weight hangs past its foot
  */
-export function printCheck(vertProperties, numProp, triVerts, { turn = null, planes = [], made = null } = {}) {
+export function printCheck(vertProperties, numProp, triVerts, { turn = null, planes = [], made = null, work = PRINT_CHECK.spanWork } = {}) {
   const P = vertProperties;
   const T = triVerts;
   const count = Math.floor(P.length / numProp);
@@ -376,15 +429,28 @@ export function printCheck(vertProperties, numProp, triVerts, { turn = null, pla
     const placeOf = (i) => {
       const r = rootOf(parent, i);
       let place = places.get(r);
-      if (!place) places.set(r, (place = { area: 0, level: true, rim: [], list: [] }));
+      if (!place) places.set(r, (place = { area: 0, level: true, lo: Infinity, hi: -Infinity, round: 0, rim: [], list: [] }));
       return place;
     };
     over.forEach((t, i) => {
       const place = placeOf(i);
       place.area += info[3 * i];
       if (info[3 * i + 1] > levelNz) place.level = false;
+      for (let k = 0; k < 3; k++) {
+        const z = X[T[3 * t + k] * 3 + 2] - z0;
+        if (z < place.lo) place.lo = z;
+        if (z > place.hi) place.hi = z;
+      }
       place.list.push(i);
     });
+    // how long each place's outline is, as seen from below: its area over half of that is how wide a band it is
+    for (const [key, i] of edges) {
+      const p = Math.floor(key / count) * 3, q = (key % count) * 3;
+      placeOf(i).round += Math.hypot(X[p] - X[q], X[p + 1] - X[q + 1]);
+    }
+    // a ceiling is level when every face of it is and it rises less than a layer in all: a roof that slopes, however
+    // little, is laid in strips that hang from one side, and no printer bridges those
+    for (const place of places.values()) if (place.hi - place.lo > R.firstLayer) place.level = false;
     // a level place's rim: an edge is held where the face beside it is a wall under the ceiling – it goes down from
     // the edge and looks in under the ceiling – and free where it is not: the open edge of a shelf, or its end, flush
     // with the end of the wall it is on
@@ -416,22 +482,41 @@ export function printCheck(vertProperties, numProp, triVerts, { turn = null, pla
       }
     }
     let under = null;
+    // a face of a level ceiling is left out where the ceiling spans little there, or – where it is no span the printer
+    // bridges – stands only a little out of its wall. A span to bridge is one all the way to its open ends, where a
+    // face in its corner is as near the open edge as a small ledge's would be
+    const leftOut = (span, ledge) => span <= R.bridge + 0.01 || (!(span <= R.bridgeLong + 0.01) && ledge <= R.lip + 0.01);
     for (const place of places.values()) {
       if (place.area < R.place) continue;
-      // how far each of a level place's faces spans between walls, or stands out of one; a place too big to measure
-      // counts in full
-      const spans = place.level && place.rim.length && place.list.length * (place.rim.length / 5) * R.spanTurns <= R.spanWork
-        ? place.list.map((i) => {
+      // a rounded bottom edge: a narrow band that starts on the first layer and is steep enough a little way up
+      if (place.lo <= R.firstLayer + 1e-6 && place.hi <= R.skirt && 2 * place.area <= R.skirtWide * place.round) {
+        supports.bridged++;
+        continue;
+      }
+      // how far each of a level place's faces spans between walls, or stands out of one. Every face is measured,
+      // however many there are; only past `work` steps does a face take the measure of one near it
+      let spans = null;
+      if (place.level && place.rim.length) {
+        const measure = spanMeasure(place.rim);
+        const near = new Map();
+        const cell = (v, a) => Math.min(R.spanCells - 1, Math.floor(((v - lo[a]) / Math.max(hi[a] - lo[a], 1e-9)) * R.spanCells));
+        spans = place.list.map((i) => {
           const t = over[i];
           const a = T[3 * t] * 3, b = T[3 * t + 1] * 3, c = T[3 * t + 2] * 3;
-          return spanAt(place.rim, (X[a] + X[b] + X[c]) / 3, (X[a + 1] + X[b + 1] + X[c + 1]) / 3);
-        })
-        : null;
+          const x = (X[a] + X[b] + X[c]) / 3, y = (X[a + 1] + X[b + 1] + X[c + 1]) / 3;
+          const key = cell(x, 0) * R.spanCells + cell(y, 1);
+          const known = near.get(key);
+          if (known && measure.spent() > work) return known;
+          const span = measure.at(x, y);
+          if (!known) near.set(key, span);
+          return span;
+        });
+      }
       let counted = false;
       place.list.forEach((i, at) => {
         const seen = info[3 * i];
         const [span, ledge] = spans ? spans[at] : [Infinity, Infinity];
-        if (span <= R.bridge + 0.01 || ledge <= R.lip + 0.01) return;
+        if (leftOut(span, ledge)) return;
         if (span <= R.bridgeLong + 0.01) {
           supports.span += seen;
           supports.reach = Math.max(supports.reach, span);
@@ -448,7 +533,7 @@ export function printCheck(vertProperties, numProp, triVerts, { turn = null, pla
         supports[onPiece ? 'piece' : 'bed'] += seen;
       });
       if (counted) supports.places++;
-      else if (spans.every(([span, ledge]) => span <= R.bridge + 0.01 || ledge <= R.lip + 0.01)) supports.bridged++;
+      else if (spans.every(([span, ledge]) => leftOut(span, ledge))) supports.bridged++;
     }
   }
 

@@ -837,7 +837,7 @@ describe('a split that takes parts out', () => {
     // the lantern carries the lid's neck and the base's slots; the collar is supported as the dome is; how each should
     // twist on, and the fit test first
     expect(glue).toContain('twist-locks need no supports');
-    expect(glue).toMatch(/piece 1 of 3 .* fits, twist-lock neck for cut A, twist-lock slots for cut B – may need supports: about 16 cm², some standing on the piece itself\n/);
+    expect(glue).toMatch(/piece 1 of 3 .* fits, twist-lock neck for cut A, twist-lock slots for cut B – may need supports: about 8 cm², some standing on the piece itself; bridges a level span of about 21 mm\n/);
     expect(glue).toContain("  The collar under cut A's neck slopes like the dome (60°): it takes whatever support the dome takes.");
     expect(glue).toContain("  The dome and cap (cut A) should twist on with a click and twist off again by hand. Try the fit test first: if it's too stiff to turn, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.");
     expect(glue).toContain("  The base (cut B) should twist in with a click and twist out again by hand. Try the fit test first: if its plug is too stiff to turn in its ring, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.");

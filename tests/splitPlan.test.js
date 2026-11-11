@@ -2358,12 +2358,20 @@ describe('notes', () => {
       { index: 3, cell: [2, 0, 0], size: [100, 60, 40], lies: 'on its side', fits: true },
     ];
     const sheet = howToGlueText({ name: 'bar', pieces, seams: [] });
-    expect(sheet).toContain('lies flat as modelled   fits – no supports needed; its 3 pin holes need no supports\n');
+    // pin holes that need no supports are for the heading to say; those that may need some are said on the piece's line
+    expect(sheet).toContain('lies flat as modelled   fits – no supports needed\n');
+    expect(howToGlueText({ name: 'bar', pieces: [{ ...pieces[0], holes: { upright: 1, pointed: 0, flat: 0, round: 2 } }], seams: [] })).toContain('fits – no supports needed; 2 of its 3 pin holes may need supports\n');
     expect(sheet).toContain('lies on a cut face   fits – may need supports: about 12 cm², partly under a glue face, standing on the bed; step lines about every 4 mm on a big face on top\n');
     // a piece with no check (an older split) keeps its line as it was
     expect(sheet).toContain('lies on its side   fits\n');
-    expect(sheet).toContain('\n  Print each piece the way its file lies – do not turn it in your slicer: its holes and joints are shaped to print that way.\n');
-    expect(sheet).toContain("\n  'May need supports' goes by the safe rule – any face flatter than 45° – so your slicer may ask for less.\n");
+    // with no holes or joints in the split, no reason is given
+    expect(sheet).toContain('\n  Print each piece lying the way its file lies – do not tip it onto another side in your slicer (spinning it flat on the bed is fine).\n');
+    expect(sheet).toContain("\n  'May need supports' goes by the safe rule – any face flatter than 45° – so your slicer may ask for less, or a little more.\n");
+    // a longer level span held at both ends is a clause of its own, with a line saying how to print it
+    expect(sheet).not.toContain('level span');
+    const spanned = howToGlueText({ name: 'bar', pieces: [{ ...pieces[0], holes: null, check: check({ span: 900, reach: 24 }) }], seams: [] });
+    expect(spanned).toContain('fits – no supports needed; bridges a level span of about 24 mm\n');
+    expect(spanned).toContain('\n  A level span is held at both ends: print it with bridging on (the default) and no supports; it may hang a little in the middle.\n');
     // with no piece that may need supports, the rule is not explained
     expect(howToGlueText({ name: 'bar', pieces: [pieces[0], pieces[2]], seams: [] })).not.toContain('safe rule');
   });
@@ -2377,11 +2385,24 @@ describe('notes', () => {
     expect(printCheckNote(row(), { pieceIndex: 1 })).toBeNull();
     expect(printCheckNote(row({ area: 600, skin: 600, bed: 600 }), { pieceIndex: 4 })).toMatchObject({
       level: 'info', code: 'PRINT_CHECK', pieceIndex: 4, supports: { skin: 600 },
-      text: "Piece 4 may need supports under about 6 cm² of the model's own faces, standing on the bed. Another way to lay it (Lay pieces) may need less.",
+      text: "Piece 4 may need supports under about 6 cm² of the model's own faces, standing on the bed. Laid another way it may need less.",
     });
     expect(printCheckNote(row({}, { tip: true, brim: 8 }), { pieceIndex: 2 })).toMatchObject({
       level: 'warn', code: 'PRINT_CHECK', pieceIndex: 2,
       text: 'Piece 2 stands 120 mm tall on a 20 × 20 mm foot and may tip or come loose: add a brim about 8 mm wide in your slicer, or lay it another way.',
+    });
+    // a piece laid the way that needs least already is not told that another way may need less
+    expect(printCheckNote(row({ area: 600, skin: 600, bed: 600 }), { pieceIndex: 4, auto: true })).toMatchObject({
+      level: 'info', pieceIndex: 4, auto: true, text: "Piece 4 may need supports under about 6 cm² of the model's own faces, standing on the bed.",
+    });
+    // under 5 cm² of the model's own faces is left to the piece's line; 1 cm² of a glue face is not
+    expect(printCheckNote(row({ area: 400, skin: 400, bed: 400 }), { pieceIndex: 4 })).toBeNull();
+    expect(printCheckNote(row({ area: 150, seam: 150, bed: 150 }), { pieceIndex: 4, auto: true }).text).toBe(
+      'Piece 4 may need supports under about 2 cm² of a glue face, standing on the bed. A glue face on supports prints rough and may want light sanding before you glue it.',
+    );
+    // a round bar lying on a strip is told to add a brim, without a warning
+    expect(printCheckNote(row({}, { strip: true, brim: 5, across: [120, 1] }), { pieceIndex: 1 })).toMatchObject({
+      level: 'info', text: 'Piece 1 rests on a narrow strip of the bed and may come loose: add a brim about 5 mm wide in your slicer, or lay it another way.',
     });
     // a piece already told it has nothing flat to stand on and needs supports is not told of supports again
     expect(printCheckNote(row({ area: 600, skin: 600, bed: 600 }, { flat: false, across: null }), { pieceIndex: 4, unstable: true })).toBeNull();

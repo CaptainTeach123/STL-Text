@@ -2264,6 +2264,18 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   const WHOLE_CHECK_TRIANGLES = 2_000_000;
 
   /**
+   * The print check of a mesh (printCheck.js), or null where it could not be made: the check only informs, so a mesh
+   * it fails on (one too big for the memory there is, say) goes without it, and the download or the split goes on.
+   */
+  function checkOf(mesh, options) {
+    try {
+      return printCheck(mesh.vertProperties, mesh.numProp, mesh.triVerts, options);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * PRINT_CHECK for a model downloaded whole, standing as it is modelled (printCheck.js): the supports it may need,
    * a big face on top that will show step lines, a foot it may tip on. Null with nothing worth saying, without a
    * solid, or for a very dense model. The check is kept on the result; the layer height comes in here.
@@ -2274,7 +2286,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       if (final.solid.numTri() > WHOLE_CHECK_TRIANGLES) final.printCheck = null;
       else {
         const mesh = final.solid.getMesh();
-        final.printCheck = printCheck(mesh.vertProperties, mesh.numProp, mesh.triVerts);
+        final.printCheck = checkOf(mesh);
       }
     }
     return final.printCheck ? printCheckNote(checkRow(final.printCheck, printing?.layerHeight ?? 0.2), { whole: true }) : null;
@@ -2576,7 +2588,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * The print check of every piece as drilled (printCheck.js), by its number: one pass over each, turned the way it
    * lies. Kept with the drill stage for as long as a piece lies the same way, so only the first result of a split
    * reads the pieces; the layer height comes in later (`checkRow`). `final` is the model the faces are told by, before
-   * any part was taken out of it.
+   * any part was taken out of it. A piece whose check could not be made is left out.
    */
   function pieceChecks(final, split, progress) {
     const { drill, laid, lying, cuts } = split;
@@ -2592,14 +2604,15 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       try {
         for (const i of wanted) {
           const mesh = solids[i].getMesh();
-          const check = printCheck(mesh.vertProperties, mesh.numProp, mesh.triVerts, { turn: LAY_DOWN[lying[i].down], planes, made: madeFaces(mesh, own) });
+          const check = checkOf(mesh, { turn: LAY_DOWN[lying[i].down], planes, made: madeFaces(mesh, own) });
           drill.checks.set(laid[i].index, { down: lying[i].down, check });
         }
       } finally {
         if (owned) solids.forEach((m) => m.delete());
       }
     }
-    return new Map(laid.map((p) => [p.index, drill.checks.get(p.index).check]));
+    // a piece whose check could not be made has none: its row goes without
+    return new Map(laid.map((p) => [p.index, drill.checks.get(p.index).check]).filter(([, check]) => check));
   }
 
   /**
@@ -3575,7 +3588,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     // what the print check found worth saying comes last, one note a piece at most; a piece told it has nothing flat
     // to stand on is not told of supports twice
     for (const p of pieces) {
-      const note = printCheckNote(p.check ?? null, { pieceIndex: p.index, unstable: notes.some((x) => x.code === 'PIECE_UNSTABLE' && x.pieceIndex === p.index) });
+      const note = printCheckNote(p.check ?? null, { pieceIndex: p.index, auto: spec.orient === 'auto', unstable: notes.some((x) => x.code === 'PIECE_UNSTABLE' && x.pieceIndex === p.index) });
       if (note) notes.push(note);
     }
     // the peg size is the one the pieces have, as the summary says: a size asked for that no face took is none of theirs

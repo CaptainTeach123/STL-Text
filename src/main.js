@@ -2974,7 +2974,7 @@ function renderPieces() {
       if (row.check?.length) {
         // one line under the piece: what printing it this way asks for
         const check = document.createElement('span');
-        check.className = 'check';
+        check.className = 'print-check';
         check.textContent = `Print check: ${row.check.join(' · ')}`;
         text.append(check);
       }

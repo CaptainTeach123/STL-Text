@@ -42,7 +42,7 @@ const leaning = (deg, up = true) => {
 describe('supports: the faces that may need them', () => {
   it('a block needs none, and stands on its whole underside', () => {
     const c = check(block([0, 0, 0], [40, 30, 20]));
-    expect(c.supports).toEqual({ area: 0, skin: 0, seam: 0, bed: 0, piece: 0, shallow: 0, places: 0, bridged: 0, joints: 0 });
+    expect(c.supports).toEqual({ area: 0, skin: 0, seam: 0, bed: 0, piece: 0, shallow: 0, places: 0, bridged: 0, span: 0, reach: 0, joints: 0 });
     expect(c.height).toBeCloseTo(20, 6);
     expect(c.box).toEqual([40, 30]);
     expect(c.foot).toMatchObject({ flat: true, tip: false, small: false, off: false, across: [40, 30], base: 30 });
@@ -145,14 +145,65 @@ describe('supports: the faces that may need them', () => {
     // a hole that ends inside the block: its end is held all round
     const blind = own(block([0, 0, 0], [30, 30, 20]).subtract(block([12, 12, -1], [18, 18, 8])));
     expect(check(blind).supports).toMatchObject({ area: 0, bridged: 1 });
-    // a tunnel 14 mm wide is too long a span
-    const wide = own(block([0, 0, 0], [30, 30, 20]).subtract(block([8, -1, 5], [22, 31, 12])));
-    expect(check(wide).supports.area).toBeCloseTo(14 * 30, 3);
-    expect(check(wide).supports.bridged).toBe(0);
+    // a tunnel 14 mm wide is a longer span, held at both ends all the same: told of apart, not as supports
+    const wide = check(own(block([0, 0, 0], [30, 30, 20]).subtract(block([8, -1, 5], [22, 31, 12]))));
+    expect(wide.supports).toMatchObject({ area: 0, places: 0, bridged: 0 });
+    expect(wide.supports.span).toBeCloseTo(14 * 30, 3);
+    expect(wide.supports.reach).toBeCloseTo(14, 3);
+    expect(checkWords(checkRow(wide, 0.2))).toEqual(['no supports needed', 'bridges a level span of about 14 mm']);
+    // one of 30 mm, the span of the app's own clips, still is; one of 34 mm may need supports
+    const tunnel30 = check(own(block([0, 0, 0], [50, 30, 20]).subtract(block([10, -1, 5], [40, 31, 12]))));
+    expect(tunnel30.supports).toMatchObject({ area: 0, places: 0 });
+    expect(tunnel30.supports.reach).toBeCloseTo(30, 3);
+    const tunnel34 = check(own(block([0, 0, 0], [50, 30, 20]).subtract(block([8, -1, 5], [42, 31, 12]))));
+    expect(tunnel34.supports.area).toBeCloseTo(34 * 30, 3);
+    expect(tunnel34.supports).toMatchObject({ places: 1, span: 0, reach: 0 });
+    // a slot that runs askew is measured across, not by its box
+    const askew = check(own(block([-30, -30, 0], [30, 30, 20]).subtract(own(block([-3, -60, 5], [3, 60, 12]).rotate([0, 0, 30])))));
+    expect(askew.supports).toMatchObject({ area: 0, places: 0, bridged: 1 });
     // a shelf 6 mm wide along a wall hangs free
     const shelf = check(join(block([0, 0, 0], [10, 30, 20]), block([10, 0, 14], [16, 30, 20])));
     expect(shelf.supports.area).toBeCloseTo(6 * 30, 3);
     expect(shelf.supports.bridged).toBe(0);
+  });
+
+  it('a ledge held along one side only is no span, however long it is for its depth', () => {
+    // a wall 20 × 100 × 40 with a ledge 8 mm deep along all of it: its ends are flush with the wall's
+    const ledge = check(join(block([0, 0, 0], [20, 100, 40]), block([20, 0, 30], [28, 100, 34])));
+    expect(ledge.supports.area).toBeCloseTo(8 * 100, 3);
+    expect(ledge.supports).toMatchObject({ places: 1, bridged: 0, span: 0 });
+    expect(checkWords(checkRow(ledge, 0.2))[0]).toBe('may need supports: about 8 cm², standing on the bed');
+    // the same 10 mm short of each end, 10 mm deep, and one on each side of the wall
+    const inset = check(join(block([0, 0, 0], [20, 100, 40]), block([20, 10, 30], [30, 90, 34])));
+    expect(inset.supports.area).toBeCloseTo(10 * 80, 3);
+    expect(inset.supports.bridged).toBe(0);
+    const both = check(join(block([0, 0, 0], [20, 100, 40]), block([20, 0, 30], [30, 100, 34]), block([-10, 0, 30], [0, 100, 34])));
+    expect(both.supports.area).toBeCloseTo(2 * 10 * 100, 3);
+    expect(both.supports).toMatchObject({ places: 2, bridged: 0, span: 0 });
+    // a ledge 1.5 mm proud – the underside of a raised letter – is left out; one 3 mm proud is not
+    const proud = (by) => check(join(block([0, 0, 0], [20, 100, 40]), block([20, 10, 20], [20 + by, 90, 34])));
+    expect(proud(1.5).supports).toMatchObject({ area: 0, places: 0, bridged: 1 });
+    expect(proud(2).supports).toMatchObject({ area: 0, places: 0, bridged: 1 });
+    expect(proud(3).supports.area).toBeCloseTo(3 * 80, 3);
+    // a shelf between two cheeks is held at its back and both ends, and still hangs free at the front
+    const cheeks = check(join(block([0, 0, 0], [20, 100, 40]), block([20, 0, 0], [28, 5, 40]), block([20, 95, 0], [28, 100, 40]), block([20, 5, 30], [28, 95, 34])));
+    expect(cheeks.supports.area).toBeCloseTo(8 * 90, 3);
+  });
+
+  it('a mesh of very many long thin faces is checked without the work running away', () => {
+    // a cone of 40,000 slivers on a stem: its rim hangs over the bed, and every sliver of its top crosses the grid
+    const cone = join(own(M.cylinder(5, 10, 10, 32)), own(own(M.cylinder(30, 50, 0, 40000)).translate([0, 0, 5])));
+    const from = Date.now();
+    const c = check(cone);
+    expect(Date.now() - from).toBeLessThan(5000);
+    expect(c.supports.area).toBeGreaterThan(7000);
+    expect(c.supports.bed).toBeCloseTo(c.supports.area, 3);
+    expect(c.supports.piece).toBe(0);
+    // and the grid still tells a face over the piece from one over the bed
+    const spool = join(own(M.cylinder(5, 50, 50, 20000)), own(own(M.cylinder(25, 10, 10, 32)).translate([0, 0, 5])), own(own(M.cylinder(5, 50, 50, 20000)).translate([0, 0, 30])));
+    const s = check(spool);
+    expect(s.supports.piece).toBeCloseTo(s.supports.area, 3);
+    expect(s.supports.area).toBeGreaterThan(7000);
   });
 
   it('leaves out specks, and what the first layer holds', () => {
@@ -232,7 +283,7 @@ describe('what a piece stands on', () => {
   it('a tall thin post may tip, and wants the wider brim; lying down it is steady', () => {
     const post = block([0, 0, 0], [10, 10, 150]);
     expect(check(post).foot).toMatchObject({ flat: true, tip: true, small: true, off: false, base: 10, ratio: 15 });
-    expect(checkRow(check(post), 0.2).foot).toEqual({ contact: 100, across: [10, 10], flat: true, tip: true, small: true, brim: PRINT_CHECK.brimTall });
+    expect(checkRow(check(post), 0.2).foot).toEqual({ contact: 100, across: [10, 10], flat: true, tip: true, small: true, strip: false, brim: PRINT_CHECK.brimTall });
     expect(check(post, '-x').foot).toMatchObject({ flat: true, tip: false, small: false });
     expect(checkRow(check(post, '-x'), 0.2).foot.brim).toBe(0);
     // five times as tall as it is wide is still steady; a little more is not
@@ -261,6 +312,33 @@ describe('what a piece stands on', () => {
     expect(checkRow(c, 0.2).foot.brim).toBe(0);
     expect(checkNote(checkRow(c, 0.2))).toBeNull();
     expect(check(block([0, 0, 0], [100, 100, 4])).foot).toMatchObject({ tip: false, small: false });
+    // thin small tubes stand on very little, but all round their outline: across, wall, height
+    for (const [d, wall, h] of [[40, 1.2, 60], [30, 1.6, 50], [20, 2, 40], [60, 0.8, 30], [40, 1, 25]]) {
+      const ring = own(own(M.cylinder(h, d / 2, d / 2, 96)).subtract(own(own(M.cylinder(h + 2, d / 2 - wall, d / 2 - wall, 96)).translate([0, 0, -1]))));
+      const r = check(ring);
+      expect(r.foot.contact, `${d} × ${wall} × ${h}`).toBeLessThan(PRINT_CHECK.smallFoot);
+      expect(r.foot, `${d} × ${wall} × ${h}`).toMatchObject({ flat: true, tip: false, small: false, strip: false });
+      expect(checkWords(checkRow(r, 0.2)), `${d} × ${wall} × ${h}`).toEqual(['no supports needed']);
+    }
+    // a thin tall rod on as little is told of
+    expect(check(block([0, 0, 0], [8, 8, 40])).foot).toMatchObject({ small: true, tip: false });
+  });
+
+  it('a round bar lying down rests on a strip: no foot to tip on, a brim all the same', () => {
+    // 12 mm across and 120 mm long, drawn with 48 sides and lying on one of them: a facet 0.8 mm wide
+    const rod = own(own(own(M.cylinder(120, 6, 6, 48)).rotate([0, 90, 0])).rotate([3.75, 0, 0]));
+    const c = check(rod);
+    expect(c.foot.contact).toBeGreaterThan(PRINT_CHECK.steady);
+    expect(c.foot.base).toBeLessThan(PRINT_CHECK.strip);
+    expect(c.foot).toMatchObject({ flat: true, strip: true, tip: false, small: false });
+    const r = checkRow(c, 0.2);
+    expect(r.foot).toMatchObject({ strip: true, brim: PRINT_CHECK.brim });
+    expect(checkWords(r).slice(1)).toEqual(['rests on a narrow strip: add a brim, 5 mm wide']);
+    expect(checkNoteWords('Piece 1', { foot: checkNote(r).foot, height: r.height })).toBe(
+      'Piece 1 rests on a narrow strip of the bed and may come loose: add a brim about 5 mm wide in your slicer, or lay it another way.',
+    );
+    // a thin wall standing on its whole edge is as narrow, but that is all of it: it may tip
+    expect(check(block([0, 0, 0], [2, 60, 40])).foot).toMatchObject({ strip: false, tip: true });
   });
 
   it('a piece whose weight hangs past its foot may tip', () => {
@@ -293,9 +371,9 @@ describe('the words of the check', () => {
     expect(row(tee())).toEqual({
       layer: 0.2,
       height: 40,
-      supports: { area: 300, skin: 300, seam: 0, bed: 300, piece: 0, shallow: 300, places: 2, bridged: 0 },
+      supports: { area: 300, skin: 300, seam: 0, bed: 300, piece: 0, shallow: 300, places: 2, bridged: 0, span: 0, reach: 0 },
       steps: [],
-      foot: { contact: 100, across: [10, 10], flat: true, tip: false, small: true, brim: 5 },
+      foot: { contact: 100, across: [10, 10], flat: true, tip: false, small: true, strip: false, brim: 5 },
     });
     expect(row(leaning(3), '-z', {}, 0.1).steps).toEqual([{ facing: 'up', tilt: 3, area: 8011, every: 1.9 }]);
   });
@@ -307,6 +385,9 @@ describe('the words of the check', () => {
     expect(checkWords(row(block([0, 0, 0], [40, 30, 20])), { upright: 0, pointed: 0, flat: 0, round: 0 })).toEqual(['no supports needed']);
     expect(checkWords(null, { upright: 1, pointed: 0, flat: 0, round: 2 })).toEqual(['2 of its 3 pin holes may need supports']);
     expect(checkWords(null, null)).toEqual([]);
+    // where the pin holes that need none are said once for all the pieces, only those that may need some are said
+    expect(checkWords(row(block([0, 0, 0], [40, 30, 20])), { upright: 2, pointed: 1, flat: 1, round: 0 }, { fine: false })).toEqual(['no supports needed']);
+    expect(checkWords(null, { upright: 1, pointed: 0, flat: 0, round: 2 }, { fine: false })).toEqual(['2 of its 3 pin holes may need supports']);
     expect(checkWords(row(tee()))).toEqual(['may need supports: about 3 cm², standing on the bed', 'small foot: add a brim, 5 mm wide']);
     expect(checkWords(row(tee(), '-z', { planes: [{ axis: 2, at: 30 }] }))[0]).toBe('may need supports: about 3 cm², under a glue face, standing on the bed');
     expect(checkWords(row(leaning(3)))).toEqual(['no supports needed', 'step lines about every 4 mm on a big face on top']);
@@ -318,9 +399,14 @@ describe('the words of the check', () => {
   it('a note only for what is worth one', () => {
     expect(checkNote(null)).toBeNull();
     expect(checkNote(row(block([0, 0, 0], [40, 30, 20])))).toBeNull();
-    // under 1 cm² of overhang is not: a bar 4 mm proud of its post
+    // a little overhang is not – the piece's line says it: a bar 4 mm proud of its post, and one with 3 cm² under it
     expect(checkNote(row(join(block([-10, -10, 0], [10, 10, 30]), block([-14, -5, 30], [14, 5, 40]))))).toBeNull();
-    expect(checkNote(row(tee()))).toMatchObject({ supports: { skin: 300 }, foot: { small: true, brim: 5 }, layer: 0.2, height: 40 });
+    expect(checkNote(row(tee()))).toEqual({ foot: expect.objectContaining({ small: true, brim: 5 }), layer: 0.2, height: 40 });
+    expect(checkNote(row(join(block([-10, -10, 0], [10, 10, 30]), block([-17.5, -10, 30], [17.5, 10, 40]))))).toBeNull();
+    expect(PRINT_CHECK.note).toBeGreaterThanOrEqual(500);
+    // 6 cm² is, and 3 cm² of a glue face is: it prints rough on supports
+    expect(checkNote(row(join(block([-10, -10, 0], [10, 10, 30]), block([-25, -10, 30], [25, 10, 40]))))).toMatchObject({ supports: { skin: 600 } });
+    expect(checkNote(row(tee(), '-z', { planes: [{ axis: 2, at: 30 }] }))).toMatchObject({ supports: { seam: 300, skin: 0 } });
     expect(checkNote(row(tee()))).not.toHaveProperty('steps');
     expect(checkNote(row(leaning(3)))).toEqual({ steps: { facing: 'up', tilt: 3, area: 8011, every: 3.8 }, layer: 0.2, height: 25.2 });
     // an underside that leans is supports, not steps
@@ -336,11 +422,16 @@ describe('the words of the check', () => {
     );
     const table = join(block([-5, -5, 0], [5, 5, 30]), block([-20, -20, 30], [20, 20, 35]));
     expect(checkNoteWords('Piece 2', checkNote(row(table)))).toBe(
-      "Piece 2 may need supports under about 15 cm² of the model's own faces, standing on the bed. Another way to lay it (Lay pieces) may need less. "
+      "Piece 2 may need supports under about 15 cm² of the model's own faces, standing on the bed. Laid another way it may need less. "
+      + 'It stands on a 10 × 10 mm foot, small for its size, and may come loose: add a brim about 5 mm wide in your slicer, or lay it another way.',
+    );
+    // a piece laid the way that needs least already is not told to try another
+    expect(checkNoteWords('Piece 2', { ...checkNote(row(table)), auto: true })).toBe(
+      "Piece 2 may need supports under about 15 cm² of the model's own faces, standing on the bed. "
       + 'It stands on a 10 × 10 mm foot, small for its size, and may come loose: add a brim about 5 mm wide in your slicer, or lay it another way.',
     );
     expect(checkNoteWords('Piece 2', checkNote(row(table, '-z', { planes: [{ axis: 2, at: 30 }] })))).toMatch(
-      /^Piece 2 may need supports under about 15 cm² of a glue face, standing on the bed\. Another way to lay it \(Lay pieces\) may need less\. A glue face on supports prints rough and may want light sanding before you glue it\. It stands on/,
+      /^Piece 2 may need supports under about 15 cm² of a glue face, standing on the bed\. Laid another way it may need less\. A glue face on supports prints rough and may want light sanding before you glue it\. It stands on/,
     );
     // a model printed whole has no Lay pieces to try
     expect(checkNoteWords('The model', { ...checkNote(row(table)), whole: true })).toBe(

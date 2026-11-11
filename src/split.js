@@ -5342,7 +5342,7 @@ const NOTE_TEXT = {
       ? `${pieceName(pieceIndex)} has nothing flat to stand on but the face its built-in pegs stand out of – it rests on a curve or an edge and needs supports. With pins (Joints: Pins) it lies on that face.`
       : `${pieceName(pieceIndex)} has nothing flat to stand on where it fits your printer – it rests on a curve or an edge and needs supports. Another cut through it gives it a flat face to lie on.`;
   },
-  PRINT_CHECK: ({ pieceIndex, whole = false, ...found }) => checkNoteWords(whole ? 'The model' : pieceName(pieceIndex), { ...found, whole }),
+  PRINT_CHECK: ({ pieceIndex, whole = false, auto = false, ...found }) => checkNoteWords(whole ? 'The model' : pieceName(pieceIndex), { ...found, whole, auto }),
   PART_TOO_BIG: ({ name, size, bed, pins = false }) => {
     const room = `${formatSize(size)}${bed ? `; the printer has room for ${roomWords(bed)}` : ''}`;
     return pins
@@ -5629,8 +5629,9 @@ const NOTE_TEXT = {
  * `pegs`: it has built-in pegs instead of pins);
  * ORIENT_FALLBACK `{ pieceIndex, mode, lies }`; HOLES_KEEP_LAY `{ pieceIndex, lies }` (a piece kept the way a lip or
  * a twist-lock that was not built laid it, as its pin holes were shaped for that); PRINT_CHECK `{ pieceIndex, whole,
- * supports, steps, foot, layer, height }` (what the print check of a piece, or with `whole` of a model printed in one
- * piece, found worth saying: printCheck.js `checkNote`; one a piece at most, and `warn` where the piece may tip);
+ * auto, supports, steps, foot, layer, height }` (what the print check of a piece, or with `whole` of a model printed
+ * in one piece, found worth saying: printCheck.js `checkNote`; one a piece at most, and `warn` where the piece may
+ * tip; `auto` where the piece is laid the best side down, and so not told to lay it another way for its supports);
  * PIECE_UNSTABLE `{ pieceIndex, pegs, lip }` (`pegs`, `lip`: only the
  * face its pegs or its lip stand out of was flat); PART_TOO_BIG `{ name, size, bed, pins }`
  * (a part printed separately, or with `pins` a single pin, too big for the bed); SPLIT_NOT_NEEDED `{ yaw, down, apart }`
@@ -5686,15 +5687,16 @@ export function splitNote(code, fields = {}) {
  * PRINT_CHECK for a piece's row of the print check (printCheck.js `checkRow`), or with `whole` for a model printed in
  * one piece: null when the check found nothing worth a note. A piece that may tip is warned of; the rest is for
  * information. A piece already told it has nothing flat to stand on and needs supports (`unstable`: PIECE_UNSTABLE)
- * is not told of supports again.
+ * is not told of supports again, and one laid the way that needs least support (`auto`: Lay pieces left at Best side
+ * down) is not told that another way may need less.
  * @param {object|null} row
- * @param {{ pieceIndex?: number|null, whole?: boolean, unstable?: boolean }} of
+ * @param {{ pieceIndex?: number|null, whole?: boolean, unstable?: boolean, auto?: boolean }} of
  */
-export function printCheckNote(row, { pieceIndex = null, whole = false, unstable = false } = {}) {
+export function printCheckNote(row, { pieceIndex = null, whole = false, unstable = false, auto = false } = {}) {
   const { supports, ...rest } = checkNote(row) ?? {};
   const found = unstable ? rest : { ...(supports ? { supports } : {}), ...rest };
   if (!found.supports && !found.steps && !found.foot) return null;
-  const note = splitNote('PRINT_CHECK', { ...(whole ? { whole: true } : { pieceIndex }), ...found });
+  const note = splitNote('PRINT_CHECK', { ...(whole ? { whole: true } : { pieceIndex, ...(auto ? { auto: true } : {}) }), ...found });
   return found.foot?.tip ? { ...note, level: 'warn' } : note;
 }
 
@@ -6046,13 +6048,16 @@ export function howToGlueText(plan) {
     for (const x of locked) if (x.pieces[0] === p.index) extra.push(`${x.apart.mech === 'plug' ? 'twist-lock slots' : 'twist-lock neck'} for cut ${x.letter}`);
     if (p.part) extra.push(`comes off at cut ${listOf(p.lids ?? [])} (the ${partCalled(p.name)})`);
     for (const x of seated) if (x.pieces[1] === p.index) extra.push(`tea-light seat Ø ${mm1(x.apart.seat.d)} mm on top`);
-    // what the print check found, and how its pin holes print: one clause each
-    const checked = checkWords(p.check ?? null, p.holes ?? null);
+    // what the print check found, one clause each; of its pin holes only what the heading does not say: those that
+    // may need supports
+    const checked = checkWords(p.check ?? null, p.holes ?? null, { fine: false });
     out.push(`  ${pad(`piece ${p.index} of ${n}`, 12)}${pad(size1(p.size), width)}${pad(`lies ${p.lies}`, 0)}${extra.join(', ')}${checked.length ? ` – ${checked.join('; ')}` : ''}`);
   });
-  // the holes and the joints are shaped for the way each file lies, and the check above is of that way
-  out.push('  Print each piece the way its file lies – do not turn it in your slicer: its holes and joints are shaped to print that way.');
-  if (pieces.some((p) => p.check?.supports.area >= PRINT_CHECK.none)) out.push("  'May need supports' goes by the safe rule – any face flatter than 45° – so your slicer may ask for less.");
+  // the holes and the joints are shaped for the way each file lies, and the check above is of that way; spinning a
+  // piece on the bed changes neither
+  out.push(`  Print each piece lying the way its file lies – do not tip it onto another side in your slicer (spinning it flat on the bed is fine)${unsupported.length ? `: its ${listOf(unsupported)} are shaped to print that way` : ''}.`);
+  if (pieces.some((p) => p.check?.supports.area >= PRINT_CHECK.none)) out.push("  'May need supports' goes by the safe rule – any face flatter than 45° – so your slicer may ask for less, or a little more.");
+  if (pieces.some((p) => p.check?.supports.span >= PRINT_CHECK.none)) out.push('  A level span is held at both ends: print it with bridging on (the default) and no supports; it may hang a little in the middle.');
   // a lid's collar slopes out under the joint as steeply as the model beside it: support the dome, support the collar
   for (const x of locked.filter((y) => y.apart.mech === 'twist' && y.apart.slope > 1 + 1e-6)) {
     const like = x.part.name === 'Dome and cap' ? 'the dome' : 'the model round it';

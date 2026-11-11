@@ -921,12 +921,15 @@ try {
     const rows = await page.locator('#pieceList li').allInnerTexts();
     check(rows.length === 2 && rows.every((r) => /fits/.test(r)), 'two pieces, both fitting the printer', rows.join(' / '));
     // the print check: one line under each piece, of how it prints the way its file lies
-    const checkLines = await page.locator('#pieceList li .check').allInnerTexts();
+    const checkLines = await page.locator('#pieceList li .print-check').allInnerTexts();
     check(
       checkLines.length === 2 && checkLines.every((t) => /^Print check: (no supports needed|may need supports: )/.test(t) && /its 2 pin holes need no supports$/.test(t)),
       'each piece has a print check line: supports, and how its pin holes print',
       checkLines.join(' / '),
     );
+    // it is words to read, not something to click: no hand over it
+    const checkCursor = await page.locator('#pieceList li .print-check').first().evaluate((el) => getComputedStyle(el).cursor);
+    check(checkCursor !== 'pointer', 'the print check line does not show a hand: there is nothing to click', checkCursor);
     check((await page.locator('#downloadBtn').innerText()) === 'Download 2 pieces (.zip)', 'the download button counts the pieces', await page.locator('#downloadBtn').innerText());
     const labelLines = await page.evaluate(() => {
       const btn = document.querySelector('#downloadBtn');
@@ -971,7 +974,7 @@ try {
     check(zip.entries['long-bar-text-how-to-glue.txt']?.includes('1A ↔ 2A'), 'the glue sheet pairs the matching labels');
     const glueSheet = zip.entries['long-bar-text-how-to-glue.txt'] ?? '';
     check(
-      /piece 1 of 2 .* fits – .*its 2 pin holes need no supports\n/.test(glueSheet) && glueSheet.includes('Print each piece the way its file lies – do not turn it in your slicer'),
+      /piece 1 of 2 .* fits – (no supports needed|may need supports: )/.test(glueSheet) && glueSheet.includes('Print each piece lying the way its file lies – do not tip it onto another side in your slicer (spinning it flat on the bed is fine)'),
       'the glue sheet says what the print check found of each piece, and not to turn the pieces in the slicer',
       glueSheet.split('\n').slice(2, 6).join(' | '),
     );

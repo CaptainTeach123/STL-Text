@@ -16,8 +16,15 @@ const RAD = Math.PI / 180;
  * - `firstLayer`: what lies within this much of the bed (mm) is the first layer, and rests on the bed.
  * - `flat`, `onBed`: a face is on the bed when it is level (its normal's z under −`flat`) and within `onBed` mm of it.
  * - `place`: a patch of overhang under this much (mm², seen from below) is left out: the underside of a letter.
- * - `bridge`, `level`, `held`: a level ceiling (within `level` degrees) no wider than `bridge` mm, with walls under
- *   at least `held` of its rim, is a short span a printer bridges without supports.
+ * - `bridge`, `bridgeLong`, `level`: a level ceiling (within `level` degrees) with a wall under it on two opposite
+ *   sides is a span the printer bridges: up to `bridge` mm from wall to wall it is left out, up to `bridgeLong` mm
+ *   (the span of the app's own clips) it is told of apart, as a span to bridge, and beyond that it may need supports.
+ *   A ledge held along one side only is no span, however long it is for its depth.
+ * - `lip`: but a level ledge that stands no more than this far (mm) out of the wall it is on is left out as well:
+ *   the underside of a raised letter, a small step.
+ * - `spanTurns`, `spanWork`: a span is measured across the ceiling in this many directions; a ceiling that would
+ *   take more than `spanWork` steps to measure is counted in full instead.
+ * - `grid`: where supports would stand is told from a grid across the bed, this many cells a side.
  * - `none`: under this much overhang in all (mm²) a piece needs no supports.
  * - `stepMin`, `stepMax`: a face leaning between these many degrees off level prints with step lines that show.
  * - `stepArea`, `stepShare`: only a big face is told of – this much (mm²) and this share of the piece's outline on
@@ -25,12 +32,16 @@ const RAD = Math.PI / 180;
  * - `stepMerge`: faces within this many degrees of each other are one face.
  * - `stepCount`: a face that rises fewer layers than this shows no steps to speak of.
  * - `steady`: with less than this on the bed (mm²) a piece stands on a point or an edge.
- * - `smallFoot`, `tall`: under this much on the bed (mm²), a piece taller than `tall` mm has a small foot.
+ * - `smallFoot`, `tall`, `slim`, `ringShare`: under this much on the bed (mm²), a piece taller than `tall` mm has a
+ *   small foot – where it is also more than `slim` times as tall as its foot is wide, or its foot spans less than
+ *   `ringShare` of its outline. A thin tube on its ring stands on little, but that little spans all of it.
  * - `footShare`: so has one whose foot spans less than this share of its outline.
+ * - `strip`: a foot narrower than this (mm), and under half as wide as the piece, is a strip: a round bar lying down.
  * - `tipRatio`: a piece more than this many times as tall as its foot is wide may tip.
  * - `brim`, `brimTall`, `tallRatio`: the brim to add (mm), the wider one for a piece more than `tallRatio` times as
  *   tall as its foot is wide.
- * - `note`: this much overhang (mm²) on the model's own faces, or on glue faces, is worth a note.
+ * - `note`, `noteSeam`: this much overhang (mm²) on the model's own faces, or this much on glue faces, is worth a
+ *   note; less is said on the piece's line only.
  * - `steps`: how many leaning faces a piece's row keeps, the largest first.
  */
 export const PRINT_CHECK = Object.freeze({
@@ -42,8 +53,12 @@ export const PRINT_CHECK = Object.freeze({
   onBed: 0.1,
   place: 4,
   bridge: 10,
+  bridgeLong: 30,
+  lip: 2,
   level: 10,
-  held: 0.45,
+  spanTurns: 12,
+  spanWork: 3e6,
+  grid: 512,
   none: 20,
   stepMin: 0.25,
   stepMax: 15,
@@ -54,12 +69,16 @@ export const PRINT_CHECK = Object.freeze({
   steady: 25,
   smallFoot: 150,
   tall: 20,
+  slim: 3,
+  ringShare: 0.5,
   footShare: 0.1,
+  strip: 2.5,
   tipRatio: 5,
   brim: 5,
   brimTall: 8,
   tallRatio: 8,
-  note: 100,
+  note: 500,
+  noteSeam: 100,
   steps: 3,
 });
 
@@ -79,47 +98,100 @@ function rootOf(parent, i) {
 }
 
 /**
- * The faces that look up, in a grid across the bed: `under(x, y, z)` says whether any of them lies straight below a
- * point, which is where a support under it would stand if not on the bed.
+ * The faces that look up, as a grid across the bed of how low the lowest of them lies in each cell: `under(x, y, z)`
+ * says whether any of them lies below a point, which is where a support under it would stand if not on the bed. A
+ * face is written into the cells it crosses, row by row, so the work grows with what the faces cover and never
+ * with how many of them there are times the grid: long thin faces by the hundred thousand cost no more than small
+ * ones. The answer is good to a cell, a five-hundredth of the piece.
  */
 function facesBelow(X, T, up, lo, hi) {
-  const n = Math.max(4, Math.min(256, Math.ceil(Math.sqrt(up.length))));
+  const n = PRINT_CHECK.grid;
   const w = Math.max(hi[0] - lo[0], 1e-9) / n;
   const h = Math.max(hi[1] - lo[1], 1e-9) / n;
   const cellOf = (v, from, step) => Math.max(0, Math.min(n - 1, Math.floor((v - from) / step)));
-  const span = (t) => {
+  const low = new Float32Array(n * n).fill(Infinity);
+  for (const t of up) {
     const a = T[3 * t] * 3, b = T[3 * t + 1] * 3, c = T[3 * t + 2] * 3;
-    return [
-      cellOf(Math.min(X[a], X[b], X[c]), lo[0], w), cellOf(Math.max(X[a], X[b], X[c]), lo[0], w),
-      cellOf(Math.min(X[a + 1], X[b + 1], X[c + 1]), lo[1], h), cellOf(Math.max(X[a + 1], X[b + 1], X[c + 1]), lo[1], h),
-    ];
-  };
-  const start = new Uint32Array(n * n + 1);
-  for (const t of up) {
-    const [i0, i1, j0, j1] = span(t);
-    for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) start[j * n + i + 1]++;
-  }
-  for (let k = 0; k < n * n; k++) start[k + 1] += start[k];
-  const list = new Uint32Array(start[n * n]);
-  const at = start.slice(0, n * n);
-  for (const t of up) {
-    const [i0, i1, j0, j1] = span(t);
-    for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) list[at[j * n + i]++] = t;
-  }
-  return (x, y, z) => {
-    const k = cellOf(y, lo[1], h) * n + cellOf(x, lo[0], w);
-    for (let q = start[k]; q < start[k + 1]; q++) {
-      const t = list[q];
-      const a = T[3 * t] * 3, b = T[3 * t + 1] * 3, c = T[3 * t + 2] * 3;
-      const d = (X[b + 1] - X[c + 1]) * (X[a] - X[c]) + (X[c] - X[b]) * (X[a + 1] - X[c + 1]);
-      if (Math.abs(d) < 1e-12) continue;
-      const u = ((X[b + 1] - X[c + 1]) * (x - X[c]) + (X[c] - X[b]) * (y - X[c + 1])) / d;
-      const v = ((X[c + 1] - X[a + 1]) * (x - X[c]) + (X[a] - X[c]) * (y - X[c + 1])) / d;
-      if (u < -1e-9 || v < -1e-9 || u + v > 1 + 1e-9) continue;
-      if (u * X[a + 2] + v * X[b + 2] + (1 - u - v) * X[c + 2] < z - 1e-4) return true;
+    const px = [X[a], X[b], X[c]];
+    const py = [X[a + 1], X[b + 1], X[c + 1]];
+    const pz = [X[a + 2], X[b + 2], X[c + 2]];
+    // the face's plane: z = pz[0] + gx (x − px[0]) + gy (y − py[0])
+    const nx = (py[1] - py[0]) * (pz[2] - pz[0]) - (pz[1] - pz[0]) * (py[2] - py[0]);
+    const ny = (pz[1] - pz[0]) * (px[2] - px[0]) - (px[1] - px[0]) * (pz[2] - pz[0]);
+    const nz = (px[1] - px[0]) * (py[2] - py[0]) - (py[1] - py[0]) * (px[2] - px[0]);
+    if (!(nz > 0)) continue;
+    const gx = -nx / nz, gy = -ny / nz;
+    const zLo = Math.min(pz[0], pz[1], pz[2]), zHi = Math.max(pz[0], pz[1], pz[2]);
+    const j1 = cellOf(Math.max(py[0], py[1], py[2]), lo[1], h);
+    for (let j = cellOf(Math.min(py[0], py[1], py[2]), lo[1], h); j <= j1; j++) {
+      // what of the face lies in this row of cells: its edges, cut to the row
+      const y0 = lo[1] + j * h, y1 = y0 + h;
+      let x0 = Infinity, x1 = -Infinity;
+      for (let k = 0; k < 3; k++) {
+        const q = (k + 1) % 3;
+        const ya = py[k], yb = py[q];
+        if ((ya < y0 && yb < y0) || (ya > y1 && yb > y1)) continue;
+        const run = yb - ya;
+        for (const y of [y0, y1]) {
+          const s = run === 0 ? 0 : Math.max(0, Math.min(1, (y - ya) / run));
+          const x = px[k] + s * (px[q] - px[k]);
+          if (x < x0) x0 = x;
+          if (x > x1) x1 = x;
+        }
+        if (run === 0) {
+          x0 = Math.min(x0, px[q]);
+          x1 = Math.max(x1, px[q]);
+        }
+      }
+      if (x0 > x1) continue;
+      const i1 = cellOf(x1, lo[0], w);
+      const y = y0 + h / 2 - py[0];
+      for (let i = cellOf(x0, lo[0], w); i <= i1; i++) {
+        const z = Math.max(zLo, Math.min(zHi, pz[0] + gx * (lo[0] + (i + 0.5) * w - px[0]) + gy * y));
+        if (z < low[j * n + i]) low[j * n + i] = z;
+      }
     }
-    return false;
-  };
+  }
+  return (x, y, z) => low[cellOf(y, lo[1], h) * n + cellOf(x, lo[0], w)] < z - 1e-4;
+}
+
+/**
+ * How far a level ceiling spans at a point of it, from a wall under it on one side to a wall under it on the other:
+ * the shortest such way across, looked for in `spanTurns` directions. Infinity where no direction has a wall at both
+ * ends – a ledge, held on one side and free on the other. And how far such a ledge stands out there: the shortest way
+ * across from a wall under it to a free edge.
+ * @param {number[]} rim the ceiling's rim, five numbers an edge: x, y of each end, and 1 where a wall under it holds it
+ * @returns {number[]} the span and the ledge's depth, mm; Infinity for none
+ */
+function spanAt(rim, x, y) {
+  let best = Infinity;
+  let ledge = Infinity;
+  for (let k = 0; k < PRINT_CHECK.spanTurns; k++) {
+    const dx = Math.cos((k * Math.PI) / PRINT_CHECK.spanTurns);
+    const dy = Math.sin((k * Math.PI) / PRINT_CHECK.spanTurns);
+    // the nearest edge of the rim each way along the line, and whether it is held
+    let ahead = Infinity, back = -Infinity, heldAhead = false, heldBack = false;
+    for (let e = 0; e < rim.length; e += 5) {
+      const ex = rim[e + 2] - rim[e], ey = rim[e + 3] - rim[e + 1];
+      const d = dx * ey - dy * ex;
+      if (Math.abs(d) < 1e-12) continue;
+      const wx = rim[e] - x, wy = rim[e + 1] - y;
+      const s = (wx * dy - wy * dx) / d;
+      if (s < -1e-9 || s > 1 + 1e-9) continue;
+      const t = (wx * ey - wy * ex) / d;
+      const held = rim[e + 4] === 1;
+      // where two edges meet on the line, a free one tells
+      if (t > 0) {
+        if (t < ahead - 1e-9) (ahead = t), (heldAhead = held);
+        else if (t < ahead + 1e-9) heldAhead = heldAhead && held;
+      } else if (t > back + 1e-9) (back = t), (heldBack = held);
+      else if (t > back - 1e-9) heldBack = heldBack && held;
+    }
+    if (!(ahead - back < Infinity)) continue;
+    if (heldAhead && heldBack) best = Math.min(best, ahead - back);
+    else if (heldAhead || heldBack) ledge = Math.min(ledge, ahead - back);
+  }
+  return [best, ledge];
 }
 
 /**
@@ -171,18 +243,22 @@ function leaningFaces(bins, least) {
  *   lock, a label): those print without supports by design and are counted apart
  * @returns {{ height: number, box: number[],
  *   supports: { area: number, skin: number, seam: number, bed: number, piece: number, shallow: number, places: number,
- *   bridged: number, joints: number },
+ *   bridged: number, span: number, reach: number, joints: number },
  *   leaning: { facing: 'up'|'down', tilt: number, area: number, rise: number }[],
  *   foot: { contact: number, across: number[]|null, base: number, ratio: number, flat: boolean, tip: boolean,
- *   small: boolean, off: boolean } }}
+ *   small: boolean, strip: boolean, off: boolean } }}
  *   `height` and `box` (its two sides on the bed) as it lies. `supports`, all mm² as seen from below: `area` what may
  *   need supports, of which `skin` on the model's own faces and `seam` on glue faces; of which `bed` where a support
  *   would stand on the bed and `piece` where it would stand on the piece itself; `shallow` the part under 30° from
- *   level; `places` how many patches it is in; `bridged` the short level spans left out, and `joints` the area of the
- *   joints' own faces left out. `leaning` the big faces a little off level, largest first (`tilt` degrees off level,
+ *   level; `places` how many patches it is in; `bridged` the short level spans and small ledges left out; `span` the
+ *   area of the longer level spans the printer is left to bridge (not in `area`) and `reach` the longest of them, mm;
+ *   `joints` the area of the joints' own faces left out. A glue face among them (`seam`) is a safeguard: a straight
+ *   cut's face that looks down is what its piece lies on, so the pieces of a split do not normally have one.
+ *   `leaning` the big faces a little off level, largest first (`tilt` degrees off level,
  *   `rise` how far the face climbs, mm). `foot`: `contact` the area on the bed, `across` the two sides of the box it
  *   spans, `base` the shorter of them, `ratio` the piece's height over that, `flat` whether it has a flat foot at
- *   all, `tip` whether it may tip, `small` whether its foot is small, `off` whether its weight hangs past its foot
+ *   all, `tip` whether it may tip, `small` whether its foot is small, `strip` whether it is a narrow strip under a
+ *   wider piece (a round bar lying down), `off` whether its weight hangs past its foot
  */
 export function printCheck(vertProperties, numProp, triVerts, { turn = null, planes = [], made = null } = {}) {
   const P = vertProperties;
@@ -279,7 +355,7 @@ export function printCheck(vertProperties, numProp, triVerts, { turn = null, pla
     info.push(area * -nz, nz, seam ? 1 : 0);
   }
 
-  const supports = { area: 0, skin: 0, seam: 0, bed: 0, piece: 0, shallow: 0, places: 0, bridged: 0, joints };
+  const supports = { area: 0, skin: 0, seam: 0, bed: 0, piece: 0, shallow: 0, places: 0, bridged: 0, span: 0, reach: 0, joints };
   if (over.length) {
     // the patches: overhanging triangles that share a point are one place
     const parent = Int32Array.from(over, (_, i) => i);
@@ -300,24 +376,18 @@ export function printCheck(vertProperties, numProp, triVerts, { turn = null, pla
     const placeOf = (i) => {
       const r = rootOf(parent, i);
       let place = places.get(r);
-      if (!place) places.set(r, (place = { area: 0, level: true, box: [Infinity, Infinity, -Infinity, -Infinity], held: 0, open: 0, list: [] }));
+      if (!place) places.set(r, (place = { area: 0, level: true, rim: [], list: [] }));
       return place;
     };
     over.forEach((t, i) => {
       const place = placeOf(i);
       place.area += info[3 * i];
       if (info[3 * i + 1] > levelNz) place.level = false;
-      for (let k = 0; k < 3; k++) {
-        const p = T[3 * t + k] * 3;
-        place.box[0] = Math.min(place.box[0], X[p]);
-        place.box[1] = Math.min(place.box[1], X[p + 1]);
-        place.box[2] = Math.max(place.box[2], X[p]);
-        place.box[3] = Math.max(place.box[3], X[p + 1]);
-      }
       place.list.push(i);
     });
-    // a level place's rim: held where the face beside it goes down from it (a wall under a ceiling), open where it
-    // does not (the free edge of a shelf)
+    // a level place's rim: an edge is held where the face beside it is a wall under the ceiling – it goes down from
+    // the edge and looks in under the ceiling – and free where it is not: the open edge of a shelf, or its end, flush
+    // with the end of the wall it is on
     if ([...places.values()].some((p) => p.level && p.area >= R.place)) {
       const isOver = new Uint8Array(tris);
       for (const t of over) isOver[t] = 1;
@@ -328,34 +398,57 @@ export function printCheck(vertProperties, numProp, triVerts, { turn = null, pla
           const q = T[3 * t + ((k + 1) % 3)];
           const i = edges.get(p < q ? p * count + q : q * count + p);
           if (i === undefined) continue;
-          const third = X[T[3 * t + ((k + 2) % 3)] * 3 + 2];
-          const length = Math.hypot(X[p * 3] - X[q * 3], X[p * 3 + 1] - X[q * 3 + 1], X[p * 3 + 2] - X[q * 3 + 2]);
           const place = placeOf(i);
-          if (third < Math.min(X[p * 3 + 2], X[q * 3 + 2]) - 1e-6) place.held += length;
-          else place.open += length;
+          if (!place.level) continue;
+          const r = T[3 * t + ((k + 2) % 3)] * 3;
+          const px = X[p * 3], py = X[p * 3 + 1], qx = X[q * 3], qy = X[q * 3 + 1];
+          // which way the face beside looks, and where the ceiling lies from the edge: its own third point
+          const nx = (qy - py) * (X[r + 2] - X[p * 3 + 2]) - (X[q * 3 + 2] - X[p * 3 + 2]) * (X[r + 1] - py);
+          const ny = (X[q * 3 + 2] - X[p * 3 + 2]) * (X[r] - px) - (qx - px) * (X[r + 2] - X[p * 3 + 2]);
+          const mine = over[i];
+          let o = T[3 * mine];
+          if (o === p || o === q) o = T[3 * mine + 1];
+          if (o === p || o === q) o = T[3 * mine + 2];
+          const inward = nx * (X[o * 3] - (px + qx) / 2) + ny * (X[o * 3 + 1] - (py + qy) / 2) > 0;
+          const down = X[r + 2] < Math.min(X[p * 3 + 2], X[q * 3 + 2]) - 1e-6;
+          place.rim.push(px, py, qx, qy, down && inward ? 1 : 0);
         }
       }
     }
     let under = null;
     for (const place of places.values()) {
       if (place.area < R.place) continue;
-      const narrow = Math.min(place.box[2] - place.box[0], place.box[3] - place.box[1]);
-      if (place.level && narrow <= R.bridge && place.held >= R.held * (place.held + place.open) && place.held > 0) {
-        supports.bridged++;
-        continue;
-      }
-      supports.places++;
-      under ??= facesBelow(X, T, up, lo, hi);
-      for (const i of place.list) {
+      // how far each of a level place's faces spans between walls, or stands out of one; a place too big to measure
+      // counts in full
+      const spans = place.level && place.rim.length && place.list.length * (place.rim.length / 5) * R.spanTurns <= R.spanWork
+        ? place.list.map((i) => {
+          const t = over[i];
+          const a = T[3 * t] * 3, b = T[3 * t + 1] * 3, c = T[3 * t + 2] * 3;
+          return spanAt(place.rim, (X[a] + X[b] + X[c]) / 3, (X[a + 1] + X[b + 1] + X[c + 1]) / 3);
+        })
+        : null;
+      let counted = false;
+      place.list.forEach((i, at) => {
+        const seen = info[3 * i];
+        const [span, ledge] = spans ? spans[at] : [Infinity, Infinity];
+        if (span <= R.bridge + 0.01 || ledge <= R.lip + 0.01) return;
+        if (span <= R.bridgeLong + 0.01) {
+          supports.span += seen;
+          supports.reach = Math.max(supports.reach, span);
+          return;
+        }
+        counted = true;
         const t = over[i];
         const a = T[3 * t] * 3, b = T[3 * t + 1] * 3, c = T[3 * t + 2] * 3;
-        const seen = info[3 * i];
         supports.area += seen;
         supports[info[3 * i + 2] ? 'seam' : 'skin'] += seen;
         if (info[3 * i + 1] < shallowNz) supports.shallow += seen;
+        under ??= facesBelow(X, T, up, lo, hi);
         const onPiece = under((X[a] + X[b] + X[c]) / 3, (X[a + 1] + X[b + 1] + X[c + 1]) / 3, (X[a + 2] + X[b + 2] + X[c + 2]) / 3);
         supports[onPiece ? 'piece' : 'bed'] += seen;
-      }
+      });
+      if (counted) supports.places++;
+      else if (spans.every(([span, ledge]) => span <= R.bridge + 0.01 || ledge <= R.lip + 0.01)) supports.bridged++;
     }
   }
 
@@ -366,14 +459,19 @@ export function printCheck(vertProperties, numProp, triVerts, { turn = null, pla
   // the weight's middle past the box its foot spans: it hangs over, and may pull the piece off the bed
   const mid = volume > 1e-9 ? [com[0] / volume, com[1] / volume] : [box[0] / 2, box[1] / 2];
   const off = flat && (mid[0] < spread[0] - 1e-6 || mid[0] > spread[2] + 1e-6 || mid[1] < spread[1] - 1e-6 || mid[1] > spread[3] + 1e-6);
-  const tip = flat && (ratio > R.tipRatio || off);
-  const small = flat && height > R.tall && (contact < R.smallFoot || across[0] * across[1] < R.footShare * box[0] * box[1]);
+  // a narrow strip under a wider piece – the lowest facets of a round bar lying down – is no foot to tip on
+  const strip = flat && base < R.strip && base < 0.5 * Math.min(box[0], box[1]);
+  const tip = flat && !strip && (ratio > R.tipRatio || off);
+  // little on the bed is a small foot only where the piece is tall for it, or the foot spans little of the piece: a
+  // thin tube on its ring stands on little, all round its outline
+  const share = flat ? (across[0] * across[1]) / Math.max(box[0] * box[1], 1e-9) : 0;
+  const small = flat && !strip && height > R.tall && ((contact < R.smallFoot && (ratio > R.slim || share < R.ringShare)) || share < R.footShare);
   return {
     height,
     box,
     supports,
     leaning: leaningFaces(bins, Math.max(R.stepArea, R.stepShare * box[0] * box[1])),
-    foot: { contact, across, base, ratio, flat, tip, small, off },
+    foot: { contact, across, base, ratio, flat, tip, small, strip, off },
   };
 }
 
@@ -402,9 +500,10 @@ const round1 = (v) => Math.round(v * 10) / 10;
  * @param {number} layer the layer height, mm
  * @returns {{ layer: number, height: number,
  *   supports: { area: number, skin: number, seam: number, bed: number, piece: number, shallow: number, places: number,
- *   bridged: number },
+ *   bridged: number, span: number, reach: number },
  *   steps: { facing: 'up'|'down', tilt: number, area: number, every: number }[],
- *   foot: { contact: number, across: number[]|null, flat: boolean, tip: boolean, small: boolean, brim: number } }}
+ *   foot: { contact: number, across: number[]|null, flat: boolean, tip: boolean, small: boolean, strip: boolean,
+ *   brim: number } }}
  *   areas in whole mm²; `steps` the largest few, those facing up first; `brim` the brim to add in mm, 0 for none
  */
 export function checkRow(check, layer = 0.2) {
@@ -414,13 +513,13 @@ export function checkRow(check, layer = 0.2) {
     .slice(0, PRINT_CHECK.steps)
     .map((f) => ({ facing: f.facing, tilt: round1(f.tilt), area: Math.round(f.area), every: round1(f.every) }));
   const f = check.foot;
-  const risky = f.tip || f.small;
+  const risky = f.tip || f.small || f.strip;
   return {
     layer,
     height: round1(check.height),
     supports: {
       area: Math.round(s.area), skin: Math.round(s.skin), seam: Math.round(s.seam), bed: Math.round(s.bed), piece: Math.round(s.piece),
-      shallow: Math.round(s.shallow), places: s.places, bridged: s.bridged,
+      shallow: Math.round(s.shallow), places: s.places, bridged: s.bridged, span: Math.round(s.span), reach: Math.round(s.reach),
     },
     steps,
     foot: {
@@ -429,7 +528,8 @@ export function checkRow(check, layer = 0.2) {
       flat: f.flat,
       tip: f.tip,
       small: f.small,
-      brim: risky ? (f.ratio > PRINT_CHECK.tallRatio ? PRINT_CHECK.brimTall : PRINT_CHECK.brim) : 0,
+      strip: f.strip,
+      brim: risky ? (!f.strip && f.ratio > PRINT_CHECK.tallRatio ? PRINT_CHECK.brimTall : PRINT_CHECK.brim) : 0,
     },
   };
 }
@@ -464,34 +564,38 @@ function seamWords(s) {
  * @param {object|null} row from `checkRow`
  * @param {{ upright?: number, pointed?: number, flat?: number, round?: number }|null} holes the piece's pin holes by
  *   how they print (split.js `holeSummary`)
+ * @param {{ fine?: boolean }} say `fine: false` leaves out the clause for pin holes that all print without supports,
+ *   where that is said once for all the pieces (the sheet's heading)
  * @returns {string[]} empty without a check and without holes
  */
-export function checkWords(row, holes = null) {
+export function checkWords(row, holes = null, { fine = true } = {}) {
   const out = [];
   if (row) {
     const s = row.supports;
     if (s.area < PRINT_CHECK.none) out.push('no supports needed');
     else out.push(`may need supports: ${[areaWords(s.area), seamWords(s), standWords(s)].filter(Boolean).join(', ')}`);
+    if ((s.span ?? 0) >= PRINT_CHECK.none) out.push(`bridges a level span of about ${s.reach} mm`);
     const top = row.steps.find((f) => f.facing === 'up');
     if (top) out.push(`step lines ${everyWords(top.every)} on a big face on top`);
     if (!row.foot.flat) out.push('nothing flat to stand on');
+    else if (row.foot.strip) out.push(`rests on a narrow strip: add a brim, ${row.foot.brim} mm wide`);
     else if (row.foot.tip) out.push(`may tip: add a brim, ${row.foot.brim} mm wide`);
     else if (row.foot.small) out.push(`small foot: add a brim, ${row.foot.brim} mm wide`);
   }
   const n = holes ? (holes.upright ?? 0) + (holes.pointed ?? 0) + (holes.flat ?? 0) + (holes.round ?? 0) : 0;
   if (n) {
     const round = holes.round ?? 0;
-    out.push(round
-      ? `${round} of its ${n} pin holes may need supports`
-      : `${n === 1 ? 'its pin hole needs' : `its ${n} pin holes need`} no supports`);
+    if (round) out.push(`${round} of its ${n} pin holes may need supports`);
+    else if (fine) out.push(`${n === 1 ? 'its pin hole needs' : `its ${n} pin holes need`} no supports`);
   }
   return out;
 }
 
 /**
- * What of a piece's check is worth a note, as the note's fields; null when nothing is. Supports under the model's
- * own faces or under a glue face (which prints rough on them), a big face on top that will show step lines, and a
- * piece that may tip or stands on a small foot.
+ * What of a piece's check is worth a note, as the note's fields; null when nothing is. Supports under a good deal of
+ * the model's own faces (a little is said on the piece's line only) or under a glue face (which prints rough on
+ * them), a big face on top that will show step lines, and a piece that may tip, stands on a small foot or rests on
+ * a narrow strip.
  * @param {object|null} row from `checkRow`
  * @returns {{ supports?: object, steps?: object, foot?: object, layer: number, height: number }|null}
  */
@@ -499,8 +603,8 @@ export function checkNote(row) {
   if (!row) return null;
   const s = row.supports;
   const top = row.steps.find((f) => f.facing === 'up');
-  const risky = row.foot.flat && (row.foot.tip || row.foot.small);
-  const supported = s.skin >= PRINT_CHECK.note || s.seam >= PRINT_CHECK.note;
+  const risky = row.foot.flat && (row.foot.tip || row.foot.small || Boolean(row.foot.strip));
+  const supported = s.skin >= PRINT_CHECK.note || s.seam >= PRINT_CHECK.noteSeam;
   if (!supported && !top && !risky) return null;
   return {
     ...(supported ? { supports: s } : {}),
@@ -515,25 +619,27 @@ export function checkNote(row) {
  * The words of a print-check note, after the piece's name (or "The model"): each thing to know in a sentence, with
  * what can be done about it.
  * @param {string} who "Piece 3", "The model"
- * @param {{ supports?: object, steps?: object, foot?: object, layer?: number, height?: number, whole?: boolean }} fields
- *   from `checkNote`; `whole` for a model printed in one piece, which has no Lay pieces setting to try
+ * @param {{ supports?: object, steps?: object, foot?: object, layer?: number, height?: number, whole?: boolean,
+ *   auto?: boolean }} fields from `checkNote`; `whole` for a model printed in one piece, which is not laid at all;
+ *   `auto` for a piece laid the way that needs least support already, which is not told to try another
  * @returns {string}
  */
-export function checkNoteWords(who, { supports = null, steps = null, foot = null, layer = 0.2, height = 0, whole = false }) {
+export function checkNoteWords(who, { supports = null, steps = null, foot = null, layer = 0.2, height = 0, whole = false, auto = false }) {
   const out = [];
   const name = () => (out.length ? 'It' : who);
   if (supports) {
     const own = supports.skin >= PRINT_CHECK.note;
     const what = own ? `${areaWords(supports.skin)} of ${whole ? 'its' : "the model's own"} faces` : `${areaWords(supports.seam)} of a glue face`;
-    out.push(`${name()} may need supports under ${what}, ${standWords(supports, whole)}. ${whole ? 'Turned another way it may need less' : 'Another way to lay it (Lay pieces) may need less'}.`);
-    if (supports.seam >= PRINT_CHECK.note) out.push('A glue face on supports prints rough and may want light sanding before you glue it.');
+    const cure = whole ? ' Turned another way it may need less.' : auto ? '' : ' Laid another way it may need less.';
+    out.push(`${name()} may need supports under ${what}, ${standWords(supports, whole)}.${cure}`);
+    if (supports.seam >= PRINT_CHECK.noteSeam) out.push('A glue face on supports prints rough and may want light sanding before you glue it.');
   }
   if (steps) {
     out.push(`${name()} has a big face on top (${areaWords(steps.area)}) that leans ${lengthWords(steps.tilt)}° off level: at ${layer} mm layers it prints with a step line ${everyWords(steps.every)}. ${whole ? 'Turning the model so that the face is level or upright' : 'Another way to lay it'}, or finer layers, shows them less.`);
   }
   if (foot) {
     const on = foot.across ? `a ${foot.across.map(lengthWords).join(' × ')} mm foot` : 'a small foot';
-    const what = foot.tip ? `${name()} stands ${lengthWords(height)} mm tall on ${on} and may tip or come loose` : `${name()} stands on ${on}, small for its size, and may come loose`;
+    const what = foot.strip ? `${name()} rests on a narrow strip of the bed and may come loose` : foot.tip ? `${name()} stands ${lengthWords(height)} mm tall on ${on} and may tip or come loose` : `${name()} stands on ${on}, small for its size, and may come loose`;
     out.push(`${what}: add a brim about ${foot.brim} mm wide in your slicer${whole ? '' : ', or lay it another way'}.`);
   }
   return out.join(' ');

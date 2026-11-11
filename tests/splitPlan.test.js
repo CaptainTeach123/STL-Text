@@ -2336,9 +2336,9 @@ describe('notes', () => {
     expect(splitNote('CONNECTORS_FILAMENT', { letter: 'C', count: 4, diameter: 6, length: 8 }).text).toBe('Cut C is too narrow for Ø6 pins: its holes take 1.75 mm filament – cut 4 pieces 8 mm long.');
     expect(splitNote('HOLES_FLAT_TOP', { letter: 'B', count: 2 })).toMatchObject({
       level: 'info',
-      text: '2 pins on cut B sit close to an edge: their holes have a flat top instead of a point, to keep the wall round them thick. They still print without supports.',
+      text: '2 pins on cut B sit close to an edge or another hole: where their holes print lying on their side they have a flat top instead of a point, to keep the wall round them thick. They still print without supports.',
     });
-    expect(splitNote('HOLES_FLAT_TOP', { letter: 'B', count: 1 }).text).toBe('1 pin on cut B sits close to an edge: its holes have a flat top instead of a point, to keep the wall round them thick. They still print without supports.');
+    expect(splitNote('HOLES_FLAT_TOP', { letter: 'B', count: 1 }).text).toBe('1 pin on cut B sits close to an edge or another hole: where its hole prints lying on its side it has a flat top instead of a point, to keep the wall round it thick. It still prints without supports.');
     expect(splitNote('CONNECTORS_DROPPED', { letter: 'B', count: 1, total: 3, wall: 6, suggestedDiameter: 4 })).toMatchObject({
       level: 'warn', suggestedDiameter: 4,
       text: 'No pin fits on 1 of 3 faces at cut B (walls under 6 mm) – it is a flat glue joint. A strip glued inside makes it stronger. Ø4 mm pins would fit.',
@@ -3365,7 +3365,11 @@ describe('cuts that come apart', () => {
     expect(modelled[1].lying.down).toBe('-z');
     const kept = layGrown(modelled, { lips: [], locks: [], lays, dowels }, U, 'model')[1];
     expect(kept).toMatchObject({ down: '-x', lies: 'on a cut face' });
-    expect(kept.notes).toEqual([]);
+    // and says why, in place of a note that it can't lie as modelled
+    expect(kept.notes).toEqual([expect.objectContaining({
+      level: 'info', code: 'HOLES_KEEP_LAY', pieceIndex: 2,
+      text: 'Piece 2 lies on a cut face: its pin holes were made to print that way, so don\'t turn it in your slicer.',
+    })]);
     expect(layGrown(modelled, { lips: [], locks: [], lays, dowels }, U, 'model')[0]).toBe(modelled[0].lying);
     expect(layGrown(modelled, { lips: [], locks: [], lays, dowels: [] }, U, 'model')[1]).toBe(modelled[1].lying);
     expect(layGrown(modelled, { lips: [], locks: [], dowels }, U, 'model')[1]).toBe(modelled[1].lying);

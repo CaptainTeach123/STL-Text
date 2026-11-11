@@ -5938,9 +5938,9 @@ try {
 
   // --- pin holes near an edge: a flat top in place of the teardrop's point ---
   {
-    // a bar 12.9 mm thick, lying flat: a pointed teardrop for a Ø5 pin needs 13 mm, so the cut used to fall back to
+    // a bar 12 mm thick, lying flat: a pointed teardrop for a Ø5 pin needs 13 mm, so the cut used to fall back to
     // filament. Now it keeps its pins, their holes get a flat top, and a note says so in plain words
-    const thinBar = Manifold.cube([300, 40, 12.9], true);
+    const thinBar = Manifold.cube([300, 40, 12], true);
     const thinBarFile = writeFixture('thin-bar.stl', soupOf(thinBar));
     thinBar.delete();
     const flatContext = await browser.newContext({ viewport: { width: 1400, height: 850 } });
@@ -5983,7 +5983,7 @@ try {
     const flatNotes = await notes();
     const flatNote = flatNotes.find((t) => /flat top/.test(t)) ?? '';
     check(
-      flatNote === '2 pins on cut A sit close to an edge: their holes have a flat top instead of a point, to keep the wall round them thick. They still print without supports.',
+      flatNote === '2 pins on cut A sit close to an edge or another hole: where their holes print lying on their side they have a flat top instead of a point, to keep the wall round them thick. They still print without supports.',
       'a bar a little too thin for pointed teardrops says its pin holes have a flat top',
       flatNote,
     );
@@ -5992,9 +5992,9 @@ try {
       'and it keeps its two Ø5 pins: nothing falls back to filament',
       flatNotes.join(' | '),
     );
-    // Auto sizes by the pointed teardrop: Ø4 pins, and no flat tops to tell of
+    // Auto sizes by the pointed teardrop: smaller pins, and no flat tops to tell of
     await pick('0');
-    await f.waitForFunction(() => /pins Ø4/.test(document.querySelector('#splitNotes').innerText), null, { timeout: 60000 });
+    await f.waitForFunction(() => /pins Ø[34] /.test(document.querySelector('#splitNotes').innerText), null, { timeout: 60000 });
     await settled();
     const autoNotes = await notes();
     check(!autoNotes.some((t) => /flat top/.test(t)), 'with Auto the same bar takes smaller pins with pointed teardrops, and the note is gone', autoNotes.join(' | '));

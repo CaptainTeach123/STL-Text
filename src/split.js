@@ -4725,7 +4725,7 @@ export function lipMale(quality, asWell = [true, true]) {
  * cut into lies on its cut face, as a lid that comes off does. A piece the
  * layout gave a way to lie for a lip or a lock that was then not built
  * (`lays`) keeps that way when it has pin holes (`dowels`): they were
- * shaped for it.
+ * shaped for it, and a note says so (`HOLES_KEEP_LAY`).
  * @param {object[]} laid from `layPieces`
  * @param {{ pegs?: { sides: { piece: number, peg: boolean }[] }[], dowels?: { sides: { piece: number }[] }[],
  *   lays?: { piece: number, down: string }[], lips?: { axis: number, dir?: number, down?: string,
@@ -4769,6 +4769,8 @@ export function layGrown(laid, { pegs = [], lips = [], locks = [], dowels = [], 
     const notes = o.notes
       .filter((x) => !((lip || sockets.length || holed) && x.code === 'ORIENT_FALLBACK'))
       .map((x) => (x.code === 'PIECE_UNSTABLE' && steady && why ? splitNote('PIECE_UNSTABLE', { pieceIndex: p.index, ...why }) : x));
+    // why it lies so is said, or it may be turned in the slicer and the round holes laid on their side after all
+    if (holed && o.down === held) notes.push(splitNote('HOLES_KEEP_LAY', { pieceIndex: p.index, lies: o.lies }));
     return { ...o, notes, ...(own.length ? { pegged: true } : {}), ...(lip ? { lip: true } : {}) };
   });
 }
@@ -5115,6 +5117,7 @@ const NOTE_LEVELS = Object.freeze({
   CONNECTORS_SHORTER: 'info',
   CONNECTORS_FILAMENT: 'info',
   HOLES_FLAT_TOP: 'info',
+  HOLES_KEEP_LAY: 'info',
   PEGS_SMALLER: 'info',
   PEGS_UPRIGHT: 'info',
   APART: 'info',
@@ -5214,8 +5217,9 @@ const NOTE_TEXT = {
     return `Cut ${letter} is too narrow for ${diameter ? `Ø${mm(diameter)} ` : ''}pins: its holes take 1.75 mm filament – cut ${cut}.`;
   },
   HOLES_FLAT_TOP: ({ letter, count = 0 }) => (count === 1
-    ? `1 pin on cut ${letter} sits close to an edge: its holes have a flat top instead of a point, to keep the wall round them thick. They still print without supports.`
-    : `${count} pins on cut ${letter} sit close to an edge: their holes have a flat top instead of a point, to keep the wall round them thick. They still print without supports.`),
+    ? `1 pin on cut ${letter} sits close to an edge or another hole: where its hole prints lying on its side it has a flat top instead of a point, to keep the wall round it thick. It still prints without supports.`
+    : `${count} pins on cut ${letter} sit close to an edge or another hole: where their holes print lying on their side they have a flat top instead of a point, to keep the wall round them thick. They still print without supports.`),
+  HOLES_KEEP_LAY: ({ pieceIndex, lies }) => `${pieceName(pieceIndex)} lies ${lies}: its pin holes were made to print that way, so don't turn it in your slicer.`,
   PEGS_SMALLER: ({ letter, asked = null, pegSizes = [] }) => {
     const count = pegSizes.reduce((n, g) => n + g.count, 0);
     const took = pegSizes.length ? `${listOf(pegSizes.map((g) => `${g.count} × ${mm(g.size)} mm`))} ${count === 1 ? 'peg' : 'pegs'}` : 'smaller pegs';
@@ -5582,7 +5586,7 @@ const NOTE_TEXT = {
  * CONNECTORS_SHORTER `{ letter, depth, pegs }` (`pegs`: the cut has built-in pegs, `depth` their length);
  * CONNECTORS_FILAMENT `{ letter, count, diameter, length, lengths: [{ length, count }] }`
  * (`length` the longest; `lengths` when the holes take more than one); HOLES_FLAT_TOP `{ letter, cutId, count }` (`count`
- * of the cut's pins have holes whose teardrop is cut off flat); PEGS_SMALLER `{ letter, asked, pegSizes: [{ size,
+ * of the cut's printed pins have a hole whose teardrop is cut off flat; filament is not counted); PEGS_SMALLER `{ letter, asked, pegSizes: [{ size,
  * count }] }` (`asked` the peg size chosen for the model, `pegSizes` the smaller ones the narrow faces took);
  * PEGS_UPRIGHT `{ letter, cutId, pieces, pins }` (`pieces` those carrying the cut's pegs, which all print pointing up;
  * `pins` that pins would fit its faces);
@@ -5615,7 +5619,8 @@ const NOTE_TEXT = {
  * the cut that splits letters, when there is more than one); PART_SPANS_CUT `{ itemId, name, letter }`;
  * DOVETAIL_NOT_PLATE `{ letter, lying, pegs }` (`lying`: through a plate, but a piece beside it can't lie flat on it;
  * `pegs`: it has built-in pegs instead of pins);
- * ORIENT_FALLBACK `{ pieceIndex, mode, lies }`; PIECE_UNSTABLE `{ pieceIndex, pegs, lip }` (`pegs`, `lip`: only the
+ * ORIENT_FALLBACK `{ pieceIndex, mode, lies }`; HOLES_KEEP_LAY `{ pieceIndex, lies }` (a piece kept the way a lip or
+ * a twist-lock that was not built laid it, as its pin holes were shaped for that); PIECE_UNSTABLE `{ pieceIndex, pegs, lip }` (`pegs`, `lip`: only the
  * face its pegs or its lip stand out of was flat); PART_TOO_BIG `{ name, size, bed, pins }`
  * (a part printed separately, or with `pins` a single pin, too big for the bed); SPLIT_NOT_NEEDED `{ yaw, down, apart }`
  * (down other than '-z' when it fits only on its side; `apart` the letters of the cuts that come apart, when the pieces

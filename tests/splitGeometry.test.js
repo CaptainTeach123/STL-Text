@@ -1056,11 +1056,19 @@ describe('pins on the cut faces', () => {
     expect(s.layout.dowels.map((d) => [d.d, d.flat ?? false])).toEqual([[5, false], [5, false]]);
     expect(codes(s)).toEqual([]);
     for (const piece of s.drilled) expect(piece.volume()).toBeCloseTo(150 * 40 * 13 - 2 * 224.6701, 2);
-    // 12.9 mm used to drop to 1.75 mm filament: now the same pins, their teardrops cut off flat
+    // 12.9 mm used to drop to 1.75 mm filament: now the same pins, a little under the middle of the bar, where their
+    // points still have their wall over them
+    s = split(bar(12.9), [[0, 0]], { diameter: 5, labels: false });
+    expect(s.layout.dowels.map((d) => [d.d, d.depth, d.flat ?? false])).toEqual([[5, 8, false], [5, 8, false]]);
+    for (const d of s.layout.dowels) expect(d.centre[2]).toBeLessThan(-0.02);
+    expect(codes(s)).toEqual([]);
+    expectHolesInside(bar(12.9), s.layout);
+    for (const piece of s.drilled) expect(piece.volume()).toBeCloseTo(150 * 40 * 12.9 - 2 * 224.6701, 2);
+    // 12 mm has no room for the point wherever the pins go: the same pins, their teardrops cut off flat
     const s5 = sizesFor(5);
     const flatHole = overlap(own(halfHole({ R: s5.R, h: s5.h, ch: s5.ch, tear: true, flat: 0.2 })), cube([100, 100, 100], [0, 0, 50]));
     expect(flatHole).toBeCloseTo(216.918, 2);
-    for (const T of [12.9, 12, 11.2]) {
+    for (const T of [12, 11.6, 11.2]) {
       s = split(bar(T), [[0, 0]], { diameter: 5, labels: false });
       expect(s.layout.dowels.map((d) => [d.d, d.depth, d.flat, d.lift]), `${T} mm`).toEqual([[5, 8, true, 0.2], [5, 8, true, 0.2]]);
       for (const d of s.layout.dowels) expect(d.sides).toEqual([{ piece: 1, tear: true, apex: [0, 0, 1] }, { piece: 2, tear: true, apex: [0, 0, 1] }]);
@@ -1090,12 +1098,42 @@ describe('pins on the cut faces', () => {
     const thin = s.layout.dowels.map((d) => [d.d, d.flat ?? false]);
     expect(thin.length).toBeGreaterThan(0);
     for (const x of thin) expect(x).toEqual([1.75, true]);
+    expect(codes(s)).not.toContain('HOLES_FLAT_TOP');
     expectHolesInside(bar(5.8), s.layout);
     // the pieces standing on their cut faces print the holes upright: round, and no flat top however thin
     s = split(own(wasm.Manifold.cube([60, 40, 12], true)), [[0, 0]], { diameter: 5, labels: false, orient: 'cut' });
     expect(s.pieces.map((p) => p.up)).toEqual(['-x', '+x']);
     for (const d of s.layout.dowels) expect([d.flat ?? false, d.sides.map((x) => x.tear)]).toEqual([false, [false, false]]);
     expect(codes(s)).not.toContain('HOLES_FLAT_TOP');
+  });
+
+  it('a wall that is thin sideways to its up keeps the point: only the round part of its holes is near an edge', () => {
+    // a 300 × 11.5 × 60 wall standing as modelled, cut across its length: the pieces print with +z up, and the face is
+    // thin in Y, so the teardrops' points have 30 mm of wall over them. A pointed teardrop's inset all round would
+    // drop the Ø5 pins; a flat-topped one's keeps them, and the point stays as nothing is near it
+    const wall = () => own(wasm.Manifold.cube([300, 11.5, 60], true));
+    let s = split(wall(), [[0, 0]], { diameter: 5, labels: false, orient: 'model' });
+    expect(s.pieces.map((p) => p.up)).toEqual(['+z', '+z']);
+    expect(s.layout.dowels.length).toBeGreaterThanOrEqual(2);
+    for (const d of s.layout.dowels) {
+      expect([d.d, d.flat ?? false]).toEqual([5, false]);
+      expect(d.sides.map((x) => x.apex)).toEqual([[0, 0, 1], [0, 0, 1]]);
+    }
+    expect(s.layout.notes).toEqual([]);
+    expectHolesInside(wall(), s.layout);
+    for (const piece of s.drilled) expect(piece.status()).toBe('NoError');
+    // every hole keeps its 2 mm of wall to the sides, and its point is well inside
+    for (const { dowel, m } of holesOf(s.layout)) {
+      const b = boxOf(m);
+      expect(5.75 - Math.max(Math.abs(b.min[1]), Math.abs(b.max[1]))).toBeGreaterThan(2);
+      expect(b.max[2] - dowel.centre[2]).toBeCloseTo(Math.SQRT2 * (2.65 + 0.5) * POLYGON_K, 6);
+      expect(30 - b.max[2]).toBeGreaterThan(2);
+    }
+    // the same wall lying on its side has the roofs towards the thin way: there the point is cut off
+    s = split(own(wasm.Manifold.cube([300, 60, 11.5], true)), [[0, 0]], { diameter: 5, labels: false });
+    expect(s.pieces.map((p) => p.up)).toEqual(['+z', '+z']);
+    for (const d of s.layout.dowels) expect([d.d, d.flat]).toEqual([5, true]);
+    expect(s.layout.notes.map((n) => n.code)).toEqual(['HOLES_FLAT_TOP']);
   });
 
   it('Auto sizes pins by the pointed teardrop still: a bar\'s size is what it was', () => {
@@ -1138,12 +1176,20 @@ describe('pins on the cut faces', () => {
       expect(s.layout.notes).toEqual([expect.objectContaining({ code: 'CONNECTORS_DROPPED', wall: 5.6 })]);
       expect(s.layout.notes[0].text).toContain('(walls under 5.6 mm)');
     }
-    for (const t of [5.6, 6, 6.1]) {
+    for (const t of [5.6, 5.8]) {
       const s = bar(t);
       expect(s.layout.dowels.map((d) => [d.d, d.flat ?? false]), `${t} mm`).toEqual([[1.75, true], [1.75, true]]);
-      expect(s.layout.notes.map((n) => n.code)).toEqual(['HOLES_FLAT_TOP', 'CONNECTORS_FILAMENT']);
+      // filament's flat is a line of plastic wide: the note about flat tops is kept for printed pins
+      expect(s.layout.notes.map((n) => n.code)).toEqual(['CONNECTORS_FILAMENT']);
       expectHolesInside(cube([300, 40, t]), s.layout);
     }
+    // at 6 mm the holes sit a little under the middle, and keep their points: only a hole whose point would break
+    // the wall has it cut off
+    const low = bar(6);
+    expect(low.layout.dowels.map((d) => [d.d, d.flat ?? false])).toEqual([[1.75, false], [1.75, false]]);
+    for (const d of low.layout.dowels) expect(d.centre[2]).toBeLessThan(-0.08);
+    expect(low.layout.notes.map((n) => n.code)).toEqual(['CONNECTORS_FILAMENT']);
+    expectHolesInside(cube([300, 40, 6]), low.layout);
     const thick = bar(6.3);
     expect(thick.layout.dowels.map((d) => [d.d, d.flat ?? false])).toEqual([[1.75, false], [1.75, false]]);
     expect(thick.layout.notes.map((n) => n.code)).toEqual(['CONNECTORS_FILAMENT']);

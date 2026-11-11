@@ -4515,13 +4515,16 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     },
   });
 
+  /** What of a patch is free of the air and the earlier holes within this reach of the face. */
+  const freeOf = (ctx, patch, withObstacles, t, reach) => t.add(patch.cs.subtract(shadowAt(ctx, reach, withObstacles)));
+
   /**
    * Pin (or peg) centres for a patch at these sizes, their holes (or socket and peg) reaching this far, or none. With
    * `flat`, a patch with a hole that lies on its side keeps its centres from the edge by a flat-topped teardrop's
    * inset, not a pointed one's.
    */
   const centresFor = (ctx, patch, s, n, withObstacles, t, reach = s.reach, flat = false) => {
-    const free = t.add(patch.cs.subtract(shadowAt(ctx, reach, withObstacles)));
+    const free = freeOf(ctx, patch, withObstacles, t, reach);
     const tear = patch.apex.some(Boolean);
     const safe = t.add(free.offset(-(tear ? (flat ? flatInset(s, lift) : s.rhoTear) : s.rho), 'Round', 2, 32));
     if (safe.isEmpty()) return [];
@@ -4529,15 +4532,40 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
   };
 
   /**
-   * A patch's pin centres at these sizes, and whether their teardrops have a flat top: pointed where that gives
-   * `need` of them, else with the point cut off flat where the patch has a hole lying on its side and that gives more
-   * – the point is what comes nearest an edge, and a short bridge over the hole costs less than losing the pins.
+   * Which of these centres' teardrops keep their wall with the point on: the hole's own outline, its point the way its
+   * piece prints it, a wall's width wider all round, lies wholly in what is free. The inset from the edge is the same
+   * all round a centre, so it also keeps away a hole whose point has all the room it wants – on a face that is thin
+   * sideways to the pieces' up, or a hole in the lower half of a thin one.
+   */
+  const pointsFit = (ctx, patch, s, pts, t) => {
+    const { CrossSection } = manifold();
+    const free = freeOf(ctx, patch, true, t, s.reach);
+    // the cut's two in-plane directions in the world, to turn a piece's up into the face's own
+    const M = TO_WORLD[ctx.cut.axis];
+    const o = applyMat4(M, [0, 0, 0]);
+    const along = [[1, 0, 0], [0, 1, 0]].map((e) => applyMat4(M, e).map((x, i) => x - o[i]));
+    const tips = patch.apex.filter(Boolean).map((up) => along.map((e) => (e[0] * up[0] + e[1] * up[1] + e[2] * up[2]) * Math.SQRT2 * s.a));
+    // drawn outside their circles, so never less than the wall
+    const disc = (r, [x, y]) => t.add(t.add(CrossSection.circle(r / Math.cos(Math.PI / 64), 64)).translate([x, y]));
+    return pts.map(([u, v]) => {
+      const round = disc(s.rho, [u, v]);
+      const outline = tips.length ? t.add(CrossSection.hull([round, ...tips.map(([du, dv]) => disc(s.wall, [u + du, v + dv]))])) : round;
+      return t.add(outline.subtract(free)).area() < 1e-6;
+    });
+  };
+
+  /**
+   * A patch's pin centres at these sizes, and which of them (`flat`, one per centre) have teardrops with a flat top:
+   * pointed all round where that gives `need` of them, else, where the patch has a hole lying on its side and it
+   * gives more, as near the edge as a flat-topped teardrop may come – a short bridge over the hole costs less than
+   * losing the pins. Of those, only a hole whose point would break the wall has it cut off (`pointsFit`).
    */
   const pinCentres = (ctx, patch, s, n, need, t) => {
     const pts = centresFor(ctx, patch, s, n, true, t);
-    if (pts.length >= need || !patch.apex.some(Boolean)) return { pts, flat: false };
+    if (pts.length >= need || !patch.apex.some(Boolean)) return { pts, flat: pts.map(() => false) };
     const more = centresFor(ctx, patch, s, n, true, t, s.reach, true);
-    return more.length > pts.length ? { pts: more, flat: true } : { pts, flat: false };
+    if (more.length <= pts.length) return { pts, flat: pts.map(() => false) };
+    return { pts: more, flat: pointsFit(ctx, patch, s, more, t).map((fits) => !fits) };
   };
 
   /**
@@ -4666,14 +4694,15 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
           dropped++;
           // what to say about it: slivers are glued and need no explaining
           if (patch.area >= SIZING_PATCH) {
-            const need = 2 * (patch.apex.some(Boolean) ? flatInset(fil, lift) : fil.rho);
-            if (2 * largestInset(patch.cs, need / 2 + 0.05) < need) thinWalls = Math.max(thinWalls, Math.ceil(need * 10 - 1e-6) / 10);
+            const across = 2 * (patch.apex.some(Boolean) ? flatInset(fil, lift) : fil.rho);
+            if (2 * largestInset(patch.cs, across / 2 + 0.05) < across) thinWalls = Math.max(thinWalls, Math.ceil(across * 10 - 1e-6) / 10);
             suggest(smallerFit(ctx, patch, D, need, t));
           }
           return;
         }
         const { s, pts, flat } = chosen;
-        if (flat) flats += pts.length;
+        // filament's flat is a line of plastic wide: nothing to tell
+        if (s.d !== FILAMENT) flats += flat.filter(Boolean).length;
         if (pts.length < need) one = true;
         if (s.d === FILAMENT && D !== FILAMENT) {
           // holes made shallower where air lies behind the face take shorter filament: each length is told apart
@@ -4681,7 +4710,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
           filament.set(2 * s.depth, (filament.get(2 * s.depth) ?? 0) + pts.length);
           suggest(smallerFit(ctx, patch, D, need, t));
         } else if (s.depth < full - 1e-9) shorter = Math.min(shorter ?? Infinity, s.depth);
-        for (const [u, v] of pts) {
+        pts.forEach(([u, v], i) => {
           const cell = cellOfPoint(applyMat4(TO_WORLD[a], [u, v, cut.at]), by);
           cell[a] += 0.5;
           const dowel = {
@@ -4700,11 +4729,11 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
             cell,
             sides: [patch.lo, patch.hi].map((piece, k) => ({ piece: piece.index, tear: Boolean(patch.apex[k]), apex: patch.apex[k] })),
             // the teardrops of its holes that lie on their side have a flat top, this far over the hole
-            ...(flat ? { flat: true, lift } : {}),
+            ...(flat[i] ? { flat: true, lift } : {}),
           };
           patch.dowels.push(dowel);
           dowels.push(dowel);
-        }
+        });
       } finally {
         t.dispose();
       }

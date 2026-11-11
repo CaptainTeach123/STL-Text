@@ -418,7 +418,7 @@ describe('how the pin holes print', () => {
   };
 
   it('a bar a little too thin for pointed teardrops keeps its Ø5 pins, on flat-topped ones, and the split says so', async () => {
-    const bar = cube([300, 40, 12.9]);
+    const bar = cube([300, 40, 12]);
     await load(bar, 'bar');
     const ex = await exportSplit(S({ diameter: 5, labels: false }), { name: 'bar' });
     const [seam] = ex.seams;
@@ -427,12 +427,12 @@ describe('how the pin holes print', () => {
     expect(codes(ex)).toEqual(['SPLIT', 'PINS', 'HOLES_FLAT_TOP']);
     expect(noteOf(ex, 'HOLES_FLAT_TOP')).toMatchObject({
       level: 'info', letter: 'A', count: 2,
-      text: '2 pins on cut A sit close to an edge: their holes have a flat top instead of a point, to keep the wall round them thick. They still print without supports.',
+      text: '2 pins on cut A sit close to an edge or another hole: where their holes print lying on their side they have a flat top instead of a point, to keep the wall round them thick. They still print without supports.',
     });
     expect(noteOf(ex, 'SPLIT').text).toBe('Cut into 2 pieces with 2 pins Ø5 × 16 mm.');
     expect(ex.pieces.map((p) => [p.up, p.holes])).toEqual([['+z', { upright: 0, pointed: 0, flat: 2, round: 0 }], ['+z', { upright: 0, pointed: 0, flat: 2, round: 0 }]]);
     // the pieces' files have the flat-topped holes: 216.918 mm³ each, where a pointed one takes 224.670 and a round one 209.901
-    for (const f of piecesOf(ex)) expect(volumeOfStl(f.stl)).toBeCloseTo(150 * 40 * 12.9 - 2 * 216.918, 0);
+    for (const f of piecesOf(ex)) expect(volumeOfStl(f.stl)).toBeCloseTo(150 * 40 * 12 - 2 * 216.918, 0);
     // rebuilt from the reply they are the same holes, the wall round each kept, the roof up
     expectWalls(bar, ex);
     for (const { dowel, m } of holesOf(ex)) expect(boxOf(m).max[2] - dowel.centre[2]).toBeCloseTo(3.365, 2);
@@ -511,6 +511,12 @@ describe('how the pin holes print', () => {
     expect(holesAgainstLay(r).wrong).toEqual([]);
     expect(r.pieces.map((p) => p.holes.round)).toEqual([0, 0, 0]);
     expect(codes(r)).not.toContain('ORIENT_FALLBACK');
+    // and the notes say why piece 2 lies so, or it might be turned in the slicer
+    expect(noteOf(r, 'HOLES_KEEP_LAY')).toMatchObject({
+      level: 'info', pieceIndex: 2,
+      text: 'Piece 2 lies on a cut face: its pin holes were made to print that way, so don\'t turn it in your slicer.',
+    });
+    expect(r.notes.filter((x) => x.code === 'HOLES_KEEP_LAY')).toHaveLength(1);
   });
 });
 

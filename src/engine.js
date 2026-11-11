@@ -21,8 +21,9 @@ import {
   applyMat4, transposeMat4, keepCrossed, keepsOf, keepsThrough, cornerPlaceNote, fitReachesCorner, bedCorner, capOf, slabCap, withinCap, wideKeeps, pickGroup,
   chooseOffsets, planEnds,
   AXES, CLIP, LIP, SPOT, catchSizes, comesOffOf, endShape, endsAsWell, keepsTo, locateBend, locateSeam, pickSpots, profileSeams, seamKind, spotScore, spotSide,
-  spotStart, spotWhy, socketsAsWell, flatLift, holeSummary,
+  spotStart, spotWhy, socketsAsWell, flatLift, holeSummary, printCheckNote, LAY_DOWN,
 } from './split.js';
+import { checkRow, printCheck } from './printCheck.js';
 import {
   buildSplitDisplay, carveParts, checkPart, clearSplitCaches, couponRow, cutPieces, drillPiece, fitTestCoupon, layoutSplit, lockFaces, lockMatrix, lockPieces, lockPoints, partFrame, partInFrame, partedSolids,
   partRows, pinAt, pinSheet, pinSpares, pinsPerSheet, placePart, planDovetails, probeLip, shellCounts, tabsAcross, wayOverlaps,
@@ -2251,10 +2252,32 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     // printed whole on a printer that keeps a corner of its bed clear: one it takes only beside or behind it is moved
     const U = bed ? bedOf(bed) : null;
     const placed = U && bedCorner(U) && final.solid ? wholeCornerNote(withSoup(splitBounds(final), final.passthrough), U) : null;
+    // and what printing it as it stands asks of the printer, where there is something to say
+    const checked = wholeCheckNote(final, printing);
     return {
-      message: { stl, triangles: soup.length / 9, notes: placed ? [...notes, placed] : notes, skipped: final.skipped, extra },
+      message: { stl, triangles: soup.length / 9, notes: [...notes, ...(placed ? [placed] : []), ...(checked ? [checked] : [])], skipped: final.skipped, extra },
       transfer: [stl, ...extra.map((e) => e.stl)],
     };
+  }
+
+  /** A model with more triangles than this is not given the print check when it is downloaded whole: it would wait. */
+  const WHOLE_CHECK_TRIANGLES = 2_000_000;
+
+  /**
+   * PRINT_CHECK for a model downloaded whole, standing as it is modelled (printCheck.js): the supports it may need,
+   * a big face on top that will show step lines, a foot it may tip on. Null with nothing worth saying, without a
+   * solid, or for a very dense model. The check is kept on the result; the layer height comes in here.
+   */
+  function wholeCheckNote(final, printing) {
+    if (!final.solid) return null;
+    if (final.printCheck === undefined) {
+      if (final.solid.numTri() > WHOLE_CHECK_TRIANGLES) final.printCheck = null;
+      else {
+        const mesh = final.solid.getMesh();
+        final.printCheck = printCheck(mesh.vertProperties, mesh.numProp, mesh.triVerts);
+      }
+    }
+    return final.printCheck ? printCheckNote(checkRow(final.printCheck, printing?.layerHeight ?? 0.2), { whole: true }) : null;
   }
 
   /**
@@ -2519,7 +2542,64 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     // a move a note suggests keeps the pieces within the Largest piece, but where a detail kept whole is longer
     const cap = capOf(largest);
     const wide = cap < Infinity && keeps.length ? wideKeeps(keeps, cap, withSoup(splitBounds(work), work.passthrough), planEnds(spec, nozzle).minEnd) : null;
-    return summarise({ final: work, spec, cuts, U, given, plan, cut, laid, lying, drill, parted: parted.carved ? parted : null, keeps, cap, wide });
+    // what each finished piece asks of the printer, lying as its file lies
+    const checks = pieceChecks(final, { final: work, cut, laid, lying, drill, cuts }, progress);
+    return summarise({ final: work, spec, cuts, U, given, plan, cut, laid, lying, drill, parted: parted.carved ? parted : null, keeps, cap, wide, checks, hl });
+  }
+
+  /**
+   * Which of a mesh's triangles the app made for a joint, one number each: those that are not the model's own (`own`,
+   * the original ids of the model's faces). Null when the mesh has none of the model's ids left to tell them by.
+   */
+  function madeFaces(mesh, own) {
+    const { runIndex, runOriginalID } = mesh;
+    const made = new Uint8Array(mesh.triVerts.length / 3);
+    let known = false;
+    for (let r = 0; r + 1 < (runIndex?.length ?? 0); r++) {
+      if (own.has(runOriginalID[r])) known = true;
+      else made.fill(1, runIndex[r] / 3, runIndex[r + 1] / 3);
+    }
+    return known ? made : null;
+  }
+
+  /** The original ids of a result's own faces: what a piece's faces are told from its joints' by. Kept on the result. */
+  function ownFaces(final) {
+    const state = splitState(final);
+    if (!state.own) {
+      const mesh = final.solid.getMesh();
+      state.own = new Set(mesh.runOriginalID ?? []);
+    }
+    return state.own;
+  }
+
+  /**
+   * The print check of every piece as drilled (printCheck.js), by its number: one pass over each, turned the way it
+   * lies. Kept with the drill stage for as long as a piece lies the same way, so only the first result of a split
+   * reads the pieces; the layer height comes in later (`checkRow`). `final` is the model the faces are told by, before
+   * any part was taken out of it.
+   */
+  function pieceChecks(final, split, progress) {
+    const { drill, laid, lying, cuts } = split;
+    drill.checks ??= new Map();
+    const wanted = laid.map((p, i) => i).filter((i) => drill.checks.get(laid[i].index)?.down !== lying[i].down);
+    if (wanted.length) {
+      progress?.('Checking how each piece prints…');
+      const own = ownFaces(final);
+      const planes = cuts.map(cutPlane).filter(Boolean);
+      // the pieces are borrowed where the stage still has them, and only drilled again where it does not
+      const held = drill.solids ?? drill.transient;
+      const { solids, owned } = held ? { solids: held, owned: false } : drilledSolids(split.final, split, progress);
+      try {
+        for (const i of wanted) {
+          const mesh = solids[i].getMesh();
+          const check = printCheck(mesh.vertProperties, mesh.numProp, mesh.triVerts, { turn: LAY_DOWN[lying[i].down], planes, made: madeFaces(mesh, own) });
+          drill.checks.set(laid[i].index, { down: lying[i].down, check });
+        }
+      } finally {
+        if (owned) solids.forEach((m) => m.delete());
+      }
+    }
+    return new Map(laid.map((p) => [p.index, drill.checks.get(p.index).check]));
   }
 
   /**
@@ -3253,7 +3333,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * next to them (`heldNotes`, the slice graph) have notes of their own.
    */
   function summarise(split) {
-    const { final, spec, cuts, U, given, plan, cut, laid, lying, drill, parted = null, keeps = [], cap = Infinity, wide = null } = split;
+    const { final, spec, cuts, U, given, plan, cut, laid, lying, drill, parted = null, keeps = [], cap = Infinity, wide = null, checks = null, hl = 0.2 } = split;
     const { layout } = drill;
     const n = laid.length;
     const lips = layout.lips ?? [];
@@ -3313,6 +3393,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         dowels: layout.dowels.filter((d) => d.sides.some((s) => s.piece === p.index)).length,
         // its pin holes by how they print: standing up (round), lying with a pointed teardrop or a flat-topped one
         holes: { upright: holes.get(p.index).upright, pointed: holes.get(p.index).pointed, flat: holes.get(p.index).flat, round: holes.get(p.index).round },
+        // the print check of the piece as drilled, lying this way: supports, step lines and what it stands on
+        ...(checks?.has(p.index) ? { check: checkRow(checks.get(p.index), hl) } : {}),
         // the built-in pegs it carries, and the sockets it has for another piece's
         pegs: layout.pegs.filter((g) => g.sides.some((s) => s.peg && s.piece === p.index)).length,
         sockets: layout.pegs.filter((g) => g.sides.some((s) => !s.peg && s.piece === p.index)).length,
@@ -3490,6 +3572,12 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     // a cut whose twist-lock was not built says what its lip gives instead
     const laidOut = layout.notes.flatMap((x) => (x.code === 'APART_TWIST' && unbuilt.has(x.cutId) ? unbuilt.get(x.cutId).notes : [x]));
     notes.push(...laidOut, ...heavyNotes(cuts, lips, laid), ...uprightPegNotes(layout.pegs, laid, lying, layout.pinnable));
+    // what the print check found worth saying comes last, one note a piece at most; a piece told it has nothing flat
+    // to stand on is not told of supports twice
+    for (const p of pieces) {
+      const note = printCheckNote(p.check ?? null, { pieceIndex: p.index, unstable: notes.some((x) => x.code === 'PIECE_UNSTABLE' && x.pieceIndex === p.index) });
+      if (note) notes.push(note);
+    }
     // the peg size is the one the pieces have, as the summary says: a size asked for that no face took is none of theirs
     // a piece printed apart that goes on last along its pins, hooked round the rest of its box (no bit: those are said)
     const ways = { 0: ['-x', '+x'], 1: ['-y', '+y'], 2: ['-z', '+z'] };

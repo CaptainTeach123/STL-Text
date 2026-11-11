@@ -11,6 +11,7 @@ import {
   percentOf, pickPart, noLockOf, noLockTitle, sizeGains, snapTolerance, snappedWords, spotLabel, throughWords, wayCaption, widthWords,
 } from './aim.js';
 import { TEA_LIGHT, gminOf, offerPercent, roundZ } from './locks.js';
+import { checkWords } from './printCheck.js';
 import { SIDES, placementMatrix, snapPartTo } from './placement.js';
 import { BUNDLED_FONTS, canQueryLocalFonts, fetchBundledFont, listLocalFonts, localFontBytes } from './fontCatalog.js';
 import {
@@ -1299,11 +1300,14 @@ async function download() {
     const tooBig = bedTooSmall();
     // printed whole, a model the printer takes only beside or behind the corner it keeps clear must be moved there
     const placed = r.notes.find((n) => n.code === 'CORNER_PLACE');
+    // and what the print check found of it standing as modelled (a warning is said with the others)
+    const checked = r.notes.find((n) => n.code === 'PRINT_CHECK' && n.level !== 'warn');
     setStatus(
       `Downloaded ${main.name} (${main.kb} KB, ${r.triangles.toLocaleString()} triangles)` +
         (extras.length ? ` and ${extras.length} separate part file${extras.length > 1 ? 's' : ''} (${extras.map((e) => e.name).join(', ')}) to print and glue in.` : '.') +
         warned +
         (placed ? `\n${placed.text}` : '') +
+        (checked ? `\n${checked.text}` : '') +
         (tooBig && canSplit()
           ? `\n${tooBig.cap ? 'Longer than your Largest piece' : tooBig.corner ? 'Too big for your printer once its corner is kept clear' : 'Bigger than your printer'} – use Split for printing (step 6).`
           : ''),
@@ -2918,6 +2922,8 @@ function renderPieces() {
         p.lids?.length ? `comes off at ${listOf(p.lids)}` : '',
         ...(locks.get(p.index) ?? []),
       ].filter(Boolean),
+      // the print check of the piece as its file lies: supports, step lines, what it stands on, its pin holes
+      check: checkWords(p.check ?? null, p.holes ?? null),
     }));
   } else if (active) {
     // a box whose loose parts print apart (a bookcase's shelves between two cuts) says how many pieces it makes
@@ -2965,6 +2971,13 @@ function renderPieces() {
         return li;
       }
       text.append(`${row.index}${row.name ? ` · ${row.name}` : ''} · ${formatSize(row.size)} · ${row.lies ? `${row.lies} · ` : ''}`, fit, row.extra?.length ? ` · ${row.extra.join(' · ')}` : '');
+      if (row.check?.length) {
+        // one line under the piece: what printing it this way asks for
+        const check = document.createElement('span');
+        check.className = 'check';
+        check.textContent = `Print check: ${row.check.join(' · ')}`;
+        text.append(check);
+      }
       li.append(swatch, text);
       if (!row.predicted) {
         // a piece pointed at stands out, and the locks it has glow on it and on the piece each one holds

@@ -8,7 +8,7 @@ import {
   howToGlueText, invertRigid, isSymmetric, keptBits, cellPiece, letterFor, localFrame, maxCellLength, mulMat4, nextCut, noSeatWords, normaliseSplit, offsetAlongRay,
   oppositeDir, orientationStats, partFileName, pieceColorIndex, pieceColors, pieceFileName, pinsFileName, planAllowance, planCost, planGrid, sheetName,
   planSamples, plateAxis, polygonsArea, polygonsCentroid, printTransform, safeFileName, cellSupport, fitPieces, flatProbes, liesFlat, statsWithSoup,
-  sizesFor, sizesForRoom, soupCells, splitActive, splitNote, teardropApex, usableBed, yawMat4, zipFileName, triangleInBox, baseAxis,
+  sizesFor, sizesForRoom, soupCells, splitActive, splitNote, printCheckNote, teardropApex, usableBed, yawMat4, zipFileName, triangleInBox, baseAxis,
   outlineColumns, pieceHolding, textNotes, AUTO_PEGS, SMALLEST_PEG, layPegged, pegAllowance, pegMales, pegSides, pegSizeOf, pegSizesFor,
   pegSizesForRoom, statsWithPegs, uprightPegNotes, APART_COLOR, APART_HOLDS, CLIP, LIP, LIP_ALLOWANCE, apartMales, catchSizes,
   clipHold, clipPush, clipShape, layGrown, lipReach, lipSides, lipSizesFor, statsWithLip, SPOT, comesOffOf, endBeds, endShape, endsAsWell, keepsTo, lipMale,
@@ -2304,8 +2304,55 @@ describe('notes', () => {
     expect(sheet).toContain('PUT TOGETHER – nothing is glued');
   });
 
+  it('the glue sheet says what the print check found of each piece, and not to turn the pieces', () => {
+    const check = (supports = {}, more = {}) => ({
+      layer: 0.2, height: 40, supports: { area: 0, skin: 0, seam: 0, bed: 0, piece: 0, shallow: 0, places: 0, bridged: 0, ...supports }, steps: [],
+      foot: { contact: 900, across: [30, 30], flat: true, tip: false, small: false, brim: 0 }, ...more,
+    });
+    const pieces = [
+      { index: 1, cell: [0, 0, 0], size: [100, 60, 40], lies: 'flat as modelled', fits: true, check: check(), holes: { upright: 0, pointed: 2, flat: 1, round: 0 } },
+      { index: 2, cell: [1, 0, 0], size: [100, 60, 40], lies: 'on a cut face', fits: true, check: check({ area: 1240, skin: 240, seam: 1000, bed: 1240, places: 2 }, { steps: [{ facing: 'up', tilt: 3, area: 5000, every: 3.8 }] }) },
+      { index: 3, cell: [2, 0, 0], size: [100, 60, 40], lies: 'on its side', fits: true },
+    ];
+    const sheet = howToGlueText({ name: 'bar', pieces, seams: [] });
+    expect(sheet).toContain('lies flat as modelled   fits – no supports needed; its 3 pin holes need no supports\n');
+    expect(sheet).toContain('lies on a cut face   fits – may need supports: about 12 cm², partly under a glue face, standing on the bed; step lines about every 4 mm on a big face on top\n');
+    // a piece with no check (an older split) keeps its line as it was
+    expect(sheet).toContain('lies on its side   fits\n');
+    expect(sheet).toContain('\n  Print each piece the way its file lies – do not turn it in your slicer: its holes and joints are shaped to print that way.\n');
+    expect(sheet).toContain("\n  'May need supports' goes by the safe rule – any face flatter than 45° – so your slicer may ask for less.\n");
+    // with no piece that may need supports, the rule is not explained
+    expect(howToGlueText({ name: 'bar', pieces: [pieces[0], pieces[2]], seams: [] })).not.toContain('safe rule');
+  });
+
+  it('the print check gives one note a piece: for information, a warning where the piece may tip, none for supports twice', () => {
+    const row = (supports = {}, foot = {}, steps = []) => ({
+      layer: 0.2, height: 120, supports: { area: 0, skin: 0, seam: 0, bed: 0, piece: 0, shallow: 0, places: 0, bridged: 0, ...supports }, steps,
+      foot: { contact: 400, across: [20, 20], flat: true, tip: false, small: false, brim: 0, ...foot },
+    });
+    expect(printCheckNote(null, { pieceIndex: 1 })).toBeNull();
+    expect(printCheckNote(row(), { pieceIndex: 1 })).toBeNull();
+    expect(printCheckNote(row({ area: 600, skin: 600, bed: 600 }), { pieceIndex: 4 })).toMatchObject({
+      level: 'info', code: 'PRINT_CHECK', pieceIndex: 4, supports: { skin: 600 },
+      text: "Piece 4 may need supports under about 6 cm² of the model's own faces, standing on the bed. Another way to lay it (Lay pieces) may need less.",
+    });
+    expect(printCheckNote(row({}, { tip: true, brim: 8 }), { pieceIndex: 2 })).toMatchObject({
+      level: 'warn', code: 'PRINT_CHECK', pieceIndex: 2,
+      text: 'Piece 2 stands 120 mm tall on a 20 × 20 mm foot and may tip or come loose: add a brim about 8 mm wide in your slicer, or lay it another way.',
+    });
+    // a piece already told it has nothing flat to stand on and needs supports is not told of supports again
+    expect(printCheckNote(row({ area: 600, skin: 600, bed: 600 }, { flat: false, across: null }), { pieceIndex: 4, unstable: true })).toBeNull();
+    const steps = [{ facing: 'up', tilt: 3, area: 8011, every: 3.8 }];
+    expect(printCheckNote(row({ area: 600, skin: 600, bed: 600 }, { flat: false, across: null }, steps), { pieceIndex: 4, unstable: true }).text).toMatch(/^Piece 4 has a big face on top/);
+    // a model printed whole
+    expect(printCheckNote(row({ area: 600, skin: 600, piece: 600 }), { whole: true })).toMatchObject({
+      level: 'info', whole: true, text: 'The model may need supports under about 6 cm² of its faces, standing on the model itself. Turned another way it may need less.',
+    });
+    expect(printCheckNote(row({ area: 600, skin: 600, piece: 600 }), { whole: true })).not.toHaveProperty('pieceIndex');
+  });
+
   it('every code has a level and a text, and keeps its fields', () => {
-    const fields = { letter: 'B', letters: ['B', 'C'], count: 2, total: 3, pieces: 3, dowels: 4, diameter: 6, length: 19, spares: 1, depth: 3.5, tabs: 2, placed: 48, dropped: 6, pieceIndex: 2, size: [262, 120, 80], bed: [220, 220, 250], thickness: 2.1, ratio: -0.0003, name: 'HELLO', mode: 'cut', lies: 'on its side', yaw: 40 };
+    const fields = { steps: { facing: 'up', tilt: 3, area: 8011, every: 3.8 }, layer: 0.2, letter: 'B', letters: ['B', 'C'], count: 2, total: 3, pieces: 3, dowels: 4, diameter: 6, length: 19, spares: 1, depth: 3.5, tabs: 2, placed: 48, dropped: 6, pieceIndex: 2, size: [262, 120, 80], bed: [220, 220, 250], thickness: 2.1, ratio: -0.0003, name: 'HELLO', mode: 'cut', lies: 'on its side', yaw: 40 };
     for (const code of SPLIT_NOTE_CODES) {
       const note = splitNote(code, fields);
       expect(['ok', 'info', 'warn']).toContain(note.level);

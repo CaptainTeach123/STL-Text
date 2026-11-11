@@ -705,7 +705,12 @@ describe('a split that takes parts out', () => {
     await client.loadBase({ kind: 'stl', bytes: stlOf(solid), name, version: ++version });
     solid.delete();
   };
-  const exportFiles = (split, p = printing) => client.export([], version, 'bat', { printing: p, split: { clearance: 0.15, ...split }, archive: 'files' });
+  // what the print check says of each piece has its own tests (printCheck.test.js, split.test.js): its notes are left
+  // out here, where the notes read are the parts' own
+  const exportFiles = async (split, p = printing) => {
+    const ex = await client.export([], version, 'bat', { printing: p, split: { clearance: 0.15, ...split }, archive: 'files' });
+    return { ...ex, notes: ex.notes.filter((n) => n.code !== 'PRINT_CHECK') };
+  };
   /** Slices the engine reads while `run` runs, counted. */
   const slicesDuring = async (run) => {
     const binding = Object.getPrototypeOf(wasm.Manifold.prototype);
@@ -832,7 +837,7 @@ describe('a split that takes parts out', () => {
     // the lantern carries the lid's neck and the base's slots; the collar is supported as the dome is; how each should
     // twist on, and the fit test first
     expect(glue).toContain('twist-locks need no supports');
-    expect(glue).toMatch(/piece 1 of 3 .* fits, twist-lock neck for cut A, twist-lock slots for cut B\n/);
+    expect(glue).toMatch(/piece 1 of 3 .* fits, twist-lock neck for cut A, twist-lock slots for cut B – may need supports: about 16 cm², some standing on the piece itself\n/);
     expect(glue).toContain("  The collar under cut A's neck slopes like the dome (60°): it takes whatever support the dome takes.");
     expect(glue).toContain("  The dome and cap (cut A) should twist on with a click and twist off again by hand. Try the fit test first: if it's too stiff to turn, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.");
     expect(glue).toContain("  The base (cut B) should twist in with a click and twist out again by hand. Try the fit test first: if its plug is too stiff to turn in its ring, raise Clearance by 0.05 mm; if it rattles or doesn't click, lower it.");
@@ -1293,7 +1298,7 @@ describe('a split that takes parts out', () => {
     );
     expect(ex.assembly[0]).toContain('Base: a 38 mm tea light sits in the seat on top of the base (Ø 39.5 mm, 3 mm deep) – stand the light in it, hold piece 1 up');
     const glue = ex.files.find((f) => f.kind === 'text').text;
-    expect(glue).toMatch(/piece 2 of 2 .*comes off at cut A \(the base\), tea-light seat Ø 39\.5 mm on top\n/);
+    expect(glue).toMatch(/piece 2 of 2 .*comes off at cut A \(the base\), tea-light seat Ø 39\.5 mm on top – no supports needed\n/);
     expect(glue).toContain('  A 38 mm tea light should drop into the seat on top of the base (cut A) and lift out with two fingers.');
     // the pieces view paints the seat apart from the lock, and puts its word on it, on the base
     const shown = await client.result([], version, { printing, split: { clearance: 0.15, cuts: [cut(true)] } });

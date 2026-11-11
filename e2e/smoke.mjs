@@ -920,6 +920,13 @@ try {
     check((await page.locator('#cutList li').count()) === 1 && Math.abs(cutAt) < 0.01, '"Split into 2 pieces" makes one cut across the middle', `${await page.locator('#cutList li').count()} cut at ${cutAt}`);
     const rows = await page.locator('#pieceList li').allInnerTexts();
     check(rows.length === 2 && rows.every((r) => /fits/.test(r)), 'two pieces, both fitting the printer', rows.join(' / '));
+    // the print check: one line under each piece, of how it prints the way its file lies
+    const checkLines = await page.locator('#pieceList li .check').allInnerTexts();
+    check(
+      checkLines.length === 2 && checkLines.every((t) => /^Print check: (no supports needed|may need supports: )/.test(t) && /its 2 pin holes need no supports$/.test(t)),
+      'each piece has a print check line: supports, and how its pin holes print',
+      checkLines.join(' / '),
+    );
     check((await page.locator('#downloadBtn').innerText()) === 'Download 2 pieces (.zip)', 'the download button counts the pieces', await page.locator('#downloadBtn').innerText());
     const labelLines = await page.evaluate(() => {
       const btn = document.querySelector('#downloadBtn');
@@ -962,6 +969,12 @@ try {
     const pinCount = pins ? shellCount(pins.file) : 0;
     check(pinCount === 3 && Math.abs(extent(pins, 2) - 5.54) < 0.05, 'the pin sheet holds 3 pins (one spare) lying on a flat', pins && `${pinCount} pins, ${extent(pins, 2).toFixed(3)} mm high`);
     check(zip.entries['long-bar-text-how-to-glue.txt']?.includes('1A ↔ 2A'), 'the glue sheet pairs the matching labels');
+    const glueSheet = zip.entries['long-bar-text-how-to-glue.txt'] ?? '';
+    check(
+      /piece 1 of 2 .* fits – .*its 2 pin holes need no supports\n/.test(glueSheet) && glueSheet.includes('Print each piece the way its file lies – do not turn it in your slicer'),
+      'the glue sheet says what the print check found of each piece, and not to turn the pieces in the slicer',
+      glueSheet.split('\n').slice(2, 6).join(' | '),
+    );
     check(/^Downloaded long-bar-text-2-pieces\.zip .*: 2 pieces, 3 pins/.test(await status()), 'the status line says what the zip holds', await status());
 
     // Joints: Built-in pegs – square pegs printed on one piece fit sockets in the other, so there is no pins file
@@ -980,7 +993,7 @@ try {
     );
     await page.waitForFunction(() => /sockets/.test(document.querySelector('#pieceList').innerText) && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 60000 });
     await measured();
-    const pegRows = await page.locator('#pieceList li').allInnerTexts();
+    const pegRows = (await page.locator('#pieceList li').allInnerTexts()).map((r) => r.split('\n')[0]); // without the print check's line
     check(
       /^1 · 159 × 40 × 20 mm · .* · 2 pegs$/.test(pegRows[0]) && /^2 · 150 × 40 × 20 mm · .* · 2 sockets$/.test(pegRows[1]),
       'piece 1 carries the pegs, its size counting how far they stand out, and piece 2 has their sockets',
@@ -2049,7 +2062,7 @@ try {
       await page.check('#resultToggle');
       await page.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
       await piecesAgain();
-      const lidRows = await page.locator('#pieceList li').allInnerTexts();
+      const lidRows = (await page.locator('#pieceList li').allInnerTexts()).map((r) => r.split('\n')[0]);
       check(
         lidRows.length === 2 && /^1 · 108 × 108 × 196 mm · .*· lip at A, 4 clips$/.test(lidRows[0]) && /^2 · 110 × 110 × 101 mm · .*· comes off at A$/.test(lidRows[1]),
         'piece 1 has the lip and its 4 clips, 6 mm taller for it, and piece 2 comes off at A',
@@ -2169,7 +2182,7 @@ try {
       await page.click('#cutList li:first-child .cut-hold label:has-text("Lifts off")');
       await piecesAgain();
       const lifts = await apartRow();
-      const liftRows = await page.locator('#pieceList li').allInnerTexts();
+      const liftRows = (await page.locator('#pieceList li').allInnerTexts()).map((r) => r.split('\n')[0]);
       check(
         lifts.hold === 'lift' && /· comes apart: lifts off$/.test(lifts.meta) && /· lip at A$/.test(liftRows[0]),
         'Lifts off: no clips, and the row says the top lifts off',
@@ -4294,7 +4307,7 @@ try {
     await settle();
     const big = await card();
     const [locking] = await partRows();
-    const stillPieces = { shown: await b.isChecked('#resultToggle'), pieces: (await b.locator('#pieceList').innerText()).split('\n').filter(Boolean) };
+    const stillPieces = { shown: await b.isChecked('#resultToggle'), pieces: (await b.locator('#pieceList').innerText()).split('\n').filter((line) => line && !/^Print check: /.test(line)) };
     check(
       (await size()) === '75.0 × 75.0 × 150.0' && locking.z === '86' && locking.d === '47.3' && locking.holds.find((h) => h.value === 'lock').checked &&
         !locking.holds.find((h) => h.value === 'lock').disabled && locking.meta === 'twist-lock, 3 lugs, 3 clicks – turn 27° · the handle stays',
@@ -4421,7 +4434,7 @@ try {
     await settle();
     await b.waitForTimeout(500);
     await settle();
-    const pieces = (await b.locator('#pieceList').innerText()).split('\n').filter(Boolean);
+    const pieces = (await b.locator('#pieceList').innerText()).split('\n').filter((line) => line && !/^Print check: /.test(line));
     const notes = await b.locator('#splitNotes').innerText();
     check(
       pieces.length === 2 && /^1 · Lantern, with the handle · 75 × 75 × 150 mm · .* · twist-lock neck, 3 lugs$/.test(pieces[0]) &&
@@ -5218,7 +5231,7 @@ try {
           }
         );
       });
-    const piecesText = async () => (await s.locator('#pieceList').innerText()).split('\n').filter(Boolean);
+    const piecesText = async () => (await s.locator('#pieceList').innerText()).split('\n').filter((line) => line && !/^Print check: /.test(line));
     await s.goto(url);
     await s.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
     await s.setInputFiles('#stlFile', seatFile);

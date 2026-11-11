@@ -2171,14 +2171,14 @@ describe('cuts that come apart', () => {
       apart: { hold: 'snap', lip: true, clips: 4, height: 6, key: true, faces: 1, flat: 0 },
     })]);
     // held well enough to carry the model by its top: no warning that it may not
-    expect(codes(ex)).toEqual(['SPLIT', 'APART']);
+    expect(codes(ex)).toEqual(['SPLIT', 'APART', 'PRINT_CHECK', 'PRINT_CHECK']); // the lantern's own eaves and arches: what the print check says of each piece
     expect(noteOf(ex, 'SPLIT').text).toBe('Cut into 2 pieces. Cut A comes apart – don\'t glue it.');
     expect(noteOf(ex, 'APART').text).toBe('Cut A comes apart: the top (piece 2) clicks onto a 6 mm lip on piece 1 – 4 clips hold it, and it pulls off again by hand.');
     expect(ex.assembly).toEqual(['Do not glue cut A: it comes apart. Press the top on until it clicks. It goes on one way round only – turn it until it drops onto the lip.']);
     const text = strFromU8(zip['lantern-how-to-glue.txt']);
     expect(text).toContain('lips and clips need no supports');
-    expect(text).toMatch(/piece 1 of 2 .*fits, lip for cut A\n/);
-    expect(text).toMatch(/piece 2 of 2 .*fits, comes off at cut A\n/);
+    expect(text).toMatch(/piece 1 of 2 .*fits, lip for cut A – may need supports: about 12 cm², some standing on the piece itself\n/);
+    expect(text).toMatch(/piece 2 of 2 .*fits, comes off at cut A – may need supports: about 22 cm², standing on the bed\n/);
     expect(text).toContain('The top of cut A should click onto its lip and pull off again by hand.');
     expect(text).toContain(`PUT TOGETHER – nothing is glued\n  1. ${ex.assembly[0]}\n`);
     expect(text).not.toContain('GLUE –');
@@ -2210,7 +2210,7 @@ describe('cuts that come apart', () => {
       apart: { hold: 'lock', lip: true, clips: 4, height: 6, key: true, faces: 1, flat: 0 },
     })]);
     // four locking clips hold far more than the body weighs: no warning
-    expect(codes(ex)).toEqual(['SPLIT', 'APART']);
+    expect(codes(ex)).toEqual(['SPLIT', 'APART', 'PRINT_CHECK', 'PRINT_CHECK']);
     // the seated top hides the key's gap inside its wall, so the only way off is a hard pull: nothing says to lever it
     expect(noteOf(ex, 'APART')).toMatchObject({
       hold: 'lock', clips: 4,
@@ -2249,7 +2249,7 @@ describe('cuts that come apart', () => {
   it('a light click may not hold up the body when the model is carried by its top, and says so', async () => {
     await lantern();
     const ex = await exportSplit(S({ cuts: [apartAt(2, 190, 'c1', 'light')], labels: false }), { name: 'lantern' });
-    expect(codes(ex)).toEqual(['SPLIT', 'APART', 'APART_HEAVY']);
+    expect(codes(ex)).toEqual(['SPLIT', 'APART', 'APART_HEAVY', 'PRINT_CHECK', 'PRINT_CHECK']);
     expect(noteOf(ex, 'APART').text).toBe('Cut A comes apart: the top (piece 2) clicks lightly onto a 6 mm lip on piece 1 – 4 clips hold it, and it pulls off again by hand.');
     // what hangs below the cut is the body as it was cut, in PLA; four light clips hold about 4.2 N, under twice its 2.7 N
     const heavy = noteOf(ex, 'APART_HEAVY');
@@ -2323,7 +2323,7 @@ describe('cuts that come apart', () => {
     expect(ex.pieces.map((p) => [p.lies, p.up, p.lips.map((l) => l.letter), p.lids])).toEqual([
       ['flat as modelled', '+z', ['A'], []], ['flat as modelled', '+z', ['A'], []], ['on a cut face', '+z', [], ['A']], ['on a cut face', '+z', [], ['A']],
     ]);
-    expect(codes(ex)).toEqual(['SPLIT', 'PINS', 'APART', 'APART_HEAVY']);
+    expect(codes(ex)).toEqual(['SPLIT', 'PINS', 'APART', 'APART_HEAVY', 'PRINT_CHECK', 'PRINT_CHECK']);
     // the glued cut's pin holes are drilled for the way the pieces print: their teardrops point up
     const holes = ex.seams.filter((s) => s.letter === 'B').flatMap((s) => s.dowels.flatMap((d) => d.sides));
     expect(holes.length).toBeGreaterThan(0);
@@ -2480,7 +2480,7 @@ describe('cuts that come apart', () => {
       // through the eave the ring socket would leave the eave's inner sliver loose in the bore: the full disc takes it
       expect([hold, ex.seams]).toMatchObject([hold, [{ joint: 'lip', pieces: [1, 2], male: 1, apart: { hold, ...twist, socket: 'disc' } }]]);
       expect(ex.seams[0].apart.r0).toBeCloseTo(44.02, 2);
-      expect(codes(ex)).toEqual(['SPLIT', 'APART_TWIST']);
+      expect(codes(ex)).toEqual(['SPLIT', 'APART_TWIST', 'PRINT_CHECK', 'PRINT_CHECK']);
     }
     const ex = await exportSplit(S({ cuts: [apartAt(2, 150, 'c1', 'lock')], labels: false }), { name: 'round' });
     expect(noteOf(ex, 'APART_TWIST').text).toBe(
@@ -2525,7 +2525,7 @@ describe('cuts that come apart', () => {
     const lifted = await exportSplit(S({ cuts: [apartAt(2, 150, 'c1', 'lift')], labels: false }), { name: 'round' });
     expect(lifted.seams[0]).toMatchObject({ joint: 'none', apart: { hold: 'lift', lip: false } });
     expect(lifted.seams[0].apart.mech).toBeUndefined();
-    expect(codes(lifted)).toEqual(['SPLIT', 'APART_FLAT']);
+    expect(codes(lifted)).toEqual(['SPLIT', 'APART_FLAT', 'PRINT_CHECK', 'PRINT_CHECK']);
   });
 
   it('a round jar\'s wall too thin for any lip still twist-locks – the lock needs no such wall – where a closed canister\'s does not', async () => {
@@ -3385,5 +3385,134 @@ describe('Largest piece', () => {
     const q = await fit(apart, { largest: 100 });
     const qx = await exportSplit({ ...apart, cuts: ids(q).map((c, i) => (i === 0 ? { ...apart.cuts[0] } : c)) }, { name: 'bar', largest: 100 });
     for (const size of material(qx)) expect(Math.max(...size)).toBeLessThanOrEqual(100 + 0.05);
+  });
+});
+
+describe('the print check', () => {
+  const sheetOf = (ex) => ex.files.find((f) => f.kind === 'text').text;
+  const checks = (r) => r.notes.filter((n) => n.code === 'PRINT_CHECK');
+  /** A table 120 × 60: a top 10 mm thick on a leg 20 mm wide down its middle, 30 mm high. */
+  const table = () => own(wasm.Manifold.union([cube([20, 60, 30], [0, 0, 15]), cube([120, 60, 10], [0, 0, 35])]));
+  /** A block 200 × 80 whose top leans `deg` degrees across its width, so both halves of a cut across x have it. */
+  const leaningBlock = (deg) => {
+    const rise = 80 * Math.tan((deg * Math.PI) / 180);
+    return own(wasm.Manifold.hull([[-100, 0, 0], [100, 0, 0], [-100, 80, 0], [100, 80, 0], [-100, 0, 20], [100, 0, 20], [-100, 80, 20 + rise], [100, 80, 20 + rise]]));
+  };
+
+  it('a piece that needs nothing says so, in its row and on the sheet, with its pin holes', async () => {
+    await load(cube([300, 40, 20]), 'bar');
+    const ex = await exportSplit(S({ labels: false }), { name: 'bar' });
+    for (const p of ex.pieces) {
+      expect(p.check).toEqual({
+        layer: 0.2, height: 20,
+        supports: { area: 0, skin: 0, seam: 0, bed: 0, piece: 0, shallow: 0, places: 0, bridged: 0 },
+        steps: [],
+        foot: { contact: 6000, across: [150, 40], flat: true, tip: false, small: false, brim: 0 },
+      });
+    }
+    expect(checks(ex)).toEqual([]);
+    const sheet = sheetOf(ex);
+    expect(sheet).toMatch(/ {2}piece 1 of 2 .* lies flat as modelled {3}fits – no supports needed; its 2 pin holes need no supports\n/);
+    expect(sheet).toContain('\n  Print each piece the way its file lies – do not turn it in your slicer: its holes and joints are shaped to print that way.\n');
+    expect(sheet).not.toContain('May need supports');
+    // the pieces as shown say the same as the download
+    const r = await resultSplit(S({ labels: false }));
+    expect(r.pieces.map((p) => p.check)).toEqual(ex.pieces.map((p) => p.check));
+  });
+
+  it('a top that hangs over the bed: how much, where the supports stand, a line on the sheet and one note a piece', async () => {
+    await load(table(), 'table');
+    const ex = await exportSplit(S({ orient: 'model', labels: false }), { name: 'table' });
+    expect(ex.pieces.map((p) => [p.lies, p.check.supports])).toEqual([
+      ['flat as modelled', { area: 3000, skin: 3000, seam: 0, bed: 3000, piece: 0, shallow: 3000, places: 1, bridged: 0 }],
+      ['flat as modelled', { area: 3000, skin: 3000, seam: 0, bed: 3000, piece: 0, shallow: 3000, places: 1, bridged: 0 }],
+    ]);
+    // half a table stands on half a leg, its weight out past it: it may tip as well, which is a warning
+    expect(checks(ex).map((n) => [n.level, n.pieceIndex, n.text])).toEqual([1, 2].map((i) => [
+      'warn', i, `Piece ${i} may need supports under about 30 cm² of the model's own faces, standing on the bed. Another way to lay it (Lay pieces) may need less. `
+        + 'It stands 40 mm tall on a 10 × 60 mm foot and may tip or come loose: add a brim about 5 mm wide in your slicer, or lay it another way.',
+    ]));
+    // the notes of the check come last
+    expect(codes(ex).slice(-2)).toEqual(['PRINT_CHECK', 'PRINT_CHECK']);
+    const sheet = sheetOf(ex);
+    expect(sheet).toMatch(/piece 2 of 2 .* fits – may need supports: about 30 cm², standing on the bed; may tip: add a brim, 5 mm wide; its \d pin holes need no supports\n/);
+    expect(sheet).toContain("\n  'May need supports' goes by the safe rule – any face flatter than 45° – so your slicer may ask for less.\n");
+    // laid the best side down each piece lies on its top, and needs none
+    const best = await exportSplit(S({ labels: false }), { name: 'table' });
+    expect(best.pieces.map((p) => [p.lies, p.check.supports.area])).toEqual([['upside down', 0], ['upside down', 0]]);
+    expect(checks(best)).toEqual([]);
+    // the files are the same pieces whatever the check says of them
+    for (const f of piecesOf(ex)) expect(volumeOfStl(f.stl)).toBeGreaterThan(0);
+  });
+
+  it('a big face that leans: the step lines at the layer height chosen, in the row, on the sheet and in a note', async () => {
+    await load(leaningBlock(3), 'wedge');
+    const ex = await exportSplit(S({ labels: false }), { name: 'wedge' });
+    expect(ex.pieces.map((p) => [p.down, p.check.steps])).toEqual([
+      ['-z', [{ facing: 'up', tilt: 3, area: 8011, every: 3.8 }]],
+      ['-z', [{ facing: 'up', tilt: 3, area: 8011, every: 3.8 }]],
+    ]);
+    expect(checks(ex).map((n) => n.text)).toEqual([1, 2].map((i) => (
+      `Piece ${i} has a big face on top (about 80 cm²) that leans 3° off level: at 0.2 mm layers it prints with a step line about every 4 mm. Another way to lay it, or finer layers, shows them less.`
+    )));
+    expect(checks(ex)[0]).toMatchObject({ level: 'info', pieceIndex: 1, layer: 0.2, steps: { tilt: 3, every: 3.8 } });
+    expect(sheetOf(ex)).toMatch(/piece 1 of 2 .* fits – no supports needed; step lines about every 4 mm on a big face on top; its 2 pin holes need no supports\n/);
+    // finer layers: the same pieces, the lines closer
+    const fine = await client.export([], version, 'wedge', { printing: { nozzle: 0.4, layerHeight: 0.1 }, split: S({ labels: false }), bed: BED, archive: 'files' });
+    expect(fine.pieces.map((p) => [p.check.layer, p.check.steps[0].every])).toEqual([[0.1, 1.9], [0.1, 1.9]]);
+    expect(checks(fine)[0].text).toContain('at 0.1 mm layers it prints with a step line about every 2 mm');
+    // a level top says nothing
+    await load(leaningBlock(0), 'block');
+    expect(checks(await exportSplit(S({ labels: false }), { name: 'block' }))).toEqual([]);
+  });
+
+  it('a tall thin piece is warned that it may tip, with the brim to add; lying down it is not', async () => {
+    await load(cube([24, 24, 300], [0, 0, 150]), 'post');
+    const cut = S({ cuts: [cutAt(2, 150)], orient: 'model', labels: false });
+    const ex = await exportSplit(cut, { name: 'post' });
+    expect(ex.pieces.map((p) => [p.lies, p.check.foot])).toEqual([
+      ['flat as modelled', { contact: 576, across: [24, 24], flat: true, tip: true, small: false, brim: 5 }],
+      ['on a cut face', { contact: expect.any(Number), across: [24, 24], flat: true, tip: true, small: false, brim: 5 }],
+    ]);
+    expect(checks(ex).map((n) => [n.level, n.text])).toEqual([1, 2].map((i) => [
+      'warn', `Piece ${i} stands 150 mm tall on a 24 × 24 mm foot and may tip or come loose: add a brim about 5 mm wide in your slicer, or lay it another way.`,
+    ]));
+    expect(sheetOf(ex)).toMatch(/piece 1 of 2 .* fits – no supports needed; may tip: add a brim, 5 mm wide; its \d pin holes? needs? no supports\n/);
+    const lying = await exportSplit({ ...cut, orient: 'auto' }, { name: 'post' });
+    expect(lying.pieces.map((p) => p.check.foot.tip)).toEqual([false, false]);
+    expect(checks(lying)).toEqual([]);
+  });
+
+  it('the joints the app makes are not counted: pin holes, pegs and sockets, a lip and its clips, a twist-lock', async () => {
+    // a block cut across z: the top's pin holes open downwards, their ends level ceilings; pegs the same
+    await load(cube([60, 60, 80], [0, 0, 40]), 'block');
+    for (const joint of ['dowels', 'pegs']) {
+      const ex = await exportSplit(S({ cuts: [cutAt(2, 40)], joint }), { name: 'block' });
+      expect(ex.pieces.map((p) => p.check.supports.area), joint).toEqual([0, 0]);
+      expect(checks(ex), joint).toEqual([]);
+    }
+    // a box whose lid clicks on, and one whose lid twist-locks
+    await load(lidBoxSolid(), 'chest');
+    for (const hold of ['snap', 'lock']) {
+      const ex = await exportSplit(S({ cuts: [{ ...cutAt(2, 49.5), joint: 'apart', hold }] }), { name: 'chest' });
+      expect(ex.pieces.map((p) => p.check.supports.area), hold).toEqual([0, 0]);
+      expect(checks(ex), hold).toEqual([]);
+    }
+  });
+
+  it('a model downloaded whole is checked standing as modelled, and a plain block says nothing', async () => {
+    await load(table(), 'table');
+    const whole = await client.export([], version, 'table', { printing, bed: BED });
+    expect(whole.notes).toEqual([expect.objectContaining({
+      level: 'info', code: 'PRINT_CHECK', whole: true,
+      text: 'The model may need supports under about 60 cm² of its faces, standing on the bed. Turned another way it may need less.',
+    })]);
+    await load(leaningBlock(3), 'wedge');
+    const fine = await client.export([], version, 'wedge', { printing: { nozzle: 0.4, layerHeight: 0.12 }, bed: BED });
+    expect(fine.notes.map((n) => n.text)).toEqual([
+      'The model has a big face on top (about 160 cm²) that leans 3° off level: at 0.12 mm layers it prints with a step line about every 2.5 mm. Turning the model so that the face is level or upright, or finer layers, shows them less.',
+    ]);
+    await load(cube([60, 40, 20]), 'block');
+    expect((await client.export([], version, 'block', { printing, bed: BED })).notes).toEqual([]);
   });
 });

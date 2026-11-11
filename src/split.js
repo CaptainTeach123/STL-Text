@@ -22,6 +22,7 @@
  *  - piece numbers are 1-based, as in "piece 2 of 3" and the label "2A".
  */
 import { TEA_LIGHT, roundAngle, roundOpening, wayWords } from './locks.js';
+import { OVERHANG_NZ, PRINT_CHECK, checkNote, checkNoteWords, checkWords } from './printCheck.js';
 import { boxHang, columnGraph, columnsOf, HANG, hangAt, looseTable, planeGrid, rasterRings, sampleWidths } from './hang.js';
 
 // ---------- printers ----------
@@ -5133,6 +5134,7 @@ const NOTE_LEVELS = Object.freeze({
   PIECE_TOO_BIG: 'warn',
   CORNER_PLACE: 'info',
   PIECE_UNSTABLE: 'warn',
+  PRINT_CHECK: 'info',
   PART_TOO_BIG: 'warn',
   SMALL_PIECE: 'warn',
   CUT_MISSES: 'warn',
@@ -5335,6 +5337,7 @@ const NOTE_TEXT = {
       ? `${pieceName(pieceIndex)} has nothing flat to stand on but the face its built-in pegs stand out of – it rests on a curve or an edge and needs supports. With pins (Joints: Pins) it lies on that face.`
       : `${pieceName(pieceIndex)} has nothing flat to stand on where it fits your printer – it rests on a curve or an edge and needs supports. Another cut through it gives it a flat face to lie on.`;
   },
+  PRINT_CHECK: ({ pieceIndex, whole = false, ...found }) => checkNoteWords(whole ? 'The model' : pieceName(pieceIndex), { ...found, whole }),
   PART_TOO_BIG: ({ name, size, bed, pins = false }) => {
     const room = `${formatSize(size)}${bed ? `; the printer has room for ${roomWords(bed)}` : ''}`;
     return pins
@@ -5620,7 +5623,10 @@ const NOTE_TEXT = {
  * DOVETAIL_NOT_PLATE `{ letter, lying, pegs }` (`lying`: through a plate, but a piece beside it can't lie flat on it;
  * `pegs`: it has built-in pegs instead of pins);
  * ORIENT_FALLBACK `{ pieceIndex, mode, lies }`; HOLES_KEEP_LAY `{ pieceIndex, lies }` (a piece kept the way a lip or
- * a twist-lock that was not built laid it, as its pin holes were shaped for that); PIECE_UNSTABLE `{ pieceIndex, pegs, lip }` (`pegs`, `lip`: only the
+ * a twist-lock that was not built laid it, as its pin holes were shaped for that); PRINT_CHECK `{ pieceIndex, whole,
+ * supports, steps, foot, layer, height }` (what the print check of a piece, or with `whole` of a model printed in one
+ * piece, found worth saying: printCheck.js `checkNote`; one a piece at most, and `warn` where the piece may tip);
+ * PIECE_UNSTABLE `{ pieceIndex, pegs, lip }` (`pegs`, `lip`: only the
  * face its pegs or its lip stand out of was flat); PART_TOO_BIG `{ name, size, bed, pins }`
  * (a part printed separately, or with `pins` a single pin, too big for the bed); SPLIT_NOT_NEEDED `{ yaw, down, apart }`
  * (down other than '-z' when it fits only on its side; `apart` the letters of the cuts that come apart, when the pieces
@@ -5669,6 +5675,22 @@ export function splitNote(code, fields = {}) {
   const text = NOTE_TEXT[code];
   if (!text) throw new Error(`Unknown split note "${code}"`);
   return { level: NOTE_LEVELS[code], code, text: text(fields), ...fields };
+}
+
+/**
+ * PRINT_CHECK for a piece's row of the print check (printCheck.js `checkRow`), or with `whole` for a model printed in
+ * one piece: null when the check found nothing worth a note. A piece that may tip is warned of; the rest is for
+ * information. A piece already told it has nothing flat to stand on and needs supports (`unstable`: PIECE_UNSTABLE)
+ * is not told of supports again.
+ * @param {object|null} row
+ * @param {{ pieceIndex?: number|null, whole?: boolean, unstable?: boolean }} of
+ */
+export function printCheckNote(row, { pieceIndex = null, whole = false, unstable = false } = {}) {
+  const { supports, ...rest } = checkNote(row) ?? {};
+  const found = unstable ? rest : { ...(supports ? { supports } : {}), ...rest };
+  if (!found.supports && !found.steps && !found.foot) return null;
+  const note = splitNote('PRINT_CHECK', { ...(whole ? { whole: true } : { pieceIndex }), ...found });
+  return found.foot?.tip ? { ...note, level: 'warn' } : note;
 }
 
 /**
@@ -5952,12 +5974,13 @@ function fitWords(fit) {
  * come apart are put together last, under a heading that says not to glue
  * them (or that nothing is glued, when no other cut is).
  * @param {{ name: string, pieces: { index: number, cell: number[], size: number[], lies: string, yaw?: number, fits?: boolean, shells?: number,
- *   part?: string, name?: string, lids?: string[] }[],
+ *   part?: string, name?: string, lids?: string[], check?: object, holes?: object }[],
  *   seams: object[], pins?: { d: number, length: number, count: number, spares?: number, own?: boolean, sheets?: number }[],
  *   parts?: { name: string }[], clearance?: number, bed?: number[], printer?: { size: number[], margin: number, corner?: number[]|null }|null, steps?: object[],
  *   bridges?: number[], fit?: object|null }} plan
  *   `seams` as for `assemblySteps`; a piece that is a part taken out has its cut's id (`part`), its `name` and the
- *   cut's letter (`lids`); `pins` one group per pin size (count without spares, `sheets` its pins files); `bed` the usable bed (with the
+ *   cut's letter (`lids`); a piece's print check (`check`, printCheck.js `checkRow`) and its pin holes by how they print
+ *   (`holes`, `holeSummary`) are said in a clause on its line; `pins` one group per pin size (count without spares, `sheets` its pins files); `bed` the usable bed (with the
  *   corner it keeps clear, the pieces that must be moved clear of it are told so); `printer` the printer itself, when
  *   known, for the heading (`corner` the sides of the corner it keeps clear); `bridges` the clips' bridges' lengths as built (each
  *   hold's own on a 1.6 mm tongue when not given); `fit` the PART_FIT note's fields, for what the fit test holds
@@ -6018,8 +6041,13 @@ export function howToGlueText(plan) {
     for (const x of locked) if (x.pieces[0] === p.index) extra.push(`${x.apart.mech === 'plug' ? 'twist-lock slots' : 'twist-lock neck'} for cut ${x.letter}`);
     if (p.part) extra.push(`comes off at cut ${listOf(p.lids ?? [])} (the ${partCalled(p.name)})`);
     for (const x of seated) if (x.pieces[1] === p.index) extra.push(`tea-light seat Ø ${mm1(x.apart.seat.d)} mm on top`);
-    out.push(`  ${pad(`piece ${p.index} of ${n}`, 12)}${pad(size1(p.size), width)}${pad(`lies ${p.lies}`, 0)}${extra.join(', ')}`);
+    // what the print check found, and how its pin holes print: one clause each
+    const checked = checkWords(p.check ?? null, p.holes ?? null);
+    out.push(`  ${pad(`piece ${p.index} of ${n}`, 12)}${pad(size1(p.size), width)}${pad(`lies ${p.lies}`, 0)}${extra.join(', ')}${checked.length ? ` – ${checked.join('; ')}` : ''}`);
   });
+  // the holes and the joints are shaped for the way each file lies, and the check above is of that way
+  out.push('  Print each piece the way its file lies – do not turn it in your slicer: its holes and joints are shaped to print that way.');
+  if (pieces.some((p) => p.check?.supports.area >= PRINT_CHECK.none)) out.push("  'May need supports' goes by the safe rule – any face flatter than 45° – so your slicer may ask for less.");
   // a lid's collar slopes out under the joint as steeply as the model beside it: support the dome, support the collar
   for (const x of locked.filter((y) => y.apart.mech === 'twist' && y.apart.slope > 1 + 1e-6)) {
     const like = x.part.name === 'Dome and cap' ? 'the dome' : 'the model round it';
@@ -6202,8 +6230,8 @@ export function wayStep(way, f) {
   return { step: steps[k], n: k + 1, of: steps.length };
 }
 
-/** A face of a lock that slopes further than this from vertical overhangs: past 45°, with a little rounding. */
-const OVERHANG_NZ = -Math.sin((46.5 * Math.PI) / 180);
+// a face of a lock overhangs where the print check says any face does (printCheck.js `OVERHANG_NZ`): sloping more
+// than 45° from vertical, with a little rounding
 /** A face of a lock that faces down within this of straight down is a flat ceiling the printer bridges. */
 const BRIDGE_NZ = -Math.cos((10 * Math.PI) / 180);
 

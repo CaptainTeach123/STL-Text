@@ -34,6 +34,11 @@
   --seat: #8b5cf6;
   --over: #e11d48;
   --bridge: #facc15;
+  /* the print check on the pieces as printed (viewer.js PRINT_COLORS) */
+  --support: #e11d48;
+  --support-seam: #f9a8b8;
+  --span: #f59e0b;
+  --step: #111827;
   color-scheme: light;
 }
 
@@ -1452,6 +1457,21 @@ ul.plan#cutList {
 .dot.bridge {
   background: transparent;
   box-shadow: inset 0 0 0 2px var(--bridge);
+}
+/* as printed, what the print check says of a piece: faces that may need supports, glue faces among them, a level span
+   the printer bridges, and step lines – dark lines across a face, on a piece's own colour */
+.dot.support {
+  background: var(--support);
+}
+.dot.support-seam {
+  background: var(--support-seam);
+}
+.dot.span {
+  background: var(--span);
+}
+.dot.steps {
+  border-radius: 2px;
+  background: repeating-linear-gradient(to bottom, #9db7e0 0 2px, var(--step) 2px 3.5px);
 }
 /* the lock's tools, bottom left of the view: what the part is doing as it comes out, over the buttons */
 .lock-panel {

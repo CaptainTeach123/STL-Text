@@ -6018,6 +6018,196 @@ try {
     await flatContext.close();
   }
 
+  // --- As printed for any split: the print check painted on the pieces, the step lines drawn ---
+  console.log('\nas printed, for any split');
+  {
+    // a desk 300 mm long, cut in two and glued: its top leans 3° (step lines), a shelf hangs off one side (supports) and
+    // a slot 24 mm wide runs under each half (a level span to bridge). No removable part, no lock
+    const rise = 80 * Math.tan((3 * Math.PI) / 180);
+    const deskBody = Manifold.hull([[-150, 0, 0], [150, 0, 0], [-150, 80, 0], [150, 80, 0], [-150, 0, 30], [150, 0, 30], [-150, 80, 30 + rise], [150, 80, 30 + rise]]);
+    const deskShelf = Manifold.cube([300, 15, 8]).translate([-150, -15, 18]);
+    const deskSlots = [-80, 56].map((x) => Manifold.cube([24, 100, 10]).translate([x, -10, -1]));
+    const deskWhole = Manifold.union([deskBody, deskShelf]);
+    const desk = deskWhole.subtract(Manifold.union(deskSlots));
+    const deskFile = writeFixture('desk.stl', soupOf(desk));
+    for (const m of [deskBody, deskShelf, ...deskSlots, deskWhole, desk]) m.delete();
+    const preserve = () => {
+      const getContext = HTMLCanvasElement.prototype.getContext;
+      HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+        if (type === 'webgl' || type === 'webgl2') attrs = { ...attrs, preserveDrawingBuffer: true };
+        return getContext.call(this, type, attrs);
+      };
+    };
+    const printedProblems = [];
+    /** The desk opened, cut in two, laid as modelled, its pieces shown. */
+    const open = async (context) => {
+      await context.addInitScript(preserve);
+      const p = await context.newPage();
+      p.on('pageerror', (e) => printedProblems.push(`pageerror: ${e.message}`));
+      p.on('console', (m) => m.type() === 'error' && printedProblems.push(`console: ${m.text()}`));
+      const settled = async () => {
+        for (let i = 0; i < 2; i++) {
+          await p.waitForTimeout(80);
+          await p.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+        }
+      };
+      const press = (selector) => p.evaluate((s) => document.querySelector(s).click(), selector);
+      await p.goto(url);
+      await settled();
+      await p.setInputFiles('#stlFile', deskFile);
+      await p.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('desk:'));
+      await settled();
+      await press('#deleteBtn'); // the desk alone, without the text it opens with
+      await settled();
+      await press('#addCutBtn');
+      await settled();
+      await p.evaluate(() => {
+        const el = document.querySelector('[data-split="orient"]');
+        el.value = 'model';
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await settled();
+      const before = await p.evaluate(() => document.querySelector('#asPrintedField').hidden);
+      await press('#resultToggle');
+      await p.waitForSelector('#pieceList li:not(.predicted)', { timeout: 60000 });
+      await settled();
+      await p.waitForTimeout(300);
+      return { p, settled, press, before };
+    };
+    /** What the page shows of the view as printed, and what is on the canvas by colour. */
+    const state = (p) =>
+      p.evaluate(() => {
+        const shown = (id) => !document.querySelector(id).hidden;
+        const c = document.querySelector('#stage canvas');
+        const probe = document.createElement('canvas');
+        probe.width = c.width;
+        probe.height = c.height;
+        const ctx = probe.getContext('2d');
+        ctx.drawImage(c, 0, 0);
+        const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
+        const out = { red: 0, amber: 0, dark: 0 };
+        for (let i = 0; i < d.length; i += 4) {
+          const [r, g, bl] = [d[i], d[i + 1], d[i + 2]];
+          if (d[i + 3] < 200) continue;
+          if (r > 150 && g < 80 && bl > 40 && bl < 130) out.red++;
+          if (r > 220 && g > 130 && g < 215 && bl < 110 && r - bl > 120) out.amber++;
+          if (r < 60 && g < 70 && bl < 90) out.dark++;
+        }
+        return {
+          ...out,
+          field: shown('#asPrintedField'),
+          ticked: document.querySelector('#asPrintedToggle').checked,
+          spread: shown('#spreadField'),
+          lockPanel: shown('#lockPanel'),
+          chips: ['#legendSupport', '#legendSeam', '#legendSpan', '#legendSteps', '#legendOver', '#legendBridge'].filter(shown).map((id) => document.querySelector(id).textContent.trim()),
+          dots: ['.dot.support', '.dot.support-seam', '.dot.span'].map((s) => getComputedStyle(document.querySelector(s)).backgroundColor),
+        };
+      });
+
+    const wide = await browser.newContext({ viewport: { width: 1400, height: 850 } });
+    const { p, settled, press, before } = await open(wide);
+    const apart = await state(p);
+    check(
+      before && apart.field && !apart.ticked && apart.spread && !apart.lockPanel && apart.chips.length === 0,
+      'a plain glued split has As printed beside Spread once its pieces are shown, with no lock on the model',
+      JSON.stringify({ before, apart }),
+    );
+    const lines = await p.locator('#pieceList li .print-check').allInnerTexts();
+    check(
+      lines.length === 2 && lines.every((t) => /may need supports: about 23 cm², standing on the bed · bridges a level span of about 24 mm · step lines about every 4 mm on a big face on top/.test(t)),
+      'each half of the desk says it may need supports, bridges a span and will show step lines',
+      lines.join(' / '),
+    );
+    await press('#asPrintedToggle');
+    await p.waitForTimeout(400);
+    const above = await state(p);
+    check(
+      above.ticked && !above.spread && above.field && JSON.stringify(above.chips) === JSON.stringify(['may need supports', 'level span to bridge', 'step lines, about here']),
+      'ticked, the pieces lie as printed: Spread gives way, and the legend names what is painted – supports, a level span, step lines',
+      JSON.stringify(above),
+    );
+    check(above.dark > apart.dark + 1500, 'the step lines are drawn dark across the leaning tops', JSON.stringify({ apart: apart.dark, printed: above.dark }));
+    // from below: the shelf's underside red, the slots' ceilings amber
+    const canvas = await p.locator('#stage canvas').boundingBox();
+    const [mx, my] = [canvas.x + canvas.width / 2, canvas.y + canvas.height / 2];
+    await p.mouse.move(mx, my);
+    await p.mouse.down();
+    await p.mouse.move(mx + 40, my - 330, { steps: 12 });
+    await p.mouse.up();
+    await p.waitForTimeout(400);
+    const below = await state(p);
+    check(
+      below.red > 1500 && below.amber > 1500 && above.red < 0.2 * below.red && above.amber < 0.2 * below.amber && apart.red < 50 && apart.amber < 50,
+      'seen from below, the faces that may need supports are red and the level spans amber; spread apart nothing is painted',
+      JSON.stringify({ below: { red: below.red, amber: below.amber }, above: { red: above.red, amber: above.amber }, apart: { red: apart.red, amber: apart.amber } }),
+    );
+    // finer layers: the pieces are worked out again, and their step lines are twice as close
+    await p.evaluate(() => (document.querySelector('#layerHeight').closest('details').open = true));
+    await p.fill('#layerHeight', '0.1');
+    await p.dispatchEvent('#layerHeight', 'change');
+    await settled();
+    await press('#resultToggle');
+    await p.waitForFunction(() => /step lines about every 2 mm/.test(document.querySelector('#pieceList').innerText), null, { timeout: 60000 });
+    await settled();
+    await press('#asPrintedToggle');
+    await press('#frameBtn');
+    await p.waitForTimeout(400);
+    const fine = await state(p);
+    check(fine.ticked && fine.dark > 1.3 * above.dark, 'at 0.1 mm layers the step lines are drawn twice as close', JSON.stringify({ at02: above.dark, at01: fine.dark }));
+    // Classic: the same chips in the same colours
+    await press('#classicLook');
+    await p.waitForTimeout(300);
+    const classic = await state(p);
+    check(
+      JSON.stringify(classic.chips) === JSON.stringify(above.chips) && JSON.stringify(classic.dots) === JSON.stringify(above.dots) && classic.dots[0] === 'rgb(225, 29, 72)' && classic.dark > 0.8 * fine.dark,
+      'in Classic the legend and the painting are the same',
+      JSON.stringify({ classic: classic.dots, cyber: above.dots, dark: classic.dark }),
+    );
+    await press('#classicLook');
+    // unticked, the pieces are spread again; and it goes with the pieces view
+    await press('#asPrintedToggle');
+    await p.waitForTimeout(300);
+    const off = await state(p);
+    await press('#asPrintedToggle');
+    await p.waitForTimeout(200);
+    await press('#resultToggle');
+    await settled();
+    const left = await state(p);
+    await press('#resultToggle');
+    await settled();
+    await p.waitForTimeout(300);
+    const back = await state(p);
+    check(
+      !off.ticked && off.spread && off.chips.length === 0 && !left.field && !left.ticked && back.field && !back.ticked && back.spread && back.chips.length === 0,
+      'unticked the pieces are spread apart again; As printed goes with the pieces view and comes back unticked',
+      JSON.stringify({ off, left, back }),
+    );
+    await wide.close();
+
+    // on a phone: the box is there, inside the screen, and neither it nor the legend covers the other
+    const small = await browser.newContext({ viewport: { width: 390, height: 664 }, isMobile: true, hasTouch: true, deviceScaleFactor: 1 });
+    const phone = await open(small);
+    await phone.press('#asPrintedToggle');
+    await phone.p.waitForTimeout(400);
+    const onPhone = await state(phone.p);
+    const fit = await phone.p.evaluate(() => {
+      const box = document.querySelector('#asPrintedField').getBoundingClientRect();
+      const tools = [...document.querySelectorAll('.stage-tools > *')].filter((x) => !x.hidden).map((x) => x.getBoundingClientRect());
+      const under = [...document.querySelectorAll('.legend > span')].filter((x) => !x.hidden).filter((x) => {
+        const r = x.getBoundingClientRect();
+        return tools.some((t) => Math.min(r.right, t.right) - Math.max(r.left, t.left) > 0 && Math.min(r.bottom, t.bottom) - Math.max(r.top, t.top) > 0);
+      }).map((x) => x.textContent.trim());
+      return { left: box.left, right: box.right, width: innerWidth, scroll: document.documentElement.scrollWidth - document.documentElement.clientWidth, under };
+    });
+    check(
+      onPhone.ticked && onPhone.chips.length === 3 && onPhone.dark > 300 && fit.left >= 0 && fit.right <= fit.width && fit.scroll === 0 && fit.under.length === 0,
+      'on a phone As printed is within the screen, the legend beside it, and the step lines are drawn',
+      JSON.stringify({ chips: onPhone.chips, dark: onPhone.dark, fit }),
+    );
+    await small.close();
+    check(printedProblems.length === 0, 'no page errors as printed', printedProblems.join(' | '));
+  }
+
   check(problems.length === 0, 'no console errors or exceptions (page or worker)', problems.join(' | '));
 } finally {
   await browser.close();

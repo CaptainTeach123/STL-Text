@@ -23,7 +23,7 @@ import {
   AXES, CLIP, LIP, SPOT, catchSizes, comesOffOf, endShape, endsAsWell, keepsTo, locateBend, locateSeam, pickSpots, profileSeams, seamKind, spotScore, spotSide,
   spotStart, spotWhy, socketsAsWell, flatLift, holeSummary, printCheckNote, LAY_DOWN,
 } from './split.js';
-import { checkRow, printCheck } from './printCheck.js';
+import { checkRow, printCheck, shownFaces } from './printCheck.js';
 import {
   buildSplitDisplay, carveParts, checkPart, clearSplitCaches, couponRow, cutPieces, drillPiece, fitTestCoupon, layoutSplit, lockFaces, lockMatrix, lockPieces, lockPoints, partFrame, partInFrame, partedSolids,
   partRows, pinAt, pinSheet, pinSpares, pinsPerSheet, placePart, planDovetails, probeLip, shellCounts, tabsAcross, wayOverlaps,
@@ -2588,7 +2588,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * The print check of every piece as drilled (printCheck.js), by its number: one pass over each, turned the way it
    * lies. Kept with the drill stage for as long as a piece lies the same way, so only the first result of a split
    * reads the pieces; the layer height comes in later (`checkRow`). `final` is the model the faces are told by, before
-   * any part was taken out of it. A piece whose check could not be made is left out.
+   * any part was taken out of it. A piece whose check could not be made is left out. Each check keeps what every
+   * triangle was counted as (`faces`), for the picture of the pieces as printed (`printedFaces`).
    */
   function pieceChecks(final, split, progress) {
     const { drill, laid, lying, cuts } = split;
@@ -2604,7 +2605,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       try {
         for (const i of wanted) {
           const mesh = solids[i].getMesh();
-          const check = checkOf(mesh, { turn: LAY_DOWN[lying[i].down], planes, made: madeFaces(mesh, own) });
+          const check = checkOf(mesh, { turn: LAY_DOWN[lying[i].down], planes, made: madeFaces(mesh, own), faces: true });
           drill.checks.set(laid[i].index, { down: lying[i].down, check });
         }
       } finally {
@@ -3641,6 +3642,16 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           return ids.size ? ids : null;
         };
         const entries = split.laid.map((p, i) => ({ solid: shown[i], soup: p.soup, part: { kind: 'piece', index: p.index }, marks: marksOf(p.index) }));
+        // for the picture of the pieces as printed (`printedFaces`): how many of each piece's triangles are its
+        // solid's, and the mesh of each lighter copy, which is checked as the piece itself is
+        const solidTris = shown.map((m) => m.numTri());
+        const lighter = new Map();
+        const own = ownFaces(final);
+        shown.forEach((m, i) => {
+          if (m === solids[i]) return;
+          const mesh = m.getMesh();
+          lighter.set(split.laid[i].index, { mesh: { vertProperties: mesh.vertProperties, numProp: mesh.numProp, triVerts: mesh.triVerts }, made: madeFaces(mesh, own) });
+        });
         for (const d of drill.layout.dowels) entries.push({ solid: temps.add(pinAt(d)), part: { kind: 'pin', cell: d.cell } });
         for (const p of final.separate) {
           const b = boxOf(p.world);
@@ -3652,7 +3663,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           const body = lock.sides.find((x) => x.role !== 'part')?.piece;
           return (lock.points ?? []).map((x) => ({ cutId: lock.cutId, name: x.name, piece: x.on === 'part' ? part : body, at: x.at.map((v) => +v.toFixed(4)) }));
         }).filter((x) => x.piece != null);
-        drill.display = { ...buildSplitDisplay(entries), marks, lockLabels };
+        drill.display = { ...buildSplitDisplay(entries), marks, lockLabels, solidTris, lighter };
       } finally {
         temps.dispose();
         if (owned) solids.forEach((m) => m.delete());
@@ -3670,6 +3681,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       marks: d.marks,
       lockLabels: d.lockLabels,
       parts: d.parts,
+      printed: printedFaces(split),
       bvhRoots: [],
     };
     return {
@@ -3684,8 +3696,39 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         skipped: final.skipped,
         info: { triangles: d.index.length / 3, pieces: split.pieces.length },
       },
-      transfer: [display.positions.buffer, display.normals.buffer, display.index.buffer],
+      transfer: [display.positions.buffer, display.normals.buffer, display.index.buffer, display.printed.buffer],
     };
+  }
+
+  /**
+   * What the print check counted each triangle of the pieces view as, one number a triangle of the display (printCheck.js
+   * `shownFaces`): the faces that may need supports, the level spans to bridge and the leaning faces that will show
+   * step lines, as each piece's line in the list tells of them – the picture of the pieces as printed is painted from
+   * the same pass the words are made from. A piece shown through a lighter copy is checked again as that copy, the
+   * same way, and painted only where the piece's own line says so. Pins, printed parts and unrepaired triangles are 0.
+   */
+  function printedFaces(split) {
+    const { drill, laid, lying, cuts, checks = null, hl = 0.2 } = split;
+    const d = drill.display;
+    const out = new Uint8Array(d.index.length / 3);
+    drill.lighterChecks ??= new Map();
+    laid.forEach((p, i) => {
+      const own = checks?.get(p.index) ?? null;
+      let check = own;
+      const copy = d.lighter.get(p.index);
+      if (copy && own) {
+        let kept = drill.lighterChecks.get(p.index);
+        if (kept?.down !== lying[i].down) {
+          kept = { down: lying[i].down, check: checkOf(copy.mesh, { turn: LAY_DOWN[lying[i].down], planes: cuts.map(cutPlane).filter(Boolean), made: copy.made, faces: true }) };
+          drill.lighterChecks.set(p.index, kept);
+        }
+        check = kept.check;
+      }
+      const faces = shownFaces(check, hl, own);
+      // the display's triangles are the solid's, in its order (mesh.js `shadedMesh`)
+      if (faces && faces.length === d.solidTris[i]) out.set(faces, d.ranges[i][0]);
+    });
+    return out;
   }
 
   /**

@@ -1,7 +1,9 @@
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
-import { LAY_DOWN, yawMat4 } from '../src/split.js';
-import { OVERHANG_NZ, PRINT_CHECK, areaWords, checkNote, checkNoteWords, checkRow, checkWords, everyWords, printCheck, stepLines } from '../src/printCheck.js';
+import { LAY_DOWN, printTransform, yawMat4 } from '../src/split.js';
+import {
+  FACE, OVERHANG_NZ, PRINT_CHECK, areaWords, checkNote, checkNoteWords, checkRow, checkWords, everyWords, faceKind, faceLean, printCheck, shownFaces, stepLines, stepSegments,
+} from '../src/printCheck.js';
 import { setup } from './helpers.js';
 
 let M;
@@ -544,5 +546,208 @@ describe('the words of the check', () => {
       + 'It stands on a 10 × 10 mm foot, small for its size, and may come loose: add a brim about 5 mm wide in your slicer.',
     );
     expect(checkNoteWords('The model', { ...checkNote(row(leaning(3))), whole: true })).toMatch(/Turning the model so that the face is level or upright, or finer layers, shows them less\.$/);
+  });
+});
+
+describe('the picture of the check: what each triangle was counted as', () => {
+  /** The check of a solid with its faces told, its mesh, and what the triangles of each kind add up to. */
+  const told = (solid, down = '-z', options = {}) => {
+    const mesh = solid.getMesh();
+    const turn = LAY_DOWN[down];
+    const c = printCheck(mesh.vertProperties, mesh.numProp, mesh.triVerts, { turn, faces: true, ...options });
+    const P = mesh.vertProperties;
+    const at = (v) => [0, 1, 2].map((a) => turn[a] * P[v * 3] + turn[4 + a] * P[v * 3 + 1] + turn[8 + a] * P[v * 3 + 2]);
+    // by kind what is seen from below, and by leaning face its own area
+    const seen = [0, 0, 0, 0];
+    const lean = [];
+    const nz = [];
+    for (let t = 0; t < mesh.triVerts.length / 3; t++) {
+      const [a, b, d] = [0, 1, 2].map((k) => at(mesh.triVerts[3 * t + k]));
+      const u = b.map((v, i) => v - a[i]), w = d.map((v, i) => v - a[i]);
+      const n = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+      const area = Math.hypot(...n) / 2;
+      seen[faceKind(c.faces[t])] += Math.max(0, -n[2] / 2);
+      if (faceKind(c.faces[t])) nz.push(n[2] / (2 * area));
+      if (faceLean(c.faces[t])) lean[faceLean(c.faces[t]) - 1] = (lean[faceLean(c.faces[t]) - 1] ?? 0) + area;
+    }
+    return { c, mesh, seen, lean, nz };
+  };
+
+  it('is asked for: without it a check has no faces', () => {
+    expect(check(tee()).faces).toBeUndefined();
+    const { c, mesh } = told(tee());
+    expect(c.faces).toBeInstanceOf(Uint8Array);
+    expect(c.faces.length).toBe(mesh.triVerts.length / 3);
+    // and the rest of the check is the same
+    const { faces, ...rest } = c;
+    expect(rest).toEqual(check(tee()));
+  });
+
+  it('the triangles of each kind add up to the areas the words are made from', () => {
+    // the model's own faces
+    const bar = told(tee());
+    expect(bar.seen[FACE.skin]).toBeCloseTo(bar.c.supports.skin, 6);
+    expect(bar.seen[FACE.skin]).toBeCloseTo(300, 3);
+    expect(bar.seen[FACE.seam] + bar.seen[FACE.span]).toBe(0);
+    // every one of them looks down further than the rule
+    expect(bar.nz.length).toBeGreaterThan(0);
+    expect(Math.max(...bar.nz)).toBeLessThan(OVERHANG_NZ);
+    // a glue face
+    const seam = told(tee(), '-z', { planes: [{ axis: 2, at: 30 }] });
+    expect(seam.seen[FACE.seam]).toBeCloseTo(seam.c.supports.seam, 6);
+    expect(seam.seen[FACE.seam]).toBeCloseTo(300, 3);
+    expect(seam.seen[FACE.skin]).toBe(0);
+    // a level span the printer bridges, and a longer one that may need supports
+    const span = told(own(block([0, 0, 0], [30, 30, 20]).subtract(block([8, -1, 5], [22, 31, 12]))));
+    expect(span.seen[FACE.span]).toBeCloseTo(span.c.supports.span, 6);
+    expect(span.seen[FACE.span]).toBeCloseTo(14 * 30, 3);
+    expect(span.seen[FACE.skin]).toBe(0);
+    const long = told(own(block([0, 0, 0], [50, 30, 20]).subtract(block([8, -1, 5], [42, 31, 12]))));
+    expect(long.seen[FACE.skin]).toBeCloseTo(long.c.supports.area, 6);
+    expect(long.seen[FACE.span]).toBe(0);
+    // what is left out is not painted: a short span, a joint's own faces, the face on the bed
+    const short = told(own(block([0, 0, 0], [30, 30, 20]).subtract(block([12, -1, 5], [18, 31, 12]))));
+    expect(short.c.faces.every((b) => b === 0)).toBe(true);
+    const mesh = tee().getMesh();
+    const joints = printCheck(mesh.vertProperties, mesh.numProp, mesh.triVerts, { made: new Uint8Array(mesh.triVerts.length / 3).fill(1), faces: true });
+    expect(joints.faces.every((b) => b === 0)).toBe(true);
+    // turned another way, the faces are those of that way
+    const lying = told(tee(), '+x');
+    expect(lying.seen[FACE.skin]).toBeCloseTo(lying.c.supports.skin, 6);
+    expect(lying.c.supports.skin).toBeGreaterThan(0);
+    expect(Math.max(...lying.nz)).toBeLessThan(OVERHANG_NZ);
+  });
+
+  it('the triangles of a leaning face are told with its number in the list', () => {
+    const top = told(leaning(3));
+    expect(top.c.leaning.length).toBe(1);
+    expect(top.lean.length).toBe(1);
+    expect(top.lean[0]).toBeCloseTo(top.c.leaning[0].area, 3);
+    // an underside that leans is both a leaning face and one that may need supports
+    const under = told(leaning(3, false));
+    const both = [...under.c.faces].filter((b) => faceLean(b) && faceKind(b) === FACE.skin).length;
+    expect(both).toBeGreaterThan(0);
+    // a level top and a small leaning face have no number
+    expect(told(block([0, 0, 0], [40, 30, 20])).c.faces.every((b) => b === 0)).toBe(true);
+  });
+
+  it('what is shown is what the line says: nothing under the least worth saying, and the leaning faces of the row', () => {
+    // a bar that hangs 15 mm² over: counted, but the line says "no supports needed"
+    const little = told(join(block([0, 0, 0], [10, 10, 10]), block([10, 0, 5], [13, 5, 10])));
+    expect(little.c.supports.area).toBeCloseTo(15, 3);
+    expect(checkWords(checkRow(little.c, 0.2))[0]).toBe('no supports needed');
+    expect(little.c.faces.some((b) => faceKind(b) === FACE.skin)).toBe(true);
+    expect(shownFaces(little.c, 0.2).every((b) => b === 0)).toBe(true);
+    // 300 mm²: said, and shown as counted
+    const bar = told(tee());
+    expect([...shownFaces(bar.c, 0.2)]).toEqual([...bar.c.faces]);
+    // a lighter copy is painted where the piece's own line says so, not where its own check would
+    expect(shownFaces(bar.c, 0.2, little.c).every((b) => b === 0)).toBe(true);
+    expect([...shownFaces(little.c, 0.2, bar.c)]).toEqual([...little.c.faces]);
+    // a level span is shown where the line tells of one
+    const span = told(own(block([0, 0, 0], [30, 30, 20]).subtract(block([8, -1, 5], [22, 31, 12]))));
+    expect(checkWords(checkRow(span.c, 0.2))).toContain('bridges a level span of about 14 mm');
+    expect([...shownFaces(span.c, 0.2)].filter((b) => faceKind(b) === FACE.span).length).toBeGreaterThan(0);
+    expect(shownFaces(span.c, 0.2, bar.c).every((b) => b === 0)).toBe(true);
+    // a leaning face is shown while its row tells of it: not at a layer so thick it climbs under two of them
+    const top = told(leaning(3));
+    expect(checkRow(top.c, 0.2).steps.length).toBe(1);
+    expect([...shownFaces(top.c, 0.2)].filter((b) => faceLean(b) === 1).length).toBe([...top.c.faces].filter((b) => faceLean(b) === 1).length);
+    expect(checkRow(top.c, 3).steps).toEqual([]);
+    expect(shownFaces(top.c, 3).every((b) => b === 0)).toBe(true);
+    // without the faces there is nothing to show
+    expect(shownFaces(check(tee()), 0.2)).toBeNull();
+    expect(shownFaces(null, 0.2)).toBeNull();
+  });
+});
+
+describe('where the step lines fall', () => {
+  /** A solid's points and triangles, its faces as shown at `layer`, and the matrix that lays it on the bed. */
+  const drawn = (solid, down = '-z', layer = 0.2) => {
+    const mesh = solid.getMesh();
+    const P = mesh.vertProperties;
+    const c = printCheck(P, mesh.numProp, mesh.triVerts, { turn: LAY_DOWN[down], faces: true });
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < P.length; i += 3) for (let a = 0; a < 3; a++) (lo[a] = Math.min(lo[a], P[i + a])), (hi[a] = Math.max(hi[a], P[i + a]));
+    const { printMatrix } = printTransform({ min: lo, max: hi }, down, 0);
+    return { P, T: mesh.triVerts, faces: shownFaces(c, layer), turn: printMatrix };
+  };
+  const laid = (turn, p) => [0, 1, 2].map((a) => turn[a] * p[0] + turn[4 + a] * p[1] + turn[8 + a] * p[2] + turn[12 + a]);
+  const ends = (segments) => Array.from({ length: segments.length / 3 }, (_, i) => [...segments.subarray(3 * i, 3 * i + 3)]);
+
+  it('a top leaning 3° has 26 lines 3.8 mm apart at 0.2 mm layers, each at the middle of a layer', () => {
+    const { P, T, faces, turn } = drawn(leaning(3));
+    const { segments, lines, every } = stepSegments(P, T, faces, { turn, layer: 0.2 });
+    expect(every).toBe(1);
+    expect(lines).toBe(segments.length / 6);
+    const points = ends(segments);
+    // every end at half a layer over a whole number of them, on the leaning top
+    const levels = new Set();
+    for (const p of points) {
+      const z = laid(turn, p)[2];
+      const k = z / 0.2 - 0.5;
+      expect(Math.abs(k - Math.round(k))).toBeLessThan(1e-3);
+      levels.add(Math.round(k));
+      expect(p[2]).toBeCloseTo(20 + p[0] * Math.tan((3 * Math.PI) / 180), 3);
+    }
+    // the top climbs from 20 to 25.24 mm: the levels 20.1, 20.3 … 25.1
+    expect([...levels].sort((a, b) => a - b)).toEqual(Array.from({ length: 26 }, (_, i) => 100 + i));
+    // across the whole face, 80 mm long each, and 3.8 mm from the next
+    const xs = [...new Set(points.map((p) => p[0].toFixed(3)))].map(Number).sort((a, b) => a - b);
+    expect(xs.length).toBe(26);
+    for (let i = 1; i < xs.length; i++) expect(xs[i] - xs[i - 1]).toBeCloseTo(0.2 / Math.tan((3 * Math.PI) / 180), 2);
+    let length = 0;
+    for (let i = 0; i < points.length; i += 2) length += Math.hypot(...points[i].map((v, a) => v - points[i + 1][a]));
+    expect(length).toBeCloseTo(26 * 80, 2);
+  });
+
+  it('finer layers give more lines, and a piece lying another way has them where it lies', () => {
+    const fine = drawn(leaning(3), '-z', 0.1);
+    const xs = new Set(ends(stepSegments(fine.P, fine.T, fine.faces, { turn: fine.turn, layer: 0.1 }).segments).map((p) => p[0].toFixed(3)));
+    expect(xs.size).toBe(52);
+    // a block whose side leans 4° off upright, laid on that side's opposite: the side is its top, leaning 4°
+    const lean = hull([[0, 0, 0], [0, 80, 0], [0, 0, 100], [0, 80, 100], [30, 0, 0], [30, 80, 0], [30 + 100 * Math.tan((4 * Math.PI) / 180), 0, 100], [30 + 100 * Math.tan((4 * Math.PI) / 180), 80, 100]]);
+    const side = drawn(lean, '-x');
+    expect(side.faces.some((b) => faceLean(b))).toBe(true);
+    const { segments, lines } = stepSegments(side.P, side.T, side.faces, { turn: side.turn, layer: 0.2 });
+    expect(lines).toBeGreaterThan(0);
+    for (const p of ends(segments)) {
+      const k = laid(side.turn, p)[2] / 0.2 - 0.5;
+      expect(Math.abs(k - Math.round(k))).toBeLessThan(1e-3);
+      // on the leaning side, as it is in the model
+      expect(p[0]).toBeCloseTo(30 + p[2] * Math.tan((4 * Math.PI) / 180), 3);
+    }
+  });
+
+  it('a piece with no leaning face shown has none, and the lines can be drawn a little off the face', () => {
+    const flat = drawn(block([0, 0, 0], [40, 30, 20]));
+    expect(stepSegments(flat.P, flat.T, flat.faces, { turn: flat.turn }).lines).toBe(0);
+    // the tee's overhang is painted, but nothing of it leans a little
+    const bar = drawn(tee());
+    expect(bar.faces.some((b) => b)).toBe(true);
+    expect(stepSegments(bar.P, bar.T, bar.faces, { turn: bar.turn }).lines).toBe(0);
+    expect(stepSegments(bar.P, bar.T, null).lines).toBe(0);
+    const { P, T, faces, turn } = drawn(leaning(3));
+    const on = ends(stepSegments(P, T, faces, { turn, layer: 0.2 }).segments);
+    const off = ends(stepSegments(P, T, faces, { turn, layer: 0.2, lift: 0.05 }).segments);
+    expect(off.length).toBe(on.length);
+    // 0.05 mm out along the face's own normal, which leans 3°
+    const n = [-Math.sin((3 * Math.PI) / 180), 0, Math.cos((3 * Math.PI) / 180)];
+    off.forEach((p, i) => p.forEach((v, a) => expect(v - on[i][a]).toBeCloseTo(0.05 * n[a], 4)));
+  });
+
+  it('never makes more than the cap: every second level is left out, then every fourth', () => {
+    const { P, T, faces, turn } = drawn(leaning(3));
+    const all = stepSegments(P, T, faces, { turn, layer: 0.2 });
+    const half = stepSegments(P, T, faces, { turn, layer: 0.2, cap: all.lines - 1 });
+    expect(half.every).toBe(2);
+    expect(half.lines).toBeLessThanOrEqual(all.lines - 1);
+    expect(new Set(ends(half.segments).map((p) => p[0].toFixed(3))).size).toBe(13);
+    const few = stepSegments(P, T, faces, { turn, layer: 0.2, cap: 10 });
+    expect(few.every).toBe(8);
+    expect(few.lines).toBeLessThanOrEqual(10);
+    expect(few.lines).toBeGreaterThan(0);
+    // the levels kept are whole multiples of the step, so neighbouring triangles keep the same ones
+    for (const p of ends(few.segments)) expect(Math.round(laid(turn, p)[2] / 0.2 - 0.5) % 8).toBe(0);
   });
 });

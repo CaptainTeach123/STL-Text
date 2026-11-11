@@ -94,6 +94,20 @@ export const PRINT_CHECK = Object.freeze({
 /** A face whose normal's z, as it prints, is under this may need supports: more than 46.5° from upright. */
 export const OVERHANG_NZ = -Math.sin((PRINT_CHECK.angle + PRINT_CHECK.tolerance) * RAD);
 
+/**
+ * What a face is to the check, for a picture of it: nothing to say, one that may need supports (the model's own, or
+ * a glue face), or part of a level span the printer is left to bridge. `printCheck` gives one number a triangle
+ * (`faces`): this in its low two bits (`faceKind`), and above them which of the piece's leaning faces the triangle is
+ * part of (`faceLean`: its number in `leaning` from 1, 0 for none).
+ */
+export const FACE = Object.freeze({ none: 0, skin: 1, seam: 2, span: 3 });
+/** What a triangle is, from its number in `faces`: one of `FACE`. */
+export const faceKind = (b) => b & 3;
+/** Which leaning face a triangle is part of, from its number in `faces`: from 1, 0 for none. */
+export const faceLean = (b) => b >> 2;
+/** How many leaning faces `faces` can tell apart. */
+const LEAN_FACES = 63;
+
 const TILT_BINS = Math.ceil(PRINT_CHECK.stepMax / 0.5);
 const TURN_BINS = 72;
 /** A line meets a wall squarely when it is within 10° of square to it (the sine of the angle between them). */
@@ -247,10 +261,12 @@ function spanMeasure(rim) {
 
 /**
  * The big faces that lean a little off level, from the bins the pass filled: bins within `stepMerge` degrees of the
- * largest left are one face with it, and a face is kept when it is big enough for the piece.
+ * largest left are one face with it, and a face is kept when it is big enough for the piece. Each bin is left with
+ * the number of the face it went into (`face`, from 1 in the list returned; 0 for none).
  */
 function leaningFaces(bins, least) {
   const list = [...bins.values()].sort((p, q) => q.area - p.area);
+  for (const bin of list) bin.face = 0;
   const near = Math.cos(PRINT_CHECK.stepMerge * RAD);
   const unit = list.map((b) => {
     const len = Math.hypot(b.n[0], b.n[1], b.n[2]) || 1;
@@ -260,10 +276,11 @@ function leaningFaces(bins, least) {
   const faces = [];
   for (let i = 0; i < list.length; i++) {
     if (used[i]) continue;
-    const face = { area: list[i].area, n: [...list[i].n], lo: list[i].lo, hi: list[i].hi };
+    const face = { area: list[i].area, n: [...list[i].n], lo: list[i].lo, hi: list[i].hi, bins: [list[i]] };
     for (let j = i + 1; j < list.length; j++) {
       if (used[j] || unit[i][0] * unit[j][0] + unit[i][1] * unit[j][1] + unit[i][2] * unit[j][2] < near) continue;
       used[j] = 1;
+      face.bins.push(list[j]);
       face.area += list[j].area;
       for (let a = 0; a < 3; a++) face.n[a] += list[j].n[a];
       face.lo = Math.min(face.lo, list[j].lo);
@@ -276,9 +293,15 @@ function leaningFaces(bins, least) {
       tilt: Math.acos(Math.min(1, Math.abs(face.n[2]) / len)) / RAD,
       area: face.area,
       rise: face.hi - face.lo,
+      bins: face.bins,
     });
   }
-  return faces.sort((p, q) => q.area - p.area);
+  faces.sort((p, q) => q.area - p.area);
+  // each bin knows which face it went into: its number in the list, from 1
+  return faces.map(({ bins: own, ...face }, i) => {
+    for (const bin of own) bin.face = i + 1;
+    return face;
+  });
 }
 
 /**
@@ -288,13 +311,15 @@ function leaningFaces(bins, least) {
  * @param {number} numProp
  * @param {Uint32Array|number[]} triVerts three points a triangle; triangles that meet share their points
  * @param {{ turn?: number[]|null, planes?: { axis: number, at: number }[], made?: ArrayLike<number>|null,
- *   work?: number }} options
+ *   work?: number, faces?: boolean }} options
  *   `turn` the 4 × 4 matrix (column-major) that turns the piece the way it prints, +z up – only its turn is used, the
  *   piece's lowest point is the bed; `planes` the cuts the piece touches, as it is in the model: a face on one is a
  *   glue face; `made` one number a triangle, not 0 for a face the app made for a joint (a hole, a socket, a lip, a
  *   lock, a label): those print without supports by design and are counted apart; `work` how many steps
- *   one ceiling's spans may take before near faces share a measure (`PRINT_CHECK.spanWork`)
- * @returns {{ height: number, box: number[],
+ *   one ceiling's spans may take before near faces share a measure (`PRINT_CHECK.spanWork`); `faces: true` also
+ *   gives `faces`, what each triangle was counted as (`FACE`, `faceKind`, `faceLean`): the very triangles the areas
+ *   below are sums of, for a picture that says what the words say
+ * @returns {{ height: number, box: number[], faces?: Uint8Array,
  *   supports: { area: number, skin: number, seam: number, bed: number, piece: number, shallow: number, places: number,
  *   bridged: number, span: number, reach: number, joints: number },
  *   leaning: { facing: 'up'|'down', tilt: number, area: number, rise: number }[],
@@ -313,7 +338,7 @@ function leaningFaces(bins, least) {
  *   all, `tip` whether it may tip, `small` whether its foot is small, `strip` whether it is a narrow strip under a
  *   wider piece (a round bar lying down), `off` whether its weight hangs past its foot
  */
-export function printCheck(vertProperties, numProp, triVerts, { turn = null, planes = [], made = null, work = PRINT_CHECK.spanWork } = {}) {
+export function printCheck(vertProperties, numProp, triVerts, { turn = null, planes = [], made = null, work = PRINT_CHECK.spanWork, faces: tell = false } = {}) {
   const P = vertProperties;
   const T = triVerts;
   const count = Math.floor(P.length / numProp);
@@ -353,6 +378,8 @@ export function printCheck(vertProperties, numProp, triVerts, { turn = null, pla
   let volume = 0;
   const com = [0, 0, 0];
   const bins = new Map();
+  const told = tell ? new Uint8Array(tris) : null; // what each triangle is counted as (`FACE`)
+  const binOf = tell ? new Int32Array(tris).fill(-1) : null; // the bin of each triangle that leans a little
   const over = []; // the triangles that may need supports
   const info = []; // for each: what is seen of it from below, its normal's z, and whether it is a glue face
   const up = [];
@@ -397,6 +424,7 @@ export function printCheck(vertProperties, numProp, triVerts, { turn = null, pla
       bin.n[2] += nzRaw / 2;
       bin.lo = Math.min(bin.lo, az, bz, cz);
       bin.hi = Math.max(bin.hi, top);
+      if (binOf) binOf[t] = key;
     }
     if (!(nz < OVERHANG_NZ) || top <= R.firstLayer) continue;
     const seam = planes.length > 0 && onPlane(T[3 * t] * numProp, T[3 * t + 1] * numProp, T[3 * t + 2] * numProp);
@@ -517,13 +545,15 @@ export function printCheck(vertProperties, numProp, triVerts, { turn = null, pla
         const seen = info[3 * i];
         const [span, ledge] = spans ? spans[at] : [Infinity, Infinity];
         if (leftOut(span, ledge)) return;
+        const t = over[i];
         if (span <= R.bridgeLong + 0.01) {
           supports.span += seen;
           supports.reach = Math.max(supports.reach, span);
+          if (told) told[t] = FACE.span;
           return;
         }
         counted = true;
-        const t = over[i];
+        if (told) told[t] = info[3 * i + 2] ? FACE.seam : FACE.skin;
         const a = T[3 * t] * 3, b = T[3 * t + 1] * 3, c = T[3 * t + 2] * 3;
         supports.area += seen;
         supports[info[3 * i + 2] ? 'seam' : 'skin'] += seen;
@@ -551,12 +581,20 @@ export function printCheck(vertProperties, numProp, triVerts, { turn = null, pla
   // thin tube on its ring stands on little, all round its outline
   const share = flat ? (across[0] * across[1]) / Math.max(box[0] * box[1], 1e-9) : 0;
   const small = flat && !strip && height > R.tall && ((contact < R.smallFoot && (ratio > R.slim || share < R.ringShare)) || share < R.footShare);
+  const leaning = leaningFaces(bins, Math.max(R.stepArea, R.stepShare * box[0] * box[1]));
+  if (told) {
+    for (let t = 0; t < tris; t++) {
+      const face = binOf[t] < 0 ? 0 : bins.get(binOf[t]).face;
+      if (face > 0 && face <= LEAN_FACES) told[t] |= face << 2;
+    }
+  }
   return {
     height,
     box,
     supports,
-    leaning: leaningFaces(bins, Math.max(R.stepArea, R.stepShare * box[0] * box[1])),
+    leaning,
     foot: { contact, across, base, ratio, flat, tip, small, strip, off },
+    ...(told ? { faces: told } : {}),
   };
 }
 
@@ -579,6 +617,19 @@ export function stepLines(leaning, layer = 0.2) {
 const round1 = (v) => Math.round(v * 10) / 10;
 
 /**
+ * The leaning faces a piece's row keeps, with their step lines at a layer height: the largest few, those facing up
+ * first. `face` is each one's number in `leaning`, from 1.
+ */
+function rowSteps(leaning, layer) {
+  const h = layer > 0 ? layer : 0.2;
+  return (leaning ?? [])
+    .map((f, i) => ({ ...stepLines([f], h)[0], face: i + 1 }))
+    .filter((f) => f.lines >= PRINT_CHECK.stepCount)
+    .sort((p, q) => (p.facing === 'up' ? 0 : 1) - (q.facing === 'up' ? 0 : 1) || q.area - p.area)
+    .slice(0, PRINT_CHECK.steps);
+}
+
+/**
  * A piece's check as its row carries it: rounded, with the step lines of the layer height and the brim a risky foot
  * wants.
  * @param {object} check from `printCheck`
@@ -593,10 +644,7 @@ const round1 = (v) => Math.round(v * 10) / 10;
  */
 export function checkRow(check, layer = 0.2) {
   const s = check.supports;
-  const steps = stepLines(check.leaning, layer)
-    .sort((p, q) => (p.facing === 'up' ? 0 : 1) - (q.facing === 'up' ? 0 : 1) || q.area - p.area)
-    .slice(0, PRINT_CHECK.steps)
-    .map((f) => ({ facing: f.facing, tilt: round1(f.tilt), area: Math.round(f.area), every: round1(f.every) }));
+  const steps = rowSteps(check.leaning, layer).map((f) => ({ facing: f.facing, tilt: round1(f.tilt), area: Math.round(f.area), every: round1(f.every) }));
   const f = check.foot;
   const risky = f.tip || f.small || f.strip;
   return {
@@ -617,6 +665,94 @@ export function checkRow(check, layer = 0.2) {
       brim: risky ? (!f.strip && f.ratio > PRINT_CHECK.tallRatio ? PRINT_CHECK.brimTall : PRINT_CHECK.brim) : 0,
     },
   };
+}
+
+/**
+ * What of a piece's check a picture of it shows, one number a triangle (`faceKind`, `faceLean`), so that the picture
+ * says what the piece's line says: the faces that may need supports only where the line says it may need them, a
+ * level span only where the line tells of one, and of the leaning faces only those the row keeps at this layer height.
+ * @param {object|null} check from `printCheck` with `faces: true`
+ * @param {number} layer the layer height, mm
+ * @param {object|null} told the check the piece's line is made from, where that is another (the piece itself, where
+ *   `check` is of a lighter copy shown in its place)
+ * @returns {Uint8Array|null} null without the check's `faces`
+ */
+export function shownFaces(check, layer = 0.2, told = null) {
+  if (!check?.faces) return null;
+  const said = (told ?? check).supports;
+  const supports = Math.round(said.area) >= PRINT_CHECK.none;
+  const span = Math.round(said.span) >= PRINT_CHECK.none;
+  const kept = new Set(rowSteps(check.leaning, layer).map((f) => f.face));
+  return check.faces.map((b) => {
+    const kind = faceKind(b);
+    const shown = kind === FACE.span ? span : kind !== FACE.none && supports;
+    return (shown ? kind : FACE.none) | (kept.has(faceLean(b)) ? faceLean(b) << 2 : 0);
+  });
+}
+
+/**
+ * Where the step lines fall on a piece's leaning faces, as line segments to draw on it. A slicer reads each layer's
+ * outline at the middle of the layer's height, so a line shows where the face crosses one of those levels: half a
+ * layer up from the bed, and every layer from there. They are about where the printer will leave them – the first
+ * layer may be of another height, and the mesh drawn may be a lighter copy.
+ *
+ * No more than `cap` segments are made: past that every second level is left out, then every fourth, and so on.
+ * @param {ArrayLike<number>} positions the piece's points as they are in the model, three numbers each
+ * @param {ArrayLike<number>} index three points a triangle
+ * @param {ArrayLike<number>} faces one number a triangle (`shownFaces`): only triangles of a leaning face are cut
+ * @param {{ turn?: number[]|null, layer?: number, cap?: number, lift?: number }} options `turn` the 4 × 4 matrix
+ *   (column-major) that lays the piece on the bed, the bed at z = 0; `layer` the layer height, mm; `cap` the most
+ *   segments; `lift` how far off the face the lines are drawn (mm), so they are not lost in it
+ * @returns {{ segments: Float32Array, lines: number, every: number }} `segments` six numbers each, the two ends as
+ *   they are in the model; `lines` how many; `every` 1 where every level is drawn, 2 for every second, …
+ */
+export function stepSegments(positions, index, faces, { turn = null, layer = 0.2, cap = 20000, lift = 0 } = {}) {
+  const h = layer > 0 ? layer : 0.2;
+  const m = turn ?? [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  const height = (v) => m[2] * positions[v] + m[6] * positions[v + 1] + m[10] * positions[v + 2] + m[14];
+  // the levels a triangle crosses: those above its lowest point, up to its highest
+  const levels = (lo, hi) => [Math.max(0, Math.floor(lo / h - 0.5) + 1), Math.floor(hi / h - 0.5)];
+  const tris = Math.min(Math.floor(index.length / 3), faces?.length ?? 0);
+  const leaning = [];
+  let most = 0;
+  for (let t = 0; t < tris; t++) {
+    if (!faceLean(faces[t])) continue;
+    const za = height(index[3 * t] * 3), zb = height(index[3 * t + 1] * 3), zc = height(index[3 * t + 2] * 3);
+    const [from, to] = levels(Math.min(za, zb, zc), Math.max(za, zb, zc));
+    if (to < from) continue;
+    leaning.push(t);
+    most += to - from + 1;
+  }
+  let every = 1;
+  while (most / every > Math.max(1, cap)) every *= 2;
+  const out = [];
+  for (const t of leaning) {
+    const v = [index[3 * t] * 3, index[3 * t + 1] * 3, index[3 * t + 2] * 3];
+    const z = v.map(height);
+    const [from, to] = levels(Math.min(...z), Math.max(...z));
+    // off the face along its own normal
+    let off = [0, 0, 0];
+    if (lift) {
+      const [a, b, c] = v;
+      const u = [positions[b] - positions[a], positions[b + 1] - positions[a + 1], positions[b + 2] - positions[a + 2]];
+      const w = [positions[c] - positions[a], positions[c + 1] - positions[a + 1], positions[c + 2] - positions[a + 2]];
+      const n = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+      const len = Math.hypot(n[0], n[1], n[2]);
+      if (len > 0) off = n.map((x) => (x / len) * lift);
+    }
+    for (let k = from + ((every - (from % every)) % every); k <= to; k += every) {
+      const at = (k + 0.5) * h;
+      const ends = [];
+      for (let e = 0; e < 3 && ends.length < 6; e++) {
+        const p = e, q = (e + 1) % 3;
+        if (z[p] < at === z[q] < at) continue;
+        const s = (at - z[p]) / (z[q] - z[p]);
+        for (let a = 0; a < 3; a++) ends.push(positions[v[p] + a] + s * (positions[v[q] + a] - positions[v[p] + a]) + off[a]);
+      }
+      if (ends.length === 6) out.push(...ends);
+    }
+  }
+  return { segments: Float32Array.from(out), lines: out.length / 6, every };
 }
 
 /** An area in plain words: "under 1 cm²", "about 12 cm²". */

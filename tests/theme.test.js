@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { APART_COLOR, CUT_COLOR } from '../src/split.js';
 import { ICONS, THEME_COLOR, THEME_KEY, applyTheme, storeTheme, storedTheme } from '../src/theme.js';
-import { LOCK_COLORS, TEXT_COLORS } from '../src/viewer.js';
+import { LOCK_COLORS, PRINT_COLORS, TEXT_COLORS } from '../src/viewer.js';
 
 const src = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../src');
 const styleCss = fs.readFileSync(path.join(src, 'style.css'), 'utf8');
@@ -175,10 +175,12 @@ describe("the legend's chips are what the view draws, in either look", () => {
     expect(classicLight['--cut']).toBe(hexOf(CUT_COLOR));
     expect(classicLight['--apart']).toBe(hexOf(APART_COLOR));
     for (const k of ['lock', 'lug', 'seat', 'over', 'bridge']) expect([k, classicLight[`--${k}`]]).toEqual([k, hexOf(LOCK_COLORS[k])]);
+    // the print check on the pieces as printed: supports, those under a glue face, a level span, the step lines
+    for (const [k, token] of [['support', '--support'], ['seam', '--support-seam'], ['span', '--span'], ['step', '--step']]) expect([k, classicLight[token]]).toEqual([k, hexOf(PRINT_COLORS[k])]);
   });
 
   it('leaves every colour that means something as it is in the cyberpunk look', () => {
-    for (const k of ['--cut', '--apart', '--amber', '--lock', '--model', '--pass', '--spot', '--lug', '--seat', '--over', '--bridge']) {
+    for (const k of ['--cut', '--apart', '--amber', '--lock', '--model', '--pass', '--spot', '--lug', '--seat', '--over', '--bridge', '--support', '--support-seam', '--span', '--step']) {
       if (k in cyber) expect([k, cyber[k]]).toEqual([k, classicLight[k]]);
     }
   });

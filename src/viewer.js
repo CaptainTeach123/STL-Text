@@ -54,6 +54,7 @@ import { placedAt, snapTolerance } from './aim.js';
 import { SEAT_WORD } from './locks.js';
 import { geometryFromBuffers } from './mesh.js';
 import { clickRadius, surfaceNormalAt } from './surfaceNormal.js';
+import { FACE, faceKind, faceLean, stepSegments } from './printCheck.js';
 import {
   APART_COLOR, CUT_COLOR, PIECE_COLORS, PIN_COLOR, TOO_BIG_COLOR, axisCuts, cellSizes, cutPlane, explodeOffset, letterFor, offsetAlongRay, pieceColorIndex, pieceColors,
   printTransform, printedFace, printedRow, snapTarget, triangleInBox, wayAt,
@@ -102,6 +103,16 @@ const TICK_COLORS = { seam: 0x64748b, spot: APART_COLOR, lip: 0xf59e0b, snapped:
  * are outlined. A base's tea-light seat, cut with its lock but no part of it, is violet.
  */
 export const LOCK_COLORS = Object.freeze({ lock: 0xff6a00, carry: 0xffb27a, lug: 0xffd60a, glow: 0xb84c00, over: 0xe11d48, bridge: 0xfacc15, seat: 0x8b5cf6 });
+
+/**
+ * The print check in the pieces view as printed, painted from what the check counted each triangle as (printCheck.js
+ * `shownFaces`): a face that may need supports red, as a lock's overhang is; one that is a glue face a paler red; a
+ * level span the printer is left to bridge amber; and the step lines of a big leaning face drawn dark across it.
+ */
+export const PRINT_COLORS = Object.freeze({ support: 0xe11d48, seam: 0xf9a8b8, span: 0xf59e0b, step: 0x111827 });
+/** The most step lines drawn on one piece, and how far off its faces they are drawn (mm) so they are not lost in them. */
+const STEP_LINES = 20000;
+const STEP_LIFT = 0.04;
 
 /** A part's circle in the model view: teal when its lock fits, amber when it only lifts off, red when it can't come out. */
 const PART_STATE_COLORS = { lock: APART_COLOR, lift: 0xf59e0b, stuck: COLORS.tooBig };
@@ -2080,13 +2091,15 @@ export class Viewer {
    * part taken out moves along its own way out (`ways`) as Spread pulls the
    * pieces apart, from the piece it comes out of.
    * @param {{ positions: Float32Array, normals?: Float32Array, index: Uint32Array, passthroughRanges?: number[][],
-   *           ranges: number[][], markRanges?: number[][], marks?: object[], parts?: object[] }|null} display
+   *           ranges: number[][], markRanges?: number[][], marks?: object[], parts?: object[], printed?: Uint8Array }|null} display
    *   `ranges[r] = [triStart, triCount, vertStart, vertCount]`, each self-contained; `parts[r]` is
    *   `{ kind: 'piece', index }`, `{ kind: 'pin', cell }` (a half-cell, between its two pieces) or `{ kind: 'part', id, cell }`;
    *   `markRanges[k] = [triStart, triCount, m]`, the triangles of lock `marks[m]` (`{ cutId, kind: 'lock'|'carry'|'lug'|'seat' }`,
-   *   'seat' a base's tea-light seat)
-   * @param {{ index: number, cell: number[], fits?: boolean, down?: string, yaw?: number }[]} [pieces] the result's
-   *   pieces; `fits: false` tints a piece red; `down` and `yaw` how it lies as printed
+   *   'seat' a base's tea-light seat); `printed` one number a triangle, what the print check counted it as
+   *   (printCheck.js `shownFaces`), painted on the pieces as printed
+   * @param {{ index: number, cell: number[], fits?: boolean, down?: string, yaw?: number, check?: { layer: number } }[]} [pieces]
+   *   the result's pieces; `fits: false` tints a piece red; `down` and `yaw` how it lies as printed; `check.layer` the
+   *   layer height its step lines are drawn at
    * @param {number[]|null} [grid] the number of cuts on each axis (from the pieces' cells without it)
    * @param {{ cutId: string, piece: number, home: number, point: number[], way: object, kind?: string, r?: number }[]} [ways]
    *   each part's piece, the piece it comes out of, a point on its axis (its circle's centre), its way out (a part
@@ -2186,10 +2199,22 @@ export class Viewer {
       // (both sides: an overhang faces down, away from a view from above, and shows through the piece faded round it)
       const over = slots.length ? new MeshStandardMaterial({ color: LOCK_COLORS.over, roughness: 0.5, metalness: 0.05, side: DoubleSide }) : null;
       if (over) materials.push(over);
+      // what the print check says of the piece's own faces, as printed (`display.printed`): materials of their own
+      // after those, for the faces that may need supports, the glue faces among them and the level spans
+      const from0 = part.kind === 'piece' ? display.printed?.subarray(t0, t0 + tc) : null;
+      const told = from0?.some((b) => b) ? from0 : null;
+      let paint = null;
+      if (told?.some((b) => faceKind(b))) {
+        cls ??= new Uint8Array(tc);
+        paint = {};
+        for (const [kind, colour] of [[FACE.skin, PRINT_COLORS.support], [FACE.seam, PRINT_COLORS.seam], [FACE.span, PRINT_COLORS.span]]) {
+          paint[kind] = materials.push(new MeshStandardMaterial({ color: colour, roughness: 0.5, metalness: 0.05, side: DoubleSide })) - 1;
+        }
+      }
       const mesh = new Mesh(geometry, cls ? materials : material);
       mesh.userData = { kind: part.kind, index: part.kind === 'piece' ? part.index : null };
       this.pieceGroup.add(mesh);
-      const entry = { mesh, kind: part.kind, index: part.kind === 'piece' ? part.index : null, cell, fits, cls, base: cls ? index.slice() : null, slots, over, printed: null, lines: null };
+      const entry = { mesh, kind: part.kind, index: part.kind === 'piece' ? part.index : null, cell, fits, cls, base: cls ? index.slice() : null, slots, over, told, paint, printed: null, lines: null, steps: null, shows: null };
       this.#groupPiece(entry);
       this.pieceEntries.push(entry);
       all.union(geometry.boundingBox);
@@ -2367,19 +2392,8 @@ export class Viewer {
    * the download saves it), its bottom on the grid, a gap between them.
    */
   #layoutPrinted() {
-    const shown = this.pieceEntries.filter((e) => e.kind === 'piece');
     const gap = this.#explodeGap(1);
-    const turned = new Map(); // piece index -> { R: Matrix4, size }
-    for (const e of shown) {
-      if (turned.has(e.index)) continue;
-      const box = new Box3();
-      for (const x of shown) if (x.index === e.index) box.union(x.mesh.geometry.boundingBox);
-      const p = this.pieceInfo?.get(e.index);
-      const { printMatrix } = printTransform({ min: box.min.toArray(), max: box.max.toArray() }, p?.down ?? '-z', p?.yaw ?? 0);
-      const M = new Matrix4().fromArray(printMatrix);
-      const lying = box.clone().applyMatrix4(M);
-      turned.set(e.index, { M, size: lying.getSize(new Vector3()) });
-    }
+    const turned = this.#printedTurns();
     const order = [...turned.keys()];
     const xs = printedRow(order.map((i) => turned.get(i).size.x), gap);
     const c = this.bounds.getCenter(new Vector3());
@@ -2397,29 +2411,66 @@ export class Viewer {
   }
 
   /**
-   * As printed, which of each piece's lock faces overhang more than 45° (red) and which are bridged ceilings
-   * (outlined), from their normals as the piece lies on the bed.
+   * How each piece is turned to lie on the bed, by its number: the matrix that lays it there (its `down` and `yaw`, as
+   * the download saves it; its middle over the origin, its bottom at z = 0) and its size lying so. All of a piece's
+   * shells go by the one box.
+   */
+  #printedTurns() {
+    const shown = this.pieceEntries.filter((e) => e.kind === 'piece');
+    const turned = new Map(); // piece index -> { M: Matrix4, size }
+    for (const e of shown) {
+      if (turned.has(e.index)) continue;
+      const box = new Box3();
+      for (const x of shown) if (x.index === e.index) box.union(x.mesh.geometry.boundingBox);
+      const p = this.pieceInfo?.get(e.index);
+      const { printMatrix } = printTransform({ min: box.min.toArray(), max: box.max.toArray() }, p?.down ?? '-z', p?.yaw ?? 0);
+      const M = new Matrix4().fromArray(printMatrix);
+      const lying = box.clone().applyMatrix4(M);
+      turned.set(e.index, { M, size: lying.getSize(new Vector3()) });
+    }
+    return turned;
+  }
+
+  /**
+   * As printed, what each piece asks of the printer, painted on it. Its own faces as the print check counted them
+   * (`told`, from the engine: the same pass the piece's line in the list is made from): those that may need supports
+   * red, the glue faces among them paler, a level span to bridge amber, and the step lines of a big leaning face drawn
+   * across it, about where they will fall. And of each piece's lock faces, which overhang more than 45° (red) and
+   * which are bridged ceilings (outlined), from their normals as the piece lies on the bed.
    */
   #classifyPrinted() {
     const R = new Matrix4();
     const n = new Vector3();
     const [a, b, c] = [new Vector3(), new Vector3(), new Vector3()];
+    const turned = this.#printedTurns();
     for (const e of this.pieceEntries) {
       this.#dropLines(e);
       e.printed = null;
-      if (!e.slots.length || e.kind !== 'piece') continue;
+      e.shows = null;
+      if (e.kind !== 'piece' || (!e.slots.length && !e.told)) continue;
+      const pos = e.mesh.geometry.attributes.position;
+      if (e.told) this.#drawSteps(e, turned.get(e.index)?.M);
+      if (!e.cls) continue;
       const p = this.pieceInfo?.get(e.index);
       const box = e.mesh.geometry.boundingBox;
       const { printMatrix } = printTransform({ min: box.min.toArray(), max: box.max.toArray() }, p?.down ?? '-z', p?.yaw ?? 0);
       R.fromArray(printMatrix);
-      const pos = e.mesh.geometry.attributes.position;
       const overAt = [e.mesh.material].flat().indexOf(e.over);
       const lockAt = new Set(e.slots.map((s) => [e.mesh.material].flat().indexOf(s.material)));
       const printed = e.cls.slice();
+      const shows = { support: false, seam: false, span: false, steps: !!e.steps };
       const edges = new Map(); // a bridged ceiling's edges, by their ends: those used once are its outline
       const key = (v) => `${v.x.toFixed(3)},${v.y.toFixed(3)},${v.z.toFixed(3)}`;
       for (let t = 0; t < printed.length; t++) {
-        if (!lockAt.has(printed[t])) continue;
+        if (!lockAt.has(printed[t])) {
+          // the piece's own face: as the print check counted it (an unrepaired triangle stays as it is)
+          const kind = e.paint && printed[t] !== LOOSE ? faceKind(e.told[t]) : FACE.none;
+          if (kind !== FACE.none) {
+            printed[t] = e.paint[kind];
+            shows[kind === FACE.skin ? 'support' : kind === FACE.seam ? 'seam' : 'span'] = true;
+          }
+          continue;
+        }
         a.fromBufferAttribute(pos, e.base[t * 3]).applyMatrix4(R);
         b.fromBufferAttribute(pos, e.base[t * 3 + 1]).applyMatrix4(R);
         c.fromBufferAttribute(pos, e.base[t * 3 + 2]).applyMatrix4(R);
@@ -2439,6 +2490,7 @@ export class Viewer {
         }
       }
       e.printed = printed;
+      e.shows = shows;
       const outline = [...edges.values()].filter((x) => x.n === 1);
       if (outline.length) {
         // drawn in the piece's own frame, so it goes where the piece goes
@@ -2460,12 +2512,34 @@ export class Viewer {
     }
   }
 
+  /**
+   * The step lines of a piece's big leaning faces, drawn across them where the face crosses the middle of each layer
+   * as the piece lies on the bed (`M`, the matrix that lays it there): about where the printer will leave them
+   * (printCheck.js `stepSegments`). In the piece's own frame, so they go where the piece goes.
+   */
+  #drawSteps(e, M) {
+    if (!M || !e.told.some((b) => faceLean(b))) return;
+    const layer = this.pieceInfo?.get(e.index)?.check?.layer ?? 0.2;
+    const { segments, lines } = stepSegments(e.mesh.geometry.attributes.position.array, e.base ?? e.mesh.geometry.index.array, e.told, { turn: M.elements, layer, cap: STEP_LINES, lift: STEP_LIFT });
+    if (!lines) return;
+    const line = new BufferGeometry();
+    line.setAttribute('position', new BufferAttribute(segments, 3));
+    e.steps = new LineSegments(line, new LineBasicMaterial({ color: PRINT_COLORS.step, transparent: true }));
+    e.steps.renderOrder = 11;
+    e.steps.raycast = () => {};
+    e.steps.userData.lines = lines;
+    e.mesh.add(e.steps);
+    e.shows = { support: false, seam: false, span: false, steps: true };
+  }
+
   #dropLines(e) {
-    if (!e.lines) return;
-    e.mesh.remove(e.lines);
-    e.lines.geometry.dispose();
-    e.lines.material.dispose();
-    e.lines = null;
+    for (const k of ['lines', 'steps']) {
+      if (!e[k]) continue;
+      e.mesh.remove(e[k]);
+      e[k].geometry.dispose();
+      e[k].material.dispose();
+      e[k] = null;
+    }
   }
 
   #stylePieces() {
@@ -2482,8 +2556,11 @@ export class Viewer {
       for (const m of new Set(materials)) {
         // a lock that glows shows through its piece faded round it; as printed every lock does, inside its piece faded
         // round it, so what it adds that overhangs shows, wherever it is
-        const lock = e.slots.some((s) => s.material === m) || m === e.over;
+        // and so does what the print check painted on a lock's piece
+        const painted = e.slots.length > 0 && !!e.paint && Object.values(e.paint).some((k) => materials[k] === m);
+        const lock = e.slots.some((s) => s.material === m) || m === e.over || painted;
         const lit = lock && (this.asPrinted || e.slots.some((s) => s.material === m && this.#lit(s.cutId)));
+        // (only a lock's piece is faded as printed: any other stays solid, what is painted on it seen from below)
         const o = lit ? stale : this.asPrinted && e.slots.length ? 0.4 * opacity : opacity;
         if (m.transparent !== o < 1) m.needsUpdate = true;
         m.transparent = o < 1;
@@ -2492,6 +2569,7 @@ export class Viewer {
       materials[0].emissive.setHex(!e.fits ? TOO_BIG_COLOR : focus != null && shown ? 0x262626 : 0);
       // a base's seat keeps its own violet, as the legend keys it: the lock's orange glow would turn it pink
       for (const s of e.slots) s.material.emissive.setHex(this.#lit(s.cutId) && s.kind !== 'seat' ? LOCK_COLORS.glow : 0);
+      if (e.steps) e.steps.material.opacity = stale * (shown ? 1 : 0.3);
     }
     for (const l of this.pieceLabels) {
       l.sprite.material.opacity = focus == null || l.index === focus ? stale : 0.35;
@@ -2601,6 +2679,21 @@ export class Viewer {
   /** Whether a lock's lugs are painted on the pieces shown, in their own colour. */
   get lugsShown() {
     return this.pieceEntries.some((e) => e.slots.some((x) => x.kind === 'lug'));
+  }
+
+  /**
+   * What of the print check is painted on the pieces as printed: faces that may need supports, glue faces among them,
+   * level spans to bridge, step lines. All false while the pieces are not shown as printed.
+   */
+  get printedShown() {
+    const out = { support: false, seam: false, span: false, steps: false };
+    for (const e of this.pieceEntries) for (const k of Object.keys(out)) if (e.shows?.[k]) out[k] = true;
+    return out;
+  }
+
+  /** How many step lines are drawn on the pieces as printed. */
+  get stepLinesShown() {
+    return this.pieceEntries.reduce((n, e) => n + (e.steps?.userData.lines ?? 0), 0);
   }
 
   /** The cuts whose twist-lock is painted on the pieces shown, in the order they first appear. */
@@ -2747,8 +2840,10 @@ export class Viewer {
   }
 
   /**
-   * As printed: each piece turned the way it lies on the bed and set on the grid in a row, the faces its lock adds
-   * that overhang more than 45° red and its bridged ceilings outlined; or the pieces apart again.
+   * As printed: each piece turned the way it lies on the bed and set on the grid in a row, with what the print check
+   * says of it painted on (`#classifyPrinted`): the faces that may need supports, the level spans, the step lines –
+   * and the faces its lock adds that overhang more than 45° red and its bridged ceilings outlined; or the pieces apart
+   * again.
    */
   setAsPrinted(on) {
     on = !!on;
@@ -2762,6 +2857,7 @@ export class Viewer {
     else {
       for (const e of this.pieceEntries) {
         e.printed = null;
+        e.shows = null;
         e.mesh.visible = true;
         this.#dropLines(e);
         this.#groupPiece(e);

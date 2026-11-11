@@ -12,7 +12,7 @@ import {
   APART_HOLDS, DIRECTIONS, FILAMENT, SPLIT_DEFAULTS, dirAxis, TO_PLANE, cellSizes, cellSupport, cutPlane, fitPieces, fitsBed, isSymmetric, keepCrossed, orientationStats, pegSizesFor,
   reachesCorner, sizesFor,
 } from '../src/split.js';
-import { PRINT_CHECK } from '../src/printCheck.js';
+import { FACE, OVERHANG_NZ, PRINT_CHECK, faceKind, faceLean } from '../src/printCheck.js';
 import { clearSplitCaches, dowelHole, halfHole, pegAt, pinAt, pinSolid, socketAt } from '../src/splitGeometry.js';
 import { lipLine, lipVerdict } from '../src/aim.js';
 import { setup, soupOf as soupGeometry } from './helpers.js';
@@ -3581,5 +3581,113 @@ describe('the print check', () => {
     expect(tee.pieces.map((p) => p.check.supports.area)).toEqual([300, 300]);
     expect(checks(tee).map((n) => n.text).join(' ')).not.toMatch(/supports/);
     expect(sheetOf(tee)).toMatch(/piece 1 of 2 .* fits – may need supports: about 3 cm², standing on the bed/);
+  });
+
+  /**
+   * What the pieces as shown are painted with as printed (`display.printed`), added up for each piece from the
+   * display's own triangles: by kind what is seen from below as the piece lies (`down`), the area of its leaning
+   * faces, and the least any painted face looks down.
+   */
+  const paintedOf = (r) => r.pieces.map((p) => {
+    const d = r.display;
+    const [t0, n] = d.ranges[d.parts.findIndex((x) => x.kind === 'piece' && x.index === p.index)];
+    const axis = 'xyz'.indexOf(p.down[1]);
+    const sign = p.down[0] === '-' ? 1 : -1; // the piece's up, along that axis
+    const seen = [0, 0, 0, 0];
+    let lean = 0;
+    let most = -1;
+    for (let t = t0; t < t0 + n; t++) {
+      const [a, b, c] = [0, 1, 2].map((k) => [...d.positions.subarray(d.index[3 * t + k] * 3, d.index[3 * t + k] * 3 + 3)]);
+      const u = b.map((v, i) => v - a[i]), w = c.map((v, i) => v - a[i]);
+      const nrm = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+      const area = Math.hypot(...nrm) / 2;
+      const up = (sign * nrm[axis]) / 2;
+      const kind = faceKind(d.printed[t]);
+      seen[kind] += Math.max(0, -up);
+      if (kind) most = Math.max(most, up / area);
+      if (faceLean(d.printed[t])) lean += area;
+    }
+    return { seen, lean, most };
+  });
+  const unpainted = (r) => r.display.parts.flatMap((x, i) => (x.kind === 'piece' ? [] : [r.display.ranges[i]])).every(([t0, n]) => r.display.printed.subarray(t0, t0 + n).every((b) => b === 0));
+
+  it('the pieces as shown carry what the check counted each triangle as, for the view as printed', async () => {
+    // the table's top, 30 cm² over the bed on each piece: the very faces its line tells of
+    await load(table(), 'table');
+    const r = await resultSplit(S({ orient: 'model', labels: false }));
+    expect(r.display.printed).toBeInstanceOf(Uint8Array);
+    expect(r.display.printed.length).toBe(r.display.index.length / 3);
+    expect(r.pieces.map((p) => p.check.supports.skin)).toEqual([3000, 3000]);
+    for (const p of paintedOf(r)) {
+      expect(p.seen[FACE.skin]).toBeCloseTo(3000, 1);
+      expect(p.seen[FACE.seam] + p.seen[FACE.span]).toBe(0);
+      expect(p.most).toBeLessThan(OVERHANG_NZ);
+      expect(p.lean).toBe(0);
+    }
+    // the pins have files of their own: nothing of them is painted
+    expect(r.display.parts.some((x) => x.kind === 'pin')).toBe(true);
+    expect(unpainted(r)).toBe(true);
+    // laid the best side down nothing hangs over, and nothing is painted
+    const best = await resultSplit(S({ labels: false }));
+    expect(best.pieces.map((p) => p.check.supports.area)).toEqual([0, 0]);
+    expect(best.display.printed.every((b) => b === 0)).toBe(true);
+    // pieces lying on their sides are painted as they lie
+    await load(own(wasm.Manifold.union([cube([30, 30, 30]), cube([100, 20, 20]), cube([20, 100, 20]), cube([20, 20, 100])])), 'jack');
+    const jack = await resultSplit(S({ cuts: [cutAt(0, 20)], labels: false }));
+    paintedOf(jack).forEach((p, i) => {
+      const s = jack.pieces[i].check.supports;
+      expect(p.seen[FACE.skin], `piece ${i + 1} lying ${jack.pieces[i].down}`).toBeCloseTo(s.skin, 0);
+      expect(p.seen[FACE.seam]).toBeCloseTo(s.seam, 0);
+      if (s.area > 0) expect(p.most).toBeLessThan(OVERHANG_NZ);
+    });
+    expect(jack.pieces.some((p) => p.down !== '-z' && p.check.supports.area >= PRINT_CHECK.none)).toBe(true);
+    // a level span the printer bridges: a tunnel 24 mm wide through a block
+    await load(own(cube([60, 120, 30], [0, 0, 15]).subtract(cube([24, 130, 12], [0, 0, 6]))), 'tunnel');
+    const tunnel = await resultSplit(S({ cuts: [cutAt(1, 0)], orient: 'model', labels: false }));
+    paintedOf(tunnel).forEach((p, i) => {
+      expect(tunnel.pieces[i].check.supports.span).toBeGreaterThan(1000);
+      expect(p.seen[FACE.span]).toBeCloseTo(tunnel.pieces[i].check.supports.span, 0);
+      expect(p.seen[FACE.skin]).toBe(0);
+    });
+  });
+
+  it('the leaning faces its row tells of are marked for their step lines, at the layer height chosen', async () => {
+    await load(leaningBlock(3), 'wedge');
+    const r = await resultSplit(S({ labels: false }));
+    expect(r.pieces.map((p) => p.check.steps.map((f) => f.area))).toEqual([[8011], [8011]]);
+    for (const p of paintedOf(r)) {
+      expect(p.lean).toBeCloseTo(8011, 0);
+      expect(p.seen[FACE.skin]).toBe(0);
+    }
+    // at layers so thick the face climbs under two of them the row tells of none, and none is marked
+    const thick = await client.result([], version, { printing: { nozzle: 0.4, layerHeight: 3 }, split: S({ labels: false }), bed: BED });
+    expect(thick.pieces.map((p) => p.check.steps)).toEqual([[], []]);
+    expect(thick.display.printed.every((b) => b === 0)).toBe(true);
+    // and back
+    const again = await resultSplit(S({ labels: false }));
+    expect([...again.display.printed]).toEqual([...r.display.printed]);
+  });
+
+  it('a split shown through lighter copies is painted from the same check of what is shown', async () => {
+    // an engine that shows any split through lighter copies
+    const engine = createEngine({ wasm, lodTriangles: 10 });
+    const light = createEngineClient({ createWorker: () => createLocalWorker(Promise.resolve(engine)) });
+    // a table with a finely faceted round leg, so the lighter copy has other triangles than the piece
+    const leg = own(own(wasm.Manifold.cylinder(30, 10, 10, 720)).translate([0, 0, 0]));
+    const top = cube([120, 60, 10], [0, 0, 35]);
+    const solid = own(wasm.Manifold.union([leg, top]));
+    await light.loadBase({ kind: 'stl', bytes: stlOf(solid), name: 'table', version: 1 });
+    const r = await light.result([], 1, { printing, split: S({ orient: 'model', labels: false }), bed: BED });
+    await load(solid, 'table');
+    const full = await resultSplit(S({ orient: 'model', labels: false }));
+    expect(r.display.index.length).toBeLessThan(full.display.index.length);
+    expect(r.pieces.map((p) => p.check)).toEqual(full.pieces.map((p) => p.check));
+    expect(r.display.printed.length).toBe(r.display.index.length / 3);
+    paintedOf(r).forEach((p, i) => {
+      expect(p.seen[FACE.skin]).toBeCloseTo(r.pieces[i].check.supports.skin, 0);
+      expect(p.most).toBeLessThan(OVERHANG_NZ);
+    });
+    expect(r.pieces[0].check.supports.skin).toBeGreaterThan(2000);
+    light.dispose?.();
   });
 });

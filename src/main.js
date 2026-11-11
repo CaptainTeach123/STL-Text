@@ -2088,19 +2088,21 @@ function lockFocus() {
 }
 
 /**
- * The lock's tools under the pieces: ▶ Show how it comes apart where a part moves along its way out, Look at the lock
- * where it has a lock (Look at the seat once a base's lock with a tea-light seat is looked at), As printed; the
- * legend's chips for the lock (and, as printed, its overhang and bridges) and for a base's seat; and what the part is
- * doing while it moves.
+ * The tools of the pieces view. As printed, beside Spread, for any pieces: each as its file lies on the bed, with what
+ * the print check says of it painted on, and the legend's chips for that. And the lock's tools under the pieces: ▶
+ * Show how it comes apart where a part moves along its way out, Look at the lock where it has a lock (Look at the seat
+ * once a base's lock with a tea-light seat is looked at); the legend's chips for the lock (and, as printed, its
+ * overhang and bridges) and for a base's seat; and what the part is doing while it moves.
  */
 function syncLockTools() {
   const pieces = viewer.viewMode === 'pieces';
   const ways = pieces ? viewer.partWays : [];
   const locks = pieces ? viewer.lockCuts : [];
-  // As printed is a look at a part's pieces: it goes when they do – the view left, or pieces with no part shown –
-  // so the next pieces are spread apart again, never laid out with nothing on screen to turn it off
-  if (viewer.asPrinted && !ways.length && !locks.length) viewer.setAsPrinted(false);
+  // As printed is a look at the pieces: it goes when they do – the view left – so the next pieces are spread apart
+  // again, never laid out with nothing on screen to turn it off
+  if (viewer.asPrinted && !pieces) viewer.setAsPrinted(false);
   $('spreadField').hidden = !pieces || viewer.asPrinted;
+  $('asPrintedField').hidden = !pieces;
   syncLegend();
   $('lockPanel').hidden = !ways.length && !locks.length;
   $('playWayBtn').hidden = !ways.length;
@@ -2120,6 +2122,12 @@ function syncLockTools() {
   $('legendSeat').hidden = !pieces || !viewer.seatCuts.length;
   $('legendOver').hidden = !(locks.length && viewer.asPrinted);
   $('legendBridge').hidden = !(locks.length && viewer.asPrinted);
+  // what the print check says of the pieces, painted on them as printed
+  const shown = viewer.printedShown;
+  $('legendSupport').hidden = !shown.support;
+  $('legendSeam').hidden = !shown.seam;
+  $('legendSpan').hidden = !shown.span;
+  $('legendSteps').hidden = !shown.steps;
   syncWayCaption();
 }
 

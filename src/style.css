@@ -1373,11 +1373,39 @@ ul.plan#cutList {
   color: var(--err);
   font-weight: 600;
 }
-/* the print check of a piece, on a line of its own under it */
+/* the print check of a piece, on a line of its own under it, and its estimate on the next */
+#pieceList .print-estimate,
 #pieceList .print-check {
   display: block;
   color: var(--muted);
   font-size: 0.92em;
+}
+
+/* under the pieces: what the whole job takes, and the suggestions for the slicer */
+.print-plan {
+  margin-top: 6px;
+}
+.print-plan.stale {
+  color: var(--muted);
+}
+#printPlanJob span {
+  display: block;
+}
+#printPlanJob span:first-child {
+  color: var(--text);
+}
+/* a small note that wraps: in the plan, and under Material and Infill in the Printing card */
+.hint.plan-note {
+  font-size: 11px;
+  margin: 4px 0;
+}
+.print-plan summary {
+  cursor: pointer;
+  font-size: 0.92em;
+}
+.print-plan ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
 }
 
 /* where a dragged cut is and how long the pieces either side of it are, next to its handle; where a cut being placed

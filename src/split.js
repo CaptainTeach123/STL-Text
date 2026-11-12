@@ -23,6 +23,7 @@
  */
 import { TEA_LIGHT, roundAngle, roundOpening, wayWords } from './locks.js';
 import { OVERHANG_NZ, PRINT_CHECK, checkNote, checkNoteWords, checkWords } from './printCheck.js';
+import { planSheetLines } from './printPlan.js';
 import { boxHang, columnGraph, columnsOf, HANG, hangAt, looseTable, planeGrid, rasterRings, sampleWidths } from './hang.js';
 
 // ---------- printers ----------
@@ -45,6 +46,9 @@ export const BED_PRESETS = Object.freeze({
   coreonel: Object.freeze({ label: 'Prusa CORE One L', size: Object.freeze([300, 300, 330]) }),
   custom: Object.freeze({ label: 'Custom', size: null }),
 });
+
+/** The printers that print fast: the print plan's rough time goes by this (printPlan.js). The rest are ordinary. */
+export const FAST_PRESETS = Object.freeze(['a1mini', 'bambux1', 'bambua1', 'mk4s', 'coreone', 'coreonel']);
 
 /**
  * The bed setting a new user starts with. A piece that is too big ruins a
@@ -5990,7 +5994,10 @@ function fitWords(fit) {
  *   (`holes`, `holeSummary`) are said in a clause on its line; `pins` one group per pin size (count without spares, `sheets` its pins files); `bed` the usable bed (with the
  *   corner it keeps clear, the pieces that must be moved clear of it are told so); `printer` the printer itself, when
  *   known, for the heading (`corner` the sides of the corner it keeps clear); `bridges` the clips' bridges' lengths as built (each
- *   hold's own on a 1.6 mm tongue when not given); `fit` the PART_FIT note's fields, for what the fit test holds
+ *   hold's own on a 1.6 mm tongue when not given); `fit` the PART_FIT note's fields, for what the fit test holds;
+ *   `estimate` what the PRINT PLAN block is worked out for (printPlan.js `planOptions`: material, infill, nozzle,
+ *   layerHeight, fast) with the separately printed parts as measured (`parts`) and the built-in pegs' size
+ *   (`pegSize`) – the block is written where the pieces carry their `volume` and `area`, and left out where none does
  * @returns {string}
  */
 export function howToGlueText(plan) {
@@ -6083,6 +6090,11 @@ export function howToGlueText(plan) {
   }
   if (anyPins || anyPegs || anyTabs || anyLip || locked.length) out.push(`  Not sure about the fit? Print the fit test first (Split card → Download fit test)${fitWords(fit)}.`);
   out.push('');
+
+  // about how much plastic and time the job takes, and a few suggestions for the slicer: worked out by the code the
+  // pieces list uses, for the material and infill chosen there (PLA and 15 % where the sheet is asked for without)
+  const planned = planSheetLines({ pieces, pins, parts: plan.estimate?.parts ?? [], pegSize: plan.estimate?.pegSize ?? null }, plan.estimate ?? {}, bed);
+  if (planned.length) out.push(...planned, '');
 
   if (!steps.length) {
     // the cuts ran only through gaps (between the letters of a sign, say): no two pieces touch

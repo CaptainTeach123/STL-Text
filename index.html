@@ -522,6 +522,14 @@
             <span class="hint">Sizes of the boxes between the cuts.</span>
             <button type="button" id="showPiecesBtn" class="btn small" title="Work out the real pieces, their joints and how each one lies">Show pieces</button>
           </div>
+          <div class="print-plan" id="printPlan" hidden>
+            <p class="hint" id="printPlanJob"></p>
+            <p class="hint plan-note">The files are solid models. Your slicer prints them mostly hollow: a few walls outside and a light pattern (the infill) inside. Choose the material and infill in the Printing card below.</p>
+            <details id="printPlanAdvice">
+              <summary>Suggestions for your slicer</summary>
+              <ul class="hint" id="printPlanAdviceList"></ul>
+            </details>
+          </div>
           <ul class="notes" id="splitNotes" aria-live="polite"></ul>
         </section>
 
@@ -532,6 +540,11 @@
             <label class="field inline"><span>Nozzle</span><input type="number" id="nozzle" min="0.1" max="2" step="0.05" value="0.4" /><span class="unit">mm</span></label>
             <label class="field inline"><span>Layer</span><input type="number" id="layerHeight" min="0.04" max="1" step="0.02" value="0.2" /><span class="unit">mm</span></label>
           </div>
+          <div class="grid2" title="What the print estimate is worked out for. Neither changes a downloaded model">
+            <label class="field inline"><span>Material</span><select id="planMaterial"></select></label>
+            <label class="field inline"><span>Infill</span><input type="number" id="planInfill" min="0" max="100" step="5" value="15" /><span class="unit">%</span></label>
+          </div>
+          <p class="hint plan-note">For the print estimate only (weight, filament, rough time), which takes 2 walls. Downloads are solid models: the slicer makes them mostly hollow, with the infill you set there.</p>
           <div class="tools">
             <label class="field inline" title="The printer the pieces of a split must fit"><span>Printer</span><select id="bedPreset"></select></label>
             <p class="hint tiny" id="bedCornerHint" hidden>Keeps its front-left corner clear, as Bambu Studio does.</p>

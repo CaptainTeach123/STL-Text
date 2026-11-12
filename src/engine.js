@@ -52,10 +52,15 @@ import { HANG, columnGraph, columnsOf, heldParts, looseTable, moveCut, planeGrid
  *                                                          the file's numbers in mm, left out of its size)
  *   preview     { item, baseVersion, printing }         -> { empty } | { geometry, bounds, stats, notes }
  *   result      { items, baseVersion, printing, split?, bed?, largest? }
- *                                                       -> { display, notes, info }
- *                                                          (+ pieces, grid, seams, diameter, pegSize with a split)
- *   export      { items, baseVersion, name, printing, split?, bed?, printer?, archive?: 'zip'|'files', largest? }
- *                                                       -> { stl, triangles, notes, extra }
+ *                                                       -> { display, notes, info, measures }
+ *                                                          (+ pieces, grid, seams, diameter, pegSize with a split;
+ *                                                          `measures` what the print plan is worked out from besides
+ *                                                          the pieces' own volume and area: `whole` – the model's
+ *                                                          volume, area and size, without a split – `pins` and
+ *                                                          `parts`, printPlan.js)
+ *   export      { items, baseVersion, name, printing, split?, bed?, printer?, archive?: 'zip'|'files', largest?,
+ *                 printPlan?: { material, infill, fast } }  (what the sheet's PRINT PLAN is worked out for)
+ *                                                       -> { stl, triangles, notes, extra, measures }
  *                                                          (stl null, + files, zip, pieces, seams, assembly, diameter,
  *                                                          pegSize with a split; a part taken out is a piece with its
  *                                                          `name` and `part` (its cut's id), and its seam has `joint:
@@ -2229,16 +2234,20 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       bvhRoots: [],
     };
     return {
-      message: { display, notes: parted ? [...final.notes, ...parted.notes] : final.notes, skipped: final.skipped, info: { triangles: d.index.length / 3 } },
+      message: {
+        display, notes: parted ? [...final.notes, ...parted.notes] : final.notes, skipped: final.skipped, info: { triangles: d.index.length / 3 },
+        // the model as measured, for the print estimate: the solid is built already, so this costs one pass
+        measures: planMeasures(final),
+      },
       transfer: [display.positions.buffer, display.normals.buffer, display.index.buffer],
     };
   }
 
-  function exportStl({ items, baseVersion, printing, name = 'model', split = null, bed = null, printer = null, archive = 'zip', largest = 0 }, progress) {
+  function exportStl({ items, baseVersion, printing, name = 'model', split = null, bed = null, printer = null, archive = 'zip', largest = 0, printPlan = null }, progress) {
     unsplit(split);
     const final = finalFor(items, baseVersion, printing, progress);
     const parted = splitFor(final, items, { split, bed, printing, largest }, progress);
-    if (parted?.cut) return splitExport(final, parted, { name, printer, archive }, progress);
+    if (parted?.cut) return splitExport(final, parted, { name, printer, archive, printing, printPlan }, progress);
     releaseSplit(final);
     const soup = concatSoups([final.solid ? manifoldToSoup(final.solid) : null, final.passthrough]);
     if (!soup || !soup.length) fail('EMPTY_RESULT', 'There is nothing to export yet. Type some text or load a model.');
@@ -2255,7 +2264,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     // and what printing it as it stands asks of the printer, where there is something to say
     const checked = wholeCheckNote(final, printing);
     return {
-      message: { stl, triangles: soup.length / 9, notes: [...notes, ...(placed ? [placed] : []), ...(checked ? [checked] : [])], skipped: final.skipped, extra },
+      message: {
+        stl, triangles: soup.length / 9, notes: [...notes, ...(placed ? [placed] : []), ...(checked ? [checked] : [])], skipped: final.skipped, extra,
+        measures: planMeasures(final),
+      },
       transfer: [stl, ...extra.map((e) => e.stl)],
     };
   }
@@ -2273,6 +2285,42 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     } catch {
       return null;
     }
+  }
+
+  /**
+   * A solid's volume (mm³) and surface (mm²), for the print plan (printPlan.js); null where it could not be measured:
+   * the plan only informs, and goes without.
+   */
+  function measureOf(solid) {
+    try {
+      const volume = solid.volume();
+      const area = solid.surfaceArea();
+      return volume > 0 && area > 0 ? { volume, area } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * What the print plan is worked out from besides a split's pieces: a model printed whole as measured (`whole`: its
+   * volume, surface and size, `partial` where unrepaired triangles are left out of it; null without a solid) and the
+   * parts printed separately, each lying as its file lies. Measured once and kept on the result.
+   */
+  function planMeasures(final, { whole = true } = {}) {
+    if (whole && final.measure === undefined) {
+      const m = final.solid ? measureOf(final.solid) : null;
+      const b = m ? boxOf(final.solid) : null;
+      final.measure = m ? { ...m, size: b.max.map((v, a) => v - b.min[a]), ...(final.passthrough.length ? { partial: true } : {}) } : null;
+    }
+    const parts = final.separate.map((p) => {
+      if (p.measure === undefined) {
+        const m = measureOf(p.local);
+        const b = m ? boxOf(p.local) : null;
+        p.measure = m ? { ...m, height: b.max[2] - b.min[2] } : null;
+      }
+      return { name: p.name, ...(p.measure ?? {}) };
+    });
+    return { ...(whole ? { whole: final.measure } : {}), parts };
   }
 
   /**
@@ -2589,12 +2637,15 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * lies. Kept with the drill stage for as long as a piece lies the same way, so only the first result of a split
    * reads the pieces; the layer height comes in later (`checkRow`). `final` is the model the faces are told by, before
    * any part was taken out of it. A piece whose check could not be made is left out. Each check keeps what every
-   * triangle was counted as (`faces`), for the picture of the pieces as printed (`printedFaces`).
+   * triangle was counted as (`faces`), for the picture of the pieces as printed (`printedFaces`). While the pieces
+   * are to hand each is measured as well, once (`drill.measures`: its volume and its surface, for the print plan).
    */
   function pieceChecks(final, split, progress) {
     const { drill, laid, lying, cuts } = split;
     drill.checks ??= new Map();
-    const wanted = laid.map((p, i) => i).filter((i) => drill.checks.get(laid[i].index)?.down !== lying[i].down);
+    drill.measures ??= new Map();
+    const stale = (i) => drill.checks.get(laid[i].index)?.down !== lying[i].down;
+    const wanted = laid.map((p, i) => i).filter((i) => stale(i) || !drill.measures.has(laid[i].index));
     if (wanted.length) {
       progress?.('Checking how each piece prints…');
       const own = ownFaces(final);
@@ -2604,6 +2655,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const { solids, owned } = held ? { solids: held, owned: false } : drilledSolids(split.final, split, progress);
       try {
         for (const i of wanted) {
+          if (!drill.measures.has(laid[i].index)) drill.measures.set(laid[i].index, measureOf(solids[i]));
+          if (!stale(i)) continue;
           const mesh = solids[i].getMesh();
           const check = checkOf(mesh, { turn: LAY_DOWN[lying[i].down], planes, made: madeFaces(mesh, own), faces: true });
           drill.checks.set(laid[i].index, { down: lying[i].down, check });
@@ -3267,6 +3320,20 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     }
   }
 
+  /** The volume of one printed pin of a group's size (mm³), for the print plan; 0 where it could not be made. */
+  function pinVolume(g) {
+    try {
+      const pin = pinAt({ axis: 2, centre: [0, 0, 0], d: g.d, depth: g.length / 2 });
+      try {
+        return pin.volume();
+      } finally {
+        pin.delete();
+      }
+    } catch {
+      return 0;
+    }
+  }
+
   /** The drilled pieces for this call: kept (borrowed), or drilled again from the kept layout (`owned`). */
   function drilledSolids(final, split, progress) {
     const { cut, drill } = split;
@@ -3349,6 +3416,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   function summarise(split) {
     const { final, spec, cuts, U, given, plan, cut, laid, lying, drill, parted = null, keeps = [], cap = Infinity, wide = null, checks = null, hl = 0.2 } = split;
     const { layout } = drill;
+    const measures = drill.measures ?? new Map();
     const n = laid.length;
     const lips = layout.lips ?? [];
     const { twisted, unbuilt, held } = builtHolds(layout);
@@ -3409,6 +3477,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         holes: { upright: holes.get(p.index).upright, pointed: holes.get(p.index).pointed, flat: holes.get(p.index).flat, round: holes.get(p.index).round },
         // the print check of the piece as drilled, lying this way: supports, step lines and what it stands on
         ...(checks?.has(p.index) ? { check: checkRow(checks.get(p.index), hl) } : {}),
+        // its volume (mm³) and surface (mm²) as drilled, for the print plan; a piece that could not be measured goes
+        // by its volume as cut, with no surface
+        ...(measures.get(p.index) ?? (p.volume > 0 ? { volume: p.volume, area: null } : {})),
         // the built-in pegs it carries, and the sockets it has for another piece's
         pegs: layout.pegs.filter((g) => g.sides.some((s) => s.peg && s.piece === p.index)).length,
         sockets: layout.pegs.filter((g) => g.sides.some((s) => !s.peg && s.piece === p.index)).length,
@@ -3482,7 +3553,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         const own = spec.pins === 'own' || g.d === FILAMENT;
         const spares = own ? 0 : pinSpares(g.count);
         // as many pins files as the bed takes them, as the download lays them out (`splitExport`)
-        return { ...g, own, spares, sheets: own ? 0 : Math.ceil((g.count + spares) / pinsPerSheet(g, U).perSheet) };
+        return { ...g, own, spares, sheets: own ? 0 : Math.ceil((g.count + spares) / pinsPerSheet(g, U).perSheet), ...(own ? {} : { volume: pinVolume(g) }) };
       });
     const notes = [];
     const main = pins[0];
@@ -3605,6 +3676,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     };
   }
 
+  /** A split's pin groups as the print plan takes them: each size's count, spares and one pin's volume. */
+  const planPins = (pins) => pins.map((g) => ({ d: g.d, length: g.length, count: g.count, spares: g.spares, own: g.own, volume: g.volume ?? 0 }));
+
   /** The `result` reply with a split: the pieces exploded apart in the viewer, one range per piece, pin and part. */
   function splitResult(final, split, progress) {
     const { cut, drill } = split;
@@ -3692,6 +3766,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         seams: split.seams,
         diameter: split.diameter,
         pegSize: split.pegSize,
+        // what the print plan needs besides the pieces: the pins to print and the parts printed separately
+        measures: { pins: planPins(split.pins), ...planMeasures(final, { whole: false }) },
         notes: [...final.notes, ...split.notes],
         skipped: final.skipped,
         info: { triangles: d.index.length / 3, pieces: split.pieces.length },
@@ -3736,7 +3812,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * the pins files of each pin size (as many as the bed needs), the separately printed parts and the glue
    * sheet, packed in one zip (`archive: 'zip'`) or sent as separate files.
    */
-  function splitExport(final, split, { name, printer, archive }, progress) {
+  function splitExport(final, split, { name, printer, archive, printing = null, printPlan = null }, progress) {
     const { laid, drill, lying, U, spec } = split;
     const n = laid.length;
     const files = [];
@@ -3792,10 +3868,14 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const assembly = assemblySteps({ pieces: split.pieces, seams, loose: [...(split.loose ?? []), ...(split.last ?? [])] });
     // the clips' bridges as built: a wide nozzle's lock has longer ones
     const bridges = [...new Set((drill.layout.lips ?? []).filter((l) => l.clips > 0 && l.i > 0).map((l) => clipShape(l.hold, l.c, l.t).span))];
+    const measures = planMeasures(final, { whole: false });
     const text = howToGlueText({
       name, pieces: split.pieces, seams, pins: split.pins, parts: final.separate.map((p) => ({ name: p.name })), loose: split.loose ?? [],
       clearance: spec.clearance, bed: U, printer, steps: assembly, ...(bridges.length ? { bridges } : {}),
       fit: split.notes.find((n) => n.code === 'PART_FIT') ?? null,
+      // the print plan: what it is worked out for (the material and infill chosen, the nozzle and layers), and the
+      // separately printed parts as measured
+      estimate: { ...(printPlan ?? {}), nozzle: printing?.nozzle, layerHeight: printing?.layerHeight, parts: measures.parts, pegSize: split.pegSize ?? null },
     });
     // a split that takes out parts and glues nothing has a sheet to print and fit the pieces by, and is called so
     const glue = glueFileName(name, { parts: split.partSeams.length > 0, glued: assembly.some((s) => !s.apart) });
@@ -3804,6 +3884,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const message = {
       stl: null, triangles, notes: [...final.notes, ...split.notes], skipped: final.skipped, extra: [],
       pieces: split.pieces, seams: split.seams, assembly: assembly.map((s) => s.text), diameter: split.diameter, pegSize: split.pegSize,
+      measures: { pins: planPins(split.pins), ...measures },
     };
     if (archive === 'files') {
       message.files = files;

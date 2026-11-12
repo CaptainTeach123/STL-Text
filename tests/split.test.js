@@ -13,6 +13,7 @@ import {
   reachesCorner, sizesFor,
 } from '../src/split.js';
 import { FACE, OVERHANG_NZ, PRINT_CHECK, faceKind, faceLean } from '../src/printCheck.js';
+import { estimateJob, gramsWords, planOptions, planSheetLines } from '../src/printPlan.js';
 import { clearSplitCaches, dowelHole, halfHole, pegAt, pinAt, pinSolid, socketAt } from '../src/splitGeometry.js';
 import { lipLine, lipVerdict } from '../src/aim.js';
 import { setup, soupOf as soupGeometry } from './helpers.js';
@@ -3730,5 +3731,149 @@ describe('the print check', () => {
     });
     expect(r.pieces[0].check.supports.skin).toBeGreaterThan(2000);
     light.dispose?.();
+  });
+});
+
+describe('the print plan', () => {
+  const sheetOf = (ex) => ex.files.find((f) => f.kind === 'text').text;
+  /** The PRINT PLAN block of a sheet: from its heading to the blank line after it. */
+  const blockOf = (sheet) => sheet.slice(sheet.indexOf('PRINT PLAN')).split('\n\n')[0].split('\n');
+
+  it('every piece is measured as drilled: its volume and its surface, the same shown and downloaded', async () => {
+    const bar = cube([300, 40, 20]);
+    await load(bar, 'bar');
+    const r = await resultSplit(S({ labels: false, diameter: 5 }));
+    expect(r.pieces).toHaveLength(2);
+    for (const p of r.pieces) {
+      expect(p.volume).toBeGreaterThan(0);
+      expect(p.area).toBeGreaterThan(0);
+    }
+    // the two halves are the bar less its pin holes, which are small
+    const whole = bar.volume();
+    const sum = r.pieces.reduce((v, p) => v + p.volume, 0);
+    expect(sum).toBeLessThan(whole);
+    expect(sum).toBeGreaterThan(0.98 * whole);
+    // each half has the bar's faces, its cut face, and the walls of its holes besides
+    for (const p of r.pieces) expect(p.area).toBeGreaterThan(2 * (150 * 40 + 150 * 20 + 40 * 20));
+    const ex = await exportSplit(S({ labels: false, diameter: 5 }), { name: 'bar' });
+    expect(ex.pieces.map((p) => [p.volume, p.area])).toEqual(r.pieces.map((p) => [p.volume, p.area]));
+    // a piece's file holds what was measured
+    ex.files.filter((f) => f.kind === 'piece').forEach((f, i) => expect(volumeOfStl(f.stl)).toBeCloseTo(ex.pieces[i].volume, 0));
+  });
+
+  it('the printed pins come with one pin\'s volume, and pins the user cuts with none', async () => {
+    await load(cube([300, 40, 20]), 'bar');
+    const r = await resultSplit(S({ labels: false, diameter: 5 }));
+    expect(r.measures.parts).toEqual([]);
+    expect(r.measures.pins).toHaveLength(1);
+    const [g] = r.measures.pins;
+    expect(g).toMatchObject({ d: 5, own: false });
+    expect(g.count).toBeGreaterThan(0);
+    // an eight-sided pin with chamfered ends: a little under the round bar it is cut from
+    const round = Math.PI * 2.5 ** 2 * g.length;
+    expect(g.volume).toBeLessThan(round);
+    expect(g.volume).toBeGreaterThan(0.8 * round);
+    const ex = await exportSplit(S({ labels: false, diameter: 5 }), { name: 'bar' });
+    expect(ex.measures).toEqual(r.measures);
+    // the pins file holds that many of them
+    const file = ex.files.find((f) => f.kind === 'pins');
+    expect(volumeOfStl(file.stl)).toBeCloseTo(g.volume * file.count, 0);
+    const mine = await resultSplit(S({ labels: false, diameter: 5, pins: 'own' }));
+    expect(mine.measures.pins.map((x) => [x.own, x.volume])).toEqual([[true, 0]]);
+  });
+
+  it('the sheet has a PRINT PLAN block after the PRINT lines, worked out as the page works it out', async () => {
+    await load(cube([300, 40, 20]), 'bar');
+    const ex = await exportSplit(S({ labels: false, diameter: 5 }), { name: 'bar' });
+    const sheet = sheetOf(ex);
+    expect(sheet.indexOf('\nPRINT PLAN (estimates only)\n')).toBeGreaterThan(sheet.indexOf('PRINT (each file'));
+    expect(sheet.indexOf('\nPRINT PLAN (estimates only)\n')).toBeLessThan(sheet.indexOf('\nDRY-FIT FIRST\n'));
+    const block = blockOf(sheet);
+    // what the page makes of the same reply, for the same settings
+    expect(block).toEqual(planSheetLines({ pieces: ex.pieces, pins: ex.measures.pins, parts: [], pegSize: ex.pegSize }, { nozzle: 0.4, layerHeight: 0.2 }, BED));
+    expect(block[1]).toBe('  The files are solid models. Your slicer prints them mostly hollow: a few walls outside and a light pattern (the infill) inside.');
+    expect(block[2]).toMatch(/^ {2}piece 1 of 2 {3}about \d+–\d+ g {2,}about [\d.–]+ m of filament {2,}very roughly (up to \d+|\d+–\d+) hours$/);
+    expect(block[4]).toMatch(/^ {2}pins {11}about [\d.–]+ g for \d+ pins, printed solid$/);
+    // the whole job's weight is that of its pieces and its pins
+    const job = estimateJob({ pieces: ex.pieces, pins: ex.measures.pins }, planOptions(), BED);
+    expect(block[5]).toContain(`WHOLE JOB (2 pieces and ${job.pins.count} pins): ${gramsWords(job.total.grams)} of PLA`);
+    expect(block).toContain('  Worked out for PLA, 15 % infill, 2 walls, 0.2 mm layers, 0.4 mm nozzle. The time is for an ordinary printer, and is the least sure of these figures.');
+    expect(block).toContain('  - No piece has a face flatter than 45° that hangs free, so supports can be left off.');
+  });
+
+  it('the block is for the material, the infill and the printer the download names, and the layers and nozzle of the print', async () => {
+    await load(cube([300, 40, 20]), 'bar');
+    const split = S({ labels: false, diameter: 5 });
+    const plain = sheetOf(await exportSplit(split, { name: 'bar' }));
+    const ex = await client.export([], version, 'bar', { printing: { nozzle: 0.6, layerHeight: 0.3 }, split, bed: BED, archive: 'files', printPlan: { material: 'petg', infill: 40, fast: true } });
+    const sheet = sheetOf(ex);
+    expect(sheet).toContain('of PETG');
+    expect(sheet).toContain('  Worked out for PETG, 40 % infill, 2 walls, 0.3 mm layers, 0.6 mm nozzle. The time is for a fast printer, slowed for PETG, and is the least sure of these figures.');
+    expect(sheet).toContain('PETG wants a little more room in the joints than PLA');
+    // a material it does not know is PLA; and nothing but the block changes with any of it
+    const odd = await client.export([], version, 'bar', { printing, split, bed: BED, archive: 'files', printPlan: { material: 'wood', infill: 'lots' } });
+    expect(sheetOf(odd)).toBe(plain);
+    const stls = (x) => x.files.filter((f) => f.stl).map((f) => Buffer.from(f.stl).toString('base64'));
+    const again = await client.export([], version, 'bar', { printing, split, bed: BED, archive: 'files', printPlan: { material: 'tpu', infill: 80 } });
+    expect(stls(again)).toEqual(stls(await exportSplit(split, { name: 'bar' })));
+    expect(again.notes).toEqual(odd.notes);
+  });
+
+  it('the suggestions take supports and the brim from each piece\'s own print check', async () => {
+    // half a table stands on half a leg with its top hanging over the bed: supports, and a brim
+    await load(own(wasm.Manifold.union([cube([20, 60, 30], [0, 0, 15]), cube([120, 60, 10], [0, 0, 35])])), 'table');
+    const ex = await exportSplit(S({ orient: 'model', labels: false }), { name: 'table' });
+    const block = blockOf(sheetOf(ex));
+    for (const p of ex.pieces) {
+      expect(p.check.supports.area).toBe(3000);
+      expect(p.check.foot.brim).toBeGreaterThan(0);
+    }
+    expect(block).toContain('  - Pieces 1 and 2 may need supports (about 60 cm² of faces in all): supports "on the build plate only" should be enough.');
+    expect(block).toContain(`  - Pieces 1 and 2: add a brim about ${ex.pieces[0].check.foot.brim} mm wide – they stand on little and may come loose.`);
+    expect(block.join('\n')).not.toContain('supports can be left off');
+  });
+
+  it('a split with nothing to glue still has the block', async () => {
+    // two blocks side by side with a gap between them, cut through the gap
+    await load(own(wasm.Manifold.union([cube([40, 40, 10], [-30, 0, 5]), cube([40, 40, 10], [30, 0, 5])])), 'pair');
+    const sheet = sheetOf(await exportSplit(S({ labels: false }), { name: 'pair' }));
+    expect(sheet).toContain('NOTHING TO GLUE');
+    expect(sheet.indexOf('PRINT PLAN (estimates only)')).toBeGreaterThan(0);
+    expect(sheet.indexOf('PRINT PLAN (estimates only)')).toBeLessThan(sheet.indexOf('NOTHING TO GLUE'));
+  });
+
+  it('a model printed whole is measured when it is shown and when it is downloaded', async () => {
+    await load(cube([100, 80, 60], [0, 0, 30]), 'block');
+    const r = await client.result([], version, { printing });
+    expect(r.measures.whole.volume).toBeCloseTo(480000, 3);
+    expect(r.measures.whole.area).toBeCloseTo(2 * (100 * 80 + 100 * 60 + 80 * 60), 3);
+    expect(r.measures.whole.size.map((v) => Math.round(v))).toEqual([100, 80, 60]);
+    expect(r.measures.whole.partial).toBeUndefined();
+    expect(r.measures.parts).toEqual([]);
+    const ex = await client.export([], version, 'block', { printing, bed: BED });
+    expect(ex.measures).toEqual(r.measures);
+  });
+
+  it('raised text adds to the measure, a separately printed part is measured on its own, and unrepaired triangles are said to be left out', async () => {
+    await load(cube([100, 80, 20], [0, 0, 10]), 'block');
+    const plain = (await client.result([], version, { printing })).measures.whole.volume;
+    const text = createItem({ text: 'HI', fontId: 'inter', size: 20, mode: 'emboss', depth: 2, position: [0, 0, 20], normal: [0, 0, 1] });
+    const raised = await client.result([text], version, { printing });
+    expect(raised.measures.whole.volume).toBeGreaterThan(plain + 50);
+    // a part joined with pegs prints on its own: measured as its file lies
+    const part = createPart('bar', 'bar', { position: [0, 0, 20], normal: [0, 0, 1], join: 'pegs', pegCount: 2, pegDiameter: 2, pegLength: 4 });
+    const apart = await client.export([part], version, 'block', { printing, bed: BED });
+    expect(apart.extra).toHaveLength(1);
+    expect(apart.measures.parts).toHaveLength(1);
+    expect(apart.measures.parts[0].name).toBe(apart.extra[0].name);
+    expect(apart.measures.parts[0].volume).toBeCloseTo(volumeOfStl(apart.extra[0].stl), 1);
+    expect(apart.measures.parts[0].area).toBeGreaterThan(0);
+    expect(apart.measures.parts[0].height).toBeGreaterThan(3);
+    // the model's own measure is of the model with the peg holes, not of the part
+    expect(apart.measures.whole.volume).toBeLessThan(plain);
+    await loadSoup(withTriangle(cube([100, 80, 20], [0, 0, 10]), [200, 0, 0, 201, 0, 0, 200, 1, 0]), 'torn');
+    const torn = await client.result([], version, { printing });
+    expect(torn.measures.whole.partial).toBe(true);
+    expect(torn.measures.whole.volume).toBeCloseTo(plain, 3);
   });
 });

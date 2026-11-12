@@ -907,6 +907,15 @@ try {
     await idle();
     const whole = await download('long-bar-whole.stl');
     check(Math.abs(whole.volume - 240000) < 1 && /use Split for printing \(step 6\)\.$/.test(await status()), 'the whole bar still downloads as one STL, with a pointer to step 6', (await status()).split('\n').pop());
+    // a model downloaded whole says about how much plastic and time it takes, on the status line and in the Model card
+    const wholeEstimate = (await status()).split('\n').find((t) => /^Print estimate/.test(t)) ?? '';
+    check(
+      /^Print estimate \(PLA, 15 % infill, 2 walls, 0\.2 mm layers, 0\.4 mm nozzle\): about \d+–\d+ g, about \d+–\d+ m of filament, very roughly (up to \d+|\d+–\d+) hours; 20 mm tall\. Not counted: supports, a brim, and waste from colour changes\./.test(wholeEstimate),
+      'a model downloaded whole has a print estimate: weight, filament and a very rough time, with what it assumes',
+      wholeEstimate,
+    );
+    const cardEstimate = (await page.locator('#modelNotes li').allInnerTexts()).find((t) => /^Print estimate/.test(t.trim())) ?? '';
+    check(/about \d+–\d+ g/.test(cardEstimate) && /Change the material and infill under Printing\./.test(cardEstimate), 'and the Model card keeps it, saying where to change the material and infill', cardEstimate.replace(/\s+/g, ' '));
     const tooBig = (await page.locator('#modelNotes li').allInnerTexts()).find((t) => /bigger than/.test(t)) ?? '';
     check(/bigger than your 220 × 220 × 250 mm printer/.test(tooBig), 'the model notes say it is bigger than the printer', tooBig.replace(/\s+/g, ' '));
 
@@ -930,6 +939,67 @@ try {
     // it is words to read, not something to click: no hand over it
     const checkCursor = await page.locator('#pieceList li .print-check').first().evaluate((el) => getComputedStyle(el).cursor);
     check(checkCursor !== 'pointer', 'the print check line does not show a hand: there is nothing to click', checkCursor);
+    // the print plan: an estimate under each piece, the whole job under the list, and a few suggestions for the slicer
+    const estimateLines = await page.locator('#pieceList li .print-estimate').allInnerTexts();
+    check(
+      estimateLines.length === 2 && estimateLines.every((t) => /^Estimate: about \d+–\d+ g · about [\d.–]+ m of filament · very roughly (up to \d+|\d+–\d+) hours$/.test(t)),
+      'each piece has an estimate line: weight and filament as a range, the time only very roughly',
+      estimateLines.join(' / '),
+    );
+    const planText = async () => (await page.locator('#printPlanJob').innerText()).replace(/\s+/g, ' ');
+    const jobText = await planText();
+    check(
+      !(await page.locator('#printPlan').isHidden()) && /^Whole job \(2 pieces and 3 pins\): about \d+–\d+ g of PLA, about \d+–\d+ m of filament \(about \d+ % of a 1 kg spool\), very roughly \d+–\d+ hours of printing in all\./.test(jobText),
+      'under the pieces the whole job: weight, filament, share of a spool and a very rough time',
+      jobText.slice(0, 160),
+    );
+    check(
+      /Tallest piece: 20 mm/.test(jobText) && /Largest on the bed: 150 × 40 mm/.test(jobText) && /Worked out for PLA, 15 % infill, 2 walls, 0\.2 mm layers, 0\.4 mm nozzle\./.test(jobText) && /Not counted: supports, a brim/.test(jobText),
+      'with the tallest piece, the room on the bed, what it is worked out for and what it leaves out',
+      jobText.slice(160),
+    );
+    const planHint = (await page.locator('#printPlan').innerText()).replace(/\s+/g, ' ');
+    check(/The files are solid models\. Your slicer prints them mostly hollow/.test(planHint), 'it says the files are solid and the slicer makes them mostly hollow');
+    check(!(await page.evaluate(() => document.querySelector('#printPlanAdvice').open)), 'the suggestions for the slicer are folded away until asked for');
+    await page.click('#printPlanAdvice summary');
+    const advice = await page.locator('#printPlanAdviceList li').allInnerTexts();
+    check(
+      advice.length >= 3 && /2 walls and 10–15 % infill is plenty/.test(advice[0]) && advice.some((t) => /supports/.test(t)) && advice.some((t) => /^Pins: print them solid/.test(t)),
+      'opened, they suggest walls and infill, say whether supports are needed and how to print the pins',
+      advice.join(' / '),
+    );
+    await page.click('#printPlanAdvice summary');
+    // Material and Infill, in the Printing card: the estimates follow at once, with nothing worked out again
+    const planControls = await page.evaluate(() => ({
+      materials: [...document.querySelectorAll('#planMaterial option')].map((o) => o.textContent),
+      material: document.querySelector('#planMaterial').value,
+      infill: document.querySelector('#planInfill').value,
+      inPrinting: !!document.querySelector('#printing #planMaterial') && !!document.querySelector('#printing #planInfill'),
+    }));
+    check(
+      planControls.inPrinting && planControls.materials.join() === 'PLA,PETG,ABS / ASA,TPU' && planControls.material === 'pla' && planControls.infill === '15',
+      'the Printing card has Material (PLA to start with) and Infill (15 %)',
+      JSON.stringify(planControls),
+    );
+    await page.selectOption('#planMaterial', 'petg');
+    await page.fill('#planInfill', '40');
+    await page.dispatchEvent('#planInfill', 'change');
+    const petgText = await planText();
+    const grams = (t) => Number(/about (\d+)–/.exec(t)?.[1]);
+    check(
+      /of PETG/.test(petgText) && /Worked out for PETG, 40 % infill/.test(petgText) && grams(petgText) > grams(jobText) && !(await page.locator('#pieceList').evaluate((el) => el.classList.contains('stale'))),
+      'changing them changes the estimate at once: PETG at 40 % weighs more',
+      `${grams(jobText)} g → ${grams(petgText)} g`,
+    );
+    const heavier = await page.locator('#pieceList li .print-estimate').allInnerTexts();
+    check(heavier.length === 2 && heavier.every((t, i) => grams(t) > grams(estimateLines[i])), 'and so does each piece', heavier.join(' / '));
+    const savedPlan = await page.evaluate(() => Object.values({ ...localStorage }).map((v) => { try { return JSON.parse(v).printPlan; } catch { return null; } }).find(Boolean));
+    check(savedPlan?.material === 'petg' && savedPlan?.infill === 40, 'the choice is remembered with the other printing settings', JSON.stringify(savedPlan));
+    await page.fill('#planInfill', '250');
+    await page.dispatchEvent('#planInfill', 'change');
+    check((await page.inputValue('#planInfill')) === '100', 'an infill over 100 % is taken as 100 %', await page.inputValue('#planInfill'));
+    await page.fill('#planInfill', '40');
+    await page.dispatchEvent('#planInfill', 'change');
     check((await page.locator('#downloadBtn').innerText()) === 'Download 2 pieces (.zip)', 'the download button counts the pieces', await page.locator('#downloadBtn').innerText());
     const labelLines = await page.evaluate(() => {
       const btn = document.querySelector('#downloadBtn');
@@ -978,6 +1048,23 @@ try {
       'the glue sheet says what the print check found of each piece, and not to turn the pieces in the slicer',
       glueSheet.split('\n').slice(2, 6).join(' | '),
     );
+    // the sheet's print plan is for the material and infill chosen in the app
+    const planBlock = glueSheet.slice(glueSheet.indexOf('PRINT PLAN')).split('\n\n')[0];
+    check(
+      glueSheet.indexOf('PRINT PLAN (estimates only)') > glueSheet.indexOf('PRINT (each file') && glueSheet.indexOf('PRINT PLAN (estimates only)') < glueSheet.indexOf('DRY-FIT FIRST') &&
+        /The files are solid models/.test(planBlock) && /\n {2}piece 2 of 2 {3}about \d+–\d+ g/.test(planBlock) && /\n {2}pins {11}about [\d.–]+ g for 3 pins, printed solid/.test(planBlock),
+      'the sheet in the zip has a PRINT PLAN block: a line a piece and the pins',
+      planBlock.split('\n').slice(0, 5).join(' | '),
+    );
+    check(
+      /WHOLE JOB \(2 pieces and 3 pins\): about \d+–\d+ g of PETG/.test(planBlock) && /Worked out for PETG, 40 % infill, 2 walls/.test(planBlock) && /Suggestions for your slicer:\n {2}- /.test(planBlock),
+      'with the whole job for the material and infill chosen, and the suggestions',
+      planBlock.split('\n').find((t) => /WHOLE JOB/.test(t)),
+    );
+    // back to the settings a new user has
+    await page.selectOption('#planMaterial', 'pla');
+    await page.fill('#planInfill', '15');
+    await page.dispatchEvent('#planInfill', 'change');
     check(/^Downloaded long-bar-text-2-pieces\.zip .*: 2 pieces, 3 pins/.test(await status()), 'the status line says what the zip holds', await status());
 
     // Joints: Built-in pegs – square pegs printed on one piece fit sockets in the other, so there is no pins file
@@ -4310,7 +4397,7 @@ try {
     await settle();
     const big = await card();
     const [locking] = await partRows();
-    const stillPieces = { shown: await b.isChecked('#resultToggle'), pieces: (await b.locator('#pieceList').innerText()).split('\n').filter((line) => line && !/^Print check: /.test(line)) };
+    const stillPieces = { shown: await b.isChecked('#resultToggle'), pieces: (await b.locator('#pieceList').innerText()).split('\n').filter((line) => line && !/^(Print check|Estimate): /.test(line)) };
     check(
       (await size()) === '75.0 × 75.0 × 150.0' && locking.z === '86' && locking.d === '47.3' && locking.holds.find((h) => h.value === 'lock').checked &&
         !locking.holds.find((h) => h.value === 'lock').disabled && locking.meta === 'twist-lock, 3 lugs, 3 clicks – turn 27° · the handle stays',
@@ -4437,7 +4524,7 @@ try {
     await settle();
     await b.waitForTimeout(500);
     await settle();
-    const pieces = (await b.locator('#pieceList').innerText()).split('\n').filter((line) => line && !/^Print check: /.test(line));
+    const pieces = (await b.locator('#pieceList').innerText()).split('\n').filter((line) => line && !/^(Print check|Estimate): /.test(line));
     const notes = await b.locator('#splitNotes').innerText();
     check(
       pieces.length === 2 && /^1 · Lantern, with the handle · 75 × 75 × 150 mm · .* · twist-lock neck, 3 lugs$/.test(pieces[0]) &&
@@ -5234,7 +5321,7 @@ try {
           }
         );
       });
-    const piecesText = async () => (await s.locator('#pieceList').innerText()).split('\n').filter((line) => line && !/^Print check: /.test(line));
+    const piecesText = async () => (await s.locator('#pieceList').innerText()).split('\n').filter((line) => line && !/^(Print check|Estimate): /.test(line));
     await s.goto(url);
     await s.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
     await s.setInputFiles('#stlFile', seatFile);

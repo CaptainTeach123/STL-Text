@@ -12,10 +12,11 @@ import {
 } from './aim.js';
 import { TEA_LIGHT, gminOf, offerPercent, roundZ } from './locks.js';
 import { checkWords } from './printCheck.js';
+import { MATERIALS, PLAN_DEFAULTS, adviseJob, estimateJob, estimateWords, jobWords, planOptions, wholeWords } from './printPlan.js';
 import { SIDES, placementMatrix, snapPartTo } from './placement.js';
 import { BUNDLED_FONTS, canQueryLocalFonts, fetchBundledFont, listLocalFonts, localFontBytes } from './fontCatalog.js';
 import {
-  BED_DEFAULTS, BED_PRESETS, FILAMENT, KEEP_LIMIT, PIECE_COLORS, PRESET_ALIASES, SPLIT_LIMITS, SPLIT_NOTE_CODES, axisCuts, bedCorner, bedSize, capOf, cellFits, cellSizes,
+  BED_DEFAULTS, BED_PRESETS, FAST_PRESETS, FILAMENT, KEEP_LIMIT, PIECE_COLORS, PRESET_ALIASES, SPLIT_LIMITS, SPLIT_NOTE_CODES, axisCuts, bedCorner, bedSize, capOf, cellFits, cellSizes,
   clampLargest, cutPlane, fitPieces, formatSize, keepName, keepsOf, keepsThrough, letterFor, nextCut, noSeatWords, pegSizeOf, pieceColorIndex, pieceColors, planEnds,
   presetOf, reachesCorner, sheetName, splitActive, splitNote, usableBed, wayStep, wideKeeps,
 } from './split.js';
@@ -45,6 +46,8 @@ const fonts = new Map(); // fontId -> { label, group }
 const partAssets = new Map(); // partId -> { name, info }
 let partCount = 0;
 const printing = { nozzle: 0.4, layerHeight: 0.2 };
+// what the print estimate is worked out for (not in `printing`: it changes no geometry, so no preview waits on it)
+const printPlan = { ...PLAN_DEFAULTS };
 const defaults = { fontId: 'inter', size: 10, mode: 'emboss', depth: 1.5, quality: 'normal', roundCorners: false };
 // the printer the pieces of a split must fit (not in `printing`: that is part of every preview's key)
 const bed = { preset: BED_DEFAULTS.preset, size: [...BED_DEFAULTS.size], margin: BED_DEFAULTS.margin, largest: BED_DEFAULTS.largest };
@@ -72,6 +75,7 @@ const MAX_FATALS = 3;
 // split for printing: view state, never in the document
 let selectedCutId = null; // the cut the arrow keys move (selecting an item lets go of it)
 let lastSplitKey = ''; // what the pieces depend on besides the content: the split, the printer and the nozzle
+let wholeMeasures = null; // the model printed whole as the engine last measured it: { content, measures }
 let lastPieces = null; // the pieces last computed: { key, content, pieces, seams, grid, diameter, pegSize, notes }
 let measured = null; // the cuts last measured on the model: { key, cuts: Map(id -> { area, islands, joint, crosses }), notes, pieces }
 let downloaded = null; // { key, content, count }: how many pieces the last download held, for the split and content it was made for
@@ -218,10 +222,20 @@ const friendly = (err) => {
   }
 };
 
+/** A material and an infill as the print plan takes them: an unknown material is PLA, the infill within 0–100 %. */
+function planChoice(given) {
+  const { material, infill } = planOptions(given ?? {});
+  return { material, infill };
+}
+
+/** What the print plan is worked out for now: the material and infill chosen, the nozzle, the layers and the printer. */
+const planNow = () => planOptions({ ...printPlan, nozzle: printing.nozzle, layerHeight: printing.layerHeight, fast: FAST_PRESETS.includes(bed.preset) });
+
 function loadSettings() {
   try {
     const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}');
     Object.assign(printing, saved.printing ?? {});
+    Object.assign(printPlan, planChoice(saved.printPlan));
     Object.assign(defaults, saved.defaults ?? {});
     if (!BUNDLED_FONTS.some((f) => f.id === defaults.fontId)) defaults.fontId = 'inter';
     // older saves have no printer or split settings: what they lack keeps its default; a printer saved under a name it
@@ -241,7 +255,7 @@ function loadSettings() {
 
 function saveSettings() {
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ printing, defaults, bed, splitDefaults }));
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ printing, printPlan, defaults, bed, splitDefaults }));
   } catch {
     /* private mode etc. */
   }
@@ -271,6 +285,11 @@ function describeModel() {
   }
   if (info.passthroughTriangles && info.watertight) {
     notes.push({ level: 'warn', text: 'The amber part of the model could not be repaired; text can only be raised there.' });
+  }
+  // printed whole: about how much plastic and time, once the model with its text has been built (shown or downloaded)
+  if (wholeMeasures?.content === lastContentKey && !activeSplit()) {
+    const estimate = wholeWords(wholeMeasures.measures.whole, planNow(), wholeMeasures.measures.parts);
+    if (estimate) notes.push({ level: 'info', text: `${estimate} Change the material and infill under Printing.` });
   }
   if (info.simplifiedView) {
     notes.push({
@@ -1178,8 +1197,13 @@ async function showResult(on, { keep = false } = {}) {
     else viewer.setResult(r.display);
     // without pieces a split still has its say: every cut missed, or the model cannot be split
     lastPieces = split
-      ? { key: splitFor, content: requestedFor, pieces: r.pieces ?? [], seams: r.seams ?? [], grid: r.grid, diameter: r.diameter, pegSize: r.pegSize ?? null, notes: r.notes.filter(isSplitNote) }
+      ? { key: splitFor, content: requestedFor, pieces: r.pieces ?? [], seams: r.seams ?? [], grid: r.grid, diameter: r.diameter, pegSize: r.pegSize ?? null, measures: r.measures ?? null, notes: r.notes.filter(isSplitNote) }
       : null;
+    // a model shown whole is measured, for its print estimate in the Model card
+    if (!r.pieces && r.measures?.whole) {
+      wholeMeasures = { content: requestedFor, measures: r.measures };
+      renderModel();
+    }
     if (split) rememberJoints(splitFor, requestedFor, jointsOfSeams(r.seams));
     viewer.showResult(true);
     // pulled apart, the pieces take more room than the model: fit them in view once, then leave the camera to the
@@ -1275,6 +1299,8 @@ async function download() {
       printer: { size: bedSize(bed), margin: bed.margin, corner: bedCorner(usableBed(bed)) }, // names the printer on the glue sheet
       archive: 'zip',
       ...largestOf(),
+      // what the sheet's print plan is worked out for
+      printPlan: { ...printPlan, fast: FAST_PRESETS.includes(bed.preset) },
     });
     if (!r) return setStatus('The model changed while the download was being prepared – try again.', '');
     const warnings = r.notes.filter((n) => n.level === 'warn');
@@ -1302,12 +1328,17 @@ async function download() {
     const placed = r.notes.find((n) => n.code === 'CORNER_PLACE');
     // and what the print check found of it standing as modelled (a warning is said with the others)
     const checked = r.notes.find((n) => n.code === 'PRINT_CHECK' && n.level !== 'warn');
+    // and about how much plastic and time it takes, here and in the Model card
+    if (r.measures?.whole) wholeMeasures = { content: requestedFor, measures: r.measures };
+    const estimate = wholeWords(r.measures?.whole ?? null, planNow(), r.measures?.parts ?? []);
+    renderModel();
     setStatus(
       `Downloaded ${main.name} (${main.kb} KB, ${r.triangles.toLocaleString()} triangles)` +
         (extras.length ? ` and ${extras.length} separate part file${extras.length > 1 ? 's' : ''} (${extras.map((e) => e.name).join(', ')}) to print and glue in.` : '.') +
         warned +
         (placed ? `\n${placed.text}` : '') +
         (checked ? `\n${checked.text}` : '') +
+        (estimate ? `\n${estimate}` : '') +
         (tooBig && canSplit()
           ? `\n${tooBig.cap ? 'Longer than your Largest piece' : tooBig.corner ? 'Too big for your printer once its corner is kept clear' : 'Bigger than your printer'} – use Split for printing (step 6).`
           : ''),
@@ -2908,6 +2939,9 @@ function renderPieces() {
     const over = overLargest();
     const b = cutBounds();
     const boxes = b && bed.largest > 0 ? new Map(cellSizes(b, cutsWithTabs()).cells.map((c) => [c.cell.join(','), c])) : null;
+    // about how much plastic and time each piece takes, for the material and infill chosen under Printing
+    const job = jobPlan(computed);
+    const estimates = new Map(job.plan.pieces.map((r) => [r.index, estimateWords(r.estimate)]));
     rows = computed.pieces.map((p) => ({
       index: p.index,
       // a piece with a name of its own: a part taken out, or the lantern it came out of
@@ -2934,6 +2968,7 @@ function renderPieces() {
       ].filter(Boolean),
       // the print check of the piece as its file lies: supports, step lines, what it stands on, its pin holes
       check: checkWords(p.check ?? null, p.holes ?? null),
+      estimate: estimates.get(p.index) ?? [],
     }));
   } else if (active) {
     // a box whose loose parts print apart (a bookcase's shelves between two cuts) says how many pieces it makes
@@ -2956,6 +2991,7 @@ function renderPieces() {
     });
   }
   list.classList.toggle('stale', !!computed && !piecesCurrent());
+  renderPrintPlan(computed);
   $('piecesHint').hidden = !rows.length || !rows[0].predicted || $('resultToggle').checked;
   const signature = JSON.stringify(rows);
   if (signature === piecesSignature) return;
@@ -2988,6 +3024,13 @@ function renderPieces() {
         check.textContent = `Print check: ${row.check.join(' · ')}`;
         text.append(check);
       }
+      if (row.estimate?.length) {
+        // and one more: about how much plastic and time it takes
+        const estimate = document.createElement('span');
+        estimate.className = 'print-estimate';
+        estimate.textContent = `Estimate: ${row.estimate.join(' · ')}`;
+        text.append(estimate);
+      }
       li.append(swatch, text);
       if (!row.predicted) {
         // a piece pointed at stands out, and the locks it has glow on it and on the piece each one holds
@@ -3000,6 +3043,42 @@ function renderPieces() {
           viewer.setLockHighlight(null);
         });
       }
+      return li;
+    }),
+  );
+}
+
+/** The print plan of the pieces last worked out (printPlan.js): the job's figures and what they are worked out for. */
+function jobPlan(computed) {
+  const o = planNow();
+  return { o, plan: estimateJob({ pieces: computed.pieces, pins: computed.measures?.pins ?? [], parts: computed.measures?.parts ?? [] }, o, usableBed(bed)) };
+}
+
+let printPlanShown = '';
+/**
+ * Under the pieces: what the whole job weighs and takes, and a few suggestions for the slicer – once the pieces are
+ * worked out, and again without asking the engine when the material or the infill changes.
+ */
+function renderPrintPlan(computed) {
+  const { o, plan } = computed ? jobPlan(computed) : { o: null, plan: null };
+  const lines = plan ? jobWords(plan, o) : [];
+  const advice = lines.length ? adviseJob(computed.pieces, o, { pins: computed.measures?.pins ?? [], pegSize: computed.pegSize }) : [];
+  const shown = JSON.stringify([lines, advice]);
+  $('printPlan').hidden = !lines.length;
+  $('printPlan').classList.toggle('stale', !!computed && !piecesCurrent());
+  if (shown === printPlanShown) return;
+  printPlanShown = shown;
+  $('printPlanJob').replaceChildren(
+    ...lines.map((line) => {
+      const span = document.createElement('span');
+      span.textContent = line;
+      return span;
+    }),
+  );
+  $('printPlanAdviceList').replaceChildren(
+    ...advice.map((line) => {
+      const li = document.createElement('li');
+      li.textContent = line;
       return li;
     }),
   );
@@ -5333,6 +5412,20 @@ function bindControls() {
       refitParts(null);
     });
   }
+
+  // the material and infill of the print estimate: remembered, and the estimates follow at once (no file changes)
+  $('planMaterial').replaceChildren(...Object.entries(MATERIALS).map(([id, m]) => new Option(m.name, id)));
+  $('planMaterial').value = printPlan.material;
+  $('planInfill').value = printPlan.infill;
+  const planChanged = () => {
+    const infill = Number.parseFloat($('planInfill').value);
+    Object.assign(printPlan, planChoice({ material: $('planMaterial').value, infill: Number.isFinite(infill) ? infill : printPlan.infill }));
+    $('planInfill').value = printPlan.infill;
+    saveSettings();
+    render();
+  };
+  $('planMaterial').addEventListener('change', planChanged);
+  $('planInfill').addEventListener('change', planChanged);
 
   document.querySelectorAll('[data-side]').forEach((btn) => btn.addEventListener('click', () => snapToSide(btn.dataset.side, { look: true })));
   $('snapBtn').addEventListener('click', snapToModel);

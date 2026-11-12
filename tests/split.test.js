@@ -3798,7 +3798,7 @@ describe('the print plan', () => {
     const job = estimateJob({ pieces: ex.pieces, pins: ex.measures.pins }, planOptions(), BED);
     expect(block[5]).toContain(`WHOLE JOB (2 pieces and ${job.pins.count} pins): ${gramsWords(job.total.grams)} of PLA`);
     expect(block).toContain('  Worked out for PLA, 15 % infill, 2 walls, 0.2 mm layers, 0.4 mm nozzle. The time is for an ordinary printer, and is the least sure of these figures.');
-    expect(block).toContain('  - No piece has a face flatter than 45° that hangs free, so supports can be left off.');
+    expect(block).toContain('  - The print check found nothing that needs supports, so they can be left off.');
   });
 
   it('the block is for the material, the infill and the printer the download names, and the layers and nozzle of the print', async () => {
@@ -3809,7 +3809,17 @@ describe('the print plan', () => {
     const sheet = sheetOf(ex);
     expect(sheet).toContain('of PETG');
     expect(sheet).toContain('  Worked out for PETG, 40 % infill, 2 walls, 0.3 mm layers, 0.6 mm nozzle. The time is for a fast printer, slowed for PETG, and is the least sure of these figures.');
-    expect(sheet).toContain('PETG wants a little more room in the joints than PLA');
+    // the split's own Clearance is named where PETG wants more, and nothing is said where it has enough
+    expect(sheet).toContain('  - PETG wants a little more room in the joints than PLA: a Clearance of at least 0.20 mm, where this split has 0.15.');
+    const roomy = await client.export([], version, 'bar', { printing, split: { ...split, clearance: 0.25 }, bed: BED, archive: 'files', printPlan: { material: 'petg' } });
+    expect(sheetOf(roomy)).not.toContain('PETG wants');
+    // finer layers on the same printer take about twice as long, and the sheet says so
+    const hoursOf = (x, layerHeight) => estimateJob({ pieces: x.pieces, pins: x.measures.pins }, planOptions({ nozzle: 0.4, layerHeight }), BED).total.hours;
+    const fine = await client.export([], version, 'bar', { printing: { nozzle: 0.4, layerHeight: 0.1 }, split, bed: BED, archive: 'files' });
+    const coarse = await exportSplit(split, { name: 'bar' });
+    expect(hoursOf(fine, 0.1)[1] / hoursOf(coarse, 0.2)[1]).toBeGreaterThan(1.8);
+    expect(blockOf(sheetOf(fine))[2]).not.toBe(blockOf(sheetOf(coarse))[2]);
+    expect(blockOf(sheetOf(fine))[2]).toBe(planSheetLines({ pieces: fine.pieces, pins: fine.measures.pins }, { nozzle: 0.4, layerHeight: 0.1 }, BED)[2]);
     // a material it does not know is PLA; and nothing but the block changes with any of it
     const odd = await client.export([], version, 'bar', { printing, split, bed: BED, archive: 'files', printPlan: { material: 'wood', infill: 'lots' } });
     expect(sheetOf(odd)).toBe(plain);

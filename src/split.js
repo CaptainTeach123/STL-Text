@@ -6093,7 +6093,7 @@ export function howToGlueText(plan) {
 
   // about how much plastic and time the job takes, and a few suggestions for the slicer: worked out by the code the
   // pieces list uses, for the material and infill chosen there (PLA and 15 % where the sheet is asked for without)
-  const planned = planSheetLines({ pieces, pins, parts: plan.estimate?.parts ?? [], pegSize: plan.estimate?.pegSize ?? null }, plan.estimate ?? {}, bed);
+  const planned = planSheetLines({ pieces, pins, parts: plan.estimate?.parts ?? [], pegSize: plan.estimate?.pegSize ?? null, clearance: plan.clearance ?? null }, plan.estimate ?? {}, bed);
   if (planned.length) out.push(...planned, '');
 
   if (!steps.length) {

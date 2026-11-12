@@ -75,7 +75,8 @@ const MAX_FATALS = 3;
 // split for printing: view state, never in the document
 let selectedCutId = null; // the cut the arrow keys move (selecting an item lets go of it)
 let lastSplitKey = ''; // what the pieces depend on besides the content: the split, the printer and the nozzle
-let wholeMeasures = null; // the model printed whole as the engine last measured it: { content, measures }
+let wholeMeasures = null; // the model printed whole as the engine last measured it: { shape, measures }
+let lastShapeKey = ''; // what those measures depend on: the model, its text and the nozzle – not the layer height
 let lastPieces = null; // the pieces last computed: { key, content, pieces, seams, grid, diameter, pegSize, notes }
 let measured = null; // the cuts last measured on the model: { key, cuts: Map(id -> { area, islands, joint, crosses }), notes, pieces }
 let downloaded = null; // { key, content, count }: how many pieces the last download held, for the split and content it was made for
@@ -287,7 +288,8 @@ function describeModel() {
     notes.push({ level: 'warn', text: 'The amber part of the model could not be repaired; text can only be raised there.' });
   }
   // printed whole: about how much plastic and time, once the model with its text has been built (shown or downloaded)
-  if (wholeMeasures?.content === lastContentKey && !activeSplit()) {
+  // (a new layer height changes the time, worked out here, but not what was measured: the estimate stays)
+  if (wholeMeasures?.shape === lastShapeKey && !activeSplit()) {
     const estimate = wholeWords(wholeMeasures.measures.whole, planNow(), wholeMeasures.measures.parts);
     if (estimate) notes.push({ level: 'info', text: `${estimate} Change the material and infill under Printing.` });
   }
@@ -1185,6 +1187,7 @@ async function showResult(on, { keep = false } = {}) {
   }
   resultBusy = true;
   const requestedFor = lastContentKey;
+  const shapeFor = lastShapeKey;
   const splitFor = lastSplitKey;
   const split = activeSplit();
   if (split) setSplitPending(true);
@@ -1197,11 +1200,11 @@ async function showResult(on, { keep = false } = {}) {
     else viewer.setResult(r.display);
     // without pieces a split still has its say: every cut missed, or the model cannot be split
     lastPieces = split
-      ? { key: splitFor, content: requestedFor, pieces: r.pieces ?? [], seams: r.seams ?? [], grid: r.grid, diameter: r.diameter, pegSize: r.pegSize ?? null, measures: r.measures ?? null, notes: r.notes.filter(isSplitNote) }
+      ? { key: splitFor, content: requestedFor, pieces: r.pieces ?? [], seams: r.seams ?? [], grid: r.grid, diameter: r.diameter, pegSize: r.pegSize ?? null, clearance: split.clearance ?? null, measures: r.measures ?? null, notes: r.notes.filter(isSplitNote) }
       : null;
     // a model shown whole is measured, for its print estimate in the Model card
     if (!r.pieces && r.measures?.whole) {
-      wholeMeasures = { content: requestedFor, measures: r.measures };
+      wholeMeasures = { shape: shapeFor, measures: r.measures };
       renderModel();
     }
     if (split) rememberJoints(splitFor, requestedFor, jointsOfSeams(r.seams));
@@ -1289,6 +1292,7 @@ async function download() {
   const name = split ? splitName() : exportName();
   const splitFor = lastSplitKey;
   const requestedFor = lastContentKey;
+  const shapeFor = lastShapeKey;
   if (split) setSplitPending(true);
   try {
     if (!(await syncBase())) return setStatus('The model is still being updated – try the download again in a moment.', '');
@@ -1329,7 +1333,7 @@ async function download() {
     // and what the print check found of it standing as modelled (a warning is said with the others)
     const checked = r.notes.find((n) => n.code === 'PRINT_CHECK' && n.level !== 'warn');
     // and about how much plastic and time it takes, here and in the Model card
-    if (r.measures?.whole) wholeMeasures = { content: requestedFor, measures: r.measures };
+    if (r.measures?.whole) wholeMeasures = { shape: shapeFor, measures: r.measures };
     const estimate = wholeWords(r.measures?.whole ?? null, planNow(), r.measures?.parts ?? []);
     renderModel();
     setStatus(
@@ -3062,7 +3066,7 @@ let printPlanShown = '';
 function renderPrintPlan(computed) {
   const { o, plan } = computed ? jobPlan(computed) : { o: null, plan: null };
   const lines = plan ? jobWords(plan, o) : [];
-  const advice = lines.length ? adviseJob(computed.pieces, o, { pins: computed.measures?.pins ?? [], pegSize: computed.pegSize }) : [];
+  const advice = lines.length ? adviseJob(computed.pieces, o, { pins: computed.measures?.pins ?? [], pegSize: computed.pegSize, clearance: computed.clearance ?? null }) : [];
   const shown = JSON.stringify([lines, advice]);
   $('printPlan').hidden = !lines.length;
   $('printPlan').classList.toggle('stale', !!computed && !piecesCurrent());
@@ -5194,6 +5198,9 @@ function render() {
   const contentKey = stableKey({ items: doc.items, base: doc.state.baseVersion, printing });
   const contentChanged = contentKey !== lastContentKey;
   lastContentKey = contentKey;
+  // what a model printed whole was measured for: as the content, without the layer height
+  const shapeKey = stableKey({ items: doc.items, base: doc.state.baseVersion, nozzle: printing.nozzle });
+  lastShapeKey = shapeKey;
   // the pieces also depend on the split, the printer and the nozzle – none of which is content the previews depend on
   const splitKey = stableKey({ split: activeSplit(), bed: usableBed(bed), nozzle: printing.nozzle, ...largestOf() });
   const splitChanged = splitKey !== lastSplitKey;

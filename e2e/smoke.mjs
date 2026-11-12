@@ -916,6 +916,23 @@ try {
     );
     const cardEstimate = (await page.locator('#modelNotes li').allInnerTexts()).find((t) => /^Print estimate/.test(t.trim())) ?? '';
     check(/about \d+–\d+ g/.test(cardEstimate) && /Change the material and infill under Printing\./.test(cardEstimate), 'and the Model card keeps it, saying where to change the material and infill', cardEstimate.replace(/\s+/g, ' '));
+    // a new layer height changes the time and not what was measured: the estimate stays, said for the new layers
+    const cardEstimateNow = async () => ((await page.locator('#modelNotes li').allInnerTexts()).find((t) => /^Print estimate/.test(t.trim())) ?? '').replace(/\s+/g, ' ');
+    const mostHours = (t) => Number(/very roughly (?:up to |\d+–)?(\d+) hours/.exec(t)?.[1] ?? NaN);
+    await page.evaluate(() => (document.querySelector('#layerHeight').closest('details').open = true));
+    await page.fill('#layerHeight', '0.1');
+    await page.dispatchEvent('#layerHeight', 'change');
+    await idle();
+    const fineEstimate = await cardEstimateNow();
+    check(
+      /0\.1 mm layers/.test(fineEstimate) && mostHours(fineEstimate) > mostHours(cardEstimate) && /about \d+–\d+ g/.test(fineEstimate),
+      'changing the layer height keeps the estimate in the Model card, with a longer time for finer layers',
+      `${mostHours(cardEstimate)} h at 0.2 mm, then: ${fineEstimate.slice(0, 150)}`,
+    );
+    await page.fill('#layerHeight', '0.2');
+    await page.dispatchEvent('#layerHeight', 'change');
+    await idle();
+    check(/0\.2 mm layers/.test(await cardEstimateNow()) && mostHours(await cardEstimateNow()) === mostHours(cardEstimate), 'and back at 0.2 mm it reads as before');
     const tooBig = (await page.locator('#modelNotes li').allInnerTexts()).find((t) => /bigger than/.test(t)) ?? '';
     check(/bigger than your 220 × 220 × 250 mm printer/.test(tooBig), 'the model notes say it is bigger than the printer', tooBig.replace(/\s+/g, ' '));
 

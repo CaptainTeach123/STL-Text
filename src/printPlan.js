@@ -384,6 +384,8 @@ const pad = (s, n) => (s.length >= n ? `${s} ` : s.padEnd(n));
 /**
  * The PRINT PLAN block of the sheet in the zip: a line a piece, the pins and the parts, the whole job, and the
  * suggestions. Plain text, to be read in any editor.
+ * The suggestion to print the pins solid is the one left out: the sheet's own pins line, in the PRINT list just above
+ * this block, already says so ("lying on a flat side, solid (4+ walls)"), and the block's pins row says it again.
  * @param {{ pieces?: object[], pins?: object[], parts?: object[], pegSize?: number|null, clearance?: number|null }} job
  *   as `estimateJob` takes it, with the size of the built-in pegs and the split's Clearance for the suggestions
  * @param {object} given what the plan is for, as `planOptions` takes it

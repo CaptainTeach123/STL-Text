@@ -13,7 +13,7 @@ import {
   reachesCorner, sizesFor,
 } from '../src/split.js';
 import { FACE, OVERHANG_NZ, PRINT_CHECK, faceKind, faceLean } from '../src/printCheck.js';
-import { estimateJob, gramsWords, planOptions, planSheetLines } from '../src/printPlan.js';
+import { adviseJob, estimateJob, gramsWords, planOptions, planSheetLines } from '../src/printPlan.js';
 import { clearSplitCaches, dowelHole, halfHole, pegAt, pinAt, pinSolid, socketAt } from '../src/splitGeometry.js';
 import { lipLine, lipVerdict } from '../src/aim.js';
 import { setup, soupOf as soupGeometry } from './helpers.js';
@@ -3794,6 +3794,16 @@ describe('the print plan', () => {
     expect(block[1]).toBe('  The files are solid models. Your slicer prints them mostly hollow: a few walls outside and a light pattern (the infill) inside.');
     expect(block[2]).toMatch(/^ {2}piece 1 of 2 {3}about \d+–\d+ g {2,}about [\d.–]+ m of filament {2,}very roughly (up to \d+|\d+–\d+) hours$/);
     expect(block[4]).toMatch(/^ {2}pins {11}about [\d.–]+ g for \d+ pins, printed solid$/);
+    // the sheet tells the reader once how to print the pins: on its pins line in the PRINT list, over this block, so the
+    // block's suggestions are the page's less that one
+    const said = sheet.split('\n').filter((l) => /^ {2}pins .*lying on a flat side, solid \(4\+ walls\)$/.test(l));
+    expect(said).toHaveLength(1);
+    expect(sheet.indexOf(said[0])).toBeLessThan(sheet.indexOf('PRINT PLAN'));
+    const page = adviseJob(ex.pieces, planOptions({ nozzle: 0.4, layerHeight: 0.2 }), { pins: ex.measures.pins, pegSize: ex.pegSize });
+    const pinsWord = page.filter((t) => t.startsWith('Pins: print them solid'));
+    expect(pinsWord).toHaveLength(1);
+    const at = block.indexOf('  Suggestions for your slicer:');
+    expect(block.slice(at + 1)).toEqual(page.filter((t) => t !== pinsWord[0]).map((t) => `  - ${t}`));
     // the whole job's weight is that of its pieces and its pins
     const job = estimateJob({ pieces: ex.pieces, pins: ex.measures.pins }, planOptions(), BED);
     expect(block[5]).toContain(`WHOLE JOB (2 pieces and ${job.pins.count} pins): ${gramsWords(job.total.grams)} of PLA`);

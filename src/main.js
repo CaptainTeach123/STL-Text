@@ -2128,6 +2128,8 @@ function syncLockTools() {
   $('legendSeam').hidden = !shown.seam;
   $('legendSpan').hidden = !shown.span;
   $('legendSteps').hidden = !shown.steps;
+  // lines too close to tell apart on the screen are thinned: the chip says so
+  relabel($('legendStepsText'), viewer.stepLinesThinned ? 'step lines, about here (not all drawn)' : 'step lines, about here');
   syncWayCaption();
 }
 

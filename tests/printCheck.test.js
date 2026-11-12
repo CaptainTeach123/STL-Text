@@ -2,7 +2,7 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
 import { LAY_DOWN, printTransform, yawMat4 } from '../src/split.js';
 import {
-  FACE, OVERHANG_NZ, PRINT_CHECK, areaWords, checkNote, checkNoteWords, checkRow, checkWords, everyWords, faceKind, faceLean, printCheck, shownFaces, stepLines, stepSegments,
+  FACE, OVERHANG_NZ, PRINT_CHECK, areaWords, checkNote, checkNoteWords, checkRow, checkWords, everyWords, faceKind, faceLean, LEAN_REST, printCheck, shownFaces, stepLines, stepSegments, stepsApart,
 } from '../src/printCheck.js';
 import { setup } from './helpers.js';
 
@@ -470,8 +470,12 @@ describe('the words of the check', () => {
     expect(areaWords(8011)).toBe('about 80 cm²');
     expect(everyWords(3.82)).toBe('about every 4 mm');
     expect(everyWords(1.91)).toBe('about every 2 mm');
-    expect(everyWords(0.76)).toBe('about every 1 mm');
-    expect(everyWords(0.2)).toBe('about every 0.5 mm');
+    expect(everyWords(0.96)).toBe('about every 1 mm');
+    // under a millimetre apart, to the tenth: close lines are not told as wider apart than they are
+    expect(everyWords(0.76)).toBe('about every 0.8 mm');
+    expect(everyWords(0.32)).toBe('about every 0.3 mm');
+    expect(everyWords(0.2)).toBe('about every 0.2 mm');
+    expect(everyWords(0.02)).toBe('about every 0.1 mm');
   });
 
   it('the row is rounded, with the layer height it was made for', () => {
@@ -672,6 +676,19 @@ describe('where the step lines fall', () => {
     const { printMatrix } = printTransform({ min: lo, max: hi }, down, 0);
     return { P, T: mesh.triVerts, faces: shownFaces(c, layer), turn: printMatrix };
   };
+  /**
+   * A block 200 × 80 whose top climbs `rise` mm from `z0` along x, the top meshed `n` × `n` (2 n² triangles): its
+   * points and triangles as `drawn` gives them, the top marked as a leaning face.
+   */
+  const finelyTopped = (z0, rise, n, layer = 0.2) => {
+    const P = [];
+    const T = [];
+    for (let j = 0; j <= n; j++) for (let i = 0; i <= n; i++) P.push((200 * i) / n, (80 * j) / n, z0 + (rise * i) / n);
+    const at = (i, j) => j * (n + 1) + i;
+    for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) T.push(at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j), at(i + 1, j + 1), at(i, j + 1));
+    // the top alone is enough for the lines: every triangle of it one leaning face
+    return { P: Float32Array.from(P), T: Uint32Array.from(T), faces: new Uint8Array(T.length / 3).fill(1 << 2), turn: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], layer };
+  };
   const laid = (turn, p) => [0, 1, 2].map((a) => turn[a] * p[0] + turn[4 + a] * p[1] + turn[8 + a] * p[2] + turn[12 + a]);
   const ends = (segments) => Array.from({ length: segments.length / 3 }, (_, i) => [...segments.subarray(3 * i, 3 * i + 3)]);
 
@@ -739,8 +756,10 @@ describe('where the step lines fall', () => {
   it('never makes more than the cap: every second level is left out, then every fourth', () => {
     const { P, T, faces, turn } = drawn(leaning(3));
     const all = stepSegments(P, T, faces, { turn, layer: 0.2 });
+    expect(all.thinned).toBe(false);
     const half = stepSegments(P, T, faces, { turn, layer: 0.2, cap: all.lines - 1 });
     expect(half.every).toBe(2);
+    expect(half.thinned).toBe(true);
     expect(half.lines).toBeLessThanOrEqual(all.lines - 1);
     expect(new Set(ends(half.segments).map((p) => p[0].toFixed(3))).size).toBe(13);
     const few = stepSegments(P, T, faces, { turn, layer: 0.2, cap: 10 });
@@ -749,5 +768,195 @@ describe('where the step lines fall', () => {
     expect(few.lines).toBeGreaterThan(0);
     // the levels kept are whole multiples of the step, so neighbouring triangles keep the same ones
     for (const p of ends(few.segments)) expect(Math.round(laid(turn, p)[2] / 0.2 - 0.5) % 8).toBe(0);
+    // a fine mesh that crosses few levels, one of them a multiple of every step tried (level 64, at 12.9 mm): however
+    // many levels are left out that one stays, so what is over the cap is cut short – the cap holds whatever it is
+    const low = finelyTopped(12.85, 0.5, 60);
+    const whole = stepSegments(low.P, low.T, low.faces, { turn: low.turn, layer: 0.2 });
+    expect(whole.lines).toBeGreaterThan(300);
+    for (const cap of [1000, 200, 100, 7, 1]) {
+      const cut = stepSegments(low.P, low.T, low.faces, { turn: low.turn, layer: 0.2, cap });
+      expect(cut.lines, `cap ${cap}`).toBeLessThanOrEqual(cap);
+      expect(cut.lines).toBeGreaterThan(0);
+      expect(cut.segments.length).toBe(cut.lines * 6);
+      expect(cut.thinned).toBe(cut.lines < whole.lines);
+    }
+  });
+
+  it('an ordinary fine mesh keeps every line: the cap counts far more than its faces need', () => {
+    // a top leaning 14° meshed 150 × 150, 45,000 triangles: a line every 0.8 mm at 0.2 mm layers, every 0.4 at 0.1
+    const at = (layer) => {
+      const fine = finelyTopped(20, 200 * Math.tan((14 * Math.PI) / 180), 150, layer);
+      const r = stepSegments(fine.P, fine.T, fine.faces, { turn: fine.turn, layer });
+      const levels = new Set(ends(r.segments).map((p) => Math.round(laid(fine.turn, p)[2] / layer - 0.5)));
+      return { ...r, levels: levels.size };
+    };
+    const coarse = at(0.2);
+    expect(coarse.every).toBe(1);
+    expect(coarse.thinned).toBe(false);
+    expect(coarse.levels).toBe(Math.floor((200 * Math.tan((14 * Math.PI) / 180)) / 0.2));
+    const fine = at(0.1);
+    expect(fine.every).toBe(1);
+    expect(fine.thinned).toBe(false);
+    expect(fine.levels).toBeGreaterThanOrEqual(2 * coarse.levels);
+  });
+
+  it('lines closer than asked are thinned, face by face, and it says so', () => {
+    // a top leaning 14° at 0.08 mm layers: a line every 0.33 mm of the face. Kept 1 mm apart, every fourth is drawn
+    const steep = drawn(leaning(14), '-z', 0.08);
+    const all = stepSegments(steep.P, steep.T, steep.faces, { turn: steep.turn, layer: 0.08 });
+    expect(all.every).toBe(1);
+    const thin = stepSegments(steep.P, steep.T, steep.faces, { turn: steep.turn, layer: 0.08, apart: 1 });
+    expect(thin.every).toBe(4);
+    expect(thin.thinned).toBe(true);
+    const levels = [...new Set(ends(thin.segments).map((p) => Math.round(laid(steep.turn, p)[2] / 0.08 - 0.5)))].sort((a, b) => a - b);
+    expect(levels.every((k) => k % 4 === 0)).toBe(true);
+    expect(levels.length).toBeGreaterThan(70);
+    expect(Math.abs(levels.length - new Set(ends(all.segments).map((p) => Math.round(laid(steep.turn, p)[2] / 0.08 - 0.5))).size / 4)).toBeLessThanOrEqual(1);
+    // across the face they are 4 × 0.08 / sin 14° = 1.32 mm apart: no closer than asked
+    const xs = [...new Set(ends(thin.segments).map((p) => p[0].toFixed(3)))].map(Number).sort((a, b) => a - b);
+    for (let i = 1; i < xs.length; i++) expect((xs[i] - xs[i - 1]) / Math.cos((14 * Math.PI) / 180)).toBeCloseTo((4 * 0.08) / Math.sin((14 * Math.PI) / 180), 2);
+    // lines already far enough apart are all drawn: 3.8 mm at 3° and 0.2 mm layers
+    const gentle = drawn(leaning(3));
+    const kept = stepSegments(gentle.P, gentle.T, gentle.faces, { turn: gentle.turn, layer: 0.2, apart: 1 });
+    expect(kept.every).toBe(1);
+    expect(kept.thinned).toBe(false);
+    expect(kept.lines).toBe(stepSegments(gentle.P, gentle.T, gentle.faces, { turn: gentle.turn, layer: 0.2 }).lines);
+    // each face by its own lean: a roof of two slopes, 3° and 12°, kept 1.5 mm apart at 0.2 mm layers – the gentle
+    // one keeps every line (3.8 mm), the steep one every second (2 × 0.96 mm)
+    const t3 = Math.tan((3 * Math.PI) / 180), t12 = Math.tan((12 * Math.PI) / 180);
+    const slope = (x0, x1, t) => hull([[x0, 0, 0], [x1, 0, 0], [x0, 80, 0], [x1, 80, 0], [x0, 0, 20 + (x0 ? 0 : 100 * t)], [x0, 80, 20 + (x0 ? 0 : 100 * t)], [x1, 0, 20 + (x1 ? 0 : 100 * t)], [x1, 80, 20 + (x1 ? 0 : 100 * t)]]);
+    const roof = drawn(join(slope(-100, 0, t3), slope(0, 100, t12)));
+    const both = stepSegments(roof.P, roof.T, roof.faces, { turn: roof.turn, layer: 0.2, apart: 1.5 });
+    expect(both.every).toBe(2);
+    const side = (left) => new Set(ends(both.segments).filter((p) => (p[0] < 0) === left && Math.abs(p[0]) > 1e-3).map((p) => Math.round(laid(roof.turn, p)[2] / 0.2 - 0.5)));
+    expect([...side(true)].some((k) => k % 2 === 1)).toBe(true);
+    expect([...side(false)].every((k) => k % 2 === 0)).toBe(true);
+    expect(side(false).size).toBeGreaterThan(20);
+  });
+
+  it('how far apart lines must be to stay lines on the screen goes by what is shown and the view', () => {
+    // 300 mm across in a view 900 dots on its shorter side: three dots are 1 mm
+    expect(stepsApart(300, 900)).toBeCloseTo(1, 9);
+    expect(stepsApart(300, 390)).toBeCloseTo(2.31, 2);
+    expect(stepsApart(300, 900, 6)).toBeCloseTo(2, 9);
+    expect(stepsApart(0, 900)).toBe(0);
+    expect(stepsApart(300, 0)).toBe(0);
+  });
+});
+
+describe('step lines are drawn where the line tells of them, and all over a rounded top', () => {
+  const marked = (c, layer = 0.2, told = null) => [...shownFaces(c, layer, told)].filter((b) => faceLean(b)).length;
+  const withFaces = (solid, down = '-z') => {
+    const mesh = solid.getMesh();
+    return { mesh, c: printCheck(mesh.vertProperties, mesh.numProp, mesh.triVerts, { turn: LAY_DOWN[down], faces: true }) };
+  };
+
+  it('a leaning face that looks down is told of by nobody: no step lines are drawn on it', () => {
+    const { mesh, c } = withFaces(leaning(5, false));
+    const row = checkRow(c, 0.2);
+    // the row keeps it, facing down; the line and the note say nothing of step lines
+    expect(row.steps.map((f) => f.facing)).toEqual(['down']);
+    expect(checkWords(row).join(' ')).not.toMatch(/step lines/);
+    expect(checkNote(row)?.steps).toBeUndefined();
+    // it is counted as a leaning face, and painted as one that may need supports – but no line is drawn on it
+    expect(c.faces.some((b) => faceLean(b))).toBe(true);
+    const shown = shownFaces(c, 0.2);
+    expect(shown.some((b) => faceKind(b) === FACE.skin)).toBe(true);
+    expect(shown.every((b) => faceLean(b) === 0)).toBe(true);
+    expect(stepSegments(mesh.vertProperties, mesh.triVerts, shown, { layer: 0.2 }).lines).toBe(0);
+    // a piece with one of each: only the one on top is drawn on
+    const two = withFaces(join(leaning(5, false), own(leaning(3).translate([0, 0, 40]))));
+    expect(checkRow(two.c, 0.2).steps.map((f) => f.facing)).toEqual(['up', 'down']);
+    const up = [...shownFaces(two.c, 0.2)].map((b, t) => (faceLean(b) ? t : -1)).filter((t) => t >= 0);
+    expect(up.length).toBeGreaterThan(0);
+    const P = two.mesh.vertProperties, T = two.mesh.triVerts;
+    for (const t of up) expect(Math.min(P[T[3 * t] * 3 + 2], P[T[3 * t + 1] * 3 + 2], P[T[3 * t + 2] * 3 + 2])).toBeGreaterThan(55);
+  });
+
+  it('a shallow cone has its step lines all the way round, not on the three faces the row names', () => {
+    // half a roof rising 8° to a point, 100 mm in radius, on a 10 mm disc: 45 faces round it, which the check takes
+    // for a few leaning faces side by side – some big enough to be told of, some not
+    const rise = 100 * Math.tan((8 * Math.PI) / 180);
+    const whole = join(own(M.cylinder(10, 100, 100, 90)), own(own(M.cylinder(rise, 100, 0, 90)).translate([0, 0, 10])));
+    const { mesh, c } = withFaces(own(whole.intersect(block([0, -100, 0], [100, 100, 40]))));
+    const row = checkRow(c, 0.2);
+    expect(row.steps.length).toBe(3);
+    expect(row.steps.reduce((sum, f) => sum + f.area, 0)).toBeLessThan(0.4 * 15900);
+    expect(checkWords(row).join(' ')).toMatch(/step lines about every 1\.5 mm on a big face on top/);
+    const P = mesh.vertProperties, T = mesh.triVerts;
+    // every triangle of the roof: those that look up with a point above the disc's top
+    const roof = [];
+    for (let t = 0; t < T.length / 3; t++) {
+      const [a, b, d] = [0, 1, 2].map((e) => T[3 * t + e] * 3);
+      const up = (P[b] - P[a]) * (P[d + 1] - P[a + 1]) - (P[b + 1] - P[a + 1]) * (P[d] - P[a]) > 1e-6;
+      if (up && Math.max(P[a + 2], P[b + 2], P[d + 2]) > 10.01) roof.push(t);
+    }
+    expect(roof.length).toBeGreaterThanOrEqual(45);
+    // as counted, the three the row names are not all of it; as shown, all of it is marked
+    expect(new Set(roof.map((t) => faceLean(c.faces[t]))).size).toBeGreaterThan(3);
+    const shown = shownFaces(c, 0.2);
+    expect(roof.every((t) => faceLean(shown[t]) > 0)).toBe(true);
+    expect(marked(c)).toBe(roof.length);
+    // and so the lines are half rings: every level is crossed from one cut edge of the roof round to the other
+    const { segments, lines, thinned } = stepSegments(P, T, shown, { layer: 0.2 });
+    expect(thinned).toBe(false);
+    const byLevel = new Map();
+    for (let i = 0; i < segments.length; i += 6) {
+      const k = Math.round(segments[i + 2] / 0.2 - 0.5);
+      const turn = (j) => Math.atan2(segments[j + 1], segments[j]);
+      const at = byLevel.get(k) ?? byLevel.set(k, [Infinity, -Infinity]).get(k);
+      at[0] = Math.min(at[0], turn(i), turn(i + 3));
+      at[1] = Math.max(at[1], turn(i), turn(i + 3));
+    }
+    expect(lines).toBeGreaterThanOrEqual(45 * (byLevel.size - 1));
+    expect(byLevel.size).toBe(Math.floor(rise / 0.2));
+    // (but for the last few at the very tip, where the faces are slivers)
+    for (const [k, [from, to]] of byLevel) if ((k + 0.5) * 0.2 < 10 + rise - 1) expect(to - from, `level ${k}`).toBeCloseTo(Math.PI, 1);
+    // at layers so thick the roof climbs under two of them nothing is told, and nothing drawn
+    expect(checkWords(checkRow(c, 8)).join(' ')).not.toMatch(/step lines/);
+    expect(marked(c, 8)).toBe(0);
+  });
+
+  it('a top rounded into many small faces is marked all over, the small ones with the big', () => {
+    // a low dome in three rings of 72 faces, on a disc with a wedge beside it whose top leans 3°: the wedge's top is
+    // the one big face the line tells of, each ring is small faces all round
+    const ring = (r0, r1, z0, z1) => own(own(M.cylinder(z1 - z0, r0, r1, 72)).translate([0, 0, z0]));
+    const t = (deg) => Math.tan((deg * Math.PI) / 180);
+    const z1 = 10 + 20 * t(12), z2 = z1 + 20 * t(8), z3 = z2 + 20 * t(4);
+    const dome = join(own(M.cylinder(10, 80, 80, 72)), ring(80, 60, 10, z1), ring(60, 40, z1, z2), ring(40, 20, z2, z3), own(leaning(3).translate([90, -40, 0])));
+    const { mesh, c } = withFaces(dome);
+    expect(c.leaning.filter((f) => f.facing === 'up').length).toBe(1);
+    const P = mesh.vertProperties, T = mesh.triVerts;
+    const shown = shownFaces(c, 0.2);
+    let slopes = 0;
+    for (let k = 0; k < T.length / 3; k++) {
+      const zs = [0, 1, 2].map((e) => P[T[3 * k + e] * 3 + 2]);
+      const xs = [0, 1, 2].map((e) => P[T[3 * k + e] * 3]);
+      // a face of a ring: over the disc, sloping
+      if (Math.max(...xs) > 80.01 || Math.min(...zs) < 9.99 || Math.max(...zs) - Math.min(...zs) < 0.5) continue;
+      slopes++;
+      expect(faceLean(c.faces[k])).toBe(LEAN_REST);
+      expect(faceLean(shown[k])).toBe(LEAN_REST);
+    }
+    expect(slopes).toBe(3 * 72 * 2);
+    // without the wedge the line tells of no step lines, and none of the dome is marked
+    const alone = withFaces(join(own(M.cylinder(10, 80, 80, 72)), ring(80, 60, 10, z1), ring(60, 40, z1, z2), ring(40, 20, z2, z3)));
+    expect(checkWords(checkRow(alone.c, 0.2)).join(' ')).not.toMatch(/step lines/);
+    expect(alone.c.faces.some((b) => faceLean(b) === LEAN_REST)).toBe(true);
+    expect(marked(alone.c)).toBe(0);
+    // a small face that leans but looks down has no number at all
+    const under = withFaces(join(block([0, 0, 0], [10, 10, 10]), hull([[10, 0, 10], [20, 0, 10 + 10 * t(5)], [10, 10, 10], [20, 10, 10 + 10 * t(5)], [10, 0, 14], [20, 0, 14], [10, 10, 14], [20, 10, 14]])));
+    expect(under.c.faces.every((b) => faceLean(b) === 0)).toBe(true);
+  });
+
+  it('a lighter copy is drawn on only where the piece itself is told of step lines', () => {
+    const top = withFaces(leaning(3));
+    const none = withFaces(block([0, 0, 0], [100, 80, 20]));
+    const under = withFaces(leaning(5, false));
+    expect(marked(top.c, 0.2, top.c)).toBeGreaterThan(0);
+    expect(marked(top.c, 0.2, none.c)).toBe(0);
+    expect(marked(top.c, 0.2, under.c)).toBe(0);
+    // and where the copy has lost its leaning face there is nothing to draw on, whatever the piece's line says
+    expect(marked(none.c, 0.2, top.c)).toBe(0);
   });
 });

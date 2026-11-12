@@ -6031,6 +6031,14 @@ try {
     const desk = deskWhole.subtract(Manifold.union(deskSlots));
     const deskFile = writeFixture('desk.stl', soupOf(desk));
     for (const m of [deskBody, deskShelf, ...deskSlots, deskWhole, desk]) m.delete();
+    // a block 200 mm long on one long foot: its top leans 14° (step lines under a millimetre apart) and its underside
+    // leans 5° over the bed (supports, and no step lines worth drawing)
+    const [t14, t5] = [14, 5].map((deg) => Math.tan((deg * Math.PI) / 180));
+    const rampBody = Manifold.hull([[-100, 0, 10], [100, 0, 10], [-100, 80, 10 + 80 * t5], [100, 80, 10 + 80 * t5], [-100, 0, 30], [100, 0, 30], [-100, 80, 30 + 80 * t14], [100, 80, 30 + 80 * t14]]);
+    const rampFoot = Manifold.cube([200, 10, 12]).translate([-100, 0, 0]);
+    const ramp = Manifold.union([rampBody, rampFoot]);
+    const rampFile = writeFixture('ramp.stl', soupOf(ramp));
+    for (const m of [rampBody, rampFoot, ramp]) m.delete();
     const preserve = () => {
       const getContext = HTMLCanvasElement.prototype.getContext;
       HTMLCanvasElement.prototype.getContext = function (type, attrs) {
@@ -6039,8 +6047,8 @@ try {
       };
     };
     const printedProblems = [];
-    /** The desk opened, cut in two, laid as modelled, its pieces shown. */
-    const open = async (context) => {
+    /** The desk (or another model) opened, cut in two, laid as modelled, its pieces shown. */
+    const open = async (context, file = deskFile, name = 'desk') => {
       await context.addInitScript(preserve);
       const p = await context.newPage();
       p.on('pageerror', (e) => printedProblems.push(`pageerror: ${e.message}`));
@@ -6054,8 +6062,8 @@ try {
       const press = (selector) => p.evaluate((s) => document.querySelector(s).click(), selector);
       await p.goto(url);
       await settled();
-      await p.setInputFiles('#stlFile', deskFile);
-      await p.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('desk:'));
+      await p.setInputFiles('#stlFile', file);
+      await p.waitForFunction((n) => document.querySelector('#modelInfo').textContent.startsWith(`${n}:`), name);
       await settled();
       await press('#deleteBtn'); // the desk alone, without the text it opens with
       await settled();
@@ -6085,13 +6093,18 @@ try {
         const ctx = probe.getContext('2d');
         ctx.drawImage(c, 0, 0);
         const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
-        const out = { red: 0, amber: 0, dark: 0 };
+        const out = { red: 0, amber: 0, dark: 0, sheet: 0 };
+        const isDark = (i) => d[i + 3] >= 200 && d[i] < 60 && d[i + 1] < 70 && d[i + 2] < 90;
+        const row = 4 * probe.width;
         for (let i = 0; i < d.length; i += 4) {
           const [r, g, bl] = [d[i], d[i + 1], d[i + 2]];
           if (d[i + 3] < 200) continue;
           if (r > 150 && g < 80 && bl > 40 && bl < 130) out.red++;
           if (r > 220 && g > 130 && g < 215 && bl < 110 && r - bl > 120) out.amber++;
-          if (r < 60 && g < 70 && bl < 90) out.dark++;
+          if (!isDark(i)) continue;
+          out.dark++;
+          // dark on every side: part of a dark sheet, not of a line
+          if (isDark(i - 4) && isDark(i + 4) && isDark(i - row) && isDark(i + row)) out.sheet++;
         }
         return {
           ...out,
@@ -6182,6 +6195,41 @@ try {
       'unticked the pieces are spread apart again; As printed goes with the pieces view and comes back unticked',
       JSON.stringify({ off, left, back }),
     );
+    // close lines and a leaning underside: the lines are thinned and the chip says so; the underside is red, unlined
+    const steep = await open(wide, rampFile, 'ramp');
+    const rampLines = await steep.p.locator('#pieceList li .print-check').allInnerTexts();
+    check(
+      rampLines.length === 2 && rampLines.every((t) => /may need supports: about \d+ cm², standing on the bed · step lines about every 0\.4 mm on a big face on top/.test(t)),
+      'a top leaning 14° is told of with its step lines 0.4 mm apart (at the 0.1 mm layers set above), a leaning underside with supports only',
+      rampLines.join(' / '),
+    );
+    const rampApart = await state(steep.p);
+    await steep.press('#asPrintedToggle');
+    await steep.p.waitForTimeout(400);
+    const rampAbove = await state(steep.p);
+    check(
+      JSON.stringify(rampAbove.chips) === JSON.stringify(['may need supports', 'step lines, about here (not all drawn)']),
+      'where the step lines are too close to draw each, some are left out and the legend says so',
+      JSON.stringify(rampAbove.chips),
+    );
+    await steep.p.screenshot({ path: path.join(out, 'as-printed-ramp.png') });
+    check(
+      rampAbove.dark > rampApart.dark + 1500 && rampAbove.sheet - rampApart.sheet < 0.1 * (rampAbove.dark - rampApart.dark),
+      'the thinned lines stay lines: the leaning tops are striped, not a dark sheet',
+      JSON.stringify({ apart: rampApart.dark, printed: rampAbove.dark, sheet: [rampApart.sheet, rampAbove.sheet] }),
+    );
+    await steep.p.mouse.move(mx, my);
+    await steep.p.mouse.down();
+    await steep.p.mouse.move(mx + 40, my - 330, { steps: 12 });
+    await steep.p.mouse.up();
+    await steep.p.waitForTimeout(400);
+    const rampBelow = await state(steep.p);
+    check(
+      rampBelow.red > 3000 && rampBelow.dark - rampApart.dark < 0.1 * rampBelow.red,
+      'seen from below the leaning underside is red, with no step lines drawn across it',
+      JSON.stringify({ red: rampBelow.red, dark: rampBelow.dark, apart: rampApart.dark }),
+    );
+    await steep.p.screenshot({ path: path.join(out, 'as-printed-ramp-below.png') });
     await wide.close();
 
     // on a phone: the box is there, inside the screen, and neither it nor the legend covers the other

@@ -98,7 +98,9 @@ export const OVERHANG_NZ = -Math.sin((PRINT_CHECK.angle + PRINT_CHECK.tolerance)
  * What a face is to the check, for a picture of it: nothing to say, one that may need supports (the model's own, or
  * a glue face), or part of a level span the printer is left to bridge. `printCheck` gives one number a triangle
  * (`faces`): this in its low two bits (`faceKind`), and above them which of the piece's leaning faces the triangle is
- * part of (`faceLean`: its number in `leaning` from 1, 0 for none).
+ * part of (`faceLean`: its number in `leaning` from 1, 0 for none; where a piece has more of them than the number
+ * holds, the last number stands for all the rest). A triangle on top that leans as little but is part of no face big
+ * enough to be told of – one of the many small faces of a rounded top – has `LEAN_REST`.
  */
 export const FACE = Object.freeze({ none: 0, skin: 1, seam: 2, span: 3 });
 /** What a triangle is, from its number in `faces`: one of `FACE`. */
@@ -106,7 +108,9 @@ export const faceKind = (b) => b & 3;
 /** Which leaning face a triangle is part of, from its number in `faces`: from 1, 0 for none. */
 export const faceLean = (b) => b >> 2;
 /** How many leaning faces `faces` can tell apart. */
-const LEAN_FACES = 63;
+const LEAN_FACES = 62;
+/** What `faceLean` gives for a triangle on top that leans a little off level but is part of no big leaning face. */
+export const LEAN_REST = 63;
 
 const TILT_BINS = Math.ceil(PRINT_CHECK.stepMax / 0.5);
 const TURN_BINS = 72;
@@ -585,7 +589,8 @@ export function printCheck(vertProperties, numProp, triVerts, { turn = null, pla
   if (told) {
     for (let t = 0; t < tris; t++) {
       const face = binOf[t] < 0 ? 0 : bins.get(binOf[t]).face;
-      if (face > 0 && face <= LEAN_FACES) told[t] |= face << 2;
+      if (face > 0) told[t] |= Math.min(face, LEAN_FACES) << 2;
+      else if (binOf[t] >= 0 && bins.get(binOf[t]).n[2] > 0) told[t] |= LEAN_REST << 2;
     }
   }
   return {
@@ -616,15 +621,18 @@ export function stepLines(leaning, layer = 0.2) {
 
 const round1 = (v) => Math.round(v * 10) / 10;
 
+/** Every leaning face that shows step lines at a layer height, with them. `face` is its number in `leaning`, from 1. */
+function leaningRows(leaning, layer) {
+  const h = layer > 0 ? layer : 0.2;
+  return (leaning ?? []).map((f, i) => ({ ...stepLines([f], h)[0], face: i + 1 })).filter((f) => f.lines >= PRINT_CHECK.stepCount);
+}
+
 /**
  * The leaning faces a piece's row keeps, with their step lines at a layer height: the largest few, those facing up
  * first. `face` is each one's number in `leaning`, from 1.
  */
 function rowSteps(leaning, layer) {
-  const h = layer > 0 ? layer : 0.2;
-  return (leaning ?? [])
-    .map((f, i) => ({ ...stepLines([f], h)[0], face: i + 1 }))
-    .filter((f) => f.lines >= PRINT_CHECK.stepCount)
+  return leaningRows(leaning, layer)
     .sort((p, q) => (p.facing === 'up' ? 0 : 1) - (q.facing === 'up' ? 0 : 1) || q.area - p.area)
     .slice(0, PRINT_CHECK.steps);
 }
@@ -670,7 +678,11 @@ export function checkRow(check, layer = 0.2) {
 /**
  * What of a piece's check a picture of it shows, one number a triangle (`faceKind`, `faceLean`), so that the picture
  * says what the piece's line says: the faces that may need supports only where the line says it may need them, a
- * level span only where the line tells of one, and of the leaning faces only those the row keeps at this layer height.
+ * level span only where the line tells of one, and step lines only where the line tells of them – on a big leaning
+ * face on top. Then every face on top that leans as little is marked, not only the largest the line names: a shallow
+ * roof that is round is many faces side by side, big and small, and its step lines run all the way round it. A
+ * leaning face that looks down is never marked: it prints on supports, or on the layer under it, and shows no step
+ * lines worth drawing.
  * @param {object|null} check from `printCheck` with `faces: true`
  * @param {number} layer the layer height, mm
  * @param {object|null} told the check the piece's line is made from, where that is another (the piece itself, where
@@ -682,7 +694,8 @@ export function shownFaces(check, layer = 0.2, told = null) {
   const said = (told ?? check).supports;
   const supports = Math.round(said.area) >= PRINT_CHECK.none;
   const span = Math.round(said.span) >= PRINT_CHECK.none;
-  const kept = new Set(rowSteps(check.leaning, layer).map((f) => f.face));
+  const onTop = (c) => leaningRows(c.leaning, layer).filter((f) => f.facing === 'up');
+  const kept = new Set(onTop(told ?? check).length ? [...onTop(check).map((f) => Math.min(f.face, LEAN_FACES)), LEAN_REST] : []);
   return check.faces.map((b) => {
     const kind = faceKind(b);
     const shown = kind === FACE.span ? span : kind !== FACE.none && supports;
@@ -696,64 +709,113 @@ export function shownFaces(check, layer = 0.2, told = null) {
  * layer up from the bed, and every layer from there. They are about where the printer will leave them – the first
  * layer may be of another height, and the mesh drawn may be a lighter copy.
  *
- * No more than `cap` segments are made: past that every second level is left out, then every fourth, and so on.
+ * Not every line need be drawn. Where the lines would lie closer than `apart` mm across a face, only every second
+ * level is drawn there, or every fourth, and so on, until they are that far apart: closer than a few dots of the
+ * screen they would run into one dark sheet. That goes by each triangle's own lean, so a flat face is thinned alike
+ * all over and a rounded one more where it is steeper. And never more than `cap` segments are made: past that every
+ * triangle keeps half its levels again, as often as that leaves any; what is still too many (a fine mesh that
+ * crosses few levels) is cut short. The levels kept are whole multiples of a triangle's step, so triangles that lean
+ * alike keep the same ones and a line runs on from one to the next.
  * @param {ArrayLike<number>} positions the piece's points as they are in the model, three numbers each
  * @param {ArrayLike<number>} index three points a triangle
  * @param {ArrayLike<number>} faces one number a triangle (`shownFaces`): only triangles of a leaning face are cut
- * @param {{ turn?: number[]|null, layer?: number, cap?: number, lift?: number }} options `turn` the 4 × 4 matrix
- *   (column-major) that lays the piece on the bed, the bed at z = 0; `layer` the layer height, mm; `cap` the most
- *   segments; `lift` how far off the face the lines are drawn (mm), so they are not lost in it
- * @returns {{ segments: Float32Array, lines: number, every: number }} `segments` six numbers each, the two ends as
- *   they are in the model; `lines` how many; `every` 1 where every level is drawn, 2 for every second, …
+ * @param {{ turn?: number[]|null, layer?: number, cap?: number, apart?: number, lift?: number }} options `turn` the
+ *   4 × 4 matrix (column-major) that lays the piece on the bed, the bed at z = 0; `layer` the layer height, mm; `cap`
+ *   the most segments; `apart` the least distance between two lines drawn on a face, mm (0: every line is drawn);
+ *   `lift` how far off the face the lines are drawn (mm), so they are not lost in it
+ * @returns {{ segments: Float32Array, lines: number, every: number, thinned: boolean }} `segments` six numbers each,
+ *   the two ends as they are in the model; `lines` how many; `every` 1 where every level is drawn, 2 where some
+ *   triangle has every second only, …; `thinned` whether any line was left out
  */
-export function stepSegments(positions, index, faces, { turn = null, layer = 0.2, cap = 20000, lift = 0 } = {}) {
+export function stepSegments(positions, index, faces, { turn = null, layer = 0.2, cap = 400000, apart = 0, lift = 0 } = {}) {
   const h = layer > 0 ? layer : 0.2;
+  const most = Math.max(1, Math.floor(cap));
   const m = turn ?? [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
   const height = (v) => m[2] * positions[v] + m[6] * positions[v + 1] + m[10] * positions[v + 2] + m[14];
-  // the levels a triangle crosses: those above its lowest point, up to its highest
-  const levels = (lo, hi) => [Math.max(0, Math.floor(lo / h - 0.5) + 1), Math.floor(hi / h - 0.5)];
+  // a triangle's normal as it is in the model, twice its area long
+  const normal = (a, b, c) => {
+    const u = [positions[b] - positions[a], positions[b + 1] - positions[a + 1], positions[b + 2] - positions[a + 2]];
+    const w = [positions[c] - positions[a], positions[c + 1] - positions[a + 1], positions[c + 2] - positions[a + 2]];
+    return [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+  };
   const tris = Math.min(Math.floor(index.length / 3), faces?.length ?? 0);
+  // the leaning triangles that cross a level, four numbers each: which, how many levels apart its lines are drawn,
+  // and the first and last level it crosses – those above its lowest point, up to its highest
   const leaning = [];
-  let most = 0;
+  let top = 0;
   for (let t = 0; t < tris; t++) {
     if (!faceLean(faces[t])) continue;
-    const za = height(index[3 * t] * 3), zb = height(index[3 * t + 1] * 3), zc = height(index[3 * t + 2] * 3);
-    const [from, to] = levels(Math.min(za, zb, zc), Math.max(za, zb, zc));
+    const a = index[3 * t] * 3, b = index[3 * t + 1] * 3, c = index[3 * t + 2] * 3;
+    const za = height(a), zb = height(b), zc = height(c);
+    const from = Math.max(0, Math.floor(Math.min(za, zb, zc) / h - 0.5) + 1);
+    const to = Math.floor(Math.max(za, zb, zc) / h - 0.5);
     if (to < from) continue;
-    leaning.push(t);
-    most += to - from + 1;
+    // for its lines to be `apart` from each other across it: a face `tilt` off level climbs a layer every
+    // `layer / sin(tilt)` mm of itself (a hair is given, so that lines just that far apart are all kept)
+    let every = 1;
+    if (apart > 0) {
+      const n = normal(a, b, c);
+      const len = Math.hypot(n[0], n[1], n[2]) || 1;
+      const up = (m[2] * n[0] + m[6] * n[1] + m[10] * n[2]) / len;
+      const sine = Math.sqrt(Math.max(0, 1 - up * up));
+      while (every * h < apart * sine * (1 - 1e-4) && every <= to) every *= 2;
+    }
+    leaning.push(t, every, from, to);
+    if (to > top) top = to;
   }
+  // within the cap: every triangle keeps half its levels again, while that helps
+  const count = (times) => {
+    let n = 0;
+    for (let i = 0; i < leaning.length; i += 4) {
+      const e = leaning[i + 1] * times;
+      n += Math.floor(leaning[i + 3] / e) - Math.ceil(leaning[i + 2] / e) + 1;
+    }
+    return n;
+  };
+  let times = 1;
+  while (times <= top && count(times) > most && count(times * 2) > 0) times *= 2;
   let every = 1;
-  while (most / every > Math.max(1, cap)) every *= 2;
+  for (let i = 0; i < leaning.length; i += 4) every = Math.max(every, (leaning[i + 1] *= times));
   const out = [];
-  for (const t of leaning) {
+  let cut = false;
+  for (let i = 0; i < leaning.length && !cut; i += 4) {
+    const t = leaning[i];
+    const e = leaning[i + 1];
     const v = [index[3 * t] * 3, index[3 * t + 1] * 3, index[3 * t + 2] * 3];
     const z = v.map(height);
-    const [from, to] = levels(Math.min(...z), Math.max(...z));
     // off the face along its own normal
     let off = [0, 0, 0];
     if (lift) {
-      const [a, b, c] = v;
-      const u = [positions[b] - positions[a], positions[b + 1] - positions[a + 1], positions[b + 2] - positions[a + 2]];
-      const w = [positions[c] - positions[a], positions[c + 1] - positions[a + 1], positions[c + 2] - positions[a + 2]];
-      const n = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+      const n = normal(v[0], v[1], v[2]);
       const len = Math.hypot(n[0], n[1], n[2]);
       if (len > 0) off = n.map((x) => (x / len) * lift);
     }
-    for (let k = from + ((every - (from % every)) % every); k <= to; k += every) {
+    for (let k = Math.ceil(leaning[i + 2] / e) * e; k <= leaning[i + 3]; k += e) {
       const at = (k + 0.5) * h;
       const ends = [];
-      for (let e = 0; e < 3 && ends.length < 6; e++) {
-        const p = e, q = (e + 1) % 3;
+      for (let s = 0; s < 3 && ends.length < 6; s++) {
+        const p = s, q = (s + 1) % 3;
         if (z[p] < at === z[q] < at) continue;
-        const s = (at - z[p]) / (z[q] - z[p]);
-        for (let a = 0; a < 3; a++) ends.push(positions[v[p] + a] + s * (positions[v[q] + a] - positions[v[p] + a]) + off[a]);
+        const along = (at - z[p]) / (z[q] - z[p]);
+        for (let a = 0; a < 3; a++) ends.push(positions[v[p] + a] + along * (positions[v[q] + a] - positions[v[p] + a]) + off[a]);
       }
-      if (ends.length === 6) out.push(...ends);
+      if (ends.length !== 6) continue;
+      if (out.length / 6 >= most) {
+        cut = true;
+        break;
+      }
+      out.push(...ends);
     }
   }
-  return { segments: Float32Array.from(out), lines: out.length / 6, every };
+  return { segments: Float32Array.from(out), lines: out.length / 6, every, thinned: every > 1 || cut };
 }
+
+/**
+ * How far apart the step lines drawn on the pieces should be at least (mm), for them to stay lines on the screen:
+ * `dots` screen dots between two of them, where what is shown – `across` mm from corner to corner – fills a view
+ * `view` dots on its shorter side.
+ */
+export const stepsApart = (across, view, dots = 3) => (across > 0 && view > 0 ? (dots * across) / view : 0);
 
 /** An area in plain words: "under 1 cm²", "about 12 cm²". */
 export function areaWords(mm2) {
@@ -763,8 +825,11 @@ export function areaWords(mm2) {
 /** A length in plain words, to the millimetre from 3 mm up and to half a millimetre under it. */
 const lengthWords = (v) => (v >= 3 ? String(Math.round(v)) : String(Math.max(0.5, Math.round(v * 2) / 2)));
 
-/** How far apart a leaning face's step lines are: "about every 4 mm". */
-export const everyWords = (every) => `about every ${lengthWords(every)} mm`;
+/**
+ * How far apart a leaning face's step lines are: "about every 4 mm"; to a tenth of a millimetre where they are under
+ * one apart ("about every 0.3 mm"), so that close lines are not told as wider apart than they are.
+ */
+export const everyWords = (every) => `about every ${every < 0.95 ? Math.max(0.1, round1(every)) : lengthWords(every)} mm`;
 
 /** Where the supports of a piece would stand: on the bed, on the piece itself, or some on each. */
 function standWords(s, whole = false) {

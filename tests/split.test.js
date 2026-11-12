@@ -3668,6 +3668,47 @@ describe('the print check', () => {
     expect([...again.display.printed]).toEqual([...r.display.printed]);
   });
 
+  it('step lines are marked all round a shallow cone, and never on a leaning face that looks down', async () => {
+    // a roof rising 8° to a point, 100 mm in radius, on a 10 mm disc, cut in two: each half's row names three leaning
+    // faces, a part of the roof – but the whole roof will show step lines, and the whole of it is marked
+    const rise = 100 * Math.tan((8 * Math.PI) / 180);
+    const cone = own(wasm.Manifold.union([own(wasm.Manifold.cylinder(10, 100, 100, 90)), own(own(wasm.Manifold.cylinder(rise, 100, 0, 90)).translate([0, 0, 10]))]));
+    const half = (Math.PI * 100 * Math.hypot(100, rise)) / 2; // half the roof's surface, 15,863 mm², were it truly round
+    const roofed = async (run) => {
+      const r = await run(S({ orient: 'model', labels: false }));
+      for (const [i, p] of paintedOf(r).entries()) {
+        const steps = r.pieces[i].check.steps;
+        expect(steps.length).toBe(3);
+        expect(steps.every((f) => f.facing === 'up')).toBe(true);
+        expect(steps.reduce((sum, f) => sum + f.area, 0)).toBeLessThan(0.5 * half);
+        expect(p.lean).toBeGreaterThan(0.99 * half);
+        expect(p.lean).toBeLessThan(1.001 * half);
+      }
+      return r;
+    };
+    await load(cone, 'cone');
+    await roofed(resultSplit);
+    // and so it is where the pieces are shown through lighter copies
+    const engine = createEngine({ wasm, lodTriangles: 10 });
+    const light = createEngineClient({ createWorker: () => createLocalWorker(Promise.resolve(engine)) });
+    await light.loadBase({ kind: 'stl', bytes: stlOf(cone), name: 'cone', version: 1 });
+    await roofed((split) => light.result([], 1, { printing, split, bed: BED }));
+    light.dispose?.();
+    // a block on a long foot whose underside leans 5°: its row keeps the underside as a leaning face that looks
+    // down, of which its line says nothing – it may need supports, and is painted so, with no step lines marked
+    const t5 = Math.tan((5 * Math.PI) / 180);
+    const body = own(wasm.Manifold.hull([[-100, 0, 10], [100, 0, 10], [-100, 80, 10 + 80 * t5], [100, 80, 10 + 80 * t5], [-100, 0, 40], [100, 0, 40], [-100, 80, 40], [100, 80, 40]]));
+    await load(own(wasm.Manifold.union([body, cube([200, 10, 12], [0, 5, 6])])), 'ramp');
+    const ramp = await resultSplit(S({ orient: 'model', labels: false }));
+    for (const [i, p] of paintedOf(ramp).entries()) {
+      const check = ramp.pieces[i].check;
+      expect(check.steps.map((f) => f.facing)).toEqual(['down']);
+      expect(check.supports.skin).toBeGreaterThan(6000);
+      expect(p.seen[FACE.skin]).toBeCloseTo(check.supports.skin, 0);
+      expect(p.lean).toBe(0);
+    }
+  });
+
   it('a split shown through lighter copies is painted from the same check of what is shown', async () => {
     // an engine that shows any split through lighter copies
     const engine = createEngine({ wasm, lodTriangles: 10 });

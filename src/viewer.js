@@ -54,7 +54,7 @@ import { placedAt, snapTolerance } from './aim.js';
 import { SEAT_WORD } from './locks.js';
 import { geometryFromBuffers } from './mesh.js';
 import { clickRadius, surfaceNormalAt } from './surfaceNormal.js';
-import { FACE, faceKind, faceLean, stepSegments } from './printCheck.js';
+import { FACE, faceKind, faceLean, stepSegments, stepsApart } from './printCheck.js';
 import {
   APART_COLOR, CUT_COLOR, PIECE_COLORS, PIN_COLOR, TOO_BIG_COLOR, axisCuts, cellSizes, cutPlane, explodeOffset, letterFor, offsetAlongRay, pieceColorIndex, pieceColors,
   printTransform, printedFace, printedRow, snapTarget, triangleInBox, wayAt,
@@ -110,9 +110,14 @@ export const LOCK_COLORS = Object.freeze({ lock: 0xff6a00, carry: 0xffb27a, lug:
  * level span the printer is left to bridge amber; and the step lines of a big leaning face drawn dark across it.
  */
 export const PRINT_COLORS = Object.freeze({ support: 0xe11d48, seam: 0xf9a8b8, span: 0xf59e0b, step: 0x111827 });
-/** The most step lines drawn on one piece, and how far off its faces they are drawn (mm) so they are not lost in them. */
-const STEP_LINES = 20000;
+/**
+ * The most step-line segments drawn on one piece, how far off its faces they are drawn (mm) so they are not lost in
+ * them, and how many screen dots apart they are kept with the pieces framed (closer, every second one is left out,
+ * or more).
+ */
+const STEP_LINES = 400000;
 const STEP_LIFT = 0.04;
+const STEP_DOTS = 3;
 
 /** A part's circle in the model view: teal when its lock fits, amber when it only lifts off, red when it can't come out. */
 const PART_STATE_COLORS = { lock: APART_COLOR, lift: 0xf59e0b, stuck: COLORS.tooBig };
@@ -2443,13 +2448,17 @@ export class Viewer {
     const n = new Vector3();
     const [a, b, c] = [new Vector3(), new Vector3(), new Vector3()];
     const turned = this.#printedTurns();
+    // how far apart step lines must be to stay lines with the row of pieces framed: three dots of the screen
+    const row = new Vector3();
+    for (const { size } of turned.values()) row.set(row.x + size.x + this.#explodeGap(1), Math.max(row.y, size.y), Math.max(row.z, size.z));
+    const apart = stepsApart(row.length(), Math.min(...this.viewSize), STEP_DOTS);
     for (const e of this.pieceEntries) {
       this.#dropLines(e);
       e.printed = null;
       e.shows = null;
       if (e.kind !== 'piece' || (!e.slots.length && !e.told)) continue;
       const pos = e.mesh.geometry.attributes.position;
-      if (e.told) this.#drawSteps(e, turned.get(e.index)?.M);
+      if (e.told) this.#drawSteps(e, turned.get(e.index)?.M, apart);
       if (!e.cls) continue;
       const p = this.pieceInfo?.get(e.index);
       const box = e.mesh.geometry.boundingBox;
@@ -2515,12 +2524,14 @@ export class Viewer {
   /**
    * The step lines of a piece's big leaning faces, drawn across them where the face crosses the middle of each layer
    * as the piece lies on the bed (`M`, the matrix that lays it there): about where the printer will leave them
-   * (printCheck.js `stepSegments`). In the piece's own frame, so they go where the piece goes.
+   * (printCheck.js `stepSegments`). Lines that would lie closer than `apart` mm are thinned – every second one drawn,
+   * or every fourth – so a steep face or fine layers do not turn the face black. In the piece's own frame, so they go
+   * where the piece goes.
    */
-  #drawSteps(e, M) {
+  #drawSteps(e, M, apart = 0) {
     if (!M || !e.told.some((b) => faceLean(b))) return;
     const layer = this.pieceInfo?.get(e.index)?.check?.layer ?? 0.2;
-    const { segments, lines } = stepSegments(e.mesh.geometry.attributes.position.array, e.base ?? e.mesh.geometry.index.array, e.told, { turn: M.elements, layer, cap: STEP_LINES, lift: STEP_LIFT });
+    const { segments, lines, thinned } = stepSegments(e.mesh.geometry.attributes.position.array, e.base ?? e.mesh.geometry.index.array, e.told, { turn: M.elements, layer, cap: STEP_LINES, apart, lift: STEP_LIFT });
     if (!lines) return;
     const line = new BufferGeometry();
     line.setAttribute('position', new BufferAttribute(segments, 3));
@@ -2528,6 +2539,7 @@ export class Viewer {
     e.steps.renderOrder = 11;
     e.steps.raycast = () => {};
     e.steps.userData.lines = lines;
+    e.steps.userData.thinned = thinned;
     e.mesh.add(e.steps);
     e.shows = { support: false, seam: false, span: false, steps: true };
   }
@@ -2689,6 +2701,11 @@ export class Viewer {
     const out = { support: false, seam: false, span: false, steps: false };
     for (const e of this.pieceEntries) for (const k of Object.keys(out)) if (e.shows?.[k]) out[k] = true;
     return out;
+  }
+
+  /** Whether some of the pieces' step lines are left out as printed, being too close to draw each. */
+  get stepLinesThinned() {
+    return this.pieceEntries.some((e) => e.steps?.userData.thinned);
   }
 
   /** How many step lines are drawn on the pieces as printed. */

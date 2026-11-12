@@ -112,12 +112,14 @@ export const LOCK_COLORS = Object.freeze({ lock: 0xff6a00, carry: 0xffb27a, lug:
 export const PRINT_COLORS = Object.freeze({ support: 0xe11d48, seam: 0xf9a8b8, span: 0xf59e0b, step: 0x111827 });
 /**
  * The most step-line segments drawn on one piece, how far off its faces they are drawn (mm) so they are not lost in
- * them, and how many screen dots apart they are kept with the pieces framed (closer, every second one is left out,
- * or more).
+ * them, how many screen dots apart they are kept with the pieces framed (closer, every second one is left out, or
+ * more), and how far back in depth the faces under them are drawn (`polygonOffset`'s factor and units), so the lines
+ * stay whole however far off a row of large pieces is seen from.
  */
 const STEP_LINES = 400000;
 const STEP_LIFT = 0.04;
 const STEP_DOTS = 3;
+const STEP_BACK = 2;
 
 /** A part's circle in the model view: teal when its lock fits, amber when it only lifts off, red when it can't come out. */
 const PART_STATE_COLORS = { lock: APART_COLOR, lift: 0xf59e0b, stuck: COLORS.tooBig };
@@ -2541,10 +2543,25 @@ export class Viewer {
     e.steps.userData.lines = lines;
     e.steps.userData.thinned = thinned;
     e.mesh.add(e.steps);
+    this.#setBack(e, true);
     e.shows = { support: false, seam: false, span: false, steps: true };
   }
 
+  /**
+   * A piece's faces drawn a hair farther from the eye than they are (`on`), or where they are: so the step lines
+   * lying on them are not lost in them. The lift of the lines alone will not do – seen from as far off as it takes
+   * to frame a row of large pieces, the view cannot tell so little apart, and the lines would come out dotted.
+   */
+  #setBack(e, on) {
+    for (const m of new Set([e.mesh.material].flat())) {
+      m.polygonOffset = on;
+      m.polygonOffsetFactor = on ? STEP_BACK : 0;
+      m.polygonOffsetUnits = on ? STEP_BACK : 0;
+    }
+  }
+
   #dropLines(e) {
+    if (e.steps) this.#setBack(e, false);
     for (const k of ['lines', 'steps']) {
       if (!e[k]) continue;
       e.mesh.remove(e[k]);

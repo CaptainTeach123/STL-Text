@@ -6031,6 +6031,10 @@ try {
     const desk = deskWhole.subtract(Manifold.union(deskSlots));
     const deskFile = writeFixture('desk.stl', soupOf(desk));
     for (const m of [deskBody, deskShelf, ...deskSlots, deskWhole, desk]) m.delete();
+    // a plain desk twice as long, 600 mm: two pieces of 300 mm, seen from twice as far off when they are framed
+    const longDesk = Manifold.hull([[-300, 0, 0], [300, 0, 0], [-300, 80, 0], [300, 80, 0], [-300, 0, 30], [300, 0, 30], [-300, 80, 30 + rise], [300, 80, 30 + rise]]);
+    const longFile = writeFixture('longdesk.stl', soupOf(longDesk));
+    longDesk.delete();
     // a block 200 mm long on one long foot: its top leans 14° (step lines under a millimetre apart) and its underside
     // leans 5° over the bed (supports, and no step lines worth drawing)
     const [t14, t5] = [14, 5].map((deg) => Math.tan((deg * Math.PI) / 180));
@@ -6093,7 +6097,7 @@ try {
         const ctx = probe.getContext('2d');
         ctx.drawImage(c, 0, 0);
         const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
-        const out = { red: 0, amber: 0, dark: 0, sheet: 0 };
+        const out = { red: 0, amber: 0, dark: 0, left: 0, sheet: 0 };
         const isDark = (i) => d[i + 3] >= 200 && d[i] < 60 && d[i + 1] < 70 && d[i + 2] < 90;
         const row = 4 * probe.width;
         for (let i = 0; i < d.length; i += 4) {
@@ -6103,6 +6107,7 @@ try {
           if (r > 220 && g > 130 && g < 215 && bl < 110 && r - bl > 120) out.amber++;
           if (!isDark(i)) continue;
           out.dark++;
+          if ((i / 4) % probe.width < probe.width / 2) out.left++; // in the left half of the view
           // dark on every side: part of a dark sheet, not of a line
           if (isDark(i - 4) && isDark(i + 4) && isDark(i - row) && isDark(i + row)) out.sheet++;
         }
@@ -6139,7 +6144,8 @@ try {
       'ticked, the pieces lie as printed: Spread gives way, and the legend names what is painted – supports, a level span, step lines',
       JSON.stringify(above),
     );
-    check(above.dark > apart.dark + 1500, 'the step lines are drawn dark across the leaning tops', JSON.stringify({ apart: apart.dark, printed: above.dark }));
+    // whole lines, not rows of dots: about 12,400 dots of them here; lost in the face under them, about 4,100
+    check(above.dark > apart.dark + 9000, 'the step lines are drawn dark across the leaning tops, whole from end to end', JSON.stringify({ apart: apart.dark, printed: above.dark }));
     // from below: the shelf's underside red, the slots' ceilings amber
     const canvas = await p.locator('#stage canvas').boundingBox();
     const [mx, my] = [canvas.x + canvas.width / 2, canvas.y + canvas.height / 2];
@@ -6230,11 +6236,26 @@ try {
       JSON.stringify({ red: rampBelow.red, dark: rampBelow.dark, apart: rampApart.dark }),
     );
     await steep.p.screenshot({ path: path.join(out, 'as-printed-ramp-below.png') });
+    // a model twice as long, seen from twice as far: the lines are whole on both pieces, the far one (in the left half
+    // of the view) and the near one – about 5,400 and 1,500 dots of them; lost in the faces, about 1,500 and none
+    // (at the 0.1 mm layers set above every second line is left out, so they are as many as at 0.2 mm)
+    const long = await open(wide, longFile, 'longdesk');
+    const longApart = await state(long.p);
+    await long.press('#asPrintedToggle');
+    await long.p.waitForTimeout(400);
+    const longAbove = await state(long.p);
+    await long.p.screenshot({ path: path.join(out, 'as-printed-long.png') });
+    check(
+      longAbove.chips.some((c) => c.startsWith('step lines, about here')) && longAbove.left - longApart.left > 3500 && longAbove.dark - longAbove.left - (longApart.dark - longApart.left) > 1000,
+      'on a model 600 mm long the step lines are whole on both pieces, the far one too',
+      JSON.stringify({ apart: [longApart.left, longApart.dark], printed: [longAbove.left, longAbove.dark] }),
+    );
     await wide.close();
 
     // on a phone: the box is there, inside the screen, and neither it nor the legend covers the other
     const small = await browser.newContext({ viewport: { width: 390, height: 664 }, isMobile: true, hasTouch: true, deviceScaleFactor: 1 });
     const phone = await open(small);
+    const phoneApart = await state(phone.p);
     await phone.press('#asPrintedToggle');
     await phone.p.waitForTimeout(400);
     const onPhone = await state(phone.p);
@@ -6248,9 +6269,9 @@ try {
       return { left: box.left, right: box.right, width: innerWidth, scroll: document.documentElement.scrollWidth - document.documentElement.clientWidth, under };
     });
     check(
-      onPhone.ticked && onPhone.chips.length === 3 && onPhone.dark > 300 && fit.left >= 0 && fit.right <= fit.width && fit.scroll === 0 && fit.under.length === 0,
+      onPhone.ticked && onPhone.chips.length === 3 && onPhone.dark > phoneApart.dark + 1000 && fit.left >= 0 && fit.right <= fit.width && fit.scroll === 0 && fit.under.length === 0,
       'on a phone As printed is within the screen, the legend beside it, and the step lines are drawn',
-      JSON.stringify({ chips: onPhone.chips, dark: onPhone.dark, fit }),
+      JSON.stringify({ chips: onPhone.chips, apart: phoneApart.dark, dark: onPhone.dark, fit }),
     );
     await small.close();
     check(printedProblems.length === 0, 'no page errors as printed', printedProblems.join(' | '));

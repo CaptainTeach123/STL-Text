@@ -1310,7 +1310,7 @@ describe('pins on the cut faces', () => {
     const face = (L, T) => own(wasm.Manifold.cube([300, L, T], true));
     const pins = (s) => s.layout.dowels.map((d) => [d.d, d.flat ?? false]);
     // faces wide enough for the size but short along: two pointed teardrops' insets leave no room for the pins' spacing,
-    // two flat-topped ones' do. Auto took the size below; now the size, as picking it by hand gives
+    // two flat-topped ones' do. Auto took the size below; now the size, with one hole's point cut off
     for (const [L, T, size] of [[31, 18, 6], [26, 15, 5], [21, 12, 4]]) {
       const s = split(face(L, T), [[0, 0]], { labels: false });
       expect(s.pieces.map((p) => p.up)).toEqual(['+z', '+z']);
@@ -1320,7 +1320,6 @@ describe('pins on the cut faces', () => {
       expect(s.layout.notes.map((n) => n.code)).toEqual(['HOLES_FLAT_TOP']);
       expectHolesInside(face(L, T), s.layout);
       for (const piece of s.drilled) expect(piece.status()).toBe('NoError');
-      expect(pins(split(face(L, T), [[0, 0]], { labels: false, diameter: size }))).toEqual(pins(s));
     }
     // a 12.9 mm bar is under three Ø5 pins wide, so Auto keeps to Ø4 though Ø5 fits when picked by hand: the
     // third-of-the-width rule is Auto's own
@@ -1328,22 +1327,86 @@ describe('pins on the cut faces', () => {
     expect(s.layout.diameter).toBe(4);
     expect(pins(s)).toEqual([[4, false], [4, false]]);
     expect(s.layout.notes).toEqual([]);
-    // across many faces: what Auto picks is what that size picked by hand lays out, and the next size up, where
-    // the face is three of it wide, does not get its two pins by hand either
+    expect(pins(split(face(40, 12.9), [[0, 0]], { labels: false, diameter: 5 }))).toEqual([[5, false], [5, false]]);
+    // across many faces, at thin layers and thick ones (the flat roof sits a layer over the hole): where Auto stops
+    // short of the largest size a third of the face allows, that size picked by hand does not get its two pins either
     const up = { 3: 4, 4: 5, 5: 6, 6: 8 };
-    for (const T of [9, 12, 13.5, 15, 18, 21, 24]) {
-      for (const L of [T + 6, 1.4 * T, 1.7 * T, 2 * T]) {
-        s = split(face(L, T), [[0, 0]], { labels: false });
-        const d = s.layout.diameter;
-        if (d === null) continue;
-        expectHolesInside(face(L, T), s.layout);
-        expect(pins(split(face(L, T), [[0, 0]], { labels: false, diameter: d })), `${L} × ${T}`).toEqual(pins(s));
-        const next = up[d];
-        if (!next || 3 * next > Math.min(L, T) + 1e-9) continue;
-        const more = pins(split(face(L, T), [[0, 0]], { labels: false, diameter: next })).filter((x) => x[0] === next);
-        expect(more.length, `${L} × ${T} at Ø${next}`).toBeLessThan(2);
+    const short = (make, width, list, hl) => {
+      const auto = split(make(), list, { labels: false }, { hl });
+      // the size Auto got two pins of: none where the face went to filament or glue (the smallest is then tried by hand)
+      const d = auto.layout.dowels.filter((x) => x.d === auto.layout.diameter).length >= 2 ? auto.layout.diameter : 0;
+      expectHolesInside(make(), auto.layout);
+      const next = d ? up[d] : 3;
+      if (!next || 3 * next > width + 1e-9) return d;
+      const byHand = pins(split(make(), list, { labels: false, diameter: next }, { hl })).filter((x) => x[0] === next);
+      expect(byHand.length, `Ø${next} by hand where Auto gave Ø${d}`).toBeLessThan(2);
+      return d;
+    };
+    let fellShort = 0;
+    for (const hl of [0.2, 0.3]) {
+      for (let T = 9; T <= 24.75; T += 0.75) {
+        for (const L of [T + 4, T + 6, 1.25 * T, 1.4 * T, 1.55 * T, 1.7 * T, 1.85 * T, 2 * T, 2.5 * T]) {
+          const d = short(() => face(L, T), T, [[0, 0]], hl);
+          expect(3 * d, `${L} × ${T}`).toBeLessThanOrEqual(T + 0.05 + 1e-9); // never over a third of the face
+          if ((d ? up[d] : 3) && 3 * (d ? up[d] : 3) <= T + 1e-9) fellShort++;
+        }
       }
     }
+    expect(fellShort).toBeGreaterThan(0); // the sweep does reach faces too short along for the size their width allows
+    // faces that are not boxes: a ring cut across, its halves standing on the cut (round holes), gets the size a third
+    // of its wall allows; an L profile lying on one arm (holes on their side) never less than by hand at that size
+    const ring = (w) => own(own(wasm.Manifold.cylinder(100, 40, 40, 96, true)).subtract(own(wasm.Manifold.cylinder(110, 40 - w, 40 - w, 96, true))));
+    const ell = (w, a) => own(own(own(wasm.CrossSection.ofPolygons([[[0, 0], [a, 0], [a, w], [w, w], [w, a], [0, a]]])).extrude(300)).rotate([0, 90, 0]).translate([-150, 0, 0]));
+    for (const [w, size] of [[9, 3], [11.9, 3], [12, 4], [13.5, 4], [15, 5], [17.9, 5], [18, 6], [24, 8]]) {
+      expect(short(() => ring(w), w, [[2, 0]], 0.2), `ring ${w}`).toBe(size);
+      for (const a of [w + 8, 2 * w, 3 * w]) {
+        for (const hl of [0.2, 0.3]) expect(short(() => ell(w, a), w, [[0, 0]], hl), `L ${w} × ${a}`).toBeGreaterThanOrEqual(a < 2 * w ? 3 : size);
+      }
+    }
+    // an L with arms 15 or 18 mm thick and only 8 mm longer than that takes the size with a flat-topped hole
+    for (const [w, size] of [[15, 5], [18, 6]]) {
+      s = split(ell(w, w + 8), [[0, 0]], { labels: false });
+      expect(pins(s).sort(), `L ${w}`).toEqual([[size, false], [size, true]]);
+      expect(s.layout.notes.map((n) => n.code)).toEqual(['HOLES_FLAT_TOP']);
+    }
+  });
+
+  it('with Auto the layer height can decide between one pin size and the next, as it does for a size picked by hand', () => {
+    // the flat roof sits one layer over the hole (0.2 mm at least), so thicker layers make a flat-topped hole taller:
+    // a face that only just has room for two at 0.2 mm layers has not at 0.3 mm, and Auto takes the size below
+    const face = (L, T) => own(wasm.Manifold.cube([300, L, T], true));
+    const pins = (s, hl) => split(...s, { hl }).layout.dowels.map((d) => [d.d, d.flat ?? false]);
+    const auto = (L, T) => [face(L, T), [[0, 0]], { labels: false }];
+    const hand = (L, T, diameter) => [face(L, T), [[0, 0]], { labels: false, diameter }];
+    for (const hl of [0.1, 0.2]) expect(pins(auto(21, 12), hl), `${hl}`).toEqual([[4, false], [4, true]]);
+    for (const hl of [0.28, 0.3]) {
+      expect(pins(auto(21, 12), hl), `${hl}`).toEqual([[3, false], [3, false]]);
+      expect(pins(hand(21, 12, 4), hl), `${hl}`).toEqual([[1.75, false], [1.75, false]]); // by hand it is filament
+    }
+    // it can run the other way: with the taller roof the two holes are spread differently, and at 0.3 mm layers a
+    // 40 × 24 face takes the Ø8 pins it has no room for at thinner ones – by hand just the same
+    for (const hl of [0.1, 0.2, 0.28]) {
+      expect(pins(auto(40, 24), hl), `${hl}`).toEqual([[6, false], [6, false]]);
+      expect(pins(hand(40, 24, 8), hl), `${hl}`).toEqual([[1.75, false], [1.75, false]]);
+    }
+    expect(pins(auto(40, 24), 0.3)).toEqual([[8, false], [8, true]]);
+    expect(pins(hand(40, 24, 8), 0.3)).toEqual([[8, false], [8, true]]);
+    const s = split(...auto(40, 24), { hl: 0.3 });
+    expect(s.layout.notes.map((n) => n.code)).toEqual(['HOLES_FLAT_TOP']);
+    expectHolesInside(face(40, 24), s.layout);
+    for (const piece of s.drilled) expect(piece.status()).toBe('NoError');
+  });
+
+  it('a bigger Auto size can mean one pin fewer on a face, each still with its wall', () => {
+    // the gothic lantern cut down the middle: its faces take Ø8 pins, which stand further apart than Ø6 ones, so the
+    // long face gets three where Ø6 picked by hand gets four; the small face has filament either way
+    const sizes = (s) => s.layout.dowels.map((d) => d.d);
+    const auto = split(own(gothicSolid()), [[0, 0]], { labels: false });
+    expect([auto.layout.diameter, sizes(auto)]).toEqual([8, [8, 8, 8, 1.75]]);
+    expectHolesInside(own(gothicSolid()), auto.layout);
+    const six = split(own(gothicSolid()), [[0, 0]], { labels: false, diameter: 6 });
+    expect(sizes(six)).toEqual([6, 6, 6, 6, 1.75]);
+    expect(auto.layout.notes.map((n) => n.code)).toEqual(six.layout.notes.map((n) => n.code));
   });
 
   it('holes never break out of a tube, falling back to filament, a smaller size or glue as the walls get thinner', () => {

@@ -1409,6 +1409,100 @@ describe('pins on the cut faces', () => {
     expect(auto.layout.notes.map((n) => n.code)).toEqual(six.layout.notes.map((n) => n.code));
   });
 
+  it('Auto steps a size down where the holes of a cut close by leave no room for the size each face takes alone', () => {
+    // a bar cut twice, 20 mm apart (12 mm on the thinnest): each face alone takes the size on the left, but the holes
+    // of the first cut reach into the slab between and leave the second no room for two more. A size down both cuts
+    // get their two pins, as they do when that size is picked by hand, and no filament (on the 36 × 18 bar the
+    // second cut's are shorter, by hand as well)
+    const bar = (L, T) => own(wasm.Manifold.cube([200, L, T], true));
+    const sizes = (s) => s.layout.dowels.map((d) => d.d);
+    for (const [L, T, gap, alone, size] of [[48, 24, 20, 8, 6], [60, 24, 20, 8, 6], [36, 18, 20, 6, 5], [30, 24, 20, 6, 5], [21, 15, 12, 4, 3]]) {
+      const name = `${L} × ${T}, ${gap} apart`;
+      expect(split(bar(L, T), [[0, 0]], { labels: false }).layout.diameter, name).toBe(alone);
+      const cuts = [[0, 0], [0, gap]];
+      const s = split(bar(L, T), cuts, { labels: false });
+      expect([s.layout.diameter, sizes(s)], name).toEqual([size, [size, size, size, size]]);
+      expect(s.layout.notes.map((n) => n.code), name).not.toContain('CONNECTORS_FILAMENT');
+      expectHolesInside(bar(L, T), s.layout);
+      for (const piece of s.drilled) expect(piece.status()).toBe('NoError');
+      // the two cuts' holes in the slab between them keep a wall apart
+      const wall = sizesFor(size).wall;
+      const holes = holesOf(s.layout);
+      for (const p of holes.filter((h) => h.dowel.letter === 'A' && h.side === 1)) {
+        for (const q of holes.filter((h) => h.dowel.letter === 'B' && h.side === 0)) expect(p.m.minGap(q.m, wall + 1), name).toBeGreaterThanOrEqual(wall - 1e-6);
+      }
+      // by hand at that size it is the same layout, and at the size each face takes alone the second cut has filament
+      const hand = split(bar(L, T), cuts, { labels: false, diameter: size });
+      expect(hand.layout.dowels.map((d) => [d.d, d.depth, d.uv])).toEqual(s.layout.dowels.map((d) => [d.d, d.depth, d.uv]));
+      expect(hand.layout.notes).toEqual(s.layout.notes);
+      const big = split(bar(L, T), cuts, { labels: false, diameter: alone });
+      expect(sizes(big), name).toEqual([alone, alone, 1.75, 1.75]);
+      expect(big.layout.notes.map((n) => n.code)).toContain('CONNECTORS_FILAMENT');
+    }
+    // far enough apart, the cuts keep the size each face takes alone
+    const far = split(bar(48, 24), [[0, 0], [0, 45]], { labels: false });
+    expect([far.layout.diameter, sizes(far)]).toEqual([8, [8, 8, 8, 8]]);
+    expect(far.layout.notes).toEqual([]);
+    // a size picked by hand is never changed
+    const fixed = split(bar(48, 24), [[0, 0], [0, 20]], { labels: false, diameter: 8 });
+    expect(fixed.layout.diameter).toBe(8);
+  });
+
+  it('Auto sizes a face whose side curves or leans away behind the cut by the face itself, each size by its own hole', () => {
+    // a tube cut along its length: behind the two long faces the wall curves away, so the deep hole of the largest pin
+    // would break out near the edges. Auto used to read the face as narrow as that left it and took a small pin; the
+    // face is as wide as the wall, and each size is tried with its own, shorter, hole
+    const tube = (R, w) => own(own(wasm.Manifold.cylinder(100, R, R, 128, true)).subtract(own(wasm.Manifold.cylinder(110, R - w, R - w, 128, true))));
+    const pins = (s, d) => s.layout.dowels.filter((x) => x.d === d).length;
+    const up = { 3: 4, 4: 5, 5: 6, 6: 8 };
+    for (const [R, w, size] of [[40, 12, 4], [40, 15, 5], [40, 18, 6], [80, 12, 4], [80, 15, 5], [80, 18, 6]]) {
+      const name = `tube R${R}, wall ${w}`;
+      const s = split(tube(R, w), [[0, 0]], { labels: false });
+      expect(s.pieces.map((p) => p.up), name).toEqual(['+z', '+z']);
+      expect(s.layout.diameter, name).toBe(size);
+      expect(pins(s, size), name).toBe(4); // two on each of the two faces
+      expect(s.layout.notes.map((n) => n.code).filter((x) => x !== 'HOLES_FLAT_TOP'), name).toEqual([]);
+      expectHolesInside(tube(R, w), s.layout);
+      for (const piece of s.drilled) expect(piece.status()).toBe('NoError');
+      // the next size up is over a third of the wall, which Auto never picks
+      expect(3 * up[size]).toBeGreaterThan(w);
+    }
+    // a wall that leans away behind the cut: a bar that crosses the cut at a slant, standing as modelled. The steeper
+    // the slant, the sooner a hole comes out of its side, and the smaller the pin whose full-length hole stays in.
+    // Auto took 3, 4, 3, 3, 4, 3, 4 and 4 mm on these
+    const lean = (w, deg) => {
+      const h = 60 * Math.tan((deg * Math.PI) / 180);
+      return own(own(wasm.CrossSection.ofPolygons([[[-60, -w / 2 + h], [60, -w / 2 - h], [60, w / 2 - h], [-60, w / 2 + h]]])).extrude(40).translate([0, 0, -20]));
+    };
+    for (const [w, deg, size] of [[15.6, 5, 5], [15.6, 10, 4], [15.6, 15, 4], [15.6, 20, 3], [18.6, 5, 6], [18.6, 10, 6], [18.6, 15, 5], [18.6, 20, 4]]) {
+      const name = `bar ${w} mm wide at ${deg}°`;
+      const s = split(lean(w, deg), [[0, 0]], { labels: false, orient: 'model' });
+      expect(s.pieces.map((p) => p.up), name).toEqual(['+z', '+z']);
+      expect([s.layout.diameter, s.layout.dowels.map((d) => [d.d, d.depth])], name).toEqual([size, [[size, sizesFor(size).depth], [size, sizesFor(size).depth]]]);
+      expect(s.layout.notes, name).toEqual([]);
+      expectHolesInside(lean(w, deg), s.layout);
+      // the next size up, where it is within a third of the face, gets no two full-length pins by hand either: only
+      // shorter ones, or filament
+      const next = up[size];
+      if (!next || 3 * next > w / Math.cos((deg * Math.PI) / 180)) continue;
+      const more = split(lean(w, deg), [[0, 0]], { labels: false, orient: 'model', diameter: next });
+      expect(more.layout.dowels.filter((d) => d.d === next && d.depth === sizesFor(next).depth).length, name).toBeLessThan(2);
+    }
+  });
+
+  it('Auto counts a face only as wide as the wall behind it, not the hollow it closes', () => {
+    // a box with walls 12 or 15 mm thick, cut where its hollow ends under a solid top: the face is the whole square,
+    // but pins only go where there is wall on both sides, and a third of that wall is the most Auto gives
+    for (const [w, size] of [[12, 4], [15, 5]]) {
+      const box = own(cube([120, 120, 140], [0, 0, 70]).subtract(cube([120 - 2 * w, 120 - 2 * w, 94], [0, 0, 53])));
+      const s = split(box, [[2, 100]], { labels: false });
+      expect(s.layout.diameter, `walls ${w}`).toBe(size);
+      expect(s.layout.dowels.every((d) => d.d === size)).toBe(true);
+      expect(s.layout.notes).toEqual([]);
+      expectHolesInside(box, s.layout);
+    }
+  });
+
   it('holes never break out of a tube, falling back to filament, a smaller size or glue as the walls get thinner', () => {
     const tube = (w) => own(cube([60, 60, 200]).subtract(cube([60 - 2 * w, 60 - 2 * w, 210])));
     let s = split(tube(10), [[2, 0]], { diameter: 5 });

@@ -201,6 +201,13 @@ function insidePoint(polys, centroid) {
 const WIDTH_SLACK = 0.05;
 
 /**
+ * How far behind a cut face (mm) air makes it narrower for the automatic size: a face counts as wide as the wall it
+ * stands on, so not where a hollow lies right behind it, yet a side that curves or leans away deeper in takes
+ * nothing off (the holes are kept inside there by their own shadows).
+ */
+const WIDTH_REACH = 1;
+
+/**
  * The largest inset (mm) at which a cross-section still has area, by
  * bisection, or `cap` as soon as an inset of `cap` has: insets close to
  * collapse are slow on dense outlines, and callers only need to know a
@@ -4664,22 +4671,30 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
 
   /**
    * The largest of `sizes` with D ≤ W/3 (W twice the deepest inset of the
-   * patch's solid columns, read with `WIDTH_SLACK` to spare) that takes two
-   * pins (or pegs, `kind`) on a patch, their holes reaching `reachOf(sizes)`
-   * from the face, within `room` of it: first against the shadow of the
-   * largest size's reach, which is conservative for every size, then,
-   * finding none, with each size's own reach. A pin whose hole lies on its
-   * side counts where a flat-topped teardrop keeps its wall, as it does when
-   * the pins are laid out (`pinCentres`), so a size picked by hand never
-   * beats Auto on a face this wide. Its sizes (`kind.room`'s, as deep as the
-   * room lets them go), or null when none takes two.
+   * face itself, less only what has air within `WIDTH_REACH` behind it,
+   * read with `WIDTH_SLACK` to spare) that takes two pins (or
+   * pegs, `kind`) on a patch, their holes reaching `reachOf(sizes)` from the
+   * face, within `room` of it. Each size is tried against the shadow of the
+   * largest size's reach first, which is there already and conservative for
+   * every size, then with its own reach: a face whose side curves or leans
+   * away behind the cut (a tube cut along its length) has room for a small
+   * pin's short hole where the largest one's would break out, and is still
+   * as wide as it is. A pin whose hole lies on its side counts where a
+   * flat-topped teardrop keeps its wall, as it does when the pins are laid
+   * out (`pinCentres`), so on a face that the holes of other cuts leave
+   * alone a size picked by hand, no more than a third of its width, never
+   * beats Auto. Its sizes (`kind.room`'s, as deep as the room lets them go),
+   * or null when none takes two.
    */
   function sizeOn(ctx, patch, kind, sizes, reachOf, room, t) {
     const need = Math.min(2, wanted || 2);
     const widest = kind.full(sizes[0], depth);
     const widthCap = (3 * sizes[0]) / 2; // D ≤ W/3, so no width beyond three of the largest size changes the answer
-    const free = t.add(patch.cs.subtract(shadowAt(ctx, reachOf(widest), false)));
-    const W = 2 * largestInset(free, widthCap) + WIDTH_SLACK;
+    const deep = reachOf(widest);
+    // the face as wide as the wall it stands on: without what has air right behind it (a lid on a hollow box)
+    const near = typeof deep === 'number' ? Math.min(deep, WIDTH_REACH) : { below: Math.min(deep.below, WIDTH_REACH), above: Math.min(deep.above, WIDTH_REACH) };
+    const W = 2 * largestInset(t.add(patch.cs.subtract(shadowAt(ctx, near, false))), widthCap) + WIDTH_SLACK;
+    const free = t.add(patch.cs.subtract(shadowAt(ctx, deep, false)));
     // a hole lying on its side: pointed where that fits, else with its point cut off flat
     const insets = (s) => (!patch.apex.some(Boolean) ? [s.rho] : kind.flat ? [s.rhoTear, flatInset(s, lift)] : [s.rhoTear]);
     for (const D of sizes) {
@@ -4689,12 +4704,6 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
         const safe = t.add(free.offset(-inset, 'Round', 2, 32));
         if (!safe.isEmpty() && chooseCentres(polygonsOf(safe), need, s.sMin, patch.centroid, { d: D }).length >= need) return s;
       }
-    }
-    const small = kind.room(sizes[sizes.length - 1], depth, room);
-    const W3 = small ? 2 * largestInset(t.add(patch.cs.subtract(shadowAt(ctx, reachOf(small), false))), widthCap) + WIDTH_SLACK : 0;
-    for (const D of sizes) {
-      const s = kind.room(D, depth, room);
-      if (!s || D > W3 / 3 + 1e-9) continue;
       if (centresFor(ctx, patch, s, need, false, t, reachOf(s)).length >= need) return s;
       if (kind.flat && centresFor(ctx, patch, s, need, false, t, reachOf(s), true).length >= need) return s;
     }
@@ -4703,8 +4712,8 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
 
   /**
    * The pins' sizing pass: per patch of at least 50 mm², the largest
-   * automatic size it takes (`sizeOn`); the model's diameter is the smallest
-   * found. Null when no patch takes any.
+   * automatic size it takes (`sizeOn`), kept on it as `sized`; the model's
+   * diameter is the smallest found. Null when no patch takes any.
    */
   function sizePass(list) {
     let best = null;
@@ -4714,6 +4723,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
         const t = scope();
         try {
           const found = sizeOn(ctx, patch, PIN, PIN.auto, (s) => s.reach, ctx.room, t)?.d ?? null;
+          patch.sized = found;
           if (found !== null) best = best === null ? found : Math.min(best, found);
         } finally {
           t.dispose();
@@ -4748,7 +4758,11 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     }
   }
 
-  /** The pins of one cut: each patch tries its options in turn; the notes say what had to give. */
+  /**
+   * The pins of one cut: each patch tries its options in turn; the notes say what had to give. Returns how many of
+   * the faces Auto sized (`sized`) did not get their two pins of the size – the holes of another cut were in the way
+   * – and the smallest size under D that one of them would take as things stand (`hint`, null when none).
+   */
   function layoutCut(ctx, D) {
     const { cut } = ctx;
     const a = cut.axis;
@@ -4764,6 +4778,12 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     let suggested = null;
     const suggest = (d) => {
       if (d) suggested = Math.max(suggested ?? 0, d);
+    };
+    let lost = 0;
+    let hint = null;
+    const lose = (d) => {
+      lost++;
+      if (d) hint = Math.min(hint ?? Infinity, d);
     };
     // the thinnest wall filament fits in: twice its inset from the edge, a flat-topped teardrop's when the holes lie
     // on their side
@@ -4797,7 +4817,9 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
           if (patch.area >= SIZING_PATCH) {
             const across = 2 * (patch.apex.some(Boolean) ? flatInset(fil, lift) : fil.rho);
             if (2 * largestInset(patch.cs, across / 2 + 0.05) < across) thinWalls = Math.max(thinWalls, Math.ceil(across * 10 - 1e-6) / 10);
-            suggest(smallerFit(ctx, patch, D, need, t));
+            const smaller = smallerFit(ctx, patch, D, need, t);
+            suggest(smaller);
+            if (patch.sized) lose(smaller);
           }
           return;
         }
@@ -4809,8 +4831,13 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
           // holes made shallower where air lies behind the face take shorter filament: each length is told apart
           filament ??= new Map();
           filament.set(2 * s.depth, (filament.get(2 * s.depth) ?? 0) + pts.length);
-          suggest(smallerFit(ctx, patch, D, need, t));
-        } else if (s.depth < full - 1e-9) shorter = Math.min(shorter ?? Infinity, s.depth);
+          const smaller = smallerFit(ctx, patch, D, need, t);
+          suggest(smaller);
+          if (patch.sized) lose(smaller);
+        } else {
+          if (s.depth < full - 1e-9) shorter = Math.min(shorter ?? Infinity, s.depth);
+          if (patch.sized && pts.length < need) lose(smallerFit(ctx, patch, D, need, t));
+        }
         pts.forEach(([u, v], i) => {
           const cell = cellOfPoint(applyMat4(TO_WORLD[a], [u, v, cut.at]), by);
           cell[a] += 0.5;
@@ -4853,6 +4880,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
       notes.push(splitNote('CONNECTORS_DROPPED', { ...base, count: dropped, total, ...(thinWalls ? { wall: thinWalls } : {}), ...(suggested && !filament ? { suggestedDiameter: suggested } : {}) }));
     }
     if (one) notes.push(splitNote('ONE_CONNECTOR', base));
+    return { lost, hint };
   }
 
   /**
@@ -5465,7 +5493,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     }
 
     // ---- one diameter for the whole model ----
-    const D = pinned.length ? manual || sizePass(pinned) || AUTO_DIAMETERS[AUTO_DIAMETERS.length - 1] : null;
+    let D = pinned.length ? manual || sizePass(pinned) || AUTO_DIAMETERS[AUTO_DIAMETERS.length - 1] : null;
 
     // ---- which piece of each pair across a pegged face carries the pegs: one for all of that face's, never one
     // whose neighbour has no room for their sockets, and where both have room, rather the one across from more of it:
@@ -5542,34 +5570,79 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
 
     // ---- pins and pegs, cut by cut, each cut avoiding the holes, pegs and sockets of the ones before and the
     // dovetail sockets ----
-    connected.forEach((ctx, done) => {
-      progress?.(stage, { done: cuts.length + 1 + done, total: steps });
-      const a = ctx.cut.axis;
-      const reach = ctx.kind.reach;
-      // the two halves of one hole overlap at the face, and so do a peg and its socket: each side's (or each kind's)
-      // are composed (and projected) apart
-      ctx.obstacles = [0, 1].map((side) => {
-        const near = placed.filter((x) => x.side === side && x.box.max[a] > ctx.cut.at - reach && x.box.min[a] < ctx.cut.at + reach);
-        return near.length ? keep.add(Manifold.compose(near.map((x) => x.m))) : null;
-      }).filter(Boolean);
-      if (sockets) ctx.obstacles.push(sockets);
-      if (ctx.joint === 'pegs') {
-        layoutPegs(ctx, P);
-        ctx.pinnable = pinsFit(ctx);
-        for (const peg of pegs.filter((x) => x.cutId === ctx.cut.id)) {
-          // side 0 the sockets, side 1 the pegs (a pegged split has no pins)
-          for (const [side, m] of [[0, keep.add(socketAt(peg))], [1, keep.add(pegAt(peg))]]) placed.push({ m, side, box: boxOf(m) });
+    const layoutAll = (size) => {
+      let lost = 0;
+      let hint = null;
+      connected.forEach((ctx, done) => {
+        progress?.(stage, { done: cuts.length + 1 + done, total: steps });
+        const a = ctx.cut.axis;
+        const reach = ctx.kind.reach;
+        // the two halves of one hole overlap at the face, and so do a peg and its socket: each side's (or each kind's)
+        // are composed (and projected) apart
+        ctx.obstacles = [0, 1].map((side) => {
+          const near = placed.filter((x) => x.side === side && x.box.max[a] > ctx.cut.at - reach && x.box.min[a] < ctx.cut.at + reach);
+          return near.length ? keep.add(Manifold.compose(near.map((x) => x.m))) : null;
+        }).filter(Boolean);
+        if (sockets) ctx.obstacles.push(sockets);
+        if (ctx.joint === 'pegs') {
+          layoutPegs(ctx, P);
+          ctx.pinnable = pinsFit(ctx);
+          for (const peg of pegs.filter((x) => x.cutId === ctx.cut.id)) {
+            // side 0 the sockets, side 1 the pegs (a pegged split has no pins)
+            for (const [side, m] of [[0, keep.add(socketAt(peg))], [1, keep.add(pegAt(peg))]]) placed.push({ m, side, box: boxOf(m) });
+          }
+          return;
         }
-        return;
-      }
-      layoutCut(ctx, D);
-      for (const dowel of dowels.filter((x) => x.cutId === ctx.cut.id)) {
-        for (const side of [0, 1]) {
-          const m = keep.add(dowelHole(dowel, side));
-          placed.push({ m, side, box: boxOf(m) });
+        const got = layoutCut(ctx, size);
+        lost += got.lost;
+        if (got.hint) hint = Math.min(hint ?? Infinity, got.hint);
+        for (const dowel of dowels.filter((x) => x.cutId === ctx.cut.id)) {
+          for (const side of [0, 1]) {
+            const m = keep.add(dowelHole(dowel, side));
+            placed.push({ m, side, box: boxOf(m) });
+          }
+        }
+      });
+      return { lost, hint };
+    };
+    // what a layout adds, taken back before another is tried: its notes, pins, pegs and holes, and each cut's shadow
+    // of the holes that were in its way
+    const mark = { notes: notes.length, placed: placed.length };
+    const undo = () => {
+      notes.length = mark.notes;
+      placed.length = mark.placed;
+      dowels.length = 0;
+      pegs.length = 0;
+      for (const ctx of connected) {
+        for (const key of [...ctx.shadows.keys()]) if (key.endsWith('|holes')) ctx.shadows.delete(key);
+        for (const patch of ctx.patches) {
+          if (patch.skip) continue;
+          patch.dowels = [];
+          patch.pegs = [];
         }
       }
-    });
+    };
+    const laid = layoutAll(D);
+    // Auto sizes each face on its own. Where the holes of a cut close by then leave a face no room for the two pins
+    // it was sized for, while a smaller size would fit there, the sizes below are laid out in turn, down to that one:
+    // the first that gives every such face its pins is the model's, else the one that leaves the fewest without (the
+    // larger of two that leave as many)
+    if (!manual && laid.lost && laid.hint) {
+      let best = { D, lost: laid.lost };
+      let at = D;
+      for (const d of AUTO_DIAMETERS) {
+        if (d >= D || d < laid.hint || best.lost === 0) continue;
+        undo();
+        at = d;
+        const { lost } = layoutAll(d);
+        if (lost < best.lost) best = { D: d, lost };
+      }
+      if (at !== best.D) {
+        undo();
+        layoutAll(best.D);
+      }
+      D = best.D;
+    }
     if (capped) notes.push(splitNote('DOWELS_CAPPED', { placed: dowels.length + pegs.length, dropped: capped, ...(pegged.length && !pinned.length ? { pegs: true } : {}) }));
 
     // ---- labels ----

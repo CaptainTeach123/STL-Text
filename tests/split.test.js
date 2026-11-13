@@ -10,7 +10,7 @@ import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
 import {
   APART_HOLDS, DIRECTIONS, FILAMENT, SPLIT_DEFAULTS, dirAxis, TO_PLANE, cellSizes, cellSupport, cutPlane, fitPieces, fitsBed, isSymmetric, keepCrossed, orientationStats, pegSizesFor,
-  reachesCorner, sizesFor, oppositeDir,
+  reachesCorner, sizesFor, oppositeDir, layOptions,
 } from '../src/split.js';
 import { FACE, OVERHANG_NZ, PRINT_CHECK, faceKind, faceLean } from '../src/printCheck.js';
 import { adviseJob, estimateJob, gramsWords, planOptions, planSheetLines } from '../src/printPlan.js';
@@ -649,7 +649,7 @@ describe('how the pin holes print', () => {
     expect(stale.pieces.map((p) => [p.down, p.fits, p.lay.chosen, p.lay.used])).toEqual([[r.pieces[0].down, true, '+x', false], ['-y', true, '-y', true]]);
     expect(noteOf(stale, 'LAY_IGNORED')).toMatchObject({
       level: 'info', pieceIndex: 1, down: '+x', why: 'bed',
-      text: "Piece 1 can't lie on its right side as you chose: it doesn't fit your printer that way. It lies flat as modelled, the app's choice – choose again in the pieces list if you like.",
+      text: "Piece 1 can't lie the way you chose (on its right side): it doesn't fit your printer that way. It lies flat as modelled, the app's choice – choose again in the pieces list if you like.",
     });
     expect(noteOf(stale, 'LAY_CHOSEN').pieces).toEqual([2]);
     expect(holesAgainstLay(stale).wrong).toEqual([]);
@@ -689,7 +689,9 @@ describe('how the pin holes print', () => {
     await load(cube([120, 40, 30]), 'bar');
     const pegs = await resultSplit(S({ joint: 'pegs', labels: false }));
     expect(pegs.pieces.map((p) => [p.down, p.pegs, p.sockets])).toEqual([['-z', 2, 0], ['-x', 0, 2]]);
-    expect(offered(pegs.pieces[0])).toEqual({ '-z': 'ok', '+z': 'ok', '-x': 'ok', '+x': 'pegs', '-y': 'ok', '+y': 'ok' });
+    // the side its pegs stand out of is on offer all the same, and says that they would go to the other piece
+    expect(offered(pegs.pieces[0])).toEqual({ '-z': 'ok', '+z': 'ok', '-x': 'ok', '+x': 'ok', '-y': 'ok', '+y': 'ok' });
+    expect(pegs.pieces[0].lay.ways.filter((w) => w.moves).map((w) => w.down)).toEqual(['+x']);
     const handed = await resultSplit(S({ joint: 'pegs', labels: false, lay: { '0,0,0': '+x' } }));
     expect(handed.pieces.map((p) => [p.down, p.pegs, p.sockets])).toEqual([['+x', 0, 2], ['-z', 2, 0]]);
     expect(offered(handed.pieces[0])['+x']).toBe('ok');
@@ -698,6 +700,68 @@ describe('how the pin holes print', () => {
     const neither = await resultSplit(S({ joint: 'pegs', labels: false, lay: { '0,0,0': '+x', '1,0,0': '-x' } }));
     expect(neither.pieces.map((p) => [p.down, p.pegs, p.sockets])).toEqual([['+x', 0, 0], ['-x', 0, 0]]);
     expect(codes(neither)).toContain('CONNECTORS_DROPPED');
+  });
+
+  it('sides chosen with pins and kept when the joints become built-in pegs never make a piece too big for the printer', async () => {
+    await load(cube([120, 40, 30]), 'bar');
+    // 62 mm tall: a half standing on its far end is 60 mm, and 69 mm with pegs on top
+    const tight = [80, 50, 62];
+    const offered = (p) => Object.fromEntries(p.lay.ways.map((w) => [w.down, w.ok ? (w.moves ? 'moves' : 'ok') : w.why]));
+    // left to the app, with pegs, everything fits
+    const auto = await resultSplit(S({ joint: 'pegs', labels: false }), { bed: tight });
+    expect(auto.pieces.every((p) => p.fits)).toBe(true);
+    expect(codes(auto)).not.toContain('PIECE_TOO_BIG');
+    // the piece that carries the pegs is offered its far end: it fits there without them, and they would go across
+    const carrier = auto.pieces.find((p) => p.pegs > 0);
+    const far = carrier.index === 1 ? '-x' : '+x';
+    expect(offered(carrier)[far]).toBe('moves');
+    // with pins both far ends are on offer, and both are chosen
+    const lay = { '0,0,0': '-x', '1,0,0': '+x' };
+    const pins = await resultSplit(S({ labels: false, lay }), { bed: tight });
+    expect(pins.pieces.map((p) => [p.down, p.fits, p.lay.used])).toEqual([['-x', true, true], ['+x', true, true]]);
+    // the joints set to built-in pegs: neither piece has room for them, so the face is glued flat – and both still fit
+    const ex = await exportSplit(S({ joint: 'pegs', labels: false, lay }), { bed: tight, name: 'bar' });
+    expect(ex.pieces.map((p) => [p.down, p.fits, p.size, p.pegs, p.lay.used])).toEqual([['-x', true, [30, 40, 60], 0, true], ['+x', true, [30, 40, 60], 0, true]]);
+    expect(codes(ex)).not.toContain('PIECE_TOO_BIG');
+    expect(codes(ex)).toContain('CONNECTORS_DROPPED');
+    expect(noteOf(ex, 'LAY_CHOSEN').pieces).toEqual([1, 2]);
+    expect(ex.files.find((f) => f.kind === 'text').text).not.toMatch(/TOO BIG/);
+    // the side each lies on is on offer in its own list
+    expect(ex.pieces.map((p) => p.lay.ways.find((w) => w.down === p.down).ok)).toEqual([true, true]);
+    // one piece on its far end: the other carries the pegs, and both fit
+    const one = await resultSplit(S({ joint: 'pegs', labels: false, lay: { '0,0,0': '-x' } }), { bed: tight });
+    expect(one.pieces.map((p) => [p.fits, p.pegs > 0])).toEqual([[true, false], [true, true]]);
+    expect(one.pieces[0]).toMatchObject({ down: '-x', lay: { used: true } });
+    // every side on offer for every piece of a bar in three is taken when chosen, and nothing ends up too big
+    await load(cube([180, 40, 30]), 'bar');
+    const cuts = [cutAt(0, -30, 'c1'), cutAt(0, 30, 'c2')];
+    const three = await resultSplit(S({ joint: 'pegs', cuts, labels: false }), { bed: tight });
+    for (const p of three.pieces) {
+      for (const way of p.lay.ways.filter((w) => w.ok)) {
+        const r = await resultSplit(S({ joint: 'pegs', cuts, labels: false, lay: { [p.lay.key]: way.down } }), { bed: tight });
+        const mine = r.pieces.find((q) => q.lay.key === p.lay.key);
+        expect([p.index, way.down, mine.down, mine.fits, mine.lay.used]).toEqual([p.index, way.down, way.down, true, true]);
+        expect([p.index, way.down, codes(r).includes('LAY_IGNORED'), codes(r).includes('PIECE_TOO_BIG')]).toEqual([p.index, way.down, false, false]);
+      }
+    }
+  });
+
+  it('a piece laid by hand on a curved side is warned in words of its own, and the app\'s choice goes on saying which side it is', async () => {
+    await load(own(wasm.Manifold.sphere(40, 48)), 'ball');
+    const cuts = [cutAt(2, 0, 'c1')];
+    const auto = await resultSplit(S({ cuts, labels: false }));
+    expect(codes(auto)).not.toContain('PIECE_UNSTABLE');
+    expect(auto.pieces[1]).toMatchObject({ down: '-z', lies: 'on a cut face', lay: { chosen: null, auto: '-z' } });
+    // the upper half told to lie on its dome
+    const r = await resultSplit(S({ cuts, labels: false, lay: { '0,0,1': '+z' } }));
+    expect(r.pieces[1]).toMatchObject({ down: '+z', lay: { chosen: '+z', used: true, auto: '-z' } });
+    const said = r.notes.filter((n) => n.code === 'PIECE_UNSTABLE');
+    expect(said).toEqual([expect.objectContaining({
+      level: 'warn', pieceIndex: 2, chosen: true,
+      text: 'Piece 2 rests on a curve or an edge on the side you chose, so it needs supports under it and may come loose while it prints – choose another side for it in the pieces list.',
+    })]);
+    expect(r.notes.map((n) => n.text).join(' ')).not.toMatch(/nothing flat to stand on|Another cut/);
+    expect(layOptions(r.pieces[1].lay, r.pieces[1].down).options[0]).toEqual({ value: '', text: "The app's choice: as in the model (a cut face)" });
   });
 });
 
@@ -1416,6 +1480,18 @@ describe('planning pieces that really print', () => {
     expect(ex.pieces.map((x) => [x.cell[0], x.shells, x.fits])).toEqual([[0, 1, true], [1, 1, true], [1, 2, true], [2, 1, true]]);
     // the two pieces of the middle box cannot be told which side to lie on (a side goes by its box); the ends can
     expect(ex.pieces.map((x) => x.lay.key ?? x.lay.why)).toEqual(['0,0,0', 'apart', 'apart', '2,0,0']);
+    // a side chosen for the middle before it came to print as two (the cuts dragged since): said once, not once a
+    // piece, and its first piece keeps the choice so that it can be handed back to the app
+    const held = await resultSplit({ ...planned(p), lay: { '1,0,0': '+z' } });
+    expect(held.pieces.map((x) => x.down)).toEqual(ex.pieces.map((x) => x.down));
+    expect(held.pieces.map((x) => [x.lay.key, x.lay.why ?? null, x.lay.chosen ?? null])).toEqual([['0,0,0', null, null], ['1,0,0', 'apart', '+z'], [null, 'apart', null], ['2,0,0', null, null]]);
+    const ignored = held.notes.filter((n) => n.code === 'LAY_IGNORED');
+    expect(ignored).toEqual([expect.objectContaining({
+      pieceIndex: 2, why: 'apart',
+      text: `Piece 2 can't lie the way you chose (upside down): that part of the model now prints as more than one piece. Each of its pieces lies the app's way – pick "The app's choice" for piece 2 in the pieces list to clear this note.`,
+    })]);
+    expect(layOptions(held.pieces[1].lay, held.pieces[1].down, '+z')).toMatchObject({ key: '1,0,0', chosen: '+z', tag: 'set by you, but not used – see the notes', options: [{ value: '' }, { value: '+z' }] });
+    expect(layOptions(held.pieces[2].lay, held.pieces[2].down)).toMatchObject({ key: null, chosen: null, tag: '' });
     for (const f of files) {
       // every shell of every file starts on the bed (a sealed hollow would come back inside out, with no volume of its own)
       for (const shell of pieceSolid(f).decompose().map(own)) expect(shell.boundingBox().min[2], f.name).toBeCloseTo(0, 3);

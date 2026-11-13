@@ -6470,6 +6470,9 @@ try {
             value: select?.value ?? null,
             off: select?.disabled ?? null,
             own: !!li.querySelector('.piece-lay-own'),
+            title: select?.title ?? null,
+            width: select ? Math.round(select.getBoundingClientRect().width) : 0,
+            below: select && li.querySelector('.piece-lay-own') ? li.querySelector('.piece-lay-own').getBoundingClientRect().top >= select.getBoundingClientRect().bottom - 1 : null,
             options: [...(select?.options ?? [])].map((o) => `${o.disabled ? '[off] ' : ''}${o.text}`),
           };
         }),
@@ -6499,7 +6502,7 @@ try {
     await settle();
     const stood = await rows();
     check(
-      /lies on a cut face/.test(stood[0].text) && stood[0].value === '+x' && stood[0].own && stood[0].options[0] === "The app's choice" && / × 1\d\d(\.\d)? mm /.test(stood[0].text),
+      /lies on a cut face/.test(stood[0].text) && stood[0].value === '+x' && stood[0].own && stood[0].options[0] === "The app's choice: as in the model" && / × 1\d\d(\.\d)? mm /.test(stood[0].text),
       'choosing its right side stands piece 1 on its cut face: the row says so, marked "set by you"',
       JSON.stringify([stood[0].text, stood[0].value, stood[0].own]),
     );
@@ -6509,6 +6512,11 @@ try {
       `${before[0].check} → ${stood[0].check}`,
     );
     check(stood[1].text === before[1].text && stood[1].value === '' && !stood[1].own, 'piece 2 lies as it did', stood[1].text);
+    check(
+      stood[0].below === true && stood[0].width >= before[0].width - 1 && /^On its right side \(a cut face\) – about \d+ cm² on the bed, /.test(stood[0].title),
+      '"set by you" sits under the list, which keeps its width, and pointing at the list shows the whole entry',
+      JSON.stringify([before[0].width, stood[0].width, stood[0].below, stood[0].title]),
+    );
     check(await q.isChecked('#resultToggle'), 'the pieces stay in view while they are worked out again');
     check(/Piece 1 lies on the side you chose in the pieces list/.test(await notes()), 'the notes say piece 1 lies on the side chosen', (await notes()).slice(0, 200));
     // as printed, piece 1 stands tall on the bed
@@ -6532,7 +6540,7 @@ try {
     fs.writeFileSync(pieceFile, Buffer.from(entries[pieceName]));
     const laid = inspectStl(pieceFile);
     check(laid.max[2] - laid.min[2] > 140 && Math.abs(laid.min[2]) < 1e-3, "piece 1's file stands on its cut face", `${(laid.max[2] - laid.min[2]).toFixed(1)} mm tall`);
-    // a side the piece cannot take is greyed out, with why: built-in pegs stand out of piece 1's cut face
+    // built-in pegs rule out no side: the one they stand out of says they would go to the other piece
     await q.selectOption('#pieceList li:nth-child(1) .piece-lay select', '');
     await q.waitForFunction(() => !document.querySelector('#pieceList li .piece-lay-own') && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 120000 });
     await settle();
@@ -6544,9 +6552,9 @@ try {
     const pegged = await rows();
     const carrier = pegged.find((r) => / pegs?$/.test(r.text) || / pegs? · /.test(r.text)) ?? pegged[0];
     check(
-      carrier.options.filter((o) => /^\[off\] /.test(o)).length === 1 && carrier.options.some((o) => /^\[off\] On its (left|right) side \(a cut face\) – not offered: its pegs stand out of that side$/.test(o)),
-      'the side a piece\'s built-in pegs stand out of is greyed out, with why',
-      carrier.options.filter((o) => /^\[off\]/.test(o)).join(' | '),
+      carrier.options.every((o) => !/^\[off\] /.test(o)) && carrier.options.filter((o) => /^On its (left|right) side \(a cut face\) – .*; its pegs go to the piece it joins$/.test(o)).length === 1,
+      'the side a piece\'s built-in pegs stand out of is on offer, and says the pegs would go to the piece it joins',
+      carrier.options.join(' | '),
     );
     await q.click('#splitSettings label:has(input[data-split="joint"][value="auto"])');
     await worked();

@@ -332,7 +332,8 @@ const nextKeepId = (keep) => `k${1 + Math.max(0, ...keep.map((k) => keepNumber(k
 /**
  * The split after `patch` (null switches it off): settings merged over the
  * current ones and the defaults, each cut copied, and a fresh id for any cut
- * without its own (a planned split arrives without ids). The details kept
+ * without its own (a planned split arrives without ids), past those of the
+ * cuts it replaces. The details kept
  * whole are copied the same way, and an empty list of them is left out; so
  * are the sides chosen by hand for pieces to lie on (`lay`).
  */
@@ -340,7 +341,9 @@ function mergeSplit(current, patch) {
   if (!patch) return null;
   const next = { ...SPLIT_DEFAULTS, ...(current ?? {}), ...patch };
   const given = next.cuts ?? [];
-  let top = Math.max(0, ...given.map((c) => cutNumber(c.id)));
+  // new ids never take up one the cuts before them had: a new plan's cuts are other cuts, and make other boxes
+  // (`cellsKey`), even where there are as many of them
+  let top = Math.max(0, ...given.map((c) => cutNumber(c.id)), ...(current?.cuts ?? []).map((c) => cutNumber(c.id)));
   const seen = new Set();
   next.cuts = given.map((cut) => {
     const id = cut.id != null && !seen.has(cut.id) ? cut.id : `c${++top}`;
@@ -414,6 +417,7 @@ export class Document {
     this.history = [];
     this.future = [];
     this.coalesceKey = null;
+    this.layAside = null; // the sides chosen by hand that a drag in progress took the boxes from, until it ends
     this.moves = 0; // the model's transforms so far, so each is a step of its own that a refit can join
     this.listeners = new Set();
   }
@@ -460,6 +464,7 @@ export class Document {
       this.history.push(clone(this.state));
       if (this.history.length > HISTORY_LIMIT) this.history.shift();
       this.future = [];
+      this.layAside = null;
     }
     this.coalesceKey = coalesce;
     const next = clone(this.state);
@@ -470,7 +475,14 @@ export class Document {
     // would name another piece, so the choices are dropped (an undo brings them back with the cuts)
     // – but not ones that arrive with the new cuts
     const carried = next.split?.lay && JSON.stringify(next.split.lay) === JSON.stringify(this.state.split?.lay ?? null);
-    if (carried && cellsKey(next.split) !== cellsKey(this.state.split)) delete next.split.lay;
+    if (carried && cellsKey(next.split) !== cellsKey(this.state.split)) {
+      // within one drag they are only set aside: a cut dragged past another and back makes the same boxes again
+      if (coalesce) this.layAside = { coalesce, cells: cellsKey(this.state.split), lay: next.split.lay };
+      delete next.split.lay;
+    } else if (this.layAside && next.split && !next.split.lay && !this.state.split?.lay && cellsKey(next.split) === this.layAside.cells) {
+      next.split.lay = { ...this.layAside.lay };
+      this.layAside = null;
+    }
     this.state = next;
     this.#notify();
   }

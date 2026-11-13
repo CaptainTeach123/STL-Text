@@ -1397,10 +1397,11 @@ ul.plan#cutList {
   width: 0;
   min-width: 9em;
 }
+/* on a line of its own, so the list above it keeps the row's whole width */
 #pieceList .piece-lay-own {
+  flex: 0 0 100%;
   color: var(--accent);
   font-weight: 600;
-  white-space: nowrap;
 }
 
 /* under the pieces: what the whole job takes, and the suggestions for the slicer */

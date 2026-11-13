@@ -3653,6 +3653,12 @@ function restingGroups(list, U, orient, flat) {
   return groups;
 }
 
+/**
+ * A piece's note that it has nothing flat to stand on (`PIECE_UNSTABLE`), for one lying on a side chosen by hand: the
+ * side chosen is why, and another side the cure – not another cut. Any other note as it is.
+ */
+const unstableChosen = (note, pieceIndex) => (note.code === 'PIECE_UNSTABLE' ? splitNote('PIECE_UNSTABLE', { pieceIndex, chosen: true }) : note);
+
 /** Whether a piece laid `down` fits the usable bed `U`, turned straight, a quarter or across the diagonal. */
 function layFits(stats, down, U) {
   const [a, b, h] = laidDims(stats.dims, down);
@@ -3696,7 +3702,9 @@ function layRefused(stats, boxes, down, U) {
  *   (so whatever is worked out from them – how it lies with pegs, which piece of a pair carries them – keeps to it),
  *   `free` holds the ways it might lie without the choice and `auto` how the app would lay it; one whose choice it cannot take (`layRefused`; a box that
  *   prints as more than one piece, 'apart') lies as the app lays it, with the `LAY_IGNORED` note that says so
- *   (`refused`, and among its `lying.notes`)
+ *   (`refused`, and among its `lying.notes`; said once for a box that prints as several pieces, with the first of them).
+ *   A piece that rests on a curve or an edge on the side chosen is told so in its own words (`PIECE_UNSTABLE` with
+ *   `chosen`)
  */
 export function layPieces(pieces, U, orient = 'auto', { flat = null, soups = null, lay = null } = {}) {
   const out = [];
@@ -3742,6 +3750,11 @@ export function layPieces(pieces, U, orient = 'auto', { flat = null, soups = nul
       // the side chosen by hand: the piece may lie no other way from here on, so its pin holes are shaped for it and
       // its pegs and lips are given out for it, as for a side the app chose. One it cannot take is left to the app
       const why = groups.length > 1 ? 'apart' : layRefused(stats, g.boxes, want, U);
+      if (why === 'apart' && g !== groups[0]) {
+        // said once for the box, with its first piece
+        out.push({ ...g, index, cell: piece.cell, from: piece.index, stats, soup: own, lying });
+        continue;
+      }
       if (why) {
         const note = splitNote('LAY_IGNORED', { pieceIndex: index, down: want, why, lies: lying.lies });
         out.push({ ...g, index, cell: piece.cell, from: piece.index, stats, soup: own, lying: { ...lying, notes: [...lying.notes, note] }, refused: note });
@@ -3752,7 +3765,7 @@ export function layPieces(pieces, U, orient = 'auto', { flat = null, soups = nul
       // that it does not lie as Lay pieces asks is no news: it lies as it was told
       out.push({
         ...g, index, cell: piece.cell, from: piece.index, stats: held, soup: own, chosen: want, free: stats.allowed, auto: lying,
-        lying: { ...chosen, notes: chosen.notes.filter((x) => x.code !== 'ORIENT_FALLBACK') },
+        lying: { ...chosen, notes: chosen.notes.filter((x) => x.code !== 'ORIENT_FALLBACK').map((x) => unstableChosen(x, index)) },
       });
     }
   }
@@ -3873,7 +3886,10 @@ export function keptBits(pieces, laid, cuts) {
  * it, and one left with no way down at all never carries them. A piece a
  * take-apart cut's lip stands out of (`forced`, `apartMales`) lies the one way
  * that keeps the lip standing up, its box taking the lip in, and is judged
- * that way: it never carries pegs on the face it lies on.
+ * that way: it never carries pegs on the face it lies on. A piece held to a
+ * side chosen by hand (`layPieces`' `chosen`) carries no pegs on that side,
+ * nor any that would push it off the bed lying on it: they go to the piece
+ * across the cut, or to neither where that one cannot carry them either.
  * Deterministic.
  * @param {{ index: number, stats: object, boxes?: object[], lying: { down: string, score: number, fits: boolean } }[]} given
  *   from `layPieces` (`boxes` its shells')
@@ -3921,6 +3937,9 @@ export function pegMales(given, U, orient = 'auto', { flat = null, length = 0, f
       const stats = off && restingOnly(along > 0 ? grown(off, faces, along) : off, p.boxes);
       if (!stats) return null;
       const o = chooseOrientation(stats, U, orient, { pieceIndex: p.index, flat });
+      // a piece held to a side chosen by hand cannot turn to make room for its pegs: where they would push it off the
+      // bed it does not carry them
+      if (p.chosen && p.lying.fits && p.lying.down === p.chosen && !o.fits) return null;
       return { ...o, need: orientationScore(stats, o.down).need, bed: stats.dirs[o.down].bed };
     };
     // whether a piece lies about as well this way as it does with no pegs: fitting as well, on at least half as much of
@@ -4839,7 +4858,8 @@ export function layGrown(laid, layout = {}, U, orient = 'auto', { flat = null } 
     const why = lip ? { lip: true } : own.length ? { pegs: true } : null;
     const notes = o.notes
       .filter((x) => !((lip || sockets.length || holed || p.chosen) && x.code === 'ORIENT_FALLBACK'))
-      .map((x) => (x.code === 'PIECE_UNSTABLE' && steady && why ? splitNote('PIECE_UNSTABLE', { pieceIndex: p.index, ...why }) : x));
+      .map((x) => (p.chosen && o.down === p.chosen ? unstableChosen(x, p.index)
+        : x.code === 'PIECE_UNSTABLE' && steady && why ? splitNote('PIECE_UNSTABLE', { pieceIndex: p.index, ...why }) : x));
     // why it lies so is said, or it may be turned in the slicer and the round holes laid on their side after all
     if (holed && o.down === held) notes.push(splitNote('HOLES_KEEP_LAY', { pieceIndex: p.index, lies: o.lies }));
     // a side chosen by hand that the piece could not take is still said once it is laid again; and so is one that a
@@ -4855,7 +4875,7 @@ export function layGrown(laid, layout = {}, U, orient = 'auto', { flat = null } 
  * `own` its built-in pegs, `tongues` the lips and twist-lock necks standing out of it, `sockets` the twist-locks whose
  * socket is cut into it, `held` the way the layout laid it for a lip or a lock (null for none) and `holed` whether it
  * keeps that way for its pin holes though the lip was not built, and `stats` its statistics with all of that in: its
- * box grown by what stands out of it, and only the ways down they leave it.
+ * box grown by what stands out of it, and only the ways down they leave it (`bare`: the same without its pegs).
  * @param {object} layout `layoutSplit`'s `pegs`, `lips`, `locks`, `dowels` and `lays`
  * @returns {(p: object, stats?: object) => { own: object[], tongues: object[], sockets: object[], held: string|null,
  *   holed: boolean, stats: object }} for a piece of `layPieces`; `stats` in place of its own
@@ -4884,8 +4904,9 @@ function carriedBy({ pegs = [], lips = [], locks = [], dowels = [], lays = [] } 
     for (const [face, H] of out) stats = { ...lipGrown(stats, face, H), allowed: [oppositeDir(faceOf(tongues[0]))] };
     if (sockets.length) stats = { ...stats, allowed: [sockets[0].down] };
     else if (holed) stats = { ...stats, allowed: [held] };
+    const bare = stats;
     if (own.length) stats = statsWithPegs(stats, own);
-    return { own, tongues, sockets, held, holed, stats, lipDown: tongues.length ? oppositeDir(faceOf(tongues[0])) : null };
+    return { own, tongues, sockets, held, holed, stats, bare, lipDown: tongues.length ? oppositeDir(faceOf(tongues[0])) : null };
   };
 }
 
@@ -4894,47 +4915,63 @@ function carriedBy({ pegs = [], lips = [], locks = [], dowels = [], lays = [] } 
  * whether it is on offer and, where it is not, why not. A side is refused where the piece may only lie flat ('flat':
  * a thin plate, a piece beside a dovetail seam) or stand as modelled ('stand': the piece a part comes out of), where a lip or a twist-lock neck stands out of it and must print
  * standing up ('lip'), where a twist-lock's socket is cut into it or its pin holes were shaped for the way a
- * take-apart cut laid it ('lock'), where its built-in pegs stand out of that side ('pegs'), where not every one of
- * its shells would rest on the bed ('rest') and where it does not fit the printer that way ('bed'). A piece that is
- * a part taken out, or one of several a box prints as, is not offered any (`why`: 'part', 'apart').
+ * take-apart cut laid it ('lock'), where not every one of
+ * its shells would rest on the bed ('rest') and where it does not fit the printer that way ('bed'). Built-in pegs
+ * refuse no side: told to lie on a side they stand out of, or one it is too big for with them, the piece hands them
+ * to the piece across the cut (`pegMales`), so the side is judged without them and marked (`moves`). A piece that is
+ * a part taken out, or one of several a box prints as, is not offered any (`why`: 'part', 'apart') – but the first
+ * piece of such a box keeps its `key` while a side chosen earlier is held for the box, so that it can be handed back.
  * @param {object[]} laid from `layPieces`
  * @param {object} layout `layoutSplit`'s, as for `layGrown`
  * @param {number[]} U the usable bed
- * @param {{ parts?: { has: function }|null, lying?: object[]|null }} options `parts` the pieces of the cut stage that
- *   are parts taken out, by number; `lying` how each piece lies in the end (`layGrown`), where that is known
- * @returns {({ key: string, chosen: string|null, used: boolean, ways: { down: string, lies: string, ok: boolean,
- *   why?: string, bed?: number, support?: number }[] }|{ key: null, why: 'part'|'apart' })[]} per piece of `laid`: `key`
+ * @param {{ parts?: { has: function }|null, lying?: object[]|null, pegs?: boolean }} options `parts` the pieces of the
+ *   cut stage that are parts taken out, by number; `lying` how each piece lies in the end (`layGrown`), where that is
+ *   known; `pegs` whether the joints are built-in pegs
+ * @returns {({ key: string, why?: 'apart', chosen: string|null, used: boolean, auto: string|null, ways: { down: string,
+ *   lies: string, ok: boolean, why?: string, bed?: number, support?: number, moves?: true }[] }|{ key: null,
+ *   why: 'part'|'apart' })[]} per piece of `laid`: `key`
  *   its box ('i,j,k', what `split.lay` goes by), `chosen` the side chosen for it by hand, `used` whether it lies on
- *   it (not where the piece could not take it, or what it carries lays it another way), and each way with how it would lie
+ *   it (not where the piece could not take it, or what it carries lays it another way), `auto` the side the app
+ *   would lay it on (null where that is not known: a piece lying as chosen with built-in pegs), and each way with how it would lie
  *   (`liesOf`), how much of it would rest on the bed (`bed`, mm²) and how much would hang over it (`support`, mm²:
  *   the faces flatter than 45° that face down, as the app counts them when it chooses)
  */
-export function layWays(laid, layout = {}, U, { parts = null, lying = null } = {}) {
+export function layWays(laid, layout = {}, U, { parts = null, lying = null, pegs = false } = {}) {
   const carried = carriedBy(layout);
   const perCell = new Map();
   for (const p of laid) perCell.set(p.cell.join(','), (perCell.get(p.cell.join(',')) ?? 0) + 1);
+  const restsOn = (stats, boxes) => restingOnly({ ...stats, allowed: [...DIR_KEYS] }, boxes)?.allowed ?? [];
   return laid.map((p, i) => {
     if (parts?.has(p.from)) return { key: null, why: 'part' };
     const key = p.cell.join(',');
-    if (perCell.get(key) > 1) return { key: null, why: 'apart' };
+    const now = (lying?.[i] ?? p.lying).down;
+    // a box that prints as several pieces: no side to choose, but one chosen before can be handed back, on its first piece
+    if (perCell.get(key) > 1) return p.refused ? { key, why: 'apart', chosen: p.refused.down, used: false, auto: now, ways: [] } : { key: null, why: 'apart' };
     const free = p.free ?? (p.stats.allowed?.length ? p.stats.allowed : DIR_KEYS);
-    const { own, tongues, sockets, held, stats, lipDown } = carried(p, { ...p.stats, allowed: [...free] });
+    const { own, tongues, sockets, held, stats, bare, lipDown } = carried(p, { ...p.stats, allowed: [...free] });
     const pegged = new Set(own.map((g) => `${g.dir > 0 ? '+' : '-'}${AXES[g.axis]}`));
-    const resting = restingOnly({ ...stats, allowed: [...DIR_KEYS] }, p.boxes)?.allowed ?? [];
+    // told to lie on a side, the piece hands the pegs that are in the way to the piece across the cut (`pegMales`):
+    // a side is judged without them, and says so where they would go
+    const resting = restsOn(bare, p.boxes);
+    const withPegs = own.length ? restsOn(stats, p.boxes) : resting;
     const ways = DIR_KEYS.map((down) => {
       const why = !free.includes(down) ? (free.length === 1 ? 'stand' : 'flat')
         : tongues.length && down !== lipDown ? 'lip'
           : sockets.length && down !== sockets[0].down ? 'lock'
             : !tongues.length && !sockets.length && held && down !== held ? 'lock'
-              : pegged.has(down) ? 'pegs'
-                : !resting.includes(down) ? 'rest'
-                  : !layFits(stats, down, U) ? 'bed' : null;
+              : !resting.includes(down) ? 'rest'
+                : !layFits(bare, down, U) ? 'bed' : null;
       const lies = liesOf(p.stats, down);
       if (why) return { down, lies, ok: false, why };
-      return { down, lies, ok: true, bed: Math.round(p.stats.dirs[down].bed), support: Math.round(p.stats.dirs[down].support) };
+      const moves = own.length > 0 && (pegged.has(down) || !withPegs.includes(down) || !layFits(stats, down, U));
+      return { down, lies, ok: true, bed: Math.round(p.stats.dirs[down].bed), support: Math.round(p.stats.dirs[down].support), ...(moves ? { moves: true } : {}) };
     });
     const chosen = p.chosen ?? p.refused?.down ?? null;
-    return { key, chosen, used: Boolean(p.chosen) && (lying?.[i] ?? p.lying).down === p.chosen, ways };
+    const used = Boolean(p.chosen) && now === p.chosen;
+    // the side the app would lay it on: where it lies now, unless that is the side chosen – then what its joint
+    // holds it to, or how the app laid it before the choice; not known with built-in pegs, which the choice moves
+    const auto = !used ? now : tongues.length ? lipDown : sockets.length ? sockets[0].down : held ?? (pegs ? null : p.auto?.down ?? null);
+    return { key, chosen, used, auto, ways };
   });
 }
 
@@ -4944,17 +4981,19 @@ const LAY_REFUSED = Object.freeze({
   stand: 'a part comes off it, so it prints standing as modelled',
   lip: 'its lip has to print standing up',
   lock: 'its take-apart joint is made for another side',
-  pegs: 'its pegs stand out of that side',
   rest: 'part of it would hang in the air',
   bed: "it doesn't fit your printer",
 });
 
 /**
  * The choice of the side a piece lies on, for its row in the pieces list, in plain words: first the app's own
- * choice, then the six sides – each on offer with about how much of the piece would rest on the bed and how much of
- * it would hang over it, as the app counts them when it chooses (the row's print check, made of the finished piece,
- * has the last word), each refused with why. The side chosen by hand is the one picked, and stays to pick even
- * where it is refused now. A piece that has no choice says why in its one entry.
+ * choice with the side that is (where it is known), then the six sides – each on offer with about how much of the
+ * piece would rest on the bed and how much of it would hang over it, as the app counts them when it chooses (the
+ * row's print check, made of the finished piece, has the last word) and whether its pegs would go to the piece
+ * across the cut, each refused with why. The side chosen by hand is the one picked, and stays to pick even
+ * where it is refused now. A piece that has no choice says why in its one entry; one of a part of the model that
+ * prints as several pieces, for which a side was chosen before, has that side as a second entry, so the choice can
+ * be handed back.
  * @param {object|null} lay a piece's `lay` (`layWays`)
  * @param {string} down the side the piece lies on now
  * @param {string|null} picked the side the document holds for it, where that is newer than `lay` (null: the app's)
@@ -4965,13 +5004,21 @@ const LAY_REFUSED = Object.freeze({
  */
 export function layOptions(lay, down, picked = lay?.chosen ?? null, { current = true } = {}) {
   if (!lay) return null;
-  if (!lay.key) {
-    const why = lay.why === 'part' ? 'a part that comes off prints one way' : 'this box prints as more than one piece';
-    return { key: null, chosen: null, tag: '', options: [{ value: '', text: `The app's choice (${why})` }] };
+  const unusedTag = 'set by you, but not used – see the notes';
+  const cap = (d) => `${LAY_SIDES[d][0].toUpperCase()}${LAY_SIDES[d].slice(1)}`;
+  if (!lay.key || lay.why) {
+    const why = lay.why === 'part' ? 'a part that comes off prints one way' : 'this part of the model prints as more than one piece';
+    const options = [{ value: '', text: `The app's choice (${why})` }];
+    // a side chosen before the part printed as several pieces stays to see, and to hand back
+    if (lay.key && picked) options.push({ value: picked, text: `${cap(picked)} – not offered: this part of the model now prints as more than one piece` });
+    return { key: lay.key ?? null, chosen: lay.key ? picked : null, tag: lay.key && picked ? unusedTag : '', options };
   }
-  const name = (w) => `${LAY_SIDES[w.down][0].toUpperCase()}${LAY_SIDES[w.down].slice(1)}${w.lies === 'on a cut face' ? ' (a cut face)' : ''}`;
-  const own = lay.ways.find((w) => w.down === down);
-  const options = [{ value: '', text: picked || lay.chosen || !own ? "The app's choice" : `The app's choice: ${LAY_SIDES[down]}${own.lies === 'on a cut face' ? ' (a cut face)' : ''}` }];
+  const cut = (w) => (w?.lies === 'on a cut face' ? ' (a cut face)' : '');
+  const name = (w) => `${cap(w.down)}${cut(w)}`;
+  // the side the app would choose, where it is known: the one the piece lies on while none is chosen for it
+  const side = lay.auto !== undefined ? lay.auto : picked || lay.chosen ? null : down;
+  const own = side ? lay.ways.find((w) => w.down === side) : null;
+  const options = [{ value: '', text: own ? `The app's choice: ${LAY_SIDES[side]}${cut(own)}` : "The app's choice" }];
   for (const w of lay.ways) {
     if (!w.ok) {
       options.push({ value: w.down, text: `${name(w)} – not offered: ${LAY_REFUSED[w.why] ?? 'it cannot print that way'}`, ...(w.down === picked ? {} : { disabled: true }) });
@@ -4979,11 +5026,11 @@ export function layOptions(lay, down, picked = lay?.chosen ?? null, { current = 
     }
     const rests = w.bed < STEADY ? 'nothing flat on the bed' : `${areaWords(w.bed)} on the bed`;
     const hangs = w.support < PRINT_CHECK.none ? 'little or no support' : w.support < 100 ? 'a little support' : `supports under ${areaWords(w.support)}`;
-    options.push({ value: w.down, text: `${name(w)} – ${rests}, ${hangs}` });
+    options.push({ value: w.down, text: `${name(w)} – ${rests}, ${hangs}${w.moves ? '; its pegs go to the piece it joins' : ''}` });
   }
   // what the document holds may be newer than the pieces: only a side the pieces were worked out for can be unused
   const unused = picked && current && !(lay.chosen === picked && lay.used);
-  return { key: lay.key, chosen: picked, tag: !picked ? '' : unused ? 'set by you, but not used – see the notes' : 'set by you', options };
+  return { key: lay.key, chosen: picked, tag: !picked ? '' : unused ? unusedTag : 'set by you', options };
 }
 
 /**
@@ -5451,9 +5498,12 @@ const NOTE_TEXT = {
       stand: 'a part comes off it, so it prints standing as modelled',
       rest: 'part of it would hang in the air',
       bed: "it doesn't fit your printer that way",
-      apart: 'its box now prints as more than one piece',
+      apart: 'that part of the model now prints as more than one piece',
     }[why] ?? 'it cannot print that way';
-    return `${pieceName(pieceIndex)} can't lie ${LAY_SIDES[down] ?? 'the way you chose'} as you chose: ${reason}. It lies ${lies}, ${joint ? 'as its joint needs' : "the app's choice"} – choose again in the pieces list if you like.`;
+    const start = `${pieceName(pieceIndex)} can't lie the way you chose${LAY_SIDES[down] ? ` (${LAY_SIDES[down]})` : ''}: ${reason}.`;
+    // no side can be chosen for a part of the model that prints as several pieces: the choice can only be handed back
+    if (why === 'apart') return `${start} Each of its pieces lies the app's way – pick "The app's choice" for ${pieceName(pieceIndex).toLowerCase()} in the pieces list to clear this note.`;
+    return `${start} It lies ${lies}, ${joint ? 'as its joint needs' : "the app's choice"} – choose again in the pieces list if you like.`;
   },
   LAY_WAITS: ({ count = 1 }) => `A cut misses the model, or lies where another cut is, so the pieces are not the ones you chose ${count === 1 ? 'a side' : 'sides'} for: the ${count === 1 ? 'side' : 'sides'} chosen in the pieces list ${count === 1 ? 'is' : 'are'} not used until that cut is moved or removed.`,
   LAYS_DROPPED: ({ count = 1, why = 'cuts' }) => {
@@ -5570,7 +5620,8 @@ const NOTE_TEXT = {
     if (whole) return `This model fits only beside or behind the bed's front-left ${sides}corner: in the slicer, move it clear of it – left in the middle of the bed it reaches into it.`;
     return `${many ? `Pieces ${listOf(pieces)} fit` : `Piece ${pieces[0] ?? ''} fits`} only beside or behind the bed's front-left ${sides}corner: in the slicer, move ${many ? 'them' : 'it'} clear of it – left in the middle of the bed ${many ? 'they reach' : 'it reaches'} into it.`;
   },
-  PIECE_UNSTABLE: ({ pieceIndex, pegs = false, lip = false }) => {
+  PIECE_UNSTABLE: ({ pieceIndex, pegs = false, lip = false, chosen = false }) => {
+    if (chosen) return `${pieceName(pieceIndex)} rests on a curve or an edge on the side you chose, so it needs supports under it and may come loose while it prints – choose another side for it in the pieces list.`;
     if (lip) return `${pieceName(pieceIndex)} has nothing flat to stand on but the face its lip stands out of – it rests on a curve or an edge and needs supports.`;
     return pegs
       ? `${pieceName(pieceIndex)} has nothing flat to stand on but the face its built-in pegs stand out of – it rests on a curve or an edge and needs supports. With pins (Joints: Pins) it lies on that face.`
@@ -5872,7 +5923,7 @@ const NOTE_TEXT = {
  * auto, supports, steps, foot, layer, height }` (what the print check of a piece, or with `whole` of a model printed
  * in one piece, found worth saying: printCheck.js `checkNote`; one a piece at most, and `warn` where the piece may
  * tip; `auto` where the piece is laid the best side down, and so not told to lay it another way for its supports);
- * PIECE_UNSTABLE `{ pieceIndex, pegs, lip }` (`pegs`, `lip`: only the
+ * PIECE_UNSTABLE `{ pieceIndex, pegs, lip, chosen }` (`chosen`: it lies on a side chosen by hand; `pegs`, `lip`: only the
  * face its pegs or its lip stand out of was flat); PART_TOO_BIG `{ name, size, bed, pins, strip }` (`strip`: the pins fit, their holding strip does not)
  * (a part printed separately, or with `pins` a single pin, too big for the bed); SPLIT_NOT_NEEDED `{ yaw, down, apart }`
  * (down other than '-z' when it fits only on its side; `apart` the letters of the cuts that come apart, when the pieces

@@ -3448,7 +3448,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     // how each piece's pin holes print, the way it lies in its file
     const holes = new Map(holeSummary(laid.map((p, i) => ({ index: p.index, up: lying[i].up })), layout.seams).map((h) => [h.index, h]));
     // the sides each piece may be told to lie on by hand, and the one it was
-    const offered = layWays(laid, layout, U, { parts: partOf, lying });
+    const offered = layWays(laid, layout, U, { parts: partOf, lying, pegs: spec.joint === 'pegs' });
     const pieces = laid.map((p, i) => {
       const o = lying[i];
       // a cut's lip may stand out of a piece on more than one face: one entry a cut, its clips added up. What comes off

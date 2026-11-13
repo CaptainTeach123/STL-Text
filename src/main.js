@@ -3084,6 +3084,8 @@ function layChoice(row) {
     select.append(option);
   }
   select.value = chosen ?? '';
+  // the closed list has room for the side's name only: the whole entry shows when it is pointed at
+  select.title = select.selectedOptions[0]?.text ?? '';
   select.disabled = !key || !!row.layOld;
   select.addEventListener('change', () => setPieceLay(key, select.value || null));
   label.append('Lies on ', select);

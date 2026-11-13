@@ -379,11 +379,12 @@ describe('split for printing', () => {
     doc.addCut({ position: [10, 0, 0], normal: X });
     doc.removeCut('c1');
     expect(doc.addCut({ position: [20, 0, 0], normal: X })).toBe('c3');
-    // a planned split arrives without ids; given ids are kept, repeats renumbered
+    // a planned split arrives without ids: its cuts get new ones, past those of the cuts they replace – they are
+    // other cuts; given ids are kept, repeats renumbered
     doc.setSplit({ cuts: [{ position: [-83.333, 0, 0], normal: X }, { position: [83.333, 0, 0], normal: X }] });
-    expect(doc.split.cuts.map((c) => c.id)).toEqual(['c1', 'c2']);
+    expect(doc.split.cuts.map((c) => c.id)).toEqual(['c4', 'c5']);
     doc.setSplit({ cuts: [{ position: [0, 0, 0], normal: X }, { id: 'c4', position: [0, 0, 0], normal: Y }, { id: 'c4', position: [0, 0, 5], normal: [0, 0, 1] }] });
-    expect(doc.split.cuts.map((c) => c.id)).toEqual(['c5', 'c4', 'c6']);
+    expect(doc.split.cuts.map((c) => c.id)).toEqual(['c6', 'c4', 'c7']);
     // a cut keeps only what a cut is
     doc.setSplit({ cuts: [{ id: 'c1', letter: 'A', axis: 'x', at: 3, position: [3, 0, 0], normal: X }] });
     expect(doc.split.cuts).toEqual([{ id: 'c1', position: [3, 0, 0], normal: X }]);
@@ -607,6 +608,61 @@ describe('the side a piece lies on, chosen by hand', () => {
     expect(doc.split.lay).toEqual(lay);
     doc.resetBase();
     expect('lay' in doc.split).toBe(false);
+  });
+
+  it('a new plan of as many cuts drops the choices, and a cut dragged past another and back in one drag keeps them', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'block');
+    // Fit to my printer hands over cuts without ids
+    doc.setSplit({ cuts: [{ position: [10, 0, 0], normal: X }, { position: [0, 0, 20], normal: Z }] });
+    const first = cellsKey(doc.split);
+    doc.setPieceLay('1,0,1', '-y');
+    // a new plan, with one cut across each axis again: other cuts, other pieces
+    doc.setSplit({ cuts: [{ position: [-40, 0, 0], normal: X }, { position: [0, 0, 70], normal: Z }] });
+    expect('lay' in doc.split).toBe(false);
+    expect(cellsKey(doc.split)).not.toBe(first);
+    doc.undo();
+    expect(doc.split.lay).toEqual({ '1,0,1': '-y' });
+    // the same places listed in another order are a new plan all the same
+    doc.setSplit({ cuts: [{ position: [0, 0, 20], normal: Z }, { position: [10, 0, 0], normal: X }] });
+    expect('lay' in doc.split).toBe(false);
+    doc.undo();
+    // the very cuts handed back with their ids are the same cuts
+    doc.setSplit({ cuts: doc.split.cuts.map((c) => ({ ...c, position: c.position.map((v) => v + 1) })) });
+    expect(doc.split.lay).toEqual({ '1,0,1': '-y' });
+
+    // one drag: past the other cut the choices are set aside, back again they return
+    const bar = new Document();
+    bar.setBase('stl', 'bar');
+    const a = bar.addCut({ position: [0, 0, 0], normal: X });
+    bar.addCut({ position: [50, 0, 0], normal: X });
+    bar.setPieceLay('2,0,0', '+x');
+    const drag = { coalesce: `split:at:${a}` };
+    bar.updateCut(a, { position: [30, 0, 0] }, drag);
+    expect(bar.split.lay).toEqual({ '2,0,0': '+x' });
+    bar.updateCut(a, { position: [60, 0, 0] }, drag);
+    expect('lay' in bar.split).toBe(false);
+    bar.updateCut(a, { position: [70, 0, 0] }, drag);
+    expect('lay' in bar.split).toBe(false);
+    bar.updateCut(a, { position: [20, 0, 0] }, drag);
+    expect(bar.split.lay).toEqual({ '2,0,0': '+x' });
+    // the whole drag is one step
+    bar.undo();
+    expect(bar.split.cuts[0].position).toEqual([0, 0, 0]);
+    expect(bar.split.lay).toEqual({ '2,0,0': '+x' });
+    // left on the far side when the drag ends, they are gone – a later drag back does not bring them
+    bar.updateCut(a, { position: [60, 0, 0] }, drag);
+    bar.endCoalescing();
+    bar.updateCut(a, { position: [20, 0, 0] }, drag);
+    expect('lay' in bar.split).toBe(false);
+    // a side chosen while the cut is on the far side is not overwritten by one set aside
+    bar.undo();
+    bar.undo();
+    expect(bar.split.lay).toEqual({ '2,0,0': '+x' });
+    bar.updateCut(a, { position: [60, 0, 0] }, drag);
+    bar.setPieceLay('0,0,0', '-y');
+    bar.updateCut(a, { position: [20, 0, 0] }, drag);
+    expect('lay' in bar.split).toBe(false);
   });
 
   it('cellsKey tells the boxes by the cuts across each axis in their order along it', () => {

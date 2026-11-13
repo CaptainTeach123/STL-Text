@@ -1722,6 +1722,50 @@ describe('the side a piece lies on, chosen by hand', () => {
     expect(layPieces(round, U, 'auto', { lay: { '0,0,0': '-y' } })[0].lying.notes).toEqual([expect.objectContaining({ code: 'PIECE_UNSTABLE', pieceIndex: 1 })]);
   });
 
+  it('a piece laid by hand on a curved side is told that the side is why – not that it has nothing flat, nor to cut again', () => {
+    const round = halves();
+    round[0].stats = boxStats([60, 40, 30], ['+x'], { '-y': { bed: 0, support: 900 } });
+    const laid = layPieces(round, U, 'auto', { lay: { '0,0,0': '-y' } });
+    const said = 'Piece 1 rests on a curve or an edge on the side you chose, so it needs supports under it and may come loose while it prints – choose another side for it in the pieces list.';
+    expect(laid[0].lying.notes).toEqual([expect.objectContaining({ code: 'PIECE_UNSTABLE', level: 'warn', pieceIndex: 1, chosen: true, text: said })]);
+    expect(laid[0].lying.notes[0].text).not.toMatch(/nothing flat|Another cut/);
+    // laid again with built-in pegs, or with pin holes only, it is told the same
+    const pegs = [{ axis: 0, at: 60, centre: [60, 20, 15], s: 6, length: 9, dir: 1, sides: [{ piece: 1, peg: true }, { piece: 2, peg: false }] }];
+    const again = layGrown(laid, { pegs }, U)[0];
+    expect(again).toMatchObject({ pegged: true, down: '-y' });
+    expect(again.notes).toEqual([expect.objectContaining({ code: 'PIECE_UNSTABLE', chosen: true, text: said })]);
+    // one the app laid so itself keeps the words it always had
+    const own = halves();
+    own[0].stats = boxStats([60, 40, 30], [], Object.fromEntries(Object.keys(DIRECTIONS).map((d) => [d, { bed: 0, support: 900 }])));
+    expect(layPieces(own, U)[0].lying.notes[0]).toMatchObject({ code: 'PIECE_UNSTABLE', text: expect.stringContaining('has nothing flat to stand on where it fits your printer') });
+    expect(layPieces(own, U)[0].lying.notes[0].chosen).toBeUndefined();
+  });
+
+  it('a side chosen for a part of the model that prints as more than one piece is said once, with its first piece', () => {
+    // a body and a loose bit held inside its box: the bit never reaches the bed, so it prints apart
+    const inner = boxStats([10, 10, 10]);
+    inner.bbox = { min: [20, 15, 10], max: [30, 25, 20] };
+    const body = boxStats([60, 40, 30], ['+x']);
+    const pieces = halves();
+    pieces[0] = { ...pieces[0], shells: 2, stats: undefined, parts: [
+      { box: body.bbox, volume: 70000, cuts: ['c1'], stats: body },
+      { box: inner.bbox, volume: 1000, cuts: [], stats: inner },
+    ] };
+    const laid = layPieces(pieces, U, 'auto', { lay: { '0,0,0': '+z' } });
+    expect(laid.map((p) => p.cell.join(','))).toEqual(['0,0,0', '0,0,0', '1,0,0']);
+    expect(laid.map((p) => Boolean(p.refused))).toEqual([true, false, false]);
+    expect(laid.flatMap((p) => p.lying.notes).filter((n) => n.code === 'LAY_IGNORED')).toEqual([expect.objectContaining({
+      pieceIndex: 1, down: '+z', why: 'apart',
+      text: `Piece 1 can't lie the way you chose (upside down): that part of the model now prints as more than one piece. Each of its pieces lies the app's way – pick "The app's choice" for piece 1 in the pieces list to clear this note.`,
+    })]);
+    expect(laid.map((p) => p.lying.down)).toEqual(layPieces(pieces, U).map((p) => p.lying.down));
+    // its first piece keeps the choice to hand back; the other has none
+    const ways = layWays(laid, {}, U);
+    expect(ways[0]).toMatchObject({ key: '0,0,0', why: 'apart', chosen: '+z', used: false });
+    expect(ways[1]).toEqual({ key: null, why: 'apart' });
+    expect(layOptions(ways[0], laid[0].lying.down, '+z').options.map((o) => o.value)).toEqual(['', '+z']);
+  });
+
   it('a side the piece cannot take is left to the app, with a note that says why', () => {
     // too tall for the printer standing on its end
     const long = halves();
@@ -1732,12 +1776,12 @@ describe('the side a piece lies on, chosen by hand', () => {
     expect(tall.lying.down).toBe(layPieces(long, U)[0].lying.down);
     expect(tall.refused).toMatchObject({ code: 'LAY_IGNORED', level: 'info', pieceIndex: 1, down: '-x', why: 'bed' });
     expect(tall.lying.notes).toEqual([tall.refused]);
-    expect(tall.refused.text).toBe(`Piece 1 can't lie on its left side as you chose: it doesn't fit your printer that way. It lies ${tall.lying.lies}, the app's choice – choose again in the pieces list if you like.`);
+    expect(tall.refused.text).toBe(`Piece 1 can't lie the way you chose (on its left side): it doesn't fit your printer that way. It lies ${tall.lying.lies}, the app's choice – choose again in the pieces list if you like.`);
     // a piece that has to lie flat for its joint (beside a dovetail seam, a thin plate)
     const flat = halves();
     flat[0].stats = { ...flat[0].stats, allowed: ['-z', '+z'] };
     const [plate] = layPieces(flat, U, 'auto', { lay: { '0,0,0': '+x' } });
-    expect(plate.refused).toMatchObject({ why: 'flat', text: expect.stringMatching(/^Piece 1 can't lie on its right side as you chose: it has to lie flat \(a thin plate, or one beside a dovetail joint\)\. It lies flat as modelled/) });
+    expect(plate.refused).toMatchObject({ why: 'flat', text: expect.stringMatching(/^Piece 1 can't lie the way you chose \(on its right side\): it has to lie flat \(a thin plate, or one beside a dovetail joint\)\. It lies flat as modelled/) });
     expect(layPieces(flat, U, 'auto', { lay: { '0,0,0': '+z' } })[0]).toMatchObject({ chosen: '+z', free: ['-z', '+z'], lying: { down: '+z' } });
     // a part taken out is never asked: it prints its one way
     const part = halves();
@@ -1756,6 +1800,28 @@ describe('the side a piece lies on, chosen by hand', () => {
     expect(pegMales(layPieces(halves(), U, 'auto', { lay: { '1,0,0': '-z' } }), U)(pair)).toEqual([1]);
   });
 
+  it('a piece held to a side never carries pegs that would push it off the bed: the other piece does, or neither', () => {
+    // a printer 62 mm tall: a half standing on its far end is 60 mm, 69 mm with pegs on top
+    const tight = [80, 50, 62];
+    const pair = [{ axis: 0, lo: 1, hi: 2 }];
+    // left to the app, the split fits: one lies flat with the pegs
+    const auto = layPieces(halves(), tight);
+    const free = pegMales(auto, tight, 'auto', { length: 9 })(pair);
+    expect(free).not.toEqual([null]);
+    // the first stands on its far end: it has no room for the pegs, so the second carries them
+    const one = layPieces(halves(), tight, 'auto', { lay: { '0,0,0': '-x' } });
+    expect(one[0].lying).toMatchObject({ down: '-x', fits: true, size: [30, 40, 60] });
+    expect(pegMales(one, tight, 'auto', { length: 9 })(pair)).toEqual([1]);
+    // both stand on their far ends (chosen while the joints were pins): neither can, so the faces are glued flat
+    const both = layPieces(halves(), tight, 'auto', { lay: { '0,0,0': '-x', '1,0,0': '+x' } });
+    expect(pegMales(both, tight, 'auto', { length: 9 })(pair)).toEqual([null]);
+    // so no piece laid as chosen is too big with what it carries
+    const pegs = [12, -12].map((y) => ({ axis: 0, at: 60, centre: [60, 20 + y, 15], s: 6, length: 9, dir: -1, sides: [{ piece: 1, peg: false }, { piece: 2, peg: true }] }));
+    expect(layGrown(one, { pegs }, tight).map((o) => o.fits)).toEqual([true, true]);
+    // with room to spare a piece standing on its far end carries them as before
+    expect(pegMales(layPieces(halves(), U, 'auto', { lay: { '0,0,0': '-x', '1,0,0': '+x' } }), U, 'auto', { length: 9 })(pair)).not.toEqual([null]);
+  });
+
   it('a lip goes where it is best whatever side was chosen: the piece that carries it lies as the lip needs, and is told so', () => {
     const lower = { index: 1, cell: [0, 0, 0], shells: 1, volume: 1, bbox: { min: [0, 0, 0], max: [80, 80, 60] }, cuts: ['c1'], stats: boxStats([80, 80, 60], ['+z']) };
     const upper = { index: 2, cell: [0, 0, 1], shells: 1, volume: 1, bbox: { min: [0, 0, 0], max: [80, 80, 60] }, cuts: ['c1'], stats: boxStats([80, 80, 60], ['-z']) };
@@ -1771,7 +1837,7 @@ describe('the side a piece lies on, chosen by hand', () => {
     expect(carries).toMatchObject({ lip: true, down: '-z', size: [80, 80, 66] });
     expect(carries.notes).toEqual([expect.objectContaining({
       code: 'LAY_IGNORED', level: 'info', pieceIndex: 1, down: '-x', why: 'lip',
-      text: "Piece 1 can't lie on its left side as you chose: its lip has to print standing up. It lies flat as modelled, as its joint needs – choose again in the pieces list if you like.",
+      text: "Piece 1 can't lie the way you chose (on its left side): its lip has to print standing up. It lies flat as modelled, as its joint needs – choose again in the pieces list if you like.",
     })]);
     // the other piece lies as it was told
     expect(other).toBe(laid[1].lying);
@@ -1833,12 +1899,25 @@ describe('the side a piece lies on, chosen by hand', () => {
     const body = halves();
     body[0].stats = { ...body[0].stats, allowed: ['-z'] };
     expect(why(layWays(layPieces(body, U), {}, U)[0].ways)).toEqual({ '+x': 'stand', '-x': 'stand', '+y': 'stand', '-y': 'stand', '+z': 'stand', '-z': 'ok' });
-    expect(layPieces(body, U, 'auto', { lay: { '0,0,0': '+z' } })[0].refused).toMatchObject({ why: 'stand', text: expect.stringContaining("can't lie upside down as you chose: a part comes off it, so it prints standing as modelled. It lies flat as modelled, the app's choice") });
-    // built-in pegs: never on the side they stand out of, and the box counts them
+    expect(layPieces(body, U, 'auto', { lay: { '0,0,0': '+z' } })[0].refused).toMatchObject({ why: 'stand', text: expect.stringContaining("can't lie the way you chose (upside down): a part comes off it, so it prints standing as modelled. It lies flat as modelled, the app's choice") });
+    // built-in pegs refuse no side: on the side they stand out of, or one the piece is too big for with them, they
+    // go to the piece across the cut, and the entry is marked so
     const pegs = [{ axis: 0, at: 60, centre: [60, 20, 15], s: 6, length: 9, dir: 1, sides: [{ piece: 1, peg: true }, { piece: 2, peg: false }] }];
-    expect(why(layWays(laid, { pegs }, U)[0].ways)).toEqual({ '+x': 'pegs', '-x': 'ok', '+y': 'ok', '-y': 'ok', '+z': 'ok', '-z': 'ok' });
-    expect(why(layWays(laid, { pegs }, U)[1].ways)['-x']).toBe('ok');
-    expect(why(layWays(laid, { pegs }, [100, 100, 65])[0].ways)['-x']).toBe('bed'); // 69 mm tall with its pegs
+    const moves = (ways) => ways.filter((w) => w.moves).map((w) => w.down);
+    expect(layWays(laid, { pegs }, U)[0].ways.every((w) => w.ok)).toBe(true);
+    expect(moves(layWays(laid, { pegs }, U)[0].ways)).toEqual(['+x']);
+    expect(moves(layWays(laid, { pegs }, U)[1].ways)).toEqual([]);
+    // 69 mm tall with its pegs, standing on either end: it fits without them
+    expect(why(layWays(laid, { pegs }, [100, 100, 65])[0].ways)).toEqual({ '+x': 'ok', '-x': 'ok', '+y': 'ok', '-y': 'ok', '+z': 'ok', '-z': 'ok' });
+    expect(moves(layWays(laid, { pegs }, [100, 100, 65])[0].ways)).toEqual(['-x', '+x']);
+    // too tall even without them: refused for the printer, as ever
+    expect(why(layWays(laid, { pegs }, small)[0].ways)).toMatchObject({ '+x': 'bed', '-x': 'bed' });
+    // the side the app would choose: where the piece lies while none is chosen; with one chosen and used, how the
+    // app laid it before – not known with built-in pegs, which the choice moves
+    expect(one.auto).toBe('+x');
+    expect(chosen.auto).toBe('+x');
+    expect(layWays(layPieces(halves(), U, 'auto', { lay: { '0,0,0': '-y' } }), {}, U, { pegs: true })[0].auto).toBeNull();
+    expect(layWays(layPieces(halves(), [100, 100, 50], 'auto', { lay: { '0,0,0': '-x' } }), {}, [100, 100, 50])[0].auto).toBe('-z');
     // a lip, or a twist-lock's neck: only standing up; the piece its socket is cut into: only on that cut face
     const lip = { cutId: 'c1', axis: 0, dir: 1, male: 0, down: '-x', H: 6, sides: [{ piece: 1, male: true }, { piece: 2, male: false }] };
     expect(why(layWays(laid, { lips: [lip] }, U)[0].ways)).toEqual({ '+x': 'lip', '-x': 'ok', '+y': 'lip', '-y': 'lip', '+z': 'lip', '-z': 'lip' });
@@ -1853,6 +1932,9 @@ describe('the side a piece lies on, chosen by hand', () => {
     expect(layWays(laid, {}, U, { parts: new Map([[2, {}]]) })[1]).toEqual({ key: null, why: 'part' });
     const apart = [{ ...laid[0] }, { ...laid[1], cell: [0, 0, 0] }];
     expect(layWays(apart, {}, U)).toEqual([{ key: null, why: 'apart' }, { key: null, why: 'apart' }]);
+    // but a side chosen for the box before it printed so stays with its first piece, to hand back
+    const stale = [{ ...laid[0], refused: splitNote('LAY_IGNORED', { pieceIndex: 1, down: '+z', why: 'apart', lies: 'on a cut face' }) }, { ...laid[1], cell: [0, 0, 0] }];
+    expect(layWays(stale, {}, U)).toEqual([{ key: '0,0,0', why: 'apart', chosen: '+z', used: false, auto: '+x', ways: [] }, { key: null, why: 'apart' }]);
   });
 
   it('the choice in a piece\'s row says each side in plain words, with what rests on the bed and what hangs over it', () => {
@@ -1874,9 +1956,17 @@ describe('the side a piece lies on, chosen by hand', () => {
       { value: '-y', text: 'On its front – about 18 cm² on the bed, a little support' },
       { value: '+y', text: 'On its back – about 18 cm² on the bed, little or no support' },
     ]);
-    // a side chosen: the app's choice is no longer told as the side it lies on, and the side is the one picked
+    // a side chosen: the app's choice still says which side that is, and the side chosen is the one picked
     const [own] = layWays(layPieces(piece, [100, 100, 50], 'auto', { lay: { '0,0,0': '+y' } }), {}, [100, 100, 50]);
-    expect(layOptions(own, '+y')).toMatchObject({ chosen: '+y', tag: 'set by you', options: expect.arrayContaining([{ value: '', text: "The app's choice" }]) });
+    expect(layOptions(own, '+y')).toMatchObject({ chosen: '+y', tag: 'set by you', options: expect.arrayContaining([{ value: '', text: "The app's choice: as in the model" }]) });
+    // with built-in pegs the app's own side is not known while another is in use: it is not named
+    const [pegged] = layWays(layPieces(piece, [100, 100, 50], 'auto', { lay: { '0,0,0': '+y' } }), {}, [100, 100, 50], { pegs: true });
+    expect(layOptions(pegged, '+y').options[0]).toEqual({ value: '', text: "The app's choice" });
+    // a side refused: the piece lies the app's way, which is named
+    expect(layOptions({ ...lay, chosen: '+x', used: false }, '-z', '+x').options[0]).toEqual({ value: '', text: "The app's choice: as in the model" });
+    // a side on which the piece's pegs would go to the piece across the cut says so
+    expect(layOptions({ key: '0,0,0', chosen: null, ways: [{ down: '+x', lies: 'on a cut face', ok: true, bed: 1200, support: 0, moves: true }] }, '-z').options[1].text)
+      .toBe('On its right side (a cut face) – about 12 cm² on the bed, little or no support; its pegs go to the piece it joins');
     // what the document holds is newer than the pieces: it is the one shown, and one refused since stays to pick
     expect(layOptions(lay, '-z', '+x', { current: false })).toMatchObject({ chosen: '+x', tag: 'set by you' });
     // once the pieces are worked out for it, a side they do not lie on is told as not used: one refused, one that
@@ -1884,18 +1974,30 @@ describe('the side a piece lies on, chosen by hand', () => {
     expect(layOptions({ ...lay, chosen: '+x', used: false }, '-z', '+x')).toMatchObject({ chosen: '+x', tag: 'set by you, but not used – see the notes' });
     expect(layOptions(lay, '-z', '+x')).toMatchObject({ chosen: '+x', tag: 'set by you, but not used – see the notes' });
     expect(layOptions(lay, '-z', '+x').options[4]).toEqual({ value: '+x', text: "On its right side (a cut face) – not offered: it doesn't fit your printer" });
-    expect(layOptions(own, '+y', null)).toMatchObject({ chosen: null, options: expect.arrayContaining([{ value: '', text: "The app's choice" }]) });
+    expect(layOptions(own, '+y', null)).toMatchObject({ chosen: null, options: expect.arrayContaining([{ value: '', text: "The app's choice: as in the model" }]) });
     // every reason in plain words
     const refused = (why) => layOptions({ key: '0,0,0', chosen: null, ways: [{ down: '-x', lies: 'on its side', ok: false, why }] }, '-z').options[1].text;
     expect(refused('flat')).toBe('On its left side – not offered: it has to lie flat (a thin plate, or one beside a dovetail joint)');
     expect(refused('stand')).toBe('On its left side – not offered: a part comes off it, so it prints standing as modelled');
     expect(refused('lip')).toBe('On its left side – not offered: its lip has to print standing up');
     expect(refused('lock')).toBe('On its left side – not offered: its take-apart joint is made for another side');
-    expect(refused('pegs')).toBe('On its left side – not offered: its pegs stand out of that side');
     expect(refused('rest')).toBe('On its left side – not offered: part of it would hang in the air');
     // no choice at all: one entry that says why
     expect(layOptions({ key: null, why: 'part' }, '-z')).toEqual({ key: null, chosen: null, tag: '', options: [{ value: '', text: "The app's choice (a part that comes off prints one way)" }] });
-    expect(layOptions({ key: null, why: 'apart' }, '-z').options).toEqual([{ value: '', text: "The app's choice (this box prints as more than one piece)" }]);
+    expect(layOptions({ key: null, why: 'apart' }, '-z').options).toEqual([{ value: '', text: "The app's choice (this part of the model prints as more than one piece)" }]);
+    // a side chosen before the part printed as several pieces: shown, not used, and the app's choice is there to pick
+    const held = { key: '1,0,0', why: 'apart', chosen: '+z', used: false, auto: '-z', ways: [] };
+    expect(layOptions(held, '-z', '+z')).toEqual({
+      key: '1,0,0', chosen: '+z', tag: 'set by you, but not used – see the notes',
+      options: [
+        { value: '', text: "The app's choice (this part of the model prints as more than one piece)" },
+        { value: '+z', text: 'Upside down – not offered: this part of the model now prints as more than one piece' },
+      ],
+    });
+    // handed back, before the pieces are worked out again
+    expect(layOptions(held, '-z', null)).toEqual({ key: '1,0,0', chosen: null, tag: '', options: [{ value: '', text: "The app's choice (this part of the model prints as more than one piece)" }] });
+    // nothing in the words shown calls a part of the model a box
+    expect(JSON.stringify([layOptions(held, '-z', '+z'), layOptions(lay, '-z'), layOptions({ key: null, why: 'apart' }, '-z')])).not.toMatch(/\bbox/i);
     expect(layOptions(null, '-z')).toBeNull();
   });
 
@@ -1905,8 +2007,15 @@ describe('the side a piece lies on, chosen by hand', () => {
       level: 'info', text: 'Piece 2 lies on the side you chose in the pieces list: its pin holes and print check are made for that side, so print it as the file lies.',
     });
     expect(splitNote('LAY_CHOSEN', { pieces: [1, 3] }).text).toBe('Pieces 1 and 3 lie on the side you chose in the pieces list: their pin holes and print check are made for that side, so print them as the files lie.');
-    expect(splitNote('LAY_IGNORED', { pieceIndex: 4, down: '+z', why: 'rest', lies: 'on a cut face' }).text).toBe("Piece 4 can't lie upside down as you chose: part of it would hang in the air. It lies on a cut face, the app's choice – choose again in the pieces list if you like.");
-    expect(splitNote('LAY_IGNORED', { pieceIndex: 4, down: '-y', why: 'apart', lies: 'on its side' }).text).toMatch(/^Piece 4 can't lie on its front as you chose: its box now prints as more than one piece\./);
+    expect(splitNote('LAY_IGNORED', { pieceIndex: 4, down: '+z', why: 'rest', lies: 'on a cut face' }).text).toBe("Piece 4 can't lie the way you chose (upside down): part of it would hang in the air. It lies on a cut face, the app's choice – choose again in the pieces list if you like.");
+    // every side reads the same way, the model's own too
+    expect(splitNote('LAY_IGNORED', { pieceIndex: 2, down: '-z', why: 'lip', lies: 'on its side', joint: true }).text).toBe("Piece 2 can't lie the way you chose (as in the model): its lip has to print standing up. It lies on its side, as its joint needs – choose again in the pieces list if you like.");
+    // a part of the model that prints as several pieces has no side to choose: the note says how to clear it instead
+    expect(splitNote('LAY_IGNORED', { pieceIndex: 4, down: '-y', why: 'apart', lies: 'on its side' }).text).toBe(`Piece 4 can't lie the way you chose (on its front): that part of the model now prints as more than one piece. Each of its pieces lies the app's way – pick "The app's choice" for piece 4 in the pieces list to clear this note.`);
+    // a piece laid by hand on a curved side is told that the side is why, and what cures it
+    expect(splitNote('PIECE_UNSTABLE', { pieceIndex: 1, chosen: true })).toMatchObject({
+      level: 'warn', text: 'Piece 1 rests on a curve or an edge on the side you chose, so it needs supports under it and may come loose while it prints – choose another side for it in the pieces list.',
+    });
     expect(splitNote('LAYS_DROPPED', { count: 1, why: 'cuts' })).toMatchObject({
       level: 'info',
       text: 'The cuts changed, so the pieces are no longer the same ones: the side you chose for a piece to lie on was dropped, and the app lays it again. Choose again in the pieces list if you like (Undo brings the choice back with the cuts as they were).',

@@ -329,27 +329,51 @@ export function cellsKey(split) {
 /** One past the highest keep mark id in use. */
 const nextKeepId = (keep) => `k${1 + Math.max(0, ...keep.map((k) => keepNumber(k.id)))}`;
 
+/** Whether two cuts are one cut in all but the id: in the same place, facing the same way, joined the same way. */
+const sameCut = (a, b) => {
+  const [p, q] = [a, b].map((c) => copyCut({ ...c, id: null }));
+  const near = (u, v) => u.length === v.length && u.every((x, i) => Math.abs(x - v[i]) < 1e-6);
+  return near(p.position, q.position) && near(p.normal, q.normal) && JSON.stringify({ ...p, position: 0, normal: 0 }) === JSON.stringify({ ...q, position: 0, normal: 0 });
+};
+
+/**
+ * The cuts `given` with an id each, as the document numbers them when they take the place of the cuts `current`: an
+ * id given is kept (a repeat is not). A cut without one that is where a cut is now, facing and joined as it is, is
+ * that cut and takes its id – so a plan asked for again changes nothing – and any other gets a new id, past those
+ * of the cuts it replaces: it is another cut, and makes other boxes (`cellsKey`), even where there are as many of
+ * them. The engine numbers a plan's cuts with this too, so what it cut for the plan is found by the split that
+ * follows.
+ * @param {object[]} given
+ * @param {{ id: string }[]} [current]
+ * @returns {object[]}
+ */
+export function numberCuts(given, current = []) {
+  let top = Math.max(0, ...given.map((c) => cutNumber(c.id)), ...current.map((c) => cutNumber(c.id)));
+  const own = new Set(given.map((c) => c.id).filter((id) => id != null));
+  const free = current.filter((c) => c && Array.isArray(c.position) && Array.isArray(c.normal) && !own.has(c.id));
+  const seen = new Set();
+  return given.map((cut) => {
+    let id = cut.id != null && !seen.has(cut.id) ? cut.id : null;
+    if (id == null) {
+      const at = free.findIndex((c) => !seen.has(c.id) && sameCut(c, cut));
+      id = at < 0 ? `c${++top}` : free[at].id;
+    }
+    seen.add(id);
+    return { ...cut, id };
+  });
+}
+
 /**
  * The split after `patch` (null switches it off): settings merged over the
- * current ones and the defaults, each cut copied, and a fresh id for any cut
- * without its own (a planned split arrives without ids), past those of the
- * cuts it replaces. The details kept
- * whole are copied the same way, and an empty list of them is left out; so
- * are the sides chosen by hand for pieces to lie on (`lay`).
+ * current ones and the defaults, each cut copied, and an id for any cut
+ * without its own (a planned split arrives without ids; `numberCuts`). The
+ * details kept whole are copied the same way, and an empty list of them is
+ * left out; so are the sides chosen by hand for pieces to lie on (`lay`).
  */
 function mergeSplit(current, patch) {
   if (!patch) return null;
   const next = { ...SPLIT_DEFAULTS, ...(current ?? {}), ...patch };
-  const given = next.cuts ?? [];
-  // new ids never take up one the cuts before them had: a new plan's cuts are other cuts, and make other boxes
-  // (`cellsKey`), even where there are as many of them
-  let top = Math.max(0, ...given.map((c) => cutNumber(c.id)), ...(current?.cuts ?? []).map((c) => cutNumber(c.id)));
-  const seen = new Set();
-  next.cuts = given.map((cut) => {
-    const id = cut.id != null && !seen.has(cut.id) ? cut.id : `c${++top}`;
-    seen.add(id);
-    return copyCut({ ...cut, id });
-  });
+  next.cuts = numberCuts(next.cuts ?? [], current?.cuts ?? []).map(copyCut);
   const marks = Array.isArray(next.keep) ? next.keep : [];
   delete next.keep;
   if (marks.length) {

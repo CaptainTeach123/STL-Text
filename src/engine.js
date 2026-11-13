@@ -7,7 +7,7 @@ import { parseSTL, triangleSoup, writeBinarySTL } from './stl.js';
 import { concatSoups, displayBuffers, manifoldToSoup, withoutCollapsed } from './mesh.js';
 import { ViewCache, passthroughRangesOf } from './view.js';
 import { ATTACH_ROTATIONS, placementMatrix, toMat4 } from './placement.js';
-import { baseMode, fontIds, hasText, isPart, isSpot, itemLabel, placeKey, shapeKey, stableKey } from './document.js';
+import { baseMode, fontIds, hasText, isPart, isSpot, itemLabel, numberCuts, placeKey, shapeKey, stableKey } from './document.js';
 import { enhanceMesh, extractRegion, isEnhanceActive, regionWeights } from './enhance.js';
 import { baseSurface, crumpleOf, findDetails, refitSpheres } from './details.js';
 import { DECOR_KINDS, buildDecor, decorPartId, normaliseDecorSpec } from './decor.js';
@@ -440,20 +440,6 @@ function boxOf(m) {
  * the taller piece's.
  */
 const lowered = (o, h) => (h != null && o.down === '-z' && h < o.size[2] - 1e-3 ? { ...o, size: [o.size[0], o.size[1], h] } : o);
-
-/** A cut id's number ('c3' → 3; 0 for any other id). */
-const cutNumber = (id) => Number(/^c(\d+)$/.exec(String(id))?.[1] ?? 0);
-
-/** Cuts numbered as the document numbers them (`mergeSplit`): an id given is kept, a cut without one gets one past the highest. */
-function numberedCuts(cuts) {
-  let top = Math.max(0, ...cuts.map((c) => cutNumber(c.id)));
-  const seen = new Set();
-  return cuts.map((c) => {
-    const id = c.id != null && !seen.has(c.id) ? c.id : `c${++top}`;
-    seen.add(id);
-    return { ...c, id };
-  });
-}
 
 /**
  * A bed size from a request: the usable [x, y, z] mm – with the corner it keeps clear, [x, y, z, ex, ey] – or the
@@ -4022,12 +4008,15 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const state = splitState(final);
       if (state.fit?.key !== key) state.fit = { key, plan: fitCuts(final, items, split, U, printing, kept, progress, cap), made: new Map() };
       // how the pieces lie decides which loose parts print apart: worked out again only for another way of laying them
-      if (!state.fit.made.has(spec.orient)) {
-        state.fit.made.set(spec.orient, planPieces(final, items, state.fit.plan, spec, U, printing, progress));
+      // – or for other ids of its cuts: the document numbers them by the cuts they replace, and the cut is found by id
+      const ids = numberCuts(state.fit.plan.cuts, split?.cuts ?? []);
+      const way = `${spec.orient}|${ids.map((c) => c.id).join(',')}`;
+      if (!state.fit.made.has(way)) {
+        state.fit.made.set(way, planPieces(final, items, { ...state.fit.plan, cuts: ids }, spec, U, printing, progress));
         releaseFrame(final); // the tabs' look at the plates is done: the copy would only hold memory
       }
       const { cuts, counts, notes: planned } = state.fit.plan;
-      const made = state.fit.made.get(spec.orient);
+      const made = state.fit.made.get(way);
       // a detail kept whole says which piece it is on, as the pieces print, by the name it has now
       const named = new Map(keeps.map((k) => [k.id, k.name]));
       const said = ({ level, code, text, ...fields }) =>
@@ -4062,9 +4051,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const boxes = plan.pieces.map(({ cell, size, fits }) => ({ cell, size, fits }));
     if (!plan.cuts.length) return { pieces: boxes.map(({ size, fits }) => ({ size, fits })), notes: plan.short ? [splitNote('LARGEST_TOO_SMALL', plan.short)] : [] };
     try {
-      // the cuts as the document will hold them once taken, numbered as it numbers them – the ones kept keep their
-      // ids, the new ones follow on – so the split that follows finds this cut
-      const { cuts, parts } = normaliseSplit({ ...spec, cuts: numberedCuts(plan.cuts) }, splitBounds(final));
+      // the cuts as the document will hold them once taken, numbered as it numbers them (`numberCuts`: the ones kept
+      // and the ones that are there already keep their ids, the new ones follow on) – so the split that follows finds
+      // this cut
+      const { cuts, parts } = normaliseSplit({ ...spec, cuts: plan.cuts }, splitBounds(final));
       const parted = parts.length ? partStage(final, parts, cuts, spec, printing, progress) : null;
       const work = parted?.carved ?? final;
       const cut = cutStage(work, items, cuts, platesFor(work, cuts, spec), progress, parted?.carved ? parted : null, U);

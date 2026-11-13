@@ -1795,7 +1795,14 @@ describe('the side a piece lies on, chosen by hand', () => {
     expect(pegMales(layPieces(halves(), U), U)(pair)).toEqual([0]);
     // …but told to stay on its cut face it cannot, so the other one does; with both told to, neither: glue only
     expect(pegMales(layPieces(halves(), U, 'auto', { lay: { '0,0,0': '+x' } }), U)(pair)).toEqual([1]);
-    expect(pegMales(layPieces(halves(), U, 'auto', { lay: { '0,0,0': '+x', '1,0,0': '-x' } }), U)(pair)).toEqual([null]);
+    const neither = pegMales(layPieces(halves(), U, 'auto', { lay: { '0,0,0': '+x', '1,0,0': '-x' } }), U)(pair);
+    expect([...neither]).toEqual([null]);
+    // …and the list says whose sides, chosen by hand, are why: left to the app, one of them would carry the pegs
+    expect(neither.byHand).toEqual([[1, 2]]);
+    expect(pegMales(layPieces(halves(), U, 'auto', { lay: { '0,0,0': '+x' } }), U)(pair).byHand).toBeUndefined();
+    // a face that has no pegs whatever side is chosen (no room for sockets either side) is not put down to the choice
+    const thin = [{ ...pair[0], sockets: [false, false] }];
+    expect(pegMales(layPieces(halves(), U, 'auto', { lay: { '0,0,0': '+x', '1,0,0': '-x' } }), U)(thin).byHand).toBeUndefined();
     // told to lie flat, a piece carries them as well as it would lying so by itself
     expect(pegMales(layPieces(halves(), U, 'auto', { lay: { '1,0,0': '-z' } }), U)(pair)).toEqual([1]);
   });
@@ -1814,7 +1821,8 @@ describe('the side a piece lies on, chosen by hand', () => {
     expect(pegMales(one, tight, 'auto', { length: 9 })(pair)).toEqual([1]);
     // both stand on their far ends (chosen while the joints were pins): neither can, so the faces are glued flat
     const both = layPieces(halves(), tight, 'auto', { lay: { '0,0,0': '-x', '1,0,0': '+x' } });
-    expect(pegMales(both, tight, 'auto', { length: 9 })(pair)).toEqual([null]);
+    expect([...pegMales(both, tight, 'auto', { length: 9 })(pair)]).toEqual([null]);
+    expect(pegMales(both, tight, 'auto', { length: 9 })(pair).byHand).toEqual([[1, 2]]);
     // so no piece laid as chosen is too big with what it carries
     const pegs = [12, -12].map((y) => ({ axis: 0, at: 60, centre: [60, 20 + y, 15], s: 6, length: 9, dir: -1, sides: [{ piece: 1, peg: false }, { piece: 2, peg: true }] }));
     expect(layGrown(one, { pegs }, tight).map((o) => o.fits)).toEqual([true, true]);
@@ -1907,6 +1915,16 @@ describe('the side a piece lies on, chosen by hand', () => {
     expect(layWays(laid, { pegs }, U)[0].ways.every((w) => w.ok)).toBe(true);
     expect(moves(layWays(laid, { pegs }, U)[0].ways)).toEqual(['+x']);
     expect(moves(layWays(laid, { pegs }, U)[1].ways)).toEqual([]);
+    // the piece across the cut is laid by the app, and turns to take them: no joint is left without
+    expect(layWays(laid, { pegs }, U)[0].ways.some((w) => w.glued)).toBe(false);
+    // …but held to its own cut face by hand it cannot, and the side says the joint would be glued flat; held to its
+    // underside it can
+    const glued = (lay) => layWays(layPieces(halves(), U, 'auto', { lay }), { pegs }, U)[0].ways.filter((w) => w.glued).map((w) => [w.down, w.glued]);
+    expect(glued({ '1,0,0': '-x' })).toEqual([['+x', [2]]]);
+    expect(glued({ '1,0,0': '-z' })).toEqual([]);
+    // on a printer 65 mm tall the other, standing on its far end by hand, has no room for them either
+    const short = [100, 100, 65];
+    expect(layWays(layPieces(halves(), short, 'auto', { lay: { '1,0,0': '+x' } }), { pegs }, short)[0].ways.filter((w) => w.glued).map((w) => w.down)).toEqual(['-x', '+x']);
     // 69 mm tall with its pegs, standing on either end: it fits without them
     expect(why(layWays(laid, { pegs }, [100, 100, 65])[0].ways)).toEqual({ '+x': 'ok', '-x': 'ok', '+y': 'ok', '-y': 'ok', '+z': 'ok', '-z': 'ok' });
     expect(moves(layWays(laid, { pegs }, [100, 100, 65])[0].ways)).toEqual(['-x', '+x']);
@@ -1967,6 +1985,12 @@ describe('the side a piece lies on, chosen by hand', () => {
     // a side on which the piece's pegs would go to the piece across the cut says so
     expect(layOptions({ key: '0,0,0', chosen: null, ways: [{ down: '+x', lies: 'on a cut face', ok: true, bed: 1200, support: 0, moves: true }] }, '-z').options[1].text)
       .toBe('On its right side (a cut face) – about 12 cm² on the bed, little or no support; its pegs go to the piece it joins');
+    // …or that they have nowhere to go, the pieces across the cut being held to a side themselves
+    const entry = (glued) => layOptions({ key: '0,0,0', chosen: null, ways: [{ down: '+x', lies: 'on a cut face', ok: true, bed: 1200, support: 0, moves: true, glued }] }, '-z').options[1].text;
+    expect(entry([2])).toBe('On its right side (a cut face) – about 12 cm² on the bed, little or no support; its joint with piece 2 would have no pegs – glued flat');
+    expect(entry([2, 3])).toBe('On its right side (a cut face) – about 12 cm² on the bed, little or no support; its joints with pieces 2 and 3 would have no pegs – glued flat');
+    expect(splitNote('CONNECTORS_DROPPED', { letter: 'B', count: 2, total: 3, pegs: true, chosen: [4] }).text)
+      .toBe("Because of the side you chose for piece 4, 2 of 3 faces at cut B have no pegs – they are flat glue joints. Pick “The app's choice” for it in the pieces list to get the pegs back, or use pins (Joints: Pins).");
     // what the document holds is newer than the pieces: it is the one shown, and one refused since stays to pick
     expect(layOptions(lay, '-z', '+x', { current: false })).toMatchObject({ chosen: '+x', tag: 'set by you' });
     // once the pieces are worked out for it, a side they do not lie on is told as not used: one refused, one that

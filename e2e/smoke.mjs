@@ -6519,6 +6519,23 @@ try {
     );
     check(await q.isChecked('#resultToggle'), 'the pieces stay in view while they are worked out again');
     check(/Piece 1 lies on the side you chose in the pieces list/.test(await notes()), 'the notes say piece 1 lies on the side chosen', (await notes()).slice(0, 200));
+    // Fit to my printer again, with nothing changed: the same cut, so the choice stays and nothing is undone by it
+    const stepsBefore = await q.isDisabled('#redoBtn');
+    await q.click('#splitFitBtn');
+    await worked();
+    const refit = await rows();
+    check(
+      refit[0].value === '+x' && refit[0].own && refit[0].text === stood[0].text && !/The cuts changed/.test(await notes()) && /Piece 1 lies on the side you chose/.test(await notes()),
+      'Fit to my printer again, with nothing changed, keeps the cut and the side chosen for piece 1',
+      JSON.stringify([refit[0].value, refit[0].own, (await notes()).slice(0, 120)]),
+    );
+    await q.click('#undoBtn');
+    await worked();
+    const unchosen = await rows();
+    check(stepsBefore && unchosen.length === 2 && unchosen[0].value === '' && !unchosen[0].own, 'it added no step of its own: one Undo takes the choice back', JSON.stringify(unchosen.map((r) => [r.value, r.own])));
+    await q.click('#redoBtn');
+    await q.waitForFunction(() => document.querySelector('#pieceList li .piece-lay-own') && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 120000 });
+    await settle();
     // as printed, piece 1 stands tall on the bed
     await q.click('#asPrintedToggle');
     await q.waitForTimeout(400);
@@ -6556,6 +6573,35 @@ try {
       'the side a piece\'s built-in pegs stand out of is on offer, and says the pegs would go to the piece it joins',
       carrier.options.join(' | '),
     );
+    // the carrier stood on that side: the pegs are the other piece's now, whose own cut face says that the joint would
+    // then have no pegs – and, chosen all the same, the warning says why and how to get them back
+    const at = pegged.indexOf(carrier);
+    const face = at === 0 ? '+x' : '-x';
+    const other = 1 - at;
+    const otherFace = at === 0 ? '-x' : '+x';
+    await q.selectOption(`#pieceList li:nth-child(${at + 1}) .piece-lay select`, face);
+    await q.waitForFunction(() => document.querySelector('#pieceList li .piece-lay-own') && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 120000 });
+    await settle();
+    const across = await rows();
+    check(
+      across[other].options.filter((o) => /^On its (left|right) side \(a cut face\) – .*; its joint with piece \d would have no pegs – glued flat$/.test(o)).length === 1 && !across[other].options.some((o) => /its pegs go to/.test(o)),
+      'with the other piece held to its cut face, the side the pegs now stand out of says the joint would have no pegs',
+      across[other].options.join(' | '),
+    );
+    await q.selectOption(`#pieceList li:nth-child(${other + 1}) .piece-lay select`, otherFace);
+    await q.waitForFunction(() => document.querySelectorAll('#pieceList li .piece-lay-own').length === 2 && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 120000 });
+    await settle();
+    check(
+      /Because of the sides you chose for pieces 1 and 2, 1 of 1 face at cut A has no pegs – it is a flat glue joint\. Pick “The app's choice” for one of them in the pieces list to get the pegs back, or use pins/.test(await notes()),
+      'both held to their cut faces, the warning says the sides chosen leave the joint without pegs, and how to get them back',
+      (await notes()).slice(0, 400),
+    );
+    for (const n of [1, 2]) {
+      await q.selectOption(`#pieceList li:nth-child(${n}) .piece-lay select`, '');
+      await q.waitForFunction((left) => document.querySelectorAll('#pieceList li .piece-lay-own').length === left && !document.querySelector('#pieceList').classList.contains('stale'), 2 - n, { timeout: 120000 });
+      await settle();
+    }
+    check(!/Because of the sides? you chose/.test(await notes()) && /joined by 2 built-in pegs/.test(await notes()), "back at the app's choice the pegs are back", (await notes()).slice(0, 200));
     await q.click('#splitSettings label:has(input[data-split="joint"][value="auto"])');
     await worked();
     // the choice lasts while the cuts stay: dragging a cut keeps it, another cut drops it, with a note; Undo brings it back

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { strFromU8, unzipSync } from 'three/examples/jsm/libs/fflate.module.js';
 import { createEngine } from '../src/engine.js';
 import { createEngineClient, createLocalWorker } from '../src/engineClient.js';
-import { createItem, createPart } from '../src/document.js';
+import { Document, createItem, createPart } from '../src/document.js';
 import { manifold } from '../src/manifold.js';
 import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
@@ -696,10 +696,25 @@ describe('how the pin holes print', () => {
     expect(handed.pieces.map((p) => [p.down, p.pegs, p.sockets])).toEqual([['+x', 0, 2], ['-z', 2, 0]]);
     expect(offered(handed.pieces[0])['+x']).toBe('ok');
     expect(codes(handed)).not.toContain('LAY_IGNORED');
+    // the second piece carries them now, and the first is held to its cut face: the second's own cut face is on offer,
+    // and says that the joint would then have no pegs – they have nowhere to go
+    const mine = handed.pieces[1].lay.ways.find((w) => w.down === '-x');
+    expect(mine).toMatchObject({ ok: true, moves: true, glued: [1] });
+    expect(layOptions(handed.pieces[1].lay, handed.pieces[1].down).options.find((o) => o.value === '-x').text)
+      .toMatch(/^On its left side \(a cut face\) – .*; its joint with piece 1 would have no pegs – glued flat$/);
+    expect(handed.pieces[1].lay.ways.filter((w) => w.glued).map((w) => w.down)).toEqual(['-x']);
     // both told to stay on the cut face: neither can carry pegs, and the notes say the face is glued flat
     const neither = await resultSplit(S({ joint: 'pegs', labels: false, lay: { '0,0,0': '+x', '1,0,0': '-x' } }));
     expect(neither.pieces.map((p) => [p.down, p.pegs, p.sockets])).toEqual([['+x', 0, 0], ['-x', 0, 0]]);
-    expect(codes(neither)).toContain('CONNECTORS_DROPPED');
+    // the warning says it is the sides chosen, and how to get the pegs back
+    expect(noteOf(neither, 'CONNECTORS_DROPPED')).toMatchObject({
+      level: 'warn', chosen: [1, 2],
+      text: "Because of the sides you chose for pieces 1 and 2, 1 of 1 face at cut A has no pegs – it is a flat glue joint. Pick “The app's choice” for one of them in the pieces list to get the pegs back, or use pins (Joints: Pins).",
+    });
+    // one handed back to the app: the pegs are back
+    const back = await resultSplit(S({ joint: 'pegs', labels: false, lay: { '1,0,0': '-x' } }));
+    expect(back.pieces.map((p) => p.pegs + p.sockets)).toEqual([2, 2]);
+    expect(codes(back)).not.toContain('CONNECTORS_DROPPED');
   });
 
   it('sides chosen with pins and kept when the joints become built-in pegs never make a piece too big for the printer', async () => {
@@ -723,7 +738,8 @@ describe('how the pin holes print', () => {
     const ex = await exportSplit(S({ joint: 'pegs', labels: false, lay }), { bed: tight, name: 'bar' });
     expect(ex.pieces.map((p) => [p.down, p.fits, p.size, p.pegs, p.lay.used])).toEqual([['-x', true, [30, 40, 60], 0, true], ['+x', true, [30, 40, 60], 0, true]]);
     expect(codes(ex)).not.toContain('PIECE_TOO_BIG');
-    expect(codes(ex)).toContain('CONNECTORS_DROPPED');
+    // the warning gives the real reason – the sides chosen – not that no piece could lie with pegs
+    expect(noteOf(ex, 'CONNECTORS_DROPPED')).toMatchObject({ chosen: [1, 2], text: expect.stringMatching(/^Because of the sides you chose for pieces 1 and 2, .* Pick “The app's choice” for one of them/) });
     expect(noteOf(ex, 'LAY_CHOSEN').pieces).toEqual([1, 2]);
     expect(ex.files.find((f) => f.kind === 'text').text).not.toMatch(/TOO BIG/);
     // the side each lies on is on offer in its own list
@@ -732,6 +748,8 @@ describe('how the pin holes print', () => {
     const one = await resultSplit(S({ joint: 'pegs', labels: false, lay: { '0,0,0': '-x' } }), { bed: tight });
     expect(one.pieces.map((p) => [p.fits, p.pegs > 0])).toEqual([[true, false], [true, true]]);
     expect(one.pieces[0]).toMatchObject({ down: '-x', lay: { used: true } });
+    // …and the other's far end is on offer saying the joint would have no pegs, as the first cannot take them
+    expect(one.pieces[1].lay.ways.find((w) => w.down === '+x')).toMatchObject({ ok: true, moves: true, glued: [1] });
     // every side on offer for every piece of a bar in three is taken when chosen, and nothing ends up too big
     await load(cube([180, 40, 30]), 'bar');
     const cuts = [cutAt(0, -30, 'c1'), cutAt(0, 30, 'c2')];
@@ -1439,6 +1457,48 @@ describe('planning pieces that really print', () => {
     await plan();
     await resultSplit(planned(p, { labels: false }));
     expect(stages.some((s) => /Cutting/.test(s))).toBe(false);
+  });
+
+  it('Fit to my printer on a model with cuts of its own: the pieces view cuts nothing again, and Fit again changes nothing', async () => {
+    await load(cube([500, 100, 60]), 'bar');
+    // the document as the page keeps it: two cuts made by hand, then Fit's plan handed over without ids
+    const doc = new Document();
+    doc.setSplit({ ...SPLIT_DEFAULTS, labels: false, cuts: [] });
+    doc.addCut({ position: [-40, 0, 0], normal: [1, 0, 0] });
+    doc.addCut({ position: [60, 0, 0], normal: [1, 0, 0] });
+    const fit = async () => {
+      const p = await plan([], BED, doc.split);
+      doc.setSplit({ cuts: p.cuts });
+      stages.length = 0;
+      const r = await resultSplit(doc.split);
+      return { p, r, cut: stages.some((x) => /Cutting/.test(x)), drilled: stages.some((x) => /Drilling/.test(x)) };
+    };
+    const first = await fit();
+    expect(first.p.cuts.length).toBeGreaterThan(0);
+    // new cuts, numbered past the ones they replace – and the engine cut the plan under those numbers
+    const ids = doc.split.cuts.map((c) => c.id);
+    expect(ids).toEqual(first.p.cuts.map((c, i) => `c${i + 3}`));
+    expect(first.cut).toBe(false);
+    expect(first.r.pieces).toHaveLength(first.p.pieces.length);
+    // a side chosen for a piece, then Fit again with nothing changed: the same cuts, no step to undo, nothing cut or
+    // drilled again, and the choice stays
+    doc.setPieceLay(first.r.pieces[0].lay.key, '-y');
+    const chosen = await resultSplit(doc.split);
+    expect(chosen.pieces[0]).toMatchObject({ down: '-y', lay: { used: true } });
+    const steps = doc.history.length;
+    const again = await fit();
+    expect(doc.split.cuts.map((c) => c.id)).toEqual(ids);
+    expect(doc.history).toHaveLength(steps);
+    expect([again.cut, again.drilled]).toEqual([false, false]);
+    expect(doc.split.lay).toEqual({ [first.r.pieces[0].lay.key]: '-y' });
+    expect(again.r.pieces[0]).toMatchObject({ down: '-y', lay: { used: true } });
+    // the plan taken away and asked for again gets the same numbers back by Undo, and new ones when made anew
+    doc.undo();
+    doc.undo();
+    expect(doc.split.cuts.map((c) => c.id)).toEqual(['c1', 'c2']);
+    const anew = await fit();
+    expect(doc.split.cuts.map((c) => c.id)).toEqual(ids);
+    expect(anew.cut).toBe(false);
   });
 
   it('only a piece whose material meets a dovetail cut is held flat by it: the top of a T\'s stem lies on its side', async () => {

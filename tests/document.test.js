@@ -383,8 +383,21 @@ describe('split for printing', () => {
     // other cuts; given ids are kept, repeats renumbered
     doc.setSplit({ cuts: [{ position: [-83.333, 0, 0], normal: X }, { position: [83.333, 0, 0], normal: X }] });
     expect(doc.split.cuts.map((c) => c.id)).toEqual(['c4', 'c5']);
-    doc.setSplit({ cuts: [{ position: [0, 0, 0], normal: X }, { id: 'c4', position: [0, 0, 0], normal: Y }, { id: 'c4', position: [0, 0, 5], normal: [0, 0, 1] }] });
-    expect(doc.split.cuts.map((c) => c.id)).toEqual(['c6', 'c4', 'c7']);
+    // the same plan handed over again is the same cuts: their ids stay, and nothing is left to undo
+    const steps = doc.history.length;
+    doc.setSplit({ cuts: [{ position: [-83.333, 0, 0], normal: X }, { position: [83.333, 0, 0], normal: X }] });
+    expect(doc.split.cuts.map((c) => c.id)).toEqual(['c4', 'c5']);
+    expect(doc.history).toHaveLength(steps);
+    // one cut of it where it was and one new: the one there keeps its id, the other follows on
+    doc.setSplit({ cuts: [{ position: [-50, 0, 0], normal: X }, { position: [83.333, 0, 0], normal: X }] });
+    expect(doc.split.cuts.map((c) => c.id)).toEqual(['c6', 'c5']);
+    // a cut in the same place that comes apart is not the glued one, and two cuts in one place are two cuts
+    doc.setSplit({ cuts: [{ position: [83.333, 0, 0], normal: X, joint: 'apart' }, { position: [-50, 0, 0], normal: X }, { position: [-50, 0, 0], normal: X }] });
+    expect(doc.split.cuts.map((c) => c.id)).toEqual(['c7', 'c6', 'c8']);
+    doc.setSplit({ cuts: [{ position: [-83.333, 0, 0], normal: X }, { position: [83.333, 0, 0], normal: X }] });
+    expect(doc.split.cuts.map((c) => c.id)).toEqual(['c9', 'c10']);
+    doc.setSplit({ cuts: [{ position: [0, 0, 0], normal: X }, { id: 'c9', position: [0, 0, 0], normal: Y }, { id: 'c9', position: [0, 0, 5], normal: [0, 0, 1] }] });
+    expect(doc.split.cuts.map((c) => c.id)).toEqual(['c11', 'c9', 'c12']);
     // a cut keeps only what a cut is
     doc.setSplit({ cuts: [{ id: 'c1', letter: 'A', axis: 'x', at: 3, position: [3, 0, 0], normal: X }] });
     expect(doc.split.cuts).toEqual([{ id: 'c1', position: [3, 0, 0], normal: X }]);
@@ -623,8 +636,18 @@ describe('the side a piece lies on, chosen by hand', () => {
     expect(cellsKey(doc.split)).not.toBe(first);
     doc.undo();
     expect(doc.split.lay).toEqual({ '1,0,1': '-y' });
-    // the same places listed in another order are a new plan all the same
+    // the same plan asked for again – in any order – is the same cuts and the same pieces: the choices stay
+    const ids = doc.split.cuts.map((c) => c.id);
+    const steps = doc.history.length;
+    doc.setSplit({ cuts: [{ position: [10, 0, 0], normal: X }, { position: [0, 0, 20], normal: Z }] });
+    expect(doc.history).toHaveLength(steps);
     doc.setSplit({ cuts: [{ position: [0, 0, 20], normal: Z }, { position: [10, 0, 0], normal: X }] });
+    expect(doc.split.cuts.map((c) => c.id)).toEqual([...ids].reverse());
+    expect(cellsKey(doc.split)).toBe(first);
+    expect(doc.split.lay).toEqual({ '1,0,1': '-y' });
+    doc.undo();
+    // one cut of the plan somewhere else: other pieces
+    doc.setSplit({ cuts: [{ position: [10, 0, 0], normal: X }, { position: [0, 0, 25], normal: Z }] });
     expect('lay' in doc.split).toBe(false);
     doc.undo();
     // the very cuts handed back with their ids are the same cuts

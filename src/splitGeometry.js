@@ -4903,6 +4903,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     let dropped = 0;
     let unlaid = 0;
     let thin = 0;
+    const byHand = new Set();
     let total = 0;
     let thinWalls = 0;
     ctx.patches.forEach((patch, patchIndex) => {
@@ -4913,6 +4914,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
       if (patch.male === null && patch.sockets.some(Boolean)) {
         unlaid++;
         if (!patch.sockets.every(Boolean)) thin++;
+        for (const piece of patch.byHand ?? []) byHand.add(piece);
         return;
       }
       // the sockets go into the piece across from the one carrying the pegs; a face with room for them on neither
@@ -4986,10 +4988,10 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     if (smaller.size) {
       notes.push(splitNote('PEGS_SMALLER', { ...base, asked: D, pegSizes: [...smaller].sort((p, q) => q[0] - p[0]).map(([size, count]) => ({ size, count })) }));
     }
-    // faces too thin for a peg are told of as such; when none is, only that no piece could carry them, or that the
-    // piece too thin for the sockets could not
+    // faces too thin for a peg are told of as such; when none is, only that no piece could carry them – because of
+    // the sides chosen for them by hand, where that is why – or that the piece too thin for the sockets could not
     if (dropped || unlaid) {
-      const why = dropped ? {} : thin === unlaid ? { thin: true } : { lying: true };
+      const why = dropped ? {} : byHand.size ? { chosen: [...byHand].sort((p, q) => p - q) } : thin === unlaid ? { thin: true } : { lying: true };
       notes.push(splitNote('CONNECTORS_DROPPED', { ...base, count: dropped + unlaid, total, ...(thinWalls ? { wall: thinWalls } : {}), ...why }));
     }
     if (one) notes.push(splitNote('ONE_CONNECTOR', base));
@@ -5538,8 +5540,15 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
       ? pegMales(list, longest, forced)
       : list.map((pair) => (!pair.sockets[1] ? (pair.sockets[0] ? 1 : null) : !pair.sockets[0] ? 0 : pair.prefer ?? 0));
     const maleOf = new Map([...pairs.keys()].map((key, i) => [key, males[i]]));
+    const handOf = new Map([...pairs.keys()].map((key, i) => [key, males.byHand?.[i] ?? null]));
     for (const ctx of pegged) {
-      for (const patch of ctx.patches) if (!patch.skip && !patch.glue) patch.male = maleOf.get(`${ctx.cut.id}|${patch.lo.index}|${patch.hi.index}`);
+      for (const patch of ctx.patches) {
+        if (patch.skip || patch.glue) continue;
+        const key = `${ctx.cut.id}|${patch.lo.index}|${patch.hi.index}`;
+        patch.male = maleOf.get(key);
+        // the pieces whose side, chosen by hand, leaves the face without pegs (split.js `pegMales`' `byHand`)
+        patch.byHand = handOf.get(key) ?? null;
+      }
     }
 
     // ---- one peg size for the whole model: the smallest that a face's sockets take on the side they go into ----

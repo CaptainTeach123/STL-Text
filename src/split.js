@@ -3902,7 +3902,8 @@ export function keptBits(pieces, laid, cuts) {
  *   => (0|1|null)[]} for each pair (the cut's axis, the numbers of the pieces below and above it, whether each of them
  *   has room for the sockets, [below, above], both when not given, and which would rather carry them, its neighbour
  *   having more room for the sockets) 0 when the piece below carries the pegs, 1 the one above, null neither; `length`
- *   the pegs' own, once their size is known
+ *   the pegs' own, once their size is known. Where a pair is left with neither only because of sides chosen by hand,
+ *   the list has a `byHand` too: for each such pair the numbers of its pieces held to a side by hand, null for the rest
  */
 export function pegMales(given, U, orient = 'auto', { flat = null, length = 0, forced = null } = {}) {
   const laid = forced?.size ? given.map((p) => (forced.has(p.index) ? lipForced(p, forced.get(p.index), U, orient, flat) : p)) : given;
@@ -4020,6 +4021,15 @@ export function pegMales(given, U, orient = 'auto', { flat = null, length = 0, f
     for (const p of laid) {
       if (fitsNow(p.index)) continue;
       [...pegged(p.index)].some((d) => hand(p.index, d, (others) => fitsNow(p.index) && others.every(fitsNow)));
+    }
+    // a face left with no pegs only because of the sides chosen by hand – laid as the app would lay them, one of its
+    // pieces would carry them – says which pieces those are
+    const held = (pair) => [pair.lo, pair.hi].filter((q) => byIndex.get(q)?.chosen);
+    if (pairs.some((pair, i) => males[i] === null && held(pair).length)) {
+      const lifted = given.map(({ chosen, ...p }) => (chosen ? { ...p, stats: { ...p.stats, allowed: p.free }, lying: p.auto } : p));
+      const free = pegMales(lifted, U, orient, { flat, length, forced })(pairs, along);
+      const byHand = pairs.map((pair, i) => (males[i] === null && free[i] !== null ? held(pair) : null));
+      if (byHand.some(Boolean)) males.byHand = byHand;
     }
     return males;
   };
@@ -4918,7 +4928,9 @@ function carriedBy({ pegs = [], lips = [], locks = [], dowels = [], lays = [] } 
  * take-apart cut laid it ('lock'), where not every one of
  * its shells would rest on the bed ('rest') and where it does not fit the printer that way ('bed'). Built-in pegs
  * refuse no side: told to lie on a side they stand out of, or one it is too big for with them, the piece hands them
- * to the piece across the cut (`pegMales`), so the side is judged without them and marked (`moves`). A piece that is
+ * to the piece across the cut (`pegMales`), so the side is judged without them and marked (`moves`) – with the
+ * pieces across that cannot take them, being held to a side themselves, so that the face would be glued flat
+ * (`glued`). A piece that is
  * a part taken out, or one of several a box prints as, is not offered any (`why`: 'part', 'apart') – but the first
  * piece of such a box keeps its `key` while a side chosen earlier is held for the box, so that it can be handed back.
  * @param {object[]} laid from `layPieces`
@@ -4928,7 +4940,7 @@ function carriedBy({ pegs = [], lips = [], locks = [], dowels = [], lays = [] } 
  *   cut stage that are parts taken out, by number; `lying` how each piece lies in the end (`layGrown`), where that is
  *   known; `pegs` whether the joints are built-in pegs
  * @returns {({ key: string, why?: 'apart', chosen: string|null, used: boolean, auto: string|null, ways: { down: string,
- *   lies: string, ok: boolean, why?: string, bed?: number, support?: number, moves?: true }[] }|{ key: null,
+ *   lies: string, ok: boolean, why?: string, bed?: number, support?: number, moves?: true, glued?: number[] }[] }|{ key: null,
  *   why: 'part'|'apart' })[]} per piece of `laid`: `key`
  *   its box ('i,j,k', what `split.lay` goes by), `chosen` the side chosen for it by hand, `used` whether it lies on
  *   it (not where the piece could not take it, or what it carries lays it another way), `auto` the side the app
@@ -4941,6 +4953,24 @@ export function layWays(laid, layout = {}, U, { parts = null, lying = null, pegs
   const perCell = new Map();
   for (const p of laid) perCell.set(p.cell.join(','), (perCell.get(p.cell.join(',')) ?? 0) + 1);
   const restsOn = (stats, boxes) => restingOnly({ ...stats, allowed: [...DIR_KEYS] }, boxes)?.allowed ?? [];
+  // the face of its piece a peg stands out of, and the number of the piece across the cut from the one carrying it
+  const faceOf = (g) => `${g.dir > 0 ? '+' : '-'}${AXES[g.axis]}`;
+  const across = (g, index) => g.sides.find((x) => x.piece !== index)?.piece ?? null;
+  const place = new Map(laid.map((q, j) => [q.index, j]));
+  // whether the piece across the cut could take a peg over: one the app lays turns to make room, but one held to a
+  // side – by hand, or by a lip or a twist-lock – takes it only where it stands off another face and leaves it room
+  const takes = (g, index) => {
+    const j = place.get(across(g, index));
+    const q = laid[j];
+    if (!q) return true;
+    const lies = (lying?.[j] ?? q.lying).down;
+    const c = carried(q);
+    if (!(q.chosen && lies === q.chosen) && !c.tongues.length && !c.sockets.length) return true;
+    const face = oppositeDir(faceOf(g));
+    if (face === lies) return false;
+    const grown = { ...lipGrown(c.stats, face, g.length), allowed: [lies] };
+    return Boolean(restingOnly(grown, q.boxes)) && layFits(grown, lies, U);
+  };
   return laid.map((p, i) => {
     if (parts?.has(p.from)) return { key: null, why: 'part' };
     const key = p.cell.join(',');
@@ -4949,7 +4979,7 @@ export function layWays(laid, layout = {}, U, { parts = null, lying = null, pegs
     if (perCell.get(key) > 1) return p.refused ? { key, why: 'apart', chosen: p.refused.down, used: false, auto: now, ways: [] } : { key: null, why: 'apart' };
     const free = p.free ?? (p.stats.allowed?.length ? p.stats.allowed : DIR_KEYS);
     const { own, tongues, sockets, held, stats, bare, lipDown } = carried(p, { ...p.stats, allowed: [...free] });
-    const pegged = new Set(own.map((g) => `${g.dir > 0 ? '+' : '-'}${AXES[g.axis]}`));
+    const pegged = new Set(own.map(faceOf));
     // told to lie on a side, the piece hands the pegs that are in the way to the piece across the cut (`pegMales`):
     // a side is judged without them, and says so where they would go
     const resting = restsOn(bare, p.boxes);
@@ -4964,7 +4994,15 @@ export function layWays(laid, layout = {}, U, { parts = null, lying = null, pegs
       const lies = liesOf(p.stats, down);
       if (why) return { down, lies, ok: false, why };
       const moves = own.length > 0 && (pegged.has(down) || !withPegs.includes(down) || !layFits(stats, down, U));
-      return { down, lies, ok: true, bed: Math.round(p.stats.dirs[down].bed), support: Math.round(p.stats.dirs[down].support), ...(moves ? { moves: true } : {}) };
+      // the pegs in the way: those on the side itself and, where the rest still leave it no room, the rest; a piece
+      // across from them that is itself held to a side cannot always take them, and then the face is glued flat
+      const rest = own.filter((g) => faceOf(g) !== down);
+      const roomy = restsOn(statsWithPegs(bare, rest), p.boxes).includes(down) && layFits(statsWithPegs(bare, rest), down, U);
+      const glued = moves ? [...new Set((roomy ? own.filter((g) => faceOf(g) === down) : own).filter((g) => !takes(g, p.index)).map((g) => across(g, p.index)))].sort((x, y) => x - y) : [];
+      return {
+        down, lies, ok: true, bed: Math.round(p.stats.dirs[down].bed), support: Math.round(p.stats.dirs[down].support),
+        ...(moves ? { moves: true } : {}), ...(glued.length ? { glued } : {}),
+      };
     });
     const chosen = p.chosen ?? p.refused?.down ?? null;
     const used = Boolean(p.chosen) && now === p.chosen;
@@ -4990,7 +5028,7 @@ const LAY_REFUSED = Object.freeze({
  * choice with the side that is (where it is known), then the six sides – each on offer with about how much of the
  * piece would rest on the bed and how much of it would hang over it, as the app counts them when it chooses (the
  * row's print check, made of the finished piece, has the last word) and whether its pegs would go to the piece
- * across the cut, each refused with why. The side chosen by hand is the one picked, and stays to pick even
+ * across the cut or, that one being held to a side too, the joint would have none, each refused with why. The side chosen by hand is the one picked, and stays to pick even
  * where it is refused now. A piece that has no choice says why in its one entry; one of a part of the model that
  * prints as several pieces, for which a side was chosen before, has that side as a second entry, so the choice can
  * be handed back.
@@ -5026,7 +5064,10 @@ export function layOptions(lay, down, picked = lay?.chosen ?? null, { current = 
     }
     const rests = w.bed < STEADY ? 'nothing flat on the bed' : `${areaWords(w.bed)} on the bed`;
     const hangs = w.support < PRINT_CHECK.none ? 'little or no support' : w.support < 100 ? 'a little support' : `supports under ${areaWords(w.support)}`;
-    options.push({ value: w.down, text: `${name(w)} – ${rests}, ${hangs}${w.moves ? '; its pegs go to the piece it joins' : ''}` });
+    const pegs = w.glued?.length
+      ? `; its ${w.glued.length > 1 ? 'joints' : 'joint'} with ${piecesOf(w.glued)} would have no pegs – glued flat`
+      : w.moves ? '; its pegs go to the piece it joins' : '';
+    options.push({ value: w.down, text: `${name(w)} – ${rests}, ${hangs}${pegs}` });
   }
   // what the document holds may be newer than the pieces: only a side the pieces were worked out for can be unused
   const unused = picked && current && !(lay.chosen === picked && lay.used);
@@ -5598,7 +5639,11 @@ const NOTE_TEXT = {
   APART_KEPT: ({ letters = [] }) => (letters.length > 1
     ? `Cuts ${listOf(letters)} come apart, so Fit to my printer kept them where they are and planned the other cuts around them.`
     : `Cut ${letters[0] ?? ''} comes apart, so Fit to my printer kept it where it is and planned the other cuts around it.`),
-  CONNECTORS_DROPPED: ({ letter, count = 1, total = count, wall = null, suggestedDiameter = null, dovetail = false, pegs = false, lying = false, thin = false }) => {
+  CONNECTORS_DROPPED: ({ letter, count = 1, total = count, wall = null, suggestedDiameter = null, dovetail = false, pegs = false, lying = false, thin = false, chosen = null }) => {
+    if (chosen?.length) {
+      const many = chosen.length > 1;
+      return `Because of the ${many ? 'sides' : 'side'} you chose for ${piecesOf(chosen)}, ${count} of ${plural(total, 'face')} at cut ${letter} ${count === 1 ? 'has no pegs – it is a flat glue joint' : 'have no pegs – they are flat glue joints'}. Pick “The app's choice” for ${many ? 'one of them' : 'it'} in the pieces list to get the pegs back, or use pins (Joints: Pins).`;
+    }
     if (dovetail) return `Cut ${letter} has no room for dovetail tabs – it is a flat glue joint. A strip glued behind it makes it stronger.`;
     if (thin) {
       return `On ${count} of ${plural(total, 'face')} at cut ${letter} one piece is too thin for sockets and can't lie flat on the bed with pegs standing out of it – ${count === 1 ? 'it is a flat glue joint' : 'they are flat glue joints'}.`;
@@ -5884,9 +5929,10 @@ const NOTE_TEXT = {
  * count }] }` (`asked` the peg size chosen for the model, `pegSizes` the smaller ones the narrow faces took);
  * PEGS_UPRIGHT `{ letter, cutId, pieces, pins }` (`pieces` those carrying the cut's pegs, which all print pointing up;
  * `pins` that pins would fit its faces);
- * CONNECTORS_DROPPED `{ letter, count, total, wall, suggestedDiameter, dovetail, pegs, lying, thin }` (`lying`: the faces could
+ * CONNECTORS_DROPPED `{ letter, count, total, wall, suggestedDiameter, dovetail, pegs, lying, thin, chosen }` (`lying`: the faces could
  * take pegs, but neither piece could lie on the bed carrying them; `thin`: only one piece has room for the sockets, and the
- * other, too thin for them, could not lie flat carrying the pegs); ONE_CONNECTOR `{ letter, pegs }`;
+ * other, too thin for them, could not lie flat carrying the pegs; `chosen`: the pieces held to a side chosen by hand
+ * that leave the faces without pegs, which they would have as the app lays the pieces); ONE_CONNECTOR `{ letter, pegs }`;
  * DOWELS_CAPPED `{ placed, dropped, pegs }`; LABELS_SKIPPED `{ letters }`;
  * PIECE_TOO_BIG `{ pieceIndex, size, bed }` (`bed` the usable bed, its corner kept clear too when it has one);
  * CORNER_PLACE `{ pieces, corner, whole? }` (on a bed that keeps a corner clear, `corner` its sides: the pieces that fit

@@ -1007,6 +1007,25 @@ describe('tipping a piece so that its big leaning face prints level', () => {
     expect(tipBarred(post, { tilt: 3.8, area: 900, normal: [0, 0, 1] })).toBe('foot');
   });
 
+  it('is barred before it is asked for where the other faces on top would still lean: a shallow roof, a low cone', () => {
+    // a roof's two sides: level one and the other leans twice as much – half the step lines stay
+    const ridge = check(roof(3));
+    expect(tipBarred(ridge, levelFace(ridge), 0.2)).toBe('steps');
+    // half a low cone on a disc: whichever part of it is made level, most of the others lean as much or more
+    const cone = check(own(join(own(M.cylinder(10, 90, 90, 96)), own(own(M.cylinder(90 * Math.tan((5 * Math.PI) / 180), 90, 0, 96)).translate([0, 0, 10]))).trimByPlane([1, 0, 0], 0)));
+    const facet = levelFace(cone, 0.2);
+    expect(facet.tilt).toBeCloseTo(5, 0);
+    expect(tipBarred(cone, facet, 0.2)).toBe('steps');
+    // two faces that lean the same way are both made level: nothing against it
+    const two = check(join(leaning(3), own(leaning(3).scale([0.5, 0.5, 1]).translate([200, 0, 0]))));
+    expect(two.leaning.filter((f) => f.facing === 'up')).toHaveLength(2);
+    expect(tipBarred(two, levelFace(two), 0.2)).toBeNull();
+    // a small face that leans another way is too little to refuse for
+    const small = check(join(leaning(3), own(own(leaning(3).scale([0.5, 0.5, 1])).rotate([0, 0, 180]).translate([300, 0, 0]))));
+    expect(small.leaning.filter((f) => f.facing === 'up')).toHaveLength(2);
+    expect(tipBarred(small, levelFace(small), 0.2)).toBeNull();
+  });
+
   it('tipped, the face is level and what the piece lay on needs supports: that is its price, and no reason to refuse', () => {
     const solid = leaning(3);
     const before = check(solid);
@@ -1070,7 +1089,36 @@ describe('tipping a piece so that its big leaning face prints level', () => {
       'Piece 2 is tipped 3° in its file so that its big face on top (about 80 cm²) prints level, without step lines. '
       + 'What that costs: it no longer lies flat – it rests on an edge, and about 80 cm² under it prints on supports, standing on the bed. '
       + 'In your slicer turn off auto-orient and don\'t use "lay on face" for it, turn supports on ("on build plate only" is enough) and add a brim about 5 mm wide. '
-      + 'Its pin holes are shaped for lying tipped. Untick "Tip this piece" in the pieces list to print it flat again, with the step lines.',
+      + 'Untick "Tip this piece" in the pieces list to print it flat again, with the step lines.',
+    );
+    // its pin holes are only spoken of where it has some: those lying on their side are shaped for the tip
+    const lead = 'and add a brim about 5 mm wide. ';
+    const tail = 'Untick "Tip this piece" in the pieces list to print it flat again, with the step lines.';
+    const told = (holes, rest) => tipNoteWords('Piece 2', { angle: face.tilt, area: face.area, check: row, holes, ...(rest ? { rest } : {}) });
+    expect(told({ lying: 0, upright: 0, down: 0 })).toContain(`${lead}${tail}`);
+    expect(told({ lying: 2, upright: 0, down: 0 })).toContain(`${lead}Its pin holes are shaped for lying tipped. ${tail}`);
+    // upright holes that open upwards have nothing over them: nothing to say
+    expect(told({ lying: 0, upright: 3, down: 0 })).toContain(`${lead}${tail}`);
+    // those that open onto the bed lean with the piece, and were not shaped for it: said, with what to do
+    expect(told({ lying: 0, upright: 3, down: 3 })).toContain(`${lead}Its 3 pin holes that open onto the bed lean with the piece, so one side of each one's end is a little flatter than 45°: keep supports out of them (a support blocker over each hole), or they are hard to dig out and the pins won't go in. ${tail}`);
+    expect(told({ lying: 0, upright: 3, down: 3 })).not.toContain('shaped for lying tipped');
+    expect(told({ lying: 2, upright: 1, down: 1 })).toContain(`${lead}Its pin holes that lie on their side are shaped for lying tipped. Its pin hole that opens onto the bed leans with the piece, so one side of its end is a little flatter than 45°: keep supports out of it (a support blocker over the hole), or they are hard to dig out and the pin won't go in. ${tail}`);
+    // the line says it too, in place of "need no supports" – and on the sheet, where that clause is left out
+    expect(checkWords(row, { upright: 3 }, { tip: { holes: { down: 3 } } }).at(-1)).toBe('keep supports out of its 3 pin holes');
+    expect(checkWords(row, { upright: 3 }, { fine: false, tip: { holes: { down: 3 } } }).at(-1)).toBe('keep supports out of its 3 pin holes');
+    expect(checkWords(row, { upright: 1, pointed: 2 }, { tip: { holes: { down: 1 } } }).at(-1)).toBe('keep supports out of its pin hole that opens onto the bed');
+    expect(checkWords(row, { upright: 2, pointed: 2 }, { tip: { holes: { down: 2 } } }).at(-1)).toBe('keep supports out of its 2 pin holes that open onto the bed');
+    expect(checkWords(row, { upright: 1 }, { tip: { holes: { down: 1 } } }).at(-1)).toBe('keep supports out of its pin hole');
+    expect(checkWords(row, { upright: 3 }, { tip: { holes: { down: 0 } } }).at(-1)).toBe('its 3 pin holes need no supports');
+    // a piece that rests on one corner is told so: a brim has nothing to hold there
+    expect(checkWords(row, null, { tip: { rest: 'corner' } })).toEqual(['needs supports: about 80 cm², standing on the bed', 'rests on one corner: the supports carry it']);
+    expect(checkWords(row, null, { tip: { rest: 'edge' } })[1]).toBe('rests on an edge: add a brim, 5 mm wide');
+    expect(told(null, 'corner')).toBe(
+      'Piece 2 is tipped 3° in its file so that its big face on top (about 80 cm²) prints level, without step lines. '
+      + 'What that costs: it no longer lies flat – it rests on one corner, and about 80 cm² under it prints on supports, standing on the bed. '
+      + 'In your slicer turn off auto-orient and don\'t use "lay on face" for it, turn supports on ("on build plate only" is enough). '
+      + 'The supports carry it, as it touches the bed at one corner only: a raft holds it better than a brim. '
+      + 'Untick "Tip this piece" in the pieces list to print it flat again, with the step lines.',
     );
     // what it lay on was a glue face: said, with what to do about it
     const seam = checkRow(tipped(solid, face, '-z', { planes: [{ axis: 2, at: 0 }] }), 0.2);

@@ -2117,7 +2117,13 @@ describe('a piece tipped so that its big leaning face prints level', () => {
     // its size is that of the points as they lie, and the top is level: both top corners at one height
     expect(t.size).toEqual([span(0)[1] - span(0)[0], span(1)[1] - span(1)[0], span(2)[1]].map((v) => expect.closeTo(v, 9)));
     expect(laid[4 * 3 + 2]).toBeCloseTo(laid[5 * 3 + 2], 9);
-    expect(t).toMatchObject({ yaw: 0, fits: true });
+    expect(t).toMatchObject({ yaw: 0, fits: true, rest: 'edge' });
+    // a face that leans across the diagonal leaves the piece on one corner; a round foot on a short stretch of rim
+    const skew = [-Math.sin(rad(3)) * Math.SQRT1_2, -Math.sin(rad(3)) * Math.SQRT1_2, Math.cos(rad(3))];
+    expect(tipTransform(tipTurn('-z', skew).turn, [points], { U }).rest).toBe('corner');
+    const disc = (r) => Array.from({ length: 360 }, (_, i) => [r * Math.cos(rad(i)), r * Math.sin(rad(i)), 0]).flat();
+    expect(tipTransform(turn, [disc(50)], { U }).rest).toBe('edge');
+    expect(tipTransform(turn, [disc(2)], { U }).rest).toBe('corner');
     closeVec(mulMat4(t.matrix, t.printMatrix), IDENTITY, 9);
     expect(det3(t.printMatrix)).toBeCloseTo(1, 12);
     // the box of the piece, tipped, would put the piece in the air and make it larger than it is: its low corner is
@@ -2204,7 +2210,7 @@ describe('a piece tipped so that its big leaning face prints level', () => {
       expect(words, why).toMatch(/^[a-z]/);
       expect(words, why).not.toMatch(/undefined|NaN/);
     }
-    expect(tipRefusedWords('steep', { angle: 10.2 })).toBe('its big face leans 10° – more than 8°, and tipped that far too much of it would hang over the bed');
+    expect(tipRefusedWords('steep', { angle: 10.2 })).toBe('its big face leans 10° – more than 8°: tipped that far it would stand on tall supports and a steep edge');
     expect(tipRefusedWords('supports', { area: 4000, extra: 5200 })).toBe('tipped it would need supports under about 52 cm² more than the face it lies on – more than the face it would make level (about 40 cm²)');
     expect(tipRefusedWords('bed')).toBe("tipped it doesn't fit your printer");
     expect(splitNote('TIP_REFUSED', { pieceIndex: 2, why: 'pegs' })).toMatchObject({

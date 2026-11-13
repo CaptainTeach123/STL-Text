@@ -3575,9 +3575,10 @@ export function tipTurn(down, normal) {
  *   (or the first three of `stride` numbers); empty ones are skipped
  * @param {{ U?: number[]|null, yaw?: number|null }} options `U` the usable bed, to turn the piece on it so that it
  *   fits; `yaw` that turn where it is known already
- * @returns {{ printMatrix: number[], matrix: number[], size: number[], yaw: number, fits: boolean }} as
- *   `chooseOrientation` gives them: `size` its sides as it lies, before a diagonal turn; `fits` false where it fits
- *   the bed no way round
+ * @returns {{ printMatrix: number[], matrix: number[], size: number[], yaw: number, fits: boolean,
+ *   rest: 'edge'|'corner' }} as `chooseOrientation` gives them: `size` its sides as it lies, before a diagonal
+ *   turn; `fits` false where it fits the bed no way round; `rest` what of it touches the bed: an 'edge' where its
+ *   points next to the bed (`PRINT_CHECK.tipNear`) lie apart (`tipRest`), else one 'corner'
  */
 export function tipTransform(turn, lists, { U = null, yaw = null } = {}) {
   const spans = (R) => {
@@ -3601,12 +3602,29 @@ export function tipTransform(turn, lists, { U = null, yaw = null } = {}) {
   };
   const flat = spans(turn);
   const [a, b, h] = flat.hi.map((v, k) => v - flat.lo[k]);
+  // what touches the bed: how far apart its lowest points lie
+  const near = { lo: [Infinity, Infinity], hi: [-Infinity, -Infinity] };
+  for (const list of lists) {
+    if (!list) continue;
+    const points = list.points ?? list;
+    const stride = list.stride ?? 3;
+    for (let i = 0; i + 2 < points.length; i += stride) {
+      const [x, y, z] = [points[i], points[i + 1], points[i + 2]];
+      if (turn[2] * x + turn[6] * y + turn[10] * z > flat.lo[2] + PRINT_CHECK.tipNear) continue;
+      for (let k = 0; k < 2; k++) {
+        const v = turn[k] * x + turn[4 + k] * y + turn[8 + k] * z;
+        if (v < near.lo[k]) near.lo[k] = v;
+        if (v > near.hi[k]) near.hi[k] = v;
+      }
+    }
+  }
+  const rest = Math.hypot(near.hi[0] - near.lo[0], near.hi[1] - near.lo[1]) >= PRINT_CHECK.tipRest ? 'edge' : 'corner';
   const found = yaw ?? (U ? (h <= U[2] + EPS ? footprintYaw(a, b, U) : null) : 0);
   const fits = found !== null;
   const R = mulMat4(yawMat4(found ?? 0), turn);
   const { lo, hi } = found ? spans(R) : flat;
   const printMatrix = mulMat4(translationMat4([-(lo[0] + hi[0]) / 2, -(lo[1] + hi[1]) / 2, -lo[2]]), R);
-  return { printMatrix, matrix: invertRigid(printMatrix), size: found === 90 ? [b, a, h] : [a, b, h], yaw: found ?? 0, fits };
+  return { printMatrix, matrix: invertRigid(printMatrix), size: found === 90 ? [b, a, h] : [a, b, h], yaw: found ?? 0, fits, rest };
 }
 
 /**
@@ -5187,10 +5205,10 @@ export function tipRefusedWords(why, { angle = 0, area = 0, extra = 0 } = {}) {
     case 'parts': return 'it is more than one part, and each has to rest on the bed';
     case 'apart': return 'that part of the model prints as more than one piece';
     case 'none': return 'the way it lies now it has no big face on top that leans a little off level';
-    case 'steep': return `its big face leans ${angleWords(angle)}° – more than ${PRINT_CHECK.tipMax}°, and tipped that far too much of it would hang over the bed`;
+    case 'steep': return `its big face leans ${angleWords(angle)}° – more than ${PRINT_CHECK.tipMax}°: tipped that far it would stand on tall supports and a steep edge`;
     case 'foot': return 'it stands on little as it lies, and tipped it would rest on an edge of that';
     case 'bed': return "tipped it doesn't fit your printer";
-    case 'steps': return 'tipped, another big face on top would lean instead, and it would show step lines on half as much of its top or more';
+    case 'steps': return 'tipped, other big faces on top would still lean, and it would show step lines on half as much of its top or more';
     case 'supports': return `tipped it would need supports under ${areaWords(extra)} more than the face it lies on – more than the face it would make level (${areaWords(area)})`;
     case 'tall': return 'tipped it would stand tall on an edge and may fall over while printing';
     default: return 'it cannot print tipped';
@@ -5761,7 +5779,7 @@ const NOTE_TEXT = {
     const what = why === 'model' ? 'The model was turned, moved or resized' : 'The cuts changed';
     return `${what}, so the pieces are no longer the same ones: the side you chose for ${count === 1 ? 'a piece' : `${count} pieces`} to lie on was dropped, and the app lays ${count === 1 ? 'it' : 'them'} again. Choose again in the pieces list if you like (Undo brings the choice back with the ${why === 'model' ? 'model as it was' : 'cuts as they were'}).`;
   },
-  PIECE_TIPPED: ({ pieceIndex, angle, area, check }) => tipNoteWords(pieceName(pieceIndex), { angle, area, check }),
+  PIECE_TIPPED: ({ pieceIndex, angle, area, check, rest, holes }) => tipNoteWords(pieceName(pieceIndex), { angle, area, check, rest, holes }),
   TIP_REFUSED: ({ pieceIndex, why, ...of }) => `${pieceName(pieceIndex)} is not tipped, though you asked for it in the pieces list: ${tipRefusedWords(why, of)}. It prints as it lies – untick "Tip this piece" for it to clear this note.`,
   TIP_WAITS: ({ count = 1 }) => `A cut misses the model, or lies where another cut is, so the pieces are not the ones you asked to tip: ${count === 1 ? 'the piece is' : 'they are'} not tipped until that cut is moved or removed.`,
   TIPS_DROPPED: ({ count = 1, why = 'cuts' }) => {
@@ -6181,8 +6199,9 @@ const NOTE_TEXT = {
  * the sides chosen by hand were dropped with the boxes they went by, `why` 'cuts' or 'model'); LAY_IGNORED `{ pieceIndex, down, why, lies,
  * joint }` (a side chosen by hand that the piece cannot take: `why` 'flat', 'stand', 'rest', 'bed' or 'apart', and with `joint`
  * 'lip', 'lock' or 'pegs': what it carries lays it another way);
- * PIECE_TIPPED `{ pieceIndex, angle, area, check }` (a piece tipped in its file so that a big leaning face prints
- * level: by how many degrees, the face's area and the tipped piece's print check); TIP_REFUSED `{ pieceIndex, why,
+ * PIECE_TIPPED `{ pieceIndex, angle, area, check, rest, holes }` (a piece tipped in its file so that a big leaning
+ * face prints level: by how many degrees, the face's area, the tipped piece's print check, whether it rests on an
+ * 'edge' or a 'corner', and its pin holes: `lying`, `upright`, and `down` those that open onto the bed); TIP_REFUSED `{ pieceIndex, why,
  * angle, area, extra }` (a piece asked to be tipped that is not: `tipRefusedWords`); TIP_WAITS `{ count }` (pieces
  * asked to be tipped that are not while a cut misses or is merged); TIPS_DROPPED `{ count, why }` (the page's own, as
  * LAYS_DROPPED);
@@ -6612,8 +6631,8 @@ export function howToGlueText(plan) {
     for (const x of seated) if (x.pieces[1] === p.index) extra.push(`tea-light seat Ø ${mm1(x.apart.seat.d)} mm on top`);
     // what the print check found, one clause each; of its pin holes only what the heading does not say: those that
     // may need supports
-    const tipped = p.tip?.used ? { angle: p.tip.angle } : null;
-    const checked = checkWords(p.check ?? null, p.holes ?? null, { fine: false, ...(tipped ? { tip: true } : {}) });
+    const tipped = p.tip?.used ? p.tip : null;
+    const checked = checkWords(p.check ?? null, p.holes ?? null, { fine: false, ...(tipped ? { tip: tipped } : {}) });
     out.push(`  ${pad(`piece ${p.index} of ${n}`, 12)}${pad(size1(p.size), width)}${pad(`lies ${p.lies}${p.lay?.used ? ', as you chose' : ''}${tipped ? `, tipped ${angleWords(tipped.angle)}°` : ''}`, 0)}${extra.join(', ')}${checked.length ? ` – ${checked.join('; ')}` : ''}`);
   });
   // a piece tipped in its file is meant to lie so: a slicer that lays it flat again brings the step lines back
@@ -6621,16 +6640,22 @@ export function howToGlueText(plan) {
   if (tipped.length) {
     const many = tipped.length > 1;
     const plate = tipped.every((p) => !p.check || p.check.supports.piece < 0.1 * p.check.supports.area);
-    out.push(`  ${many ? `Pieces ${listOf(tipped.map((p) => p.index))} are` : `Piece ${tipped[0].index} is`} meant to lie tipped, as ${many ? 'their files have them' : 'its file has it'}: one big face is then level and prints without step lines, and the piece rests on an edge.`);
-    out.push(`  For ${many ? 'them' : 'it'}, turn off auto-orient in your slicer and do not use "lay on face"; turn supports on${plate ? ' (on build plate only is enough)' : ''} and add a brim.`);
+    const corners = tipped.filter((p) => p.tip.rest === 'corner').map((p) => p.index);
+    const rests = !corners.length ? 'an edge' : corners.length === tipped.length ? 'one corner' : 'an edge or one corner';
+    out.push(`  ${many ? `Pieces ${listOf(tipped.map((p) => p.index))} are` : `Piece ${tipped[0].index} is`} meant to lie tipped, as ${many ? 'their files have them' : 'its file has it'}: one big face is then level and prints without step lines, and the piece rests on ${rests}.`);
+    out.push(`  For ${many ? 'them' : 'it'}, turn off auto-orient in your slicer and do not use "lay on face"; turn supports on${plate ? ' (on build plate only is enough)' : ''}${corners.length === tipped.length ? '' : ' and add a brim'}.`);
+    if (corners.length) out.push(`  ${corners.length > 1 ? `Pieces ${listOf(corners)} touch` : `Piece ${corners[0]} touches`} the bed at one corner only, so the supports carry ${corners.length > 1 ? 'them' : 'it'}: a raft holds ${corners.length > 1 ? 'them' : 'it'} better than a brim.`);
     // what a tipped piece lay on prints on supports now: where that is a glue face, it wants sanding
     const rough = tipped.filter((p) => p.check?.supports.seam >= PRINT_CHECK.none).map((p) => p.index);
     if (rough.length) out.push(`  The glue face under ${rough.length > 1 ? `pieces ${listOf(rough)}` : `piece ${rough[0]}`} prints on supports and comes out rough: sand it lightly before you glue it.`);
+    // its pin holes that open onto the bed lean with it, and were not shaped for that
+    const open = tipped.filter((p) => p.tip.holes?.down > 0).map((p) => p.index);
+    if (open.length) out.push(`  The pin holes of ${open.length > 1 ? `pieces ${listOf(open)}` : `piece ${open[0]}`} that open onto the bed lean with the piece: keep supports out of them (a support blocker over each hole), or they are hard to dig out and the pins won't go in.`);
   }
   // the holes and the joints are shaped for the way each file lies, and the check above is of that way; spinning a
   // piece on the bed changes neither
   out.push(`  Print each piece lying the way its file lies – do not tip it onto another side in your slicer (spinning it flat on the bed is fine)${unsupported.length ? `: its ${listOf(unsupported)} are shaped to print that way` : ''}.`);
-  if (pieces.some((p) => p.check?.supports.area >= PRINT_CHECK.none)) out.push("  'May need supports' goes by the safe rule – any face flatter than 45° – so your slicer may ask for less, or a little more.");
+  if (pieces.some((p) => !p.tip?.used && p.check?.supports.area >= PRINT_CHECK.none)) out.push("  'May need supports' goes by the safe rule – any face flatter than 45° – so your slicer may ask for less, or a little more.");
   if (pieces.some((p) => p.check?.supports.span >= PRINT_CHECK.none)) out.push('  A level span is held at both ends: print it with bridging on (the default) and no supports; it may hang a little in the middle.');
   // a lid's collar slopes out under the joint as steeply as the model beside it: support the dome, support the collar
   for (const x of locked.filter((y) => y.apart.mech === 'twist' && y.apart.slope > 1 + 1e-6)) {

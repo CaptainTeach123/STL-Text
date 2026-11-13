@@ -6799,6 +6799,70 @@ try {
     await settle();
     const flat = await rows();
     check(flat[0].ticked === false && flat[0].text === before[0].text && flat[0].check === before[0].check && !/is tipped/.test(await notes()), 'unticked, piece 1 lies flat again with its step lines', JSON.stringify([flat[0].text, flat[0].check]));
+    // two more shapes, each on a page of its own: the first piece's tick box, its print check and the notes
+    const tipOn = async (name, solid, ticked) => {
+      const file = writeFixture(`${name}.stl`, soupOf(solid));
+      solid.delete();
+      const r = await ctx.newPage();
+      r.on('pageerror', (e) => tipProblems.push(e.message));
+      r.on('console', (m) => m.type() === 'error' && tipProblems.push(m.text()));
+      await r.goto(url);
+      const calm = async () => {
+        for (let i = 0; i < 2; i++) {
+          await r.waitForTimeout(60);
+          await r.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+        }
+      };
+      const done = async () => {
+        await r.waitForFunction(() => document.querySelector('#pieceList li:not(.predicted)') && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 120000 });
+        await calm();
+      };
+      await calm();
+      await r.setInputFiles('#stlFile', file);
+      await r.waitForFunction((n) => document.querySelector('#modelInfo').textContent.startsWith(`${n}:`), name);
+      await calm();
+      await r.click('#deleteBtn');
+      await calm();
+      await r.click('#addCutBtn');
+      await calm();
+      await r.evaluate(() => {
+        const el = document.querySelector('[data-split="orient"]');
+        el.value = 'model';
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await calm();
+      await r.click('#resultToggle');
+      await done();
+      if (ticked) {
+        await r.click('#pieceList li:nth-child(1) .piece-tip input');
+        await r.waitForFunction(() => /^tipped – needs supports/.test(document.querySelector('#pieceList li:nth-child(1) .piece-tip .piece-lay-own')?.textContent ?? '') && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 120000 });
+        await calm();
+      }
+      const row = await r.locator('#pieceList li:nth-child(1)').evaluate((li) => ({
+        off: li.querySelector('.piece-tip input')?.disabled ?? null,
+        tip: li.querySelector('.piece-tip span')?.textContent ?? null,
+        check: li.querySelector('.print-check')?.textContent ?? '',
+      }));
+      const said = (await r.locator('#splitNotes li .text').allInnerTexts()).join(' / ');
+      await r.close();
+      return { row, said };
+    };
+    // a top that leans across a corner: tipped, the piece rests on that corner, and is told the supports carry it
+    const [rx, ry] = [300 * Math.tan((2 * Math.PI) / 180), 80 * Math.tan((2 * Math.PI) / 180)];
+    const skew = await tipOn('tipskew', Manifold.hull([[-150, 0, 0], [150, 0, 0], [-150, 80, 0], [150, 80, 0], [-150, 0, 30], [150, 0, 30 + rx], [-150, 80, 30 + ry], [150, 80, 30 + rx + ry]]), true);
+    check(
+      /rests on one corner: the supports carry it/.test(skew.row.check) && !/rests on an edge/.test(skew.row.check) && /it rests on one corner, and about \d+ cm² under it prints on supports/.test(skew.said) && /a raft holds it better than a brim/.test(skew.said),
+      'a piece whose face leans across a corner is told it rests on one corner and that the supports carry it',
+      JSON.stringify([skew.row.check, skew.said.slice(0, 500)]),
+    );
+    // a shallow roof: levelling one side leaves the other leaning, so the box is greyed out before it is asked for
+    const ridge = 40 * Math.tan((3 * Math.PI) / 180);
+    const roofed = await tipOn('tiproof', Manifold.hull([[-150, 0, 0], [150, 0, 0], [-150, 80, 0], [150, 80, 0], [-150, 0, 30], [150, 0, 30], [-150, 80, 30], [150, 80, 30], [-150, 40, 30 + ridge], [150, 40, 30 + ridge]]), false);
+    check(
+      roofed.row.off === true && /^Can't be tipped to print its big face level: tipped, other big faces on top would still lean/.test(roofed.row.tip ?? ''),
+      'a shallow roof is not offered the tip: its box is greyed out and says the other side would still lean',
+      JSON.stringify(roofed.row),
+    );
     check(tipProblems.length === 0, 'no page errors while tipping pieces', tipProblems.join(' | '));
     await ctx.close();
   }

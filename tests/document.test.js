@@ -802,6 +802,29 @@ describe('pieces asked to be tipped so that a leaning face prints level', () => 
     expect(doc.split).toMatchObject({ lay: { '0,0,0': '-y' }, tip: { '0,0,0': true, '2,0,0': true } });
   });
 
+  it('cuts that arrive with sides chosen for their pieces still drop a tip asked for the old ones, and the other way round', () => {
+    const doc = new Document();
+    const cutX = { id: 'c1', position: [0, 0, 0], normal: [1, 0, 0] };
+    const cutY = { id: 'c2', position: [0, 0, 0], normal: [0, 1, 0] };
+    doc.setSplit({ cuts: [cutX] });
+    doc.setPieceTip('1,0,0', true);
+    // new cuts with a side chosen for one of their pieces: the side is theirs and stays, the tip was the old pieces'
+    doc.setSplit({ cuts: [cutX, cutY], lay: { '0,0,0': '-y' } });
+    expect(doc.split.lay).toEqual({ '0,0,0': '-y' });
+    expect('tip' in doc.split).toBe(false);
+    doc.undo();
+    expect(doc.split.tip).toEqual({ '1,0,0': true });
+    expect('lay' in doc.split).toBe(false);
+    // and a tip that arrives with new cuts stays, while the side chosen for an old piece goes
+    doc.setPieceLay('0,0,0', '+z');
+    doc.setSplit({ cuts: [cutX, cutY], tip: { '0,1,0': true } });
+    expect(doc.split.tip).toEqual({ '0,1,0': true });
+    expect('lay' in doc.split).toBe(false);
+    // both arriving with the cuts both stay
+    doc.setSplit({ cuts: [cutX], lay: { '1,0,0': '-y' }, tip: { '0,0,0': true } });
+    expect(doc.split).toMatchObject({ lay: { '1,0,0': '-y' }, tip: { '0,0,0': true } });
+  });
+
   it('a cut dragged past another and back in one drag keeps the tip, with a side chosen or without', () => {
     const bar = new Document();
     bar.setBase('stl', 'bar');

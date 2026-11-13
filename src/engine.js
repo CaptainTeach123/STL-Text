@@ -21,7 +21,7 @@ import {
   applyMat4, transposeMat4, keepCrossed, keepsOf, keepsThrough, cornerPlaceNote, fitReachesCorner, bedCorner, capOf, slabCap, withinCap, wideKeeps, pickGroup,
   chooseOffsets, planEnds,
   AXES, CLIP, LIP, SPOT, catchSizes, comesOffOf, endShape, endsAsWell, keepsTo, locateBend, locateSeam, pickSpots, profileSeams, seamKind, spotScore, spotSide,
-  spotStart, spotWhy, socketsAsWell, flatLift, holeSummary, printCheckNote, LAY_DOWN, tipTransform, tipTurn, tipWays,
+  spotStart, spotWhy, socketsAsWell, flatLift, holeSummary, printCheckNote, LAY_DOWN, tipTransform, tipTurn, tipWays, dirAxis,
 } from './split.js';
 import { checkRow, levelFace, printCheck, shownFaces, tipBarred, tipWorse } from './printCheck.js';
 import {
@@ -2633,7 +2633,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
 
   /** How a piece lies (`chooseOrientation`'s answer) once it is tipped: its place on the bed and its size as tipped. */
   const tippedLying = (o, t) => ({
-    ...o, printMatrix: t.printMatrix, matrix: t.matrix, size: t.size, yaw: t.yaw, fits: true, tip: { turn: t.turn, angle: t.angle, area: t.area },
+    ...o, printMatrix: t.printMatrix, matrix: t.matrix, size: t.size, yaw: t.yaw, fits: true, tip: { turn: t.turn, angle: t.angle, area: t.area, rest: t.rest },
   });
 
   /**
@@ -2644,7 +2644,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * prints no worse than the step lines cured (`tipWorse`). A piece's outside is the same whichever way its pin
    * holes point, so what is found here holds for the piece drilled again for the tip.
    * @returns {Map<number, object>} by the piece's place in `laid`: `{ ok: true, down, turn, up, angle, area,
-   *   printMatrix, matrix, size, yaw }`, or `{ ok: false, why, angle?, area?, extra? }`
+   *   printMatrix, matrix, size, yaw, rest }` (`rest` whether it then rests on an 'edge' or one 'corner'), or `{ ok: false, why, angle?, area?, extra? }`
    */
   function tipChoices(final, split, checks, asked, { hl, U }, progress) {
     const { cut, laid, lying, drill, cuts } = split;
@@ -2655,7 +2655,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       if (!ways[i].key) continue;
       const check = checks.get(laid[i].index) ?? null;
       const face = levelFace(check, hl);
-      const why = ways[i].why ?? tipBarred(check, face) ?? (lying[i].fits ? null : 'bed');
+      const why = ways[i].why ?? tipBarred(check, face, hl) ?? (lying[i].fits ? null : 'bed');
       if (why) found.set(i, { ok: false, why, ...(face ? { angle: face.tilt, area: face.area } : {}) });
       else wanted.push({ i, face, check });
     }
@@ -2677,7 +2677,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         }
         const worse = tipWorse(check, checkOf(mesh, { turn, planes, made: madeFaces(mesh, own), skirt: false }), face, hl);
         if (worse) found.set(i, { ok: false, ...worse, ...told });
-        else found.set(i, { ok: true, down: lying[i].down, turn, up, ...told, printMatrix: place.printMatrix, matrix: place.matrix, size: place.size, yaw: place.yaw });
+        else found.set(i, { ok: true, down: lying[i].down, turn, up, ...told, printMatrix: place.printMatrix, matrix: place.matrix, size: place.size, yaw: place.yaw, rest: place.rest });
       }
     } finally {
       if (owned) solids.forEach((m) => m.delete());
@@ -3512,7 +3512,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * A piece that has a big leaning face on top, or was asked to be tipped so
    * that it prints level (`tips`, `tipChoices`), carries what its tick box in
    * the list says (`tip`: `key` its box, `asked`, `used`, the face's `angle`
-   * and `area`, `why` it is not or cannot be tipped, and tipped its `turn`),
+   * and `area`, `why` it is not or cannot be tipped, and tipped its `turn`,
+   * whether it rests on an 'edge' or one 'corner' (`rest`) and its pin `holes`),
    * with a note where it is tipped (PIECE_TIPPED) or was refused (TIP_REFUSED).
    */
   function summarise(split) {
@@ -3537,17 +3538,33 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const offered = layWays(laid, layout, U, { parts: partOf, lying, pegs: spec.joint === 'pegs' });
     // which pieces may be tipped so that a big leaning face prints level, as far as the layout tells
     const tippable = tipWays(laid, layout, { parts: partOf });
+    // a tipped piece's pin holes: those that lie on their side (shaped for the tip), those that stand upright, and
+    // of these the ones that open onto the bed – they lean with the piece, and are told of
+    const tipHoles = (p, o) => {
+      const out = { lying: 0, upright: 0, down: 0 };
+      for (const d of layout.dowels) {
+        d.sides.forEach((side, k) => {
+          if (side.piece !== p.index) return;
+          if (dirAxis(o.up) !== d.axis) out.lying++;
+          else {
+            out.upright++;
+            if (o.down === `${k === 0 ? '+' : '-'}${AXES[d.axis]}`) out.down++;
+          }
+        });
+      }
+      return out;
+    };
     // a piece's tick box for it: one asked to be tipped says whether it is, and why not; one not asked is offered
     // it where its check finds such a face, greyed out with the reason where it cannot be
     const tipRow = (p, i) => {
       const { key, why } = tippable[i];
       if (!key) return null;
       const t = tips?.get(i);
-      if (t) return { key, asked: true, used: t.ok, ...(t.ok ? { turn: t.turn } : { why: t.why }), ...(t.angle != null ? { angle: t.angle, area: t.area } : {}), ...(t.extra ? { extra: t.extra } : {}) };
+      if (t) return { key, asked: true, used: t.ok, ...(t.ok ? { turn: t.turn, rest: t.rest, holes: tipHoles(p, lying[i]) } : { why: t.why }), ...(t.angle != null ? { angle: t.angle, area: t.area } : {}), ...(t.extra ? { extra: t.extra } : {}) };
       const check = checks?.get(p.index) ?? null;
       const face = why === 'apart' ? null : levelFace(check, hl);
       if (!face) return null;
-      const barred = why ?? tipBarred(check, face);
+      const barred = why ?? tipBarred(check, face, hl);
       return { key, asked: false, used: false, angle: face.tilt, area: face.area, ...(barred ? { why: barred } : {}) };
     };
     const pieces = laid.map((p, i) => {
@@ -3795,7 +3812,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     for (const p of pieces) {
       // a piece tipped in its file is told what the tip costs, all in one note; one asked to be and not tipped, why
       if (p.tip?.used && p.check) {
-        notes.push(splitNote('PIECE_TIPPED', { pieceIndex: p.index, angle: p.tip.angle, area: p.tip.area, check: p.check }));
+        notes.push(splitNote('PIECE_TIPPED', { pieceIndex: p.index, angle: p.tip.angle, area: p.tip.area, check: p.check, rest: p.tip.rest, holes: p.tip.holes }));
         continue;
       }
       if (p.tip?.asked && !p.tip.used) notes.push(splitNote('TIP_REFUSED', { pieceIndex: p.index, why: p.tip.why, ...(p.tip.angle != null ? { angle: p.tip.angle, area: p.tip.area } : {}), ...(p.tip.extra ? { extra: p.tip.extra } : {}) }));

@@ -352,18 +352,29 @@ export function adviseJob(pieces, o, { pins = [], pegSize = null, clearance = nu
     out.push(`${piecesWords(list)}: add a brim about ${brim} mm wide – ${they(list, 'it stands', 'they stand')} on little and may come loose.`);
   }
 
-  // a piece tipped in its file so that a big face prints level rests on an edge, and must stay as its file has it
-  const tipped = of((p) => p.tip?.used);
-  if (tipped.length) {
-    out.push(`${piecesWords(tipped)}: tipped in ${they(tipped, 'its file', 'their files')} so that a big face prints level – turn off auto-orient for ${they(tipped, 'it', 'them')}, keep supports on and add a brim about ${PRINT_CHECK.brim} mm wide, as ${they(tipped, 'it rests', 'they rest')} on an edge.`);
+  // a piece tipped in its file so that a big face prints level rests on an edge (or on one corner), and must stay
+  // as its file has it. It needs its supports, where a piece that lies flat only may: they are told here, with the
+  // tip, and not again below
+  const about = (list) => areaWords(list.reduce((sum, p) => sum + p.check.supports.area, 0));
+  for (const corner of [false, true]) {
+    const list = pieces.filter((p) => p.tip?.used && (p.tip.rest === 'corner') === corner);
+    if (!list.length) continue;
+    const tipped = list.map((p) => p.index);
+    const propped = list.filter((p) => p.check?.supports.area >= PRINT_CHECK.none);
+    const plate = propped.every((p) => p.check.supports.piece < 0.1 * p.check.supports.area);
+    const supports = propped.length ? `turn supports on (${about(propped)} of faces in all${plate ? ': "on the build plate only" is enough' : ', some standing on the piece itself: allow them everywhere'})` : 'keep supports on';
+    const hold = corner
+      ? `– ${they(tipped, 'it touches', 'they touch')} the bed at one corner only, so the supports carry ${they(tipped, 'it', 'them')}, and a raft holds ${they(tipped, 'it', 'them')} better than a brim`
+      : `and add a brim about ${PRINT_CHECK.brim} mm wide, as ${they(tipped, 'it rests', 'they rest')} on an edge`;
+    out.push(`${piecesWords(tipped)}: tipped in ${they(tipped, 'its file', 'their files')} so that a big face prints level – turn off auto-orient for ${they(tipped, 'it', 'them')}, ${supports} ${hold}.`);
   }
 
   // supports, by the same figure as each piece's line: where they would stand says which kind is enough
   const checked = pieces.filter((p) => p.check);
   const needing = checked.filter((p) => p.check.supports.area >= PRINT_CHECK.none);
-  const onBed = needing.filter((p) => p.check.supports.piece < 0.1 * p.check.supports.area);
-  const onPiece = needing.filter((p) => !onBed.includes(p));
-  const about = (list) => areaWords(list.reduce((sum, p) => sum + p.check.supports.area, 0));
+  const may = needing.filter((p) => !p.tip?.used);
+  const onBed = may.filter((p) => p.check.supports.piece < 0.1 * p.check.supports.area);
+  const onPiece = may.filter((p) => !onBed.includes(p));
   if (onBed.length) out.push(`${piecesWords(onBed.map((p) => p.index))} may need supports (${about(onBed)} of faces in all): supports "on the build plate only" should be enough.`);
   if (onPiece.length) out.push(`${piecesWords(onPiece.map((p) => p.index))} may need supports (${about(onPiece)} of faces in all), some standing on the piece itself: allow them everywhere on ${they(onPiece, 'that piece', 'those pieces')}.`);
   if (checked.length && checked.length === pieces.length) {

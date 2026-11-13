@@ -4642,14 +4642,14 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
    * all round a centre, so it also keeps away a hole whose point has all the room it wants – on a face that is thin
    * sideways to the pieces' up, or a hole in the lower half of a thin one.
    */
-  const pointsFit = (ctx, patch, s, pts, t) => {
+  const pointsFit = (ctx, patch, s, pts, t, apex = patch.apex) => {
     const { CrossSection } = manifold();
     const free = freeOf(ctx, patch, true, t, s.reach);
     // the cut's two in-plane directions in the world, to turn a piece's up into the face's own
     const M = TO_WORLD[ctx.cut.axis];
     const o = applyMat4(M, [0, 0, 0]);
     const along = [[1, 0, 0], [0, 1, 0]].map((e) => applyMat4(M, e).map((x, i) => x - o[i]));
-    const tips = patch.apex.filter(Boolean).map((up) => along.map((e) => (e[0] * up[0] + e[1] * up[1] + e[2] * up[2]) * Math.SQRT2 * s.a));
+    const tips = apex.filter(Boolean).map((up) => along.map((e) => (e[0] * up[0] + e[1] * up[1] + e[2] * up[2]) * Math.SQRT2 * s.a));
     // drawn outside their circles, so never less than the wall
     const disc = (r, [x, y]) => t.add(t.add(CrossSection.circle(r / Math.cos(Math.PI / 64), 64)).translate([x, y]));
     return pts.map(([u, v]) => {
@@ -4670,8 +4670,18 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
     if (pts.length >= need || !patch.apex.some(Boolean)) return { pts, flat: pts.map(() => false) };
     const more = centresFor(ctx, patch, s, n, true, t, s.reach, true);
     if (more.length <= pts.length) return { pts, flat: pts.map(() => false) };
-    return { pts: more, flat: pointsFit(ctx, patch, s, more, t).map((fits) => !fits) };
+    const lain = pointsFit(ctx, patch, s, more, t).map((fits) => !fits);
+    if (!leans(patch)) return { pts: more, flat: lain };
+    // a tipped piece's point is a few degrees round: where it would break the wall there, it is cut off as well
+    const tipped = pointsFit(ctx, patch, s, more, t, patch.point);
+    return { pts: more, flat: lain.map((flat, i) => flat || !tipped[i]), lain };
   };
+
+  /** Whether a patch has a hole whose point is turned for a piece tipped in its file. */
+  const leans = (patch) => patch.point.some((v, k) => v && patch.apex[k] && v.some((x, i) => x !== patch.apex[k][i]));
+
+  // the holes of a tipped piece as the layout sees them: as they would be with the piece not tipped
+  const lainHoles = new Map();
 
   /**
    * The largest of `sizes` with D ≤ W/3 (W twice the deepest inset of the
@@ -4807,12 +4817,12 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
           const s = sizesForRoom(d, c, nozzle, dep, ctx.room);
           if (!s || seen.has(`${d}|${s.depth}`)) continue;
           seen.add(`${d}|${s.depth}`);
-          const { pts, flat } = pinCentres(ctx, patch, s, patch.alloc, need, t);
+          const { pts, flat, lain = flat } = pinCentres(ctx, patch, s, patch.alloc, need, t);
           if (pts.length >= need) {
-            chosen = { s, pts, flat };
+            chosen = { s, pts, flat, lain };
             break;
           }
-          if (pts.length === 1 && !single) single = { s, pts, flat };
+          if (pts.length === 1 && !single) single = { s, pts, flat, lain };
         }
         chosen ??= single;
         if (!chosen) {
@@ -4827,7 +4837,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
           }
           return;
         }
-        const { s, pts, flat } = chosen;
+        const { s, pts, flat, lain } = chosen;
         // filament's flat is a line of plastic wide: nothing to tell
         if (s.d !== FILAMENT) flats += flat.filter(Boolean).length;
         if (pts.length < need) one = true;
@@ -4859,10 +4869,14 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
             h: s.h,
             ch: s.ch,
             cell,
-            sides: [patch.lo, patch.hi].map((piece, k) => ({ piece: piece.index, tear: Boolean(patch.apex[k]), apex: patch.apex[k] })),
+            sides: [patch.lo, patch.hi].map((piece, k) => ({ piece: piece.index, tear: Boolean(patch.apex[k]), apex: patch.point[k] })),
             // the teardrops of its holes that lie on their side have a flat top, this far over the hole
             ...(flat[i] ? { flat: true, lift } : {}),
           };
+          if (leans(patch)) {
+            const asLain = { ...dowel, sides: dowel.sides.map((x, k) => ({ ...x, apex: patch.apex[k] })), flat: lain[i], lift };
+            lainHoles.set(dowel, asLain);
+          }
           patch.dowels.push(dowel);
           dowels.push(dowel);
         });
@@ -5292,7 +5306,10 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
             }
           });
         }
-        patch.apex = patch.skip ? [null, null] : [teardropApex(patch.lo.up ?? '+z', a, patch.lo.tip), teardropApex(patch.hi.up ?? '+z', a, patch.hi.tip)];
+        patch.apex = patch.skip ? [null, null] : [teardropApex(patch.lo.up ?? '+z', a), teardropApex(patch.hi.up ?? '+z', a)];
+        // a piece tipped in its file has its holes' points where up is then (`point`); where the pins go is still
+        // found from the pieces as they lie (`apex`), so that tipping a piece moves no pin
+        patch.point = patch.skip ? [null, null] : [teardropApex(patch.lo.up ?? '+z', a, patch.lo.tip), teardropApex(patch.hi.up ?? '+z', a, patch.hi.tip)];
         patch.dowels = [];
         patch.pegs = [];
         patch.male = null;
@@ -5447,7 +5464,9 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
       });
       for (const ctx of contexts) {
         for (const patch of ctx.patches) {
-          if (!patch.skip) patch.apex = [teardropApex(patch.lo.up ?? '+z', ctx.cut.axis, patch.lo.tip), teardropApex(patch.hi.up ?? '+z', ctx.cut.axis, patch.hi.tip)];
+          if (patch.skip) continue;
+          patch.apex = [teardropApex(patch.lo.up ?? '+z', ctx.cut.axis), teardropApex(patch.hi.up ?? '+z', ctx.cut.axis)];
+          patch.point = [teardropApex(patch.lo.up ?? '+z', ctx.cut.axis, patch.lo.tip), teardropApex(patch.hi.up ?? '+z', ctx.cut.axis, patch.hi.tip)];
         }
       }
       for (const ctx of lipped) {
@@ -5611,7 +5630,11 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
         if (got.hint) hint = Math.min(hint ?? Infinity, got.hint);
         for (const dowel of dowels.filter((x) => x.cutId === ctx.cut.id)) {
           for (const side of [0, 1]) {
-            const m = keep.add(dowelHole(dowel, side));
+            // a tipped piece's hole is in the way of the other cuts' pins as it would be with the piece not tipped:
+            // the pins are then where they are without the tip, and the pieces across the other cuts are the very
+            // same. Its point, a few degrees round (`PRINT_CHECK.tipMax` at most), moves by a fifth of the hole's
+            // radius at most – a quarter of the wall kept between two holes
+            const m = keep.add(dowelHole(lainHoles.get(dowel) ?? dowel, side));
             placed.push({ m, side, box: boxOf(m) });
           }
         }

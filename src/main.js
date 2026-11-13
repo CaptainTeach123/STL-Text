@@ -2977,7 +2977,7 @@ function renderPieces() {
         ...(locks.get(p.index) ?? []),
       ].filter(Boolean),
       // the print check of the piece as its file lies: supports, step lines, what it stands on, its pin holes
-      check: checkWords(p.check ?? null, p.holes ?? null, p.tip?.used ? { tip: true } : {}),
+      check: checkWords(p.check ?? null, p.holes ?? null, p.tip?.used ? { tip: p.tip } : {}),
       estimate: estimates.get(p.index) ?? [],
       // the side it lies on, to choose: what the document holds shows at once, the new pieces follow
       // pieces of other boxes than the cuts make now (a cut added since) are not to choose for: their numbers are not
@@ -3079,7 +3079,7 @@ function tipChoice(row) {
   const { key, checked, disabled, text, tag } = row.tip;
   const label = document.createElement('label');
   label.className = 'piece-tip';
-  label.title = 'Turns this piece a few degrees in its file, so that its big leaning face lies level and prints without step lines. The piece then rests on an edge and needs supports under it; its pin holes are shaped for lying tipped. Off unless you tick it.';
+  label.title = 'Turns this piece a few degrees in its file, so that its big leaning face lies level and prints without step lines. The piece then rests on an edge or a corner and needs supports under it; its pin holes that lie on their side are shaped for lying tipped. Off unless you tick it.';
   const box = document.createElement('input');
   box.type = 'checkbox';
   box.dataset.tip = key;

@@ -518,14 +518,13 @@ export class Document {
     // the sides chosen by hand for pieces to lie on go by each piece's box: once the cuts make other boxes, a number
     // would name another piece, so the choices are dropped (an undo brings them back with the cuts)
     // – but not ones that arrive with the new cuts
-    // and so with the pieces asked to be tipped, which go by their boxes as well
-    const held = (split) => JSON.stringify([split?.lay ?? null, split?.tip ?? null]);
-    const carried = (next.split?.lay || next.split?.tip) && held(next.split) === held(this.state.split);
-    if (carried && cellsKey(next.split) !== cellsKey(this.state.split)) {
+    // and so with the pieces asked to be tipped, which go by their boxes as well. Each is judged on its own: what
+    // is as it was is dropped, what arrives with the new cuts is kept
+    const carried = ['lay', 'tip'].filter((k) => next.split?.[k] && JSON.stringify(next.split[k]) === JSON.stringify(this.state.split?.[k] ?? null));
+    if (carried.length && cellsKey(next.split) !== cellsKey(this.state.split)) {
       // within one drag they are only set aside: a cut dragged past another and back makes the same boxes again
-      if (coalesce) this.layAside = { coalesce, cells: cellsKey(this.state.split), lay: next.split.lay ?? null, tip: next.split.tip ?? null };
-      delete next.split.lay;
-      delete next.split.tip;
+      if (coalesce) this.layAside = { coalesce, cells: cellsKey(this.state.split), lay: carried.includes('lay') ? next.split.lay : null, tip: carried.includes('tip') ? next.split.tip : null };
+      for (const k of carried) delete next.split[k];
     } else if (this.layAside && next.split && !next.split.lay && !next.split.tip && !this.state.split?.lay && !this.state.split?.tip && cellsKey(next.split) === this.layAside.cells) {
       if (this.layAside.lay) next.split.lay = { ...this.layAside.lay };
       if (this.layAside.tip) next.split.tip = { ...this.layAside.tip };

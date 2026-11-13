@@ -6163,12 +6163,14 @@ try {
       'and it keeps its two Ø5 pins: nothing falls back to filament',
       flatNotes.join(' | '),
     );
-    // Auto sizes by the pointed teardrop: smaller pins, and no flat tops to tell of
+    // Auto keeps to a third of the bar's 12 mm: Ø4 pins (not Ø3, as a width read a hair short once gave), whose
+    // pointed teardrops have their room, so there are no flat tops to tell of
     await pick('0');
     await f.waitForFunction(() => /pins Ø[34] /.test(document.querySelector('#splitNotes').innerText), null, { timeout: 60000 });
     await settled();
     const autoNotes = await notes();
     check(!autoNotes.some((t) => /flat top/.test(t)), 'with Auto the same bar takes smaller pins with pointed teardrops, and the note is gone', autoNotes.join(' | '));
+    check(autoNotes.some((t) => /2 pins Ø4 × /.test(t)), 'and Auto gives the bar exactly 12 mm thick its Ø4 pins, a third of its thickness', autoNotes.join(' | '));
     check(flatProblems.length === 0, 'no page errors with flat-topped pin holes', flatProblems.join(' | '));
     await flatContext.close();
   }

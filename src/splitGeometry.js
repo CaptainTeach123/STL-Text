@@ -194,6 +194,13 @@ function insidePoint(polys, centroid) {
 }
 
 /**
+ * What `largestInset` may read a face's width short by (mm), and a little over: it stops ten halvings from the true
+ * inset, on the low side, so a face exactly three pin sizes wide would otherwise read as a hair under and be given
+ * the next size down. Far less than the 3 mm of width between one size and the next.
+ */
+const WIDTH_SLACK = 0.05;
+
+/**
  * The largest inset (mm) at which a cross-section still has area, by
  * bisection, or `cap` as soon as an inset of `cap` has: insets close to
  * collapse are slow on dense outlines, and callers only need to know a
@@ -4567,6 +4574,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
   // what pins and pegs differ in: their sizes, the sizes Auto tries and how far into a piece they may reach
   const PIN = {
     auto: AUTO_DIAMETERS, full: (d, dep) => sizesFor(d, c, nozzle, dep), room: (d, dep, room) => sizesForRoom(d, c, nozzle, dep, room), reach: reachMax,
+    flat: true, // a pin's hole may have a flat-topped teardrop; a peg needs no teardrop
   };
   const PEG = {
     auto: AUTO_PEGS, full: (d, dep) => pegSizesFor(d, c, nozzle, dep), room: (d, dep, room) => pegSizesForRoom(d, c, nozzle, dep, room), reach: pegReach,
@@ -4656,32 +4664,39 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
 
   /**
    * The largest of `sizes` with D ≤ W/3 (W twice the deepest inset of the
-   * patch's solid columns) that takes two pins (or pegs, `kind`) on a patch,
-   * their holes reaching `reachOf(sizes)` from the face, within `room` of it:
-   * first against the shadow of the largest size's reach, which is
-   * conservative for every size, then, finding none, with each size's own
-   * reach. Its sizes (`kind.room`'s, as deep as the room lets them go), or
-   * null when none takes two.
+   * patch's solid columns, read with `WIDTH_SLACK` to spare) that takes two
+   * pins (or pegs, `kind`) on a patch, their holes reaching `reachOf(sizes)`
+   * from the face, within `room` of it: first against the shadow of the
+   * largest size's reach, which is conservative for every size, then,
+   * finding none, with each size's own reach. A pin whose hole lies on its
+   * side counts where a flat-topped teardrop keeps its wall, as it does when
+   * the pins are laid out (`pinCentres`), so a size picked by hand never
+   * beats Auto on a face this wide. Its sizes (`kind.room`'s, as deep as the
+   * room lets them go), or null when none takes two.
    */
   function sizeOn(ctx, patch, kind, sizes, reachOf, room, t) {
     const need = Math.min(2, wanted || 2);
     const widest = kind.full(sizes[0], depth);
     const widthCap = (3 * sizes[0]) / 2; // D ≤ W/3, so no width beyond three of the largest size changes the answer
     const free = t.add(patch.cs.subtract(shadowAt(ctx, reachOf(widest), false)));
-    const W = 2 * largestInset(free, widthCap);
-    const tear = patch.apex.some(Boolean);
+    const W = 2 * largestInset(free, widthCap) + WIDTH_SLACK;
+    // a hole lying on its side: pointed where that fits, else with its point cut off flat
+    const insets = (s) => (!patch.apex.some(Boolean) ? [s.rho] : kind.flat ? [s.rhoTear, flatInset(s, lift)] : [s.rhoTear]);
     for (const D of sizes) {
       const s = kind.room(D, depth, room);
       if (!s || D > W / 3 + 1e-9) continue;
-      const safe = t.add(free.offset(-(tear ? s.rhoTear : s.rho), 'Round', 2, 32));
-      if (!safe.isEmpty() && chooseCentres(polygonsOf(safe), need, s.sMin, patch.centroid, { d: D }).length >= need) return s;
+      for (const inset of insets(s)) {
+        const safe = t.add(free.offset(-inset, 'Round', 2, 32));
+        if (!safe.isEmpty() && chooseCentres(polygonsOf(safe), need, s.sMin, patch.centroid, { d: D }).length >= need) return s;
+      }
     }
     const small = kind.room(sizes[sizes.length - 1], depth, room);
-    const W3 = small ? 2 * largestInset(t.add(patch.cs.subtract(shadowAt(ctx, reachOf(small), false))), widthCap) : 0;
+    const W3 = small ? 2 * largestInset(t.add(patch.cs.subtract(shadowAt(ctx, reachOf(small), false))), widthCap) + WIDTH_SLACK : 0;
     for (const D of sizes) {
       const s = kind.room(D, depth, room);
       if (!s || D > W3 / 3 + 1e-9) continue;
       if (centresFor(ctx, patch, s, need, false, t, reachOf(s)).length >= need) return s;
+      if (kind.flat && centresFor(ctx, patch, s, need, false, t, reachOf(s), true).length >= need) return s;
     }
     return null;
   }

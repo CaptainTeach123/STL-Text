@@ -1,5 +1,5 @@
 {
- "commit": "c3a03c8 with changes to src",
+ "commit": "7272623 with changes to src",
  "cases": {
   "lantern/lock-190": {
    "files": {
@@ -72,7 +72,7 @@
     "lantern-how-to-glue.txt": "77d336ddd2a2e6ea"
    },
    "notes": "0e83abd1e2f22af9",
-   "fit": "bcf3dfa295ce8a7d 50c91caed4662ee4"
+   "fit": "268b54f1e256399a 4b368f07a64c5a37"
   },
   "lantern/fit-mini": {
    "plan": "cb9c4c0b2b53f9ba",
@@ -94,7 +94,7 @@
    "notes": "259bb2f8c6ee4b0e",
    "fit": "41052f525c0f558f 5240c580d88d54dc"
   },
-  "gothic/pins-190": {
+  "gothic/pins-190-no-strip": {
    "files": {
     "gothic-piece-1-of-2.stl": "c11e963b40d708fd",
     "gothic-piece-2-of-2.stl": "787d20a0cf76e1d6",
@@ -103,6 +103,16 @@
    },
    "notes": "6c3485b00e6242c3",
    "fit": "bc2f739e1f5c55f8 bdddeaa12da2311b"
+  },
+  "gothic/pins-190": {
+   "files": {
+    "gothic-piece-1-of-2.stl": "c11e963b40d708fd",
+    "gothic-piece-2-of-2.stl": "787d20a0cf76e1d6",
+    "gothic-pins-7x-5x16mm.stl": "95af7be693525152",
+    "gothic-how-to-glue.txt": "302597c0a1c1608e"
+   },
+   "notes": "eb3679535294d822",
+   "fit": "e30db41a7ae4f91f 301a6d557b08b235"
   },
   "gothic/own-pins-190": {
    "files": {
@@ -171,11 +181,11 @@
    "files": {
     "loggia-piece-1-of-2.stl": "6cf147ab148c21f8",
     "loggia-piece-2-of-2.stl": "03300d06c5528983",
-    "loggia-pins-10x-3x10mm.stl": "afc4b634d8f60489",
-    "loggia-how-to-glue.txt": "e511a4b4a73a7063"
+    "loggia-pins-10x-3x10mm.stl": "d827e3c90bcaefe7",
+    "loggia-how-to-glue.txt": "021744a8a66e6ec1"
    },
-   "notes": "16b1b581d73521f3",
-   "fit": "7569cfab23a0a28f 6a23f54a5c990895"
+   "notes": "ae35ffbab91c3897",
+   "fit": "c5f50781287b99f6 73757c266f5b733e"
   },
   "slender/lock-35": {
    "files": {

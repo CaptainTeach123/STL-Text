@@ -1058,6 +1058,12 @@ try {
     const pins = zip.entries['long-bar-text-pins-3x-6x19mm.stl'];
     const pinCount = pins ? shellCount(pins.file) : 0;
     check(pinCount === 3 && Math.abs(extent(pins, 2) - 5.54) < 0.05, 'the pin sheet holds 3 pins (one spare) lying on a flat', pins && `${pinCount} pins, ${extent(pins, 2).toFixed(3)} mm high`);
+    // three Ø6 × 19 pins in a row, 12 mm apart, are 81 × 5.54 mm: each on its strip, 5 mm wider all round
+    check(
+      pins && Math.abs(extent(pins, 0) - 91) < 0.05 && Math.abs(extent(pins, 1) - 15.54) < 0.05 && Math.abs(pins.min[2]) < 0.01,
+      'each pin lies on a thin strip that reaches 5 mm past it, to hold it to the bed',
+      pins && `${extent(pins, 0).toFixed(2)} × ${extent(pins, 1).toFixed(2)} mm`,
+    );
     check(zip.entries['long-bar-text-how-to-glue.txt']?.includes('1A ↔ 2A'), 'the glue sheet pairs the matching labels');
     const glueSheet = zip.entries['long-bar-text-how-to-glue.txt'] ?? '';
     check(
@@ -1069,7 +1075,7 @@ try {
     const planBlock = glueSheet.slice(glueSheet.indexOf('PRINT PLAN')).split('\n\n')[0];
     check(
       glueSheet.indexOf('PRINT PLAN (estimates only)') > glueSheet.indexOf('PRINT (each file') && glueSheet.indexOf('PRINT PLAN (estimates only)') < glueSheet.indexOf('DRY-FIT FIRST') &&
-        /The files are solid models/.test(planBlock) && /\n {2}piece 2 of 2 {3}about \d+–\d+ g/.test(planBlock) && /\n {2}pins {11}about [\d.–]+ g for 3 pins, printed solid/.test(planBlock),
+        /The files are solid models/.test(planBlock) && /\n {2}piece 2 of 2 {3}about \d+–\d+ g/.test(planBlock) && /\n {2}pins {11}about [\d.–]+ g for 3 pins and their holding strip, printed solid/.test(planBlock),
       'the sheet in the zip has a PRINT PLAN block: a line a piece and the pins',
       planBlock.split('\n').slice(0, 5).join(' | '),
     );
@@ -1083,6 +1089,37 @@ try {
     await page.fill('#planInfill', '15');
     await page.dispatchEvent('#planInfill', 'change');
     check(/^Downloaded long-bar-text-2-pieces\.zip .*: 2 pieces, 3 pins/.test(await status()), 'the status line says what the zip holds', await status());
+    check(
+      glueSheet.includes('on a thin strip that holds them to the bed: print with a 0.2 mm first layer and no brim,') && glueSheet.includes('then peel the strip off and snap the pins out'),
+      'the glue sheet says how to print the pins on their strip and get them off it',
+      glueSheet.split('\n').filter((t) => /strip/.test(t)).join(' | '),
+    );
+    const stripNote = (await page.locator('#splitNotes li').allInnerTexts()).find((t) => /Print the pins file/.test(t)) ?? '';
+    check(/The pins come on a thin strip that holds them to the bed: print it with a 0\.2 mm first layer and no brim, .* then peel the strip off and snap the pins out\./.test(stripNote), 'and so does the note about the pins file', stripNote);
+
+    // Printing: Hold printed pins down with a thin strip – on to start with; off, the pins lie on the bed on their own
+    await page.evaluate(() => (document.querySelector('#printing').open = true));
+    const stripBox = await page.evaluate(() => ({ on: document.querySelector('#printing #pinStrip')?.checked, label: document.querySelector('#pinStrip')?.closest('label').textContent.trim() }));
+    check(stripBox.on === true && stripBox.label === 'Hold printed pins down with a thin strip', 'the Printing card has "Hold printed pins down with a thin strip", ticked', JSON.stringify(stripBox));
+    await page.uncheck('#pinStrip');
+    await idle();
+    const bareZip = await downloadZip();
+    const barePins = bareZip.entries['long-bar-text-pins-3x-6x19mm.stl'];
+    check(
+      barePins && shellCount(barePins.file) === 3 && Math.abs(extent(barePins, 0) - 81) < 0.05 && Math.abs(extent(barePins, 1) - 5.54) < 0.05,
+      'unticked, the pin sheet is the three pins alone',
+      barePins && `${extent(barePins, 0).toFixed(2)} × ${extent(barePins, 1).toFixed(2)} mm`,
+    );
+    check(!/strip/.test(bareZip.entries['long-bar-text-how-to-glue.txt'] ?? 'strip'), 'and the glue sheet says nothing of a strip');
+    const barePieces = Object.keys(bareZip.entries).filter((n) => /piece-\d+-of-2\.stl$/.test(n));
+    check(
+      barePieces.length === 2 && barePieces.every((n) => Buffer.from(bareZip.entries[n].file).equals(Buffer.from(zip.entries[n].file))),
+      'the pieces are the same files with the strip and without',
+    );
+    const kept = await page.evaluate(() => Object.keys(localStorage).map((k) => localStorage.getItem(k)).filter((v) => /"pinStrip":false/.test(v)).length);
+    check(kept === 1, 'the choice is remembered with the other settings');
+    await page.check('#pinStrip');
+    await idle();
 
     // Joints: Built-in pegs – square pegs printed on one piece fit sockets in the other, so there is no pins file
     await page.click('#splitSettings label:has(input[data-split="joint"][value="pegs"])');
@@ -1330,8 +1367,10 @@ try {
     // the fit test is made from the split as it stands: the pin size Auto picks for a 20 mm bar
     await page.waitForTimeout(1000);
     const pinTest = await fitTest('long-bar-fit-test.stl');
-    const pinShell = pinTest.shells.filter((e) => Math.abs(e[0] - 5.54) < 0.05 && Math.abs(e[1] - 5.54) < 0.05);
-    check(/the Ø6 mm pin slides into both holes/.test(pinTest.status) && !/tab/.test(pinTest.status) && pinShell.length === 1, 'the fit test has the Ø6 pin the pieces use, not a Ø5 one', `${pinTest.shells.map((e) => e.map((v) => v.toFixed(1)).join('×')).join(', ')} | ${pinTest.status}`);
+    // the pin lies on its strip: 5.54 mm high, 19 + 10 long and 5.54 + 10 wide
+    const pinShell = pinTest.shells.filter((e) => Math.abs(e[0] - 5.54) < 0.05 && Math.abs(e[1] - 15.54) < 0.05 && Math.abs(e[2] - 29) < 0.05);
+    check(/peel the strip off and snap the pin out\.$/.test(pinTest.status), 'the fit test says its pin comes on a strip to peel off', pinTest.status);
+    check(/the Ø6 mm pin slides into both holes/.test(pinTest.status) && !/tab/.test(pinTest.status) && pinShell.length === 1, 'the fit test has the Ø6 pin the pieces use, not a Ø5 one, on its strip', `${pinTest.shells.map((e) => e.map((v) => v.toFixed(1)).join('×')).join(', ')} | ${pinTest.status}`);
     // Glue only: nothing is drilled or engraved, so what is about holes and labels is off
     await page.click('#splitSettings label:has(input[data-split="joint"][value="none"])');
     await idle();

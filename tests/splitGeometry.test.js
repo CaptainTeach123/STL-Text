@@ -31,7 +31,9 @@ import {
   pegAt,
   pegSolid,
   pinAt,
+  PIN_STRIP,
   pinSheet,
+  pinStripVolume,
   pinSolid,
   pinSpares,
   pinsPerSheet,
@@ -197,6 +199,112 @@ describe('holes and pins', () => {
     expect(boxOf(own(pinSheet({ d: 8, length: 26, count: perSheet + 1 }, U))).size[1]).toBeGreaterThan(U[1]);
     // the room it is laid out in is the bed's own
     expect(pinsPerSheet({ d: 8, length: 26 }, U).room).toEqual(U);
+  });
+
+  it('with the holding strip every column of pins is one solid on a thin slab, and the pins are where they were', () => {
+    expect(PIN_STRIP).toEqual({ reach: 5, thick: 0.2 });
+    const group = { d: 5, length: 16, count: 30 };
+    const bare = own(pinSheet(group, BED));
+    const held = own(pinSheet(group, BED, { strip: true }));
+    // 210 mm less the strip's 5 mm at either end takes seven pins a row where the bare sheet takes eight: seven
+    // columns, each one solid
+    const columns = shells(held);
+    expect(shells(bare)).toHaveLength(30);
+    expect(columns).toHaveLength(7);
+    // the sheet is 5 mm wider all round than its pins, no taller, and still centred and on the bed
+    const pinsOnly = boxOf(own(pinSheet(group, [200, 210, 249])));
+    const b = boxOf(held);
+    expect(b.size[0]).toBeCloseTo(pinsOnly.size[0] + 10, 6);
+    expect(b.size[1]).toBeCloseTo(pinsOnly.size[1] + 10, 6);
+    expect(b.size[2]).toBeCloseTo(pinsOnly.size[2], 6);
+    expect(b.size[0]).toBeLessThanOrEqual(BED[0]);
+    expect(b.min[2]).toBeCloseTo(0, 6);
+    expect(b.min[0] + b.max[0]).toBeCloseTo(0, 6);
+    expect(b.min[1] + b.max[1]).toBeCloseTo(0, 6);
+    // the pins themselves are untouched: cut the lowest 0.2 mm away and what is left is the same sheet without a
+    // strip, laid out seven to a row
+    const { Manifold } = manifold();
+    // (cut a hair above the strip's top, so no face of the cut lies in it)
+    const above = own(own(Manifold.cube([400, 400, 20], true)).translate([0, 0, 10 + PIN_STRIP.thick + 0.001]));
+    const upper = own(held.intersect(above));
+    const same = own(own(pinSheet(group, [200, 210, 249])).intersect(above));
+    expect(shells(upper)).toHaveLength(30);
+    expect(upper.volume()).toBeCloseTo(same.volume(), 4);
+    expect(own(upper.subtract(same)).volume()).toBeCloseTo(0, 6);
+    expect(own(same.subtract(upper)).volume()).toBeCloseTo(0, 6);
+    // and the whole sheet holds every pin of the bare one, whole
+    expect(own(own(pinSheet(group, [200, 210, 249])).subtract(held)).volume()).toBeCloseTo(0, 6);
+    // a column's slab is as wide as a pin is long and 5 mm more at either end, reaches 5 mm past its first and last
+    // pin, and is one first layer thick: nothing of it is higher than 0.2 mm but the pins
+    const slabs = own(held.subtract(own(own(Manifold.cube([400, 400, 20], true)).translate([0, 0, 10 + PIN_STRIP.thick]))));
+    const boxes = shells(slabs).map(boxOf).sort((p, q) => p.min[0] - q.min[0]);
+    expect(boxes).toHaveLength(7);
+    for (const c of boxes) {
+      expect(c.size[0]).toBeCloseTo(26, 6);
+      expect(c.size[2]).toBeCloseTo(0.2, 6);
+    }
+    // 30 pins seven to a row: two columns of five and five of four, 12 mm between the pins of a column
+    expect(boxes.map((c) => +c.size[1].toFixed(3))).toEqual([5, 5, 4, 4, 4, 4, 4].map((n) => +(n * 4.619397 + (n - 1) * 12 + 10).toFixed(3)));
+    // the strips of two columns stay 2 mm apart, so each peels off on its own
+    for (let i = 1; i < boxes.length; i++) expect(boxes[i].min[0] - boxes[i - 1].max[0]).toBeCloseTo(2, 6);
+    // what the strips take, as the print plan counts it: the slabs, a little over what they add to the pins
+    const added = held.volume() - bare.volume();
+    const counted = pinStripVolume(group, BED);
+    expect(counted).toBeGreaterThan(added);
+    expect(counted).toBeLessThan(1.1 * added);
+    // one pin gets a strip of its own
+    const one = boxOf(own(pinSheet({ d: 6, length: 19, count: 1 }, BED, { strip: true })));
+    expect(one.size.map((v) => +v.toFixed(3))).toEqual([29, 15.543, 5.543]);
+    expect(shells(own(pinSheet({ d: 6, length: 19, count: 1 }, BED, { strip: true })))).toHaveLength(1);
+  });
+
+  it('a pins file with the holding strip still fits the bed, strip and all, with fewer pins where a row no longer fits', () => {
+    const U = [110, 110, 119];
+    const bare = pinsPerSheet({ d: 8, length: 26 }, U);
+    const held = pinsPerSheet({ d: 8, length: 26 }, U, { strip: true });
+    // 100 mm of the 110 are left for the pins: two to a row where three fitted, and five rows where six did
+    expect(bare.perSheet).toBe(3 * 6);
+    expect(held.perSheet).toBe(2 * 5);
+    expect(held.room).toEqual(U);
+    // a sheet of one pin is its strip's size
+    expect(held.size.map((v) => +v.toFixed(3))).toEqual([36, 17.391, 7.391]);
+    const full = boxOf(own(pinSheet({ d: 8, length: 26, count: held.perSheet }, held.room, { strip: true })));
+    expect(full.size[0]).toBeLessThanOrEqual(U[0] + 1e-6);
+    expect(full.size[1]).toBeLessThanOrEqual(U[1] + 1e-6);
+    expect(boxOf(own(pinSheet({ d: 8, length: 26, count: held.perSheet + 1 }, held.room, { strip: true }))).size[1]).toBeGreaterThan(U[1]);
+    // on a printer that keeps a corner clear the sheet, strip and all, misses the corner left in the middle of the bed
+    const X1 = [246, 246, 249, 18, 28];
+    for (const [d, length] of [[8, 26], [5, 16], [3, 10], [10, 30]]) {
+      const { perSheet, room } = pinsPerSheet({ d, length }, X1, { strip: true });
+      expect(perSheet).toBeLessThanOrEqual(pinsPerSheet({ d, length }, X1).perSheet);
+      const sheet = boxOf(own(pinSheet({ d, length, count: perSheet }, room, { strip: true })));
+      expect(sheet.size[0]).toBeLessThanOrEqual(room[0] + 1e-6);
+      expect(sheet.size[1]).toBeLessThanOrEqual(room[1] + 1e-6);
+      expect(fitsBed(sheet.size, X1, { flat: 2 }).fits).toBe(true);
+      expect(reachesCorner(sheet.size, 0, X1)).toBe(false);
+    }
+  });
+
+  it("the fit test's pin lies on the same strip when asked, and nothing else of the fit test changes", () => {
+    const bare = shells(own(fitTestCoupon({ diameter: 5, clearance: 0.15 }, 0.4)));
+    const held = shells(own(fitTestCoupon({ diameter: 5, clearance: 0.15 }, 0.4, { strip: true })));
+    expect(held).toHaveLength(bare.length);
+    const byWidth = (list) => list.map((m) => ({ m, b: boxOf(m) })).sort((p, q) => p.b.size[2] - q.b.size[2]);
+    const [pin, ...blocks] = byWidth(bare);
+    const [onStrip, ...same] = byWidth(held);
+    // the blocks are the same blocks
+    expect(same.map((x) => +x.m.volume().toFixed(3)).sort()).toEqual(blocks.map((x) => +x.m.volume().toFixed(3)).sort());
+    // the pin is as tall as it was, with 5 mm of strip round it, 0.2 mm thick
+    expect(onStrip.b.size[2]).toBeCloseTo(pin.b.size[2], 6);
+    expect(onStrip.b.size[0]).toBeCloseTo(pin.b.size[0] + 10, 6);
+    expect(onStrip.b.size[1]).toBeCloseTo(pin.b.size[1] + 10, 6);
+    expect(onStrip.b.min[2]).toBeCloseTo(0, 6);
+    const extra = onStrip.m.volume() - pin.m.volume();
+    expect(extra).toBeGreaterThan(0.9 * onStrip.b.size[0] * onStrip.b.size[1] * 0.2);
+    expect(extra).toBeLessThan(onStrip.b.size[0] * onStrip.b.size[1] * 0.2);
+    // filament and your own dowels have no pin, so no strip either
+    expect(own(fitTestCoupon({ diameter: 1.75 }, 0.4, { strip: true })).volume()).toBeCloseTo(own(fitTestCoupon({ diameter: 1.75 }, 0.4)).volume(), 6);
+    expect(own(fitTestCoupon({ diameter: 5, pins: 'own' }, 0.4, { strip: true })).volume()).toBeCloseTo(own(fitTestCoupon({ diameter: 5, pins: 'own' }, 0.4)).volume(), 6);
   });
 
   it('on a printer that keeps a corner clear, a pins file misses the corner even left in the middle of the bed', () => {

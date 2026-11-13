@@ -171,6 +171,20 @@ describe('the estimate of one solid', () => {
   it('pins are counted solid', () => {
     expect(estimateSolid(300, 5, o).plastic).toBe(300);
   });
+
+  it('the strips that hold printed pins to the bed are counted with them, and said', () => {
+    const bare = estimateJob({ pins: [{ d: 5, length: 16, count: 4, spares: 1, own: false, volume: 280 }] }, o);
+    const held = estimateJob({ pins: [{ d: 5, length: 16, count: 4, spares: 1, own: false, volume: 280, strip: 430 }] }, o);
+    expect(bare.pins).toMatchObject({ count: 5, strip: false });
+    expect(bare.pins.estimate.plastic).toBe(5 * 280);
+    expect(held.pins).toMatchObject({ count: 5, strip: true });
+    expect(held.pins.estimate.plastic).toBe(5 * 280 + 430);
+    expect(held.total.grams[0]).toBeGreaterThan(bare.total.grams[0]);
+    const pieces = [{ index: 1, size: [50, 50, 50], volume: 125000, area: 15000 }];
+    const pins = [{ d: 5, length: 16, count: 4, spares: 1, own: false, volume: 280, strip: 430 }];
+    expect(planSheetLines({ pieces, pins }, {}, [210, 210, 249]).find((l) => l.startsWith('  pins'))).toBe('  pins           about 2–2.3 g for 5 pins and their holding strip, printed solid');
+    expect(planSheetLines({ pieces, pins: [{ ...pins[0], strip: 0 }] }, {}, [210, 210, 249]).find((l) => l.startsWith('  pins'))).toBe('  pins           about 1.6–1.7 g for 5 pins, printed solid');
+  });
 });
 
 describe('the words of an estimate', () => {

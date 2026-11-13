@@ -140,11 +140,11 @@ const add = (p, q) => [p[0] + q[0], p[1] + q[1]];
  * The plan of a whole job: every piece, the printed pins and the separately printed parts, and all of them together.
  * @param {{ pieces?: object[], pins?: object[], parts?: object[] }} job `pieces` the piece rows of a split (index,
  *   size as laid, volume, area, unrepaired); `pins` its pin groups (d, length, count, spares, own, volume of one
- *   pin); `parts` the parts printed separately (name, volume, area, height)
+ *   pin, and `strip`: the volume of the strips that hold them to the bed, when they get them); `parts` the parts printed separately (name, volume, area, height)
  * @param {object} o from `planOptions`
  * @param {number[]|null} [bed] the room on the bed, mm [x, y]
  * @returns {{ pieces: { index: number, estimate: object|null, unrepaired: boolean }[],
- *   pins: { count: number, estimate: object }|null, parts: { name: string, estimate: object|null }[],
+ *   pins: { count: number, estimate: object, strip: boolean }|null, parts: { name: string, estimate: object|null }[],
  *   total: { grams: number[], metres: number[], hours: number[] }, counted: number, left: number, unrepaired: boolean,
  *   tallest: { index: number, height: number }|null, widest: { index: number, size: number[] }|null, beds: number|null }}
  *   `left` how many pieces and parts could not be measured and are not in the total; `beds` how many times the bed
@@ -158,9 +158,9 @@ export function estimateJob({ pieces = [], pins = [], parts = [] } = {}, o, bed 
   }));
   const printed = pins.filter((g) => !g.own && g.volume > 0 && g.count > 0);
   const pinCount = printed.reduce((n, g) => n + g.count + (g.spares ?? 0), 0);
-  const pinEstimates = printed.map((g) => estimateSolid(g.volume * (g.count + (g.spares ?? 0)), g.d, o));
+  const pinEstimates = printed.map((g) => estimateSolid(g.volume * (g.count + (g.spares ?? 0)) + (g.strip > 0 ? g.strip : 0), g.d, o));
   const pinRow = printed.length
-    ? { count: pinCount, estimate: pinEstimates.reduce((sum, e) => ({ plastic: sum.plastic + e.plastic, grams: add(sum.grams, e.grams), metres: add(sum.metres, e.metres), hours: add(sum.hours, e.hours) })) }
+    ? { count: pinCount, strip: printed.some((g) => g.strip > 0), estimate: pinEstimates.reduce((sum, e) => ({ plastic: sum.plastic + e.plastic, grams: add(sum.grams, e.grams), metres: add(sum.metres, e.metres), hours: add(sum.hours, e.hours) })) }
     : null;
   const partRows = parts.map((p) => ({ name: p.name, estimate: estimatePiece(p, o) }));
   const all = [...rows, ...partRows, ...(pinRow ? [pinRow] : [])].map((r) => r.estimate);
@@ -403,7 +403,7 @@ export function planSheetLines(job, given, bed = null) {
     out.push(`  ${pad(name, 15)}${words.length ? words.map((w, i) => (i < words.length - 1 ? pad(w, i ? 28 : 18) : w)).join('') : 'not measured'}${more}`);
   };
   for (const r of [...plan.pieces].sort((p, q) => p.index - q.index)) line(`piece ${r.index} of ${n}`, r.estimate);
-  if (plan.pins) out.push(`  ${pad('pins', 15)}${gramsWords(plan.pins.estimate.grams)} for ${count(plan.pins.count, 'pin')}, printed solid`);
+  if (plan.pins) out.push(`  ${pad('pins', 15)}${gramsWords(plan.pins.estimate.grams)} for ${count(plan.pins.count, 'pin')}${plan.pins.strip ? ' and their holding strip' : ''}, printed solid`);
   plan.parts.forEach((p, i) => line(`part ${i + 1}`, p.estimate));
   const [total, ...rest] = jobWords(plan, o);
   out.push(`  ${total.replace(/^Whole job/, 'WHOLE JOB')}`);

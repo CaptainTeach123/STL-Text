@@ -26,7 +26,7 @@ import {
 import { checkRow, printCheck, shownFaces } from './printCheck.js';
 import {
   buildSplitDisplay, carveParts, checkPart, clearSplitCaches, couponRow, cutPieces, drillPiece, fitTestCoupon, layoutSplit, lockFaces, lockMatrix, lockPieces, lockPoints, partFrame, partInFrame, partedSolids,
-  partRows, pinAt, pinSheet, pinSpares, pinsPerSheet, placePart, planDovetails, probeLip, shellCounts, tabsAcross, wayOverlaps,
+  partRows, pinAt, pinSheet, pinSpares, pinStripVolume, pinsPerSheet, placePart, planDovetails, probeLip, shellCounts, tabsAcross, wayOverlaps,
 } from './splitGeometry.js';
 import { EDGE_MOST, FINE_SPECK, LEAST_MOST, WAY_START, WAY_STEP, findParts, fineSlices, freeWindows, sliceStack } from './partFinder.js';
 import { plugLayoutOk, scalePercent, seatSizes, sizes, slitBridge, takesTeaLight } from './locks.js';
@@ -113,7 +113,7 @@ import { HANG, columnGraph, columnsOf, heldParts, looseTable, moveCut, planeGrid
  *                                                          partFinder.js)
  *   split.fitTest { items?, baseVersion?, split, printing, bed?, name, dovetail? }
  *                                                       -> { stl, name, triangles, diameter, pins, dovetail, pegs, pegSize,
- *                                                          apart }
+ *                                                          apart, strip? } (`strip`: its pin is on a holding strip)
  *   ping        {}                                      -> { ready: true, caches }
  *
  * `display` = { positions, normals, index, passthroughStart, bvhRoots } —
@@ -133,6 +133,9 @@ import { HANG, columnGraph, columnsOf, heldParts, looseTable, moveCut, planeGrid
  * each axis (but where a detail kept whole is longer), and the pieces'
  * notes suggest no move of a cut that would make one longer; it never makes
  * a piece too big, nor is it sent with a measure or a fit test.
+ * `printing` is { nozzle, layerHeight } and, for a split's printed pins,
+ * `pinStrip`: false leaves out the thin strip that holds them to the bed
+ * (on the pins files and under the fit test's pin); anything else has it.
  *
  * Final geometry has fixed semantics regardless of item order:
  *   union(model, all raised text) minus union(all cut-in text).
@@ -2604,7 +2607,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const wide = cap < Infinity && keeps.length ? wideKeeps(keeps, cap, withSoup(splitBounds(work), work.passthrough), planEnds(spec, nozzle).minEnd) : null;
     // what each finished piece asks of the printer, lying as its file lies
     const checks = pieceChecks(final, { final: work, cut, laid, lying, drill, cuts }, progress);
-    return summarise({ final: work, spec, cuts, U, given, plan, cut, laid, lying, drill, parted: parted.carved ? parted : null, keeps, cap, wide, checks, hl });
+    return summarise({ final: work, spec, cuts, U, given, plan, cut, laid, lying, drill, parted: parted.carved ? parted : null, keeps, cap, wide, checks, hl, strip: pinStripOf(printing) });
   }
 
   /**
@@ -3320,6 +3323,15 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     }
   }
 
+  /** Whether printed pins stand on the strip that holds them to the bed: the Printing setting, on unless turned off. */
+  const pinStripOf = (printing) => printing?.pinStrip !== false;
+
+  /** How many pins each of a group's pins files holds: all of them (spares too) shared out evenly over the files. */
+  function sheetCounts(all, perSheet) {
+    const sheets = Math.ceil(all / perSheet);
+    return Array.from({ length: sheets }, (_, i) => Math.floor(all / sheets) + (i < all % sheets ? 1 : 0));
+  }
+
   /** The volume of one printed pin of a group's size (mm³), for the print plan; 0 where it could not be made. */
   function pinVolume(g) {
     try {
@@ -3414,7 +3426,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * next to them (`heldNotes`, the slice graph) have notes of their own.
    */
   function summarise(split) {
-    const { final, spec, cuts, U, given, plan, cut, laid, lying, drill, parted = null, keeps = [], cap = Infinity, wide = null, checks = null, hl = 0.2 } = split;
+    const { final, spec, cuts, U, given, plan, cut, laid, lying, drill, parted = null, keeps = [], cap = Infinity, wide = null, checks = null, hl = 0.2, strip = false } = split;
     const { layout } = drill;
     const measures = drill.measures ?? new Map();
     const n = laid.length;
@@ -3552,8 +3564,13 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       .map((g) => {
         const own = spec.pins === 'own' || g.d === FILAMENT;
         const spares = own ? 0 : pinSpares(g.count);
-        // as many pins files as the bed takes them, as the download lays them out (`splitExport`)
-        return { ...g, own, spares, sheets: own ? 0 : Math.ceil((g.count + spares) / pinsPerSheet(g, U).perSheet), ...(own ? {} : { volume: pinVolume(g) }) };
+        if (own) return { ...g, own, spares, sheets: 0 };
+        // as many pins files as the bed takes them, as the download lays them out (`splitExport`), each column of
+        // every file on its holding strip when the pins get one
+        const { perSheet, room } = pinsPerSheet(g, U, { strip });
+        const counts = sheetCounts(g.count + spares, perSheet);
+        const held = strip ? { strip: counts.reduce((v, count) => v + pinStripVolume({ ...g, count }, room), 0) } : {};
+        return { ...g, own, spares, sheets: counts.length, volume: pinVolume(g), ...held };
       });
     const notes = [];
     const main = pins[0];
@@ -3576,7 +3593,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     for (const g of pins) {
       // pins that fell back to filament on some faces are told of by that cut's own note
       if (g.d === FILAMENT && layout.diameter !== FILAMENT) continue;
-      notes.push(splitNote('PINS', { count: g.count, spares: g.spares, diameter: g.d, length: g.length, own: g.own, sheets: g.sheets }));
+      notes.push(splitNote('PINS', { count: g.count, spares: g.spares, diameter: g.d, length: g.length, own: g.own, sheets: g.sheets, ...(g.strip ? { strip: true } : {}) }));
     }
     for (const x of cut.dovetails) {
       const seam = seams.find((s) => s.cutId === x.cutId && s.joint === 'dovetail');
@@ -3640,8 +3657,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       if (!fitsBed(size, U, { flat: 2 }).fits) notes.push(splitNote('PART_TOO_BIG', { itemId: p.id, name: p.name, size, bed: U }));
     }
     for (const g of pins) {
-      const one = g.own ? null : pinsPerSheet(g, U).size;
-      if (one && !fitsBed(one, U, { flat: 2 }).fits) notes.push(splitNote('PART_TOO_BIG', { pins: true, size: one, bed: U }));
+      const one = g.own ? null : pinsPerSheet(g, U, { strip }).size;
+      if (!one || fitsBed(one, U, { flat: 2 }).fits) continue;
+      // a pin that would fit on its own, were it not for the strip that holds it to the bed, is said to be so
+      const bare = strip && fitsBed(pinsPerSheet(g, U).size, U, { flat: 2 }).fits;
+      notes.push(splitNote('PART_TOO_BIG', { pins: true, size: one, bed: U, ...(bare ? { strip: true } : {}) }));
     }
     lying.forEach((o, i) => {
       // a piece on a dovetail seam lies flat by design, and one carrying pegs never lies on them: that it cannot lie on
@@ -3676,8 +3696,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     };
   }
 
-  /** A split's pin groups as the print plan takes them: each size's count, spares and one pin's volume. */
-  const planPins = (pins) => pins.map((g) => ({ d: g.d, length: g.length, count: g.count, spares: g.spares, own: g.own, volume: g.volume ?? 0 }));
+  /**
+   * A split's pin groups as the print plan takes them: each size's count, spares and one pin's volume, and the volume
+   * of the strips that hold them to the bed where they get them.
+   */
+  const planPins = (pins) => pins.map((g) => ({ d: g.d, length: g.length, count: g.count, spares: g.spares, own: g.own, volume: g.volume ?? 0, ...(g.strip ? { strip: g.strip } : {}) }));
 
   /** The `result` reply with a split: the pieces exploded apart in the viewer, one range per piece, pin and part. */
   function splitResult(final, split, progress) {
@@ -3838,12 +3861,13 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     for (const g of split.pins) {
       if (g.own) continue;
       // as many pins files as the bed needs, each lying as it is laid out
-      const all = g.count + g.spares;
-      const { perSheet, room } = pinsPerSheet(g, U);
-      const sheets = Math.ceil(all / perSheet);
+      const strip = g.strip > 0; // on the strip that holds them to the bed, as the split counted its files
+      const { perSheet, room } = pinsPerSheet(g, U, { strip });
+      const counts = sheetCounts(g.count + g.spares, perSheet); // shared out evenly
+      const sheets = counts.length;
       for (let i = 0; i < sheets; i++) {
-        const count = Math.floor(all / sheets) + (i < all % sheets ? 1 : 0); // shared out evenly
-        const sheet = pinSheet({ d: g.d, length: g.length, count }, room);
+        const count = counts[i];
+        const sheet = pinSheet({ d: g.d, length: g.length, count }, room, { strip });
         try {
           const b = boxOf(sheet);
           const size = b.max.map((v, a) => v - b.min[a]);
@@ -5896,7 +5920,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const shells = [];
       if (others) {
         shells.push(temps.add(fitTestCoupon({ ...spec, diameter: uses.pegs ? uses.pegSize : uses.diameter }, printing?.nozzle ?? 0.4, {
-          dovetail: uses.dovetail, pins: uses.pins, pegs: uses.pegs, apart: uses.apart,
+          dovetail: uses.dovetail, pins: uses.pins, pegs: uses.pegs, apart: uses.apart, strip: pinStripOf(printing),
         })));
       }
       let twist = null;
@@ -5918,6 +5942,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         message: {
           stl, name: file, triangles: soup.length / 9, diameter: uses.pins ? uses.diameter : null, pins: uses.pins, dovetail: uses.dovetail,
           pegs: uses.pegs, pegSize: uses.pegs ? uses.pegSize : null, apart: uses.apart, ...(twist ? { twist } : {}), ...(plug ? { plug } : {}),
+          // a printed pin lies in the row, on the strip that holds it to the bed when the pins get one
+          ...(others && uses.pins && !uses.pegs && uses.diameter !== FILAMENT && spec.pins !== 'own' && pinStripOf(printing) ? { strip: true } : {}),
         },
         transfer: [stl],
       };

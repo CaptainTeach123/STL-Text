@@ -31,7 +31,7 @@ const MODELS = {
 
 const BED = [210, 210, 249]; // the default printer's room: 220 × 220 × 250 less a 5 mm margin
 const MINI = [170, 170, 179]; // an A1 mini's room
-const PRINTING = Object.freeze({ nozzle: 0.4, layerHeight: 0.2 });
+const USUAL = Object.freeze({ nozzle: 0.4, layerHeight: 0.2 });
 
 const along = (axis, at, id) => ({ id, position: [0, 1, 2].map((a) => (a === axis ? at : 0)), normal: [0, 1, 2].map((a) => (a === axis ? 1 : 0)) });
 const apart = (at, hold, id = 'c1') => ({ ...along(2, at, id), joint: 'apart', hold });
@@ -39,7 +39,7 @@ const glued = (at, id = 'c1') => along(2, at, id);
 
 /**
  * Every case: a model, its split (the settings over the defaults) and the bed. `plan` asks Fit to my printer for its
- * cuts first, the cut given kept, and downloads the split it plans.
+ * cuts first, the cut given kept, and downloads the split it plans; `printing` is a Printing setting over the usual.
  */
 export const EXPORT_CASES = Object.freeze([
   { key: 'lantern/lock-190', model: 'lantern', split: { cuts: [apart(190, 'lock')] } },
@@ -52,6 +52,10 @@ export const EXPORT_CASES = Object.freeze([
   { key: 'lantern/dovetail-x0', model: 'lantern', split: { cuts: [along(0, 0, 'c1')], joint: 'dovetail' } },
   { key: 'lantern/fit-mini', model: 'lantern', split: { cuts: [apart(190, 'snap', 'c5')], labels: false }, bed: MINI, plan: true },
   { key: 'gothic/lock-174.5', model: 'gothic', split: { cuts: [apart(174.5, 'lock')] } },
+  // printed pins without the strip that holds them to the bed, then with it: without, the download and the fit test
+  // are what 'gothic/pins-190' was before there was a strip (taken first, as that case was: a fit test made a second
+  // time for the same split is the same solid with its triangles in another order)
+  { key: 'gothic/pins-190-no-strip', model: 'gothic', split: { cuts: [glued(190)], joint: 'dowels', diameter: 5 }, printing: { pinStrip: false } },
   { key: 'gothic/pins-190', model: 'gothic', split: { cuts: [glued(190)], joint: 'dowels', diameter: 5 } },
   { key: 'gothic/own-pins-190', model: 'gothic', split: { cuts: [glued(190)], joint: 'dowels', pins: 'own' } },
   { key: 'gothic/pegs-190', model: 'gothic', split: { cuts: [glued(190)], joint: 'pegs' } },
@@ -97,21 +101,22 @@ export async function openExports() {
     }
     loaded = name;
   };
-  const digest = async ({ model, split: patch, bed = BED, plan = false }) => {
+  const digest = async ({ model, split: patch, bed = BED, plan = false, printing: asked = null }) => {
     await load(model);
+    const printing = asked ? { ...USUAL, ...asked } : USUAL;
     let split = { ...SPLIT_DEFAULTS, ...patch };
     const out = {};
     if (plan) {
-      const p = await client.planSplit([], version, { printing: PRINTING, split, bed, mode: 'fit' });
+      const p = await client.planSplit([], version, { printing, split, bed, mode: 'fit' });
       out.plan = sha(JSON.stringify(p));
       const highest = Math.max(...split.cuts.map((c) => Number(c.id.slice(1))));
       const added = p.cuts.filter((c) => !c.id).map((c, i) => ({ id: `c${highest + 1 + i}`, ...c }));
       split = { ...split, cuts: [...p.cuts.filter((c) => c.id), ...added] };
     }
-    const ex = await client.export([], version, model, { printing: PRINTING, split, bed, archive: 'files' });
+    const ex = await client.export([], version, model, { printing, split, bed, archive: 'files' });
     out.files = Object.fromEntries(ex.files.map((f) => [f.file, sha(f.stl ?? f.text)]));
     out.notes = sha(ex.notes.map((n) => `${n.level}:${n.code}: ${n.text}`).join('\n'));
-    const fit = await client.fitTest([], version, { printing: PRINTING, split, bed, name: model });
+    const fit = await client.fitTest([], version, { printing, split, bed, name: model });
     const { stl, ...about } = fit;
     out.fit = `${stl ? sha(stl) : '-'} ${sha(JSON.stringify(about))}`;
     return out;

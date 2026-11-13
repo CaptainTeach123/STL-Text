@@ -2076,6 +2076,21 @@ describe('files and the glue sheet', () => {
     expect(lines).toContain('  piece 1 of 2   150.0 × 40.0 × 20.0 mm   lies flat as modelled   fits');
     expect(lines).toContain('  pins           3 × Ø6 × 19 mm (one spare), lying on a flat side, solid (4+ walls)');
     expect(lines).toContain('                 or Ø6 mm wooden dowels cut to 19 mm');
+    expect(text).not.toContain('strip');
+    // pins on their holding strip: two more lines under the pins', before the dowels
+    const held = howToGlueText({
+      name: 'long-bar-text',
+      pieces: [{ index: 1, cell: [0, 0, 0], size: [150, 40, 20], lies: 'flat as modelled', fits: true }, { index: 2, cell: [1, 0, 0], size: [150, 40, 20], lies: 'flat as modelled', fits: true }],
+      seams: [{ letter: 'A', axis: 0, at: 0, pieces: [1, 2], joint: 'dowels', dowels: 2, labels: ['1A', '2A'] }],
+      pins: [{ d: 6, length: 19, count: 2, spares: 1, strip: 240 }, { d: 5, length: 16, count: 2, own: true, strip: 0 }],
+    }).split('\n');
+    const at = held.indexOf('  pins           3 × Ø6 × 19 mm (one spare), lying on a flat side, solid (4+ walls)');
+    expect(held.slice(at + 1, at + 4)).toEqual([
+      '                 on a thin strip that holds them to the bed: print with a 0.2 mm first layer and no brim,',
+      '                 where the file puts them (no auto-arrange); then peel the strip off and snap the pins out',
+      '                 or Ø6 mm wooden dowels cut to 19 mm',
+    ]);
+    expect(held.filter((l) => l.includes('strip'))).toHaveLength(2);
     expect(text).toContain('DRY-FIT FIRST');
     expect(text).toContain('GLUE – put each letter on the same letter (medium/thick CA or 5-minute epoxy; holes have 0.15 mm of room per side)');
     expect(text).toContain('1A ↔ 2A');
@@ -2443,6 +2458,13 @@ describe('notes', () => {
     expect(splitNote('PINS', { count: 48, spares: 12, diameter: 6, length: 19, sheets: 2 }).text).toBe('Print the 2 pins files (60 pins, 12 spares) lying flat – or use Ø6 mm wooden dowels cut to 19 mm.');
     expect(splitNote('PINS', { count: 4, spares: 1, diameter: 6, length: 19, sheets: 1 }).text).toMatch(/^Print the pins file \(/);
     expect(splitNote('PINS', { count: 4, diameter: 5, length: 16, own: true }).text).toMatch(/cut 4 Ø5 mm dowels to 16 mm/);
+    // on their holding strip: how to print it and get the pins off it
+    expect(splitNote('PINS', { count: 4, spares: 1, diameter: 6, length: 19, strip: true }).text).toBe(
+      'Print the pins file (5 pins, one spare) lying flat – or use Ø6 mm wooden dowels cut to 19 mm. The pins come on a thin strip that holds them to the bed: print it with a 0.2 mm first layer and no brim, where the file puts it (no auto-arrange), then peel the strip off and snap the pins out.',
+    );
+    expect(splitNote('PINS', { count: 48, spares: 12, diameter: 6, length: 19, sheets: 2, strip: true }).text).toContain('print each file with a 0.2 mm first layer and no brim');
+    // pins that are not printed have no strip to speak of
+    expect(splitNote('PINS', { count: 4, diameter: 5, length: 16, own: true, strip: true }).text).not.toContain('strip');
     expect(splitNote('CONNECTORS_SHORTER', { letter: 'B', depth: 3.5 }).text).toBe('Cut B uses 3.5 mm-deep holes – deeper ones would break through the side.');
     expect(splitNote('CONNECTORS_FILAMENT', { letter: 'C', count: 4, diameter: 6, length: 8 }).text).toBe('Cut C is too narrow for Ø6 pins: its holes take 1.75 mm filament – cut 4 pieces 8 mm long.');
     expect(splitNote('HOLES_FLAT_TOP', { letter: 'B', count: 2 })).toMatchObject({

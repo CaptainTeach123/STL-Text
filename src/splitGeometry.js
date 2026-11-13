@@ -103,6 +103,14 @@ const LABEL_SMALLEST = 3;
  * across it breaks off instead of webbing two pins together, and that the part fan's air gets between them.
  */
 const PIN_GAP = 12;
+/**
+ * The strip that holds printed pins to the bed (mm): a pin lying on its narrow flat touches the bed along a line too
+ * thin to hold it, so each column of pins on a sheet stands in a slab one first layer thick (`thick`: the 0.2 mm a
+ * slicer lays first by default, whatever the layers above it are) that reaches `reach` past the pins on every side.
+ * The pins are where they are without it: the slab is joined to their lowest 0.2 mm, peeled off the bed with them and
+ * the pins snapped out. `reach` is less than half of `PIN_GAP`, so the strips of two columns stay apart.
+ */
+export const PIN_STRIP = Object.freeze({ reach: 5, thick: 0.2 });
 /** The gap between the parts of the fit test (mm). */
 const COUPON_GAP = 5;
 /** A dovetail tab's root on its own side, the room it needs inside the plate, and the rounding of every corner (mm). */
@@ -470,6 +478,27 @@ function lyingPin(pin) {
   }
 }
 
+/**
+ * Pins lying on the bed made one solid with the strip that holds them down (`PIN_STRIP`): a slab from their lowest
+ * point up, reaching past the box they fill together on every side. The pins stay where they are.
+ * @param {Manifold[]} pins the caller's
+ * @returns {Manifold}
+ */
+function onStrip(pins) {
+  const { Manifold } = manifold();
+  const t = scope();
+  try {
+    const boxes = pins.map(boxOf);
+    const min = [0, 1, 2].map((a) => Math.min(...boxes.map((b) => b.min[a])));
+    const max = [0, 1].map((a) => Math.max(...boxes.map((b) => b.max[a])));
+    const { reach, thick } = PIN_STRIP;
+    const slab = t.add(t.add(Manifold.cube([max[0] - min[0] + 2 * reach, max[1] - min[1] + 2 * reach, thick])).translate([min[0] - reach, min[1] - reach, min[2]]));
+    return Manifold.union([slab, ...pins]);
+  } finally {
+    t.dispose();
+  }
+}
+
 /** Shells laid out in a row along x, `gap` apart, the row centred on x = y = 0 and standing on z = 0. */
 function rowOf(shells, gap) {
   const { Manifold } = manifold();
@@ -511,22 +540,29 @@ function lyingPinBox(d, length) {
  * room that misses the corner even left in the middle of the bed – less
  * the corner's side twice off its width, or off its depth, whichever holds
  * more pins: a sheet can be any shape, so it need not be moved by hand.
+ * With the holding strip (`PIN_STRIP`) the pins keep its reach from every
+ * side of that room, so the strip fits too: a sheet holds fewer pins where
+ * the last row or column no longer fits.
  * @param {{ d: number, length: number }} group
  * @param {number[]} U the usable bed
- * @returns {{ perSheet: number, size: number[], room: number[] }} `size` one pin's box as laid; `room` the room the
- *   sheet is laid out in (for `pinSheet`), the bed's own without a corner
+ * @param {{ strip?: boolean }} [options] `strip`: the pins stand on the holding strip
+ * @returns {{ perSheet: number, size: number[], room: number[] }} `size` the box of a sheet of one pin as laid (the
+ *   pin's own without the strip); `room` the room the sheet is laid out in (for `pinSheet`), the bed's own without a
+ *   corner
  */
-export function pinsPerSheet({ d, length }, U) {
+export function pinsPerSheet({ d, length }, U, { strip = false } = {}) {
   const b = lyingPinBox(d, length);
-  const size = b.max.map((v, a) => v - b.min[a]);
+  const edge = strip ? 2 * PIN_STRIP.reach : 0;
+  const one = b.max.map((v, a) => v - b.min[a]);
+  const size = [one[0] + edge, one[1] + edge, one[2]];
   const corner = bedCorner(U);
   const rooms = corner
     ? [[Math.max(1, U[0] - 2 * corner[0]), U[1]], [U[0], Math.max(1, U[1] - 2 * corner[1])]]
     : [[U[0], U[1]]];
   let best = null;
   for (const [w, h] of rooms) {
-    const perRow = Math.max(1, Math.floor((w + PIN_GAP) / (size[0] + PIN_GAP)));
-    const rows = Math.max(1, Math.floor((h + PIN_GAP) / (size[1] + PIN_GAP)));
+    const perRow = Math.max(1, Math.floor((w - edge + PIN_GAP) / (one[0] + PIN_GAP)));
+    const rows = Math.max(1, Math.floor((h - edge + PIN_GAP) / (one[1] + PIN_GAP)));
     if (!best || perRow * rows > best.perSheet) best = { perSheet: perRow * rows, room: [w, h, U[2]] };
   }
   return { perSheet: best.perSheet, size, room: best.room };
@@ -538,12 +574,18 @@ export function pinsPerSheet({ d, length }, U) {
  * wrapped to the bed's width, `PIN_GAP` apart along a row and between rows
  * so each prints clean on its own. Centred on x = y = 0, standing
  * on z = 0. Put spares in `count` (`pinSpares`); more than the bed takes
- * (`pinsPerSheet`) go in more than one file.
+ * (`pinsPerSheet`) go in more than one file. With the holding strip
+ * (`PIN_STRIP`) the pins are exactly where they are without it, and every
+ * column of them (the pins one behind the other along y) is one solid with
+ * a thin slab under it that reaches past its pins on every side – as wide
+ * as a pin is long and a little more, so the strips of two columns stay
+ * 2 mm apart and peel off one at a time.
  * @param {{ d: number, length: number, count: number }} group
  * @param {number[]|null} U the room to lay it out in, `pinsPerSheet`'s (only its x is used)
+ * @param {{ strip?: boolean }} [options] `strip`: the pins stand on the holding strip (as `pinsPerSheet` was asked)
  * @returns {Manifold}
  */
-export function pinSheet({ d, length, count }, U = null) {
+export function pinSheet({ d, length, count }, U = null, { strip = false } = {}) {
   const { Manifold } = manifold();
   const t = scope();
   try {
@@ -551,7 +593,7 @@ export function pinSheet({ d, length, count }, U = null) {
     const b = boxOf(one);
     const sx = b.max[0] - b.min[0];
     const sy = b.max[1] - b.min[1];
-    const perRow = Math.max(1, Math.floor(((U?.[0] ?? 200) + PIN_GAP) / (sx + PIN_GAP)));
+    const perRow = Math.max(1, Math.floor(((U?.[0] ?? 200) - (strip ? 2 * PIN_STRIP.reach : 0) + PIN_GAP) / (sx + PIN_GAP)));
     const rows = Math.ceil(count / perRow);
     const cols = Math.min(count, perRow);
     const x0 = -(cols * sx + (cols - 1) * PIN_GAP) / 2 - b.min[0];
@@ -562,10 +604,32 @@ export function pinSheet({ d, length, count }, U = null) {
       const row = Math.floor(i / perRow);
       pins.push(t.add(one.translate([x0 + col * (sx + PIN_GAP), y0 + row * (sy + PIN_GAP), -b.min[2]])));
     }
-    return Manifold.compose(pins);
+    if (!strip) return Manifold.compose(pins);
+    // a column's pins are every `perRow`th: each column on a strip of its own
+    return Manifold.compose(Array.from({ length: cols }, (_, col) => t.add(onStrip(pins.filter((_pin, i) => i % perRow === col)))));
   } finally {
     t.dispose();
   }
+}
+
+/**
+ * About how much plastic the holding strips of a pins file take (mm³): the slabs `pinSheet` lays under its columns,
+ * the little of each that a pin's own lowest 0.2 mm already fills counted too (a few parts in a hundred).
+ * @param {{ d: number, length: number, count: number }} group
+ * @param {number[]|null} U the room it is laid out in, as `pinSheet`'s
+ * @returns {number}
+ */
+export function pinStripVolume({ d, length, count }, U = null) {
+  const b = lyingPinBox(d, length);
+  const [sx, sy] = [b.max[0] - b.min[0], b.max[1] - b.min[1]];
+  const { reach, thick } = PIN_STRIP;
+  const perRow = Math.max(1, Math.floor(((U?.[0] ?? 200) - 2 * reach + PIN_GAP) / (sx + PIN_GAP)));
+  let volume = 0;
+  for (let col = 0; col < Math.min(count, perRow); col++) {
+    const n = Math.ceil((count - col) / perRow); // the pins in this column
+    volume += (sx + 2 * reach) * (n * sy + (n - 1) * PIN_GAP + 2 * reach) * thick;
+  }
+  return volume;
 }
 
 /**
@@ -575,7 +639,9 @@ export function pinSheet({ d, length, count }, U = null) {
  * hole (as on a piece printed on its side) and one pin; for built-in pegs
  * instead a block with one peg and a block with its socket, both lying on
  * their side as a bar's halves print them; for dovetails two small plates
- * with one tab (N = 6). Filament and your own dowels get no pin. Where a
+ * with one tab (N = 6). Filament and your own dowels get no pin; a printed
+ * pin lies on its narrow flat as on its sheet, and with `strip` on the same
+ * thin strip that holds it to the bed (`PIN_STRIP`). Where a
  * cut comes apart, a small closed box (60 × 30 × 24 mm, 4 mm walls, a 2 mm
  * floor and top) cut at 12 mm, with the same lip, clips and key at the same
  * clearance: the box standing upright, its lid on its cut face, as the
@@ -588,10 +654,11 @@ export function pinSheet({ d, length, count }, U = null) {
  * @param {{ dovetail?: boolean, pins?: boolean, pegs?: boolean, apart?: string|null }} options `dovetail` adds the
  *   plates (default: when the joint is set to dovetails); `pins: false` leaves the blocks and the pin out, for a split
  *   held by tabs or lips alone; `pegs` gives the peg and socket blocks in their place (default: when the joint is set
- *   to built-in pegs); `apart` the hold of a cut that comes apart, for the box and its lid
+ *   to built-in pegs); `apart` the hold of a cut that comes apart, for the box and its lid; `strip` puts the pin on the
+ *   strip that holds it to the bed
  * @returns {Manifold}
  */
-export function fitTestCoupon(spec = {}, nozzle = 0.4, { dovetail = spec.joint === 'dovetail', pins = true, pegs = spec.joint === 'pegs', apart = null } = {}) {
+export function fitTestCoupon(spec = {}, nozzle = 0.4, { dovetail = spec.joint === 'dovetail', pins = true, pegs = spec.joint === 'pegs', apart = null, strip = false } = {}) {
   const { Manifold } = manifold();
   const t = scope();
   try {
@@ -618,7 +685,10 @@ export function fitTestCoupon(spec = {}, nozzle = 0.4, { dovetail = spec.joint =
       const lying = t.add(t.add(Manifold.cube([side, long, side])).translate([-side / 2, 0, 0]));
       const drop = t.add(t.add(halfHole({ ...hole, tear: true })).transform(localFrame('+y', '+z', [0, 0, side / 2])));
       shells.push(t.add(lying.subtract(drop)));
-      if (D !== FILAMENT && spec.pins !== 'own') shells.push(t.add(lyingPin(pinOf(D, s.depth))));
+      if (D !== FILAMENT && spec.pins !== 'own') {
+        const pin = t.add(lyingPin(pinOf(D, s.depth)));
+        shells.push(strip ? t.add(onStrip([pin])) : pin);
+      }
     }
     if (dovetail) {
       const plate = t.add(t.add(Manifold.cube([80, 30, 5], true)).translate([0, 0, 2.5]));

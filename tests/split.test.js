@@ -275,7 +275,8 @@ describe('cutting a model into pieces', () => {
 
   it('the pins file holds one pin per hole pair plus a spare, lying flat', async () => {
     await load(cube([120, 40, 30]));
-    const ex = await exportSplit(S({ diameter: 5, depth: 8, count: 2, labels: false }));
+    // the pins alone, without the strip that holds them to the bed (told of with the bed's room for them, below)
+    const ex = await client.export([], version, 'box', { printing: { ...printing, pinStrip: false }, split: S({ diameter: 5, depth: 8, count: 2, labels: false }), bed: BED, archive: 'files' });
     const sheet = ex.files.find((f) => f.kind === 'pins');
     expect(sheet).toMatchObject({ name: 'box-pins-3x-5x16mm', d: 5, length: 16, count: 3, spares: 1, fits: true });
     const pins = pieceSolid(sheet).decompose().map(own);
@@ -890,8 +891,9 @@ describe('checking and planning cuts', () => {
 
   it('pins go in as many files as the bed needs, each fitting lying as it is laid out', async () => {
     await load(cube([120, 40, 30]));
-    // three Ø5 × 16 pins (one spare) on a bed with room for two side by side (12 mm apart) and one row
-    const ex = await exportSplit(S({ diameter: 5, depth: 8, count: 2, labels: false }), { bed: [46, 12, 100] });
+    // three Ø5 × 16 pins (one spare) on a bed with room for two side by side (12 mm apart) and one row, without the
+    // strip that holds them to the bed
+    const ex = await client.export([], version, 'box', { printing: { ...printing, pinStrip: false }, split: S({ diameter: 5, depth: 8, count: 2, labels: false }), bed: [46, 12, 100], archive: 'files' });
     const pins = ex.files.filter((f) => f.kind === 'pins');
     expect(pins.map((f) => [f.name, f.count, f.fits])).toEqual([['box-pins-2x-5x16mm-1-of-2', 2, true], ['box-pins-1x-5x16mm-2-of-2', 1, true]]);
     expect(codes(ex)).not.toContain('PART_TOO_BIG');
@@ -906,6 +908,96 @@ describe('checking and planning cuts', () => {
     expect(noteOf(roomy, 'PINS')).toMatchObject({ sheets: 1 });
     expect(noteOf(roomy, 'PINS').text).toMatch(/^Print the pins file \(3 pins, one spare\) lying flat/);
     expect(roomy.files.find((f) => f.kind === 'text').text).not.toContain('pins files');
+  });
+
+  it('printed pins come on a thin strip that holds them to the bed, unless the Printing setting turns it off', async () => {
+    await load(cube([120, 40, 30]));
+    const split = S({ diameter: 5, depth: 8, count: 2, labels: false });
+    const bare = await client.export([], version, 'box', { printing: { ...printing, pinStrip: false }, split, bed: BED, archive: 'files' });
+    const held = await exportSplit(split); // nothing said: the strip is there
+    const asked = await client.export([], version, 'box', { printing: { ...printing, pinStrip: true }, split, bed: BED, archive: 'files' });
+    const bytes = (f) => Buffer.from(f.stl ?? f.text).toString('base64');
+    expect(asked.files.map(bytes)).toEqual(held.files.map(bytes));
+    // the pieces are the same files either way; the pins file has the same name and the same three pins
+    expect(piecesOf(held).map(bytes)).toEqual(piecesOf(bare).map(bytes));
+    const [plain, strip] = [bare, held].map((ex) => ex.files.find((f) => f.kind === 'pins'));
+    expect(strip).toMatchObject({ name: 'box-pins-3x-5x16mm', d: 5, length: 16, count: 3, spares: 1, fits: true });
+    expect(plain).toMatchObject({ name: 'box-pins-3x-5x16mm', count: 3, spares: 1, fits: true });
+    expect(pieceSolid(plain).decompose().map(own)).toHaveLength(3);
+    // one row of three: three columns of one pin, each on a strip of its own 5 mm wider all round
+    const columns = pieceSolid(strip).decompose().map(own);
+    expect(columns).toHaveLength(3);
+    for (const c of columns) expect(boxOf(c).size.map((v) => v.toFixed(3))).toEqual(['26.000', '14.619', '4.619']);
+    expect(strip.size.map((v) => +v.toFixed(3))).toEqual([plain.size[0] + 10, +(plain.size[1] + 10).toFixed(3), +plain.size[2].toFixed(3)]);
+    expect(boxOf(pieceSolid(strip)).min[2]).toBeCloseTo(0, 6);
+    // every pin of the plain file is in the strip's, where it was
+    expect(own(pieceSolid(plain).subtract(pieceSolid(strip))).volume()).toBeCloseTo(0, 3);
+    expect(pieceSolid(strip).volume() - pieceSolid(plain).volume()).toBeGreaterThan(0.9 * 3 * 26 * 14.619 * 0.2);
+    // the note and the sheet say how to print it and get the pins off; without the strip neither speaks of one
+    expect(codes(held)).toEqual(codes(bare));
+    expect(noteOf(held, 'PINS')).toMatchObject({ strip: true });
+    expect(noteOf(held, 'PINS').text).toMatch(/^Print the pins file \(3 pins, one spare\) lying flat .* The pins come on a thin strip that holds them to the bed: print it with a 0\.2 mm first layer and no brim, where the file puts it \(no auto-arrange\), then peel the strip off and snap the pins out\.$/);
+    expect(noteOf(bare, 'PINS').strip).toBeUndefined();
+    expect(noteOf(bare, 'PINS').text).not.toContain('strip');
+    const sheet = (ex) => ex.files.find((f) => f.kind === 'text').text;
+    expect(sheet(held)).toContain('on a thin strip that holds them to the bed: print with a 0.2 mm first layer and no brim,');
+    expect(sheet(held)).toContain('then peel the strip off and snap the pins out');
+    expect(sheet(held)).toMatch(/pins +about [\d.–]+ g for 3 pins and their holding strip, printed solid/);
+    expect(sheet(bare)).not.toContain('strip');
+    // the print plan counts the strips' plastic with the pins
+    expect(bare.measures.pins[0].strip).toBeUndefined();
+    expect(held.measures.pins[0].strip).toBeCloseTo(3 * 26 * 14.619397 * 0.2, 2);
+    // your own dowels: nothing printed, nothing said
+    const mine = await exportSplit({ ...split, pins: 'own' });
+    expect(noteOf(mine, 'PINS').text).not.toContain('strip');
+    expect(sheet(mine)).not.toContain('strip');
+  });
+
+  it('a pins file on its strip still fits the bed: fewer pins a file where the strip takes the room', async () => {
+    await load(cube([120, 40, 30]));
+    const split = S({ diameter: 5, depth: 8, count: 2, labels: false });
+    // room for two pins side by side and one row without the strip: with it (10 mm more each way) a pin a file
+    const bed = [46, 15, 100];
+    const bare = await client.export([], version, 'box', { printing: { ...printing, pinStrip: false }, split, bed, archive: 'files' });
+    expect(bare.files.filter((f) => f.kind === 'pins').map((f) => [f.name, f.count, f.fits])).toEqual([['box-pins-2x-5x16mm-1-of-2', 2, true], ['box-pins-1x-5x16mm-2-of-2', 1, true]]);
+    const held = await exportSplit(split, { bed });
+    const pins = held.files.filter((f) => f.kind === 'pins');
+    expect(pins.map((f) => [f.name, f.count, f.fits])).toEqual([['box-pins-1x-5x16mm-1-of-3', 1, true], ['box-pins-1x-5x16mm-2-of-3', 1, true], ['box-pins-1x-5x16mm-3-of-3', 1, true]]);
+    for (const f of pins) {
+      expect(f.size[0]).toBeLessThanOrEqual(bed[0]);
+      expect(f.size[1]).toBeLessThanOrEqual(bed[1]);
+    }
+    expect(noteOf(held, 'PINS')).toMatchObject({ sheets: 3, strip: true });
+    expect(noteOf(held, 'PINS').text).toContain('print each file with a 0.2 mm first layer');
+    // a bed the pin fits but its strip does not: told of, as a pin too long is
+    const tight = await exportSplit(split, { bed: [20, 12, 100] });
+    expect(noteOf(tight, 'PART_TOO_BIG')).toMatchObject({ pins: true, strip: true });
+    expect(noteOf(tight, 'PART_TOO_BIG').text).toMatch(/^The pins fit your printer, but not on the strip that holds them to the bed \(26 × 14\.6 × 4\.6 mm; .*\) – turn off "Hold printed pins down with a thin strip" under Printing, or use wooden dowels\.$/);
+    const loose = await client.export([], version, 'box', { printing: { ...printing, pinStrip: false }, split, bed: [20, 12, 100], archive: 'files' });
+    expect(codes(loose)).not.toContain('PART_TOO_BIG');
+  });
+
+  it("the fit test's pin lies on the same strip, and without the setting the fit test is as it was", async () => {
+    await load(cube([120, 40, 30]));
+    const split = S({ diameter: 5, depth: 8, count: 2, labels: false });
+    const bare = await client.fitTest([], version, { printing: { ...printing, pinStrip: false }, split, bed: BED, name: 'box' });
+    const held = await client.fitTest([], version, { printing, split, bed: BED, name: 'box' });
+    expect(bare.strip).toBeUndefined();
+    expect(held).toMatchObject({ pins: true, diameter: 5, strip: true });
+    const [plain, strip] = [bare, held].map((r) => own(solidOfStl(r.stl)));
+    expect(strip.decompose().map(own)).toHaveLength(plain.decompose().map(own).length);
+    // two blocks and a pin in a row, 5 mm apart: the row is 10 mm longer for the strip, and no taller
+    expect(boxOf(strip).size[0]).toBeCloseTo(boxOf(plain).size[0] + 10, 4);
+    expect(boxOf(strip).size[2]).toBeCloseTo(boxOf(plain).size[2], 4);
+    expect(strip.volume() - plain.volume()).toBeGreaterThan(0.9 * 26 * 14.619 * 0.2);
+    expect(strip.volume() - plain.volume()).toBeLessThan(26 * 14.619 * 0.2);
+    // your own dowels and built-in pegs have no printed pin: no strip, the same file
+    for (const patch of [{ pins: 'own' }, { joint: 'pegs' }]) {
+      const off = await client.fitTest([], version, { printing: { ...printing, pinStrip: false }, split: { ...split, ...patch }, bed: BED, name: 'box' });
+      const on = await client.fitTest([], version, { printing, split: { ...split, ...patch }, bed: BED, name: 'box' });
+      expect(on.strip).toBeUndefined();
+      expect(Buffer.from(on.stl).equals(Buffer.from(off.stl))).toBe(true);
+    }
   });
 });
 
@@ -1826,7 +1918,9 @@ describe('the engine around a split', () => {
     await load(cube([300, 40, 20]), 'bar');
     let r = await client.fitTest([], version, { printing, split: S(), bed: BED, name: 'bar' });
     expect(r).toMatchObject({ diameter: 6, pins: true, dovetail: false });
-    expect(shellSizes(r)).toContainEqual([5.543, 5.543, 19]);
+    // lying on its holding strip, 5 mm wider all round
+    expect(r.strip).toBe(true);
+    expect(shellSizes(r)).toContainEqual([5.543, 15.543, 29]);
     // a sign joined by dovetail tabs alone (joint Auto): two plates with a tab, and no pin it would never use
     await load(cube([400, 100, 4]), 'sign');
     r = await client.fitTest([], version, { printing, split: S(), bed: BED, name: 'sign' });
@@ -3777,7 +3871,13 @@ describe('the print plan', () => {
     expect(ex.measures).toEqual(r.measures);
     // the pins file holds that many of them
     const file = ex.files.find((f) => f.kind === 'pins');
-    expect(volumeOfStl(file.stl)).toBeCloseTo(g.volume * file.count, 0);
+    // and the strip that holds them to the bed, whose plastic is counted a little over (where a pin stands in it)
+    const strip = volumeOfStl(file.stl) - g.volume * file.count;
+    expect(strip).toBeGreaterThan(0.9 * g.strip);
+    expect(strip).toBeLessThan(g.strip);
+    const bare = await client.export([], version, 'bar', { printing: { ...printing, pinStrip: false }, split: S({ labels: false, diameter: 5 }), bed: BED, archive: 'files' });
+    expect(bare.measures.pins[0].strip).toBeUndefined();
+    expect(volumeOfStl(bare.files.find((f) => f.kind === 'pins').stl)).toBeCloseTo(g.volume * file.count, 0);
     const mine = await resultSplit(S({ labels: false, diameter: 5, pins: 'own' }));
     expect(mine.measures.pins.map((x) => [x.own, x.volume])).toEqual([[true, 0]]);
   });
@@ -3793,7 +3893,7 @@ describe('the print plan', () => {
     expect(block).toEqual(planSheetLines({ pieces: ex.pieces, pins: ex.measures.pins, parts: [], pegSize: ex.pegSize }, { nozzle: 0.4, layerHeight: 0.2 }, BED));
     expect(block[1]).toBe('  The files are solid models. Your slicer prints them mostly hollow: a few walls outside and a light pattern (the infill) inside.');
     expect(block[2]).toMatch(/^ {2}piece 1 of 2 {3}about \d+–\d+ g {2,}about [\d.–]+ m of filament {2,}very roughly (up to \d+|\d+–\d+) hours$/);
-    expect(block[4]).toMatch(/^ {2}pins {11}about [\d.–]+ g for \d+ pins, printed solid$/);
+    expect(block[4]).toMatch(/^ {2}pins {11}about [\d.–]+ g for \d+ pins and their holding strip, printed solid$/);
     // the sheet tells the reader once how to print the pins: on its pins line in the PRINT list, over this block, so the
     // block's suggestions are the page's less that one
     const said = sheet.split('\n').filter((l) => /^ {2}pins .*lying on a flat side, solid \(4\+ walls\)$/.test(l));

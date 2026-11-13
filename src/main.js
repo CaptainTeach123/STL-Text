@@ -46,6 +46,10 @@ const fonts = new Map(); // fontId -> { label, group }
 const partAssets = new Map(); // partId -> { name, info }
 let partCount = 0;
 const printing = { nozzle: 0.4, layerHeight: 0.2 };
+// whether printed pins come on a thin strip that holds them to the bed (not in `printing`: no preview waits on it)
+const pinHold = { strip: true };
+/** The printing settings as a split takes them: with whether its printed pins come on their holding strip. */
+const splitPrinting = () => ({ ...printing, pinStrip: pinHold.strip });
 // what the print estimate is worked out for (not in `printing`: it changes no geometry, so no preview waits on it)
 const printPlan = { ...PLAN_DEFAULTS };
 const defaults = { fontId: 'inter', size: 10, mode: 'emboss', depth: 1.5, quality: 'normal', roundCorners: false };
@@ -236,6 +240,7 @@ function loadSettings() {
   try {
     const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}');
     Object.assign(printing, saved.printing ?? {});
+    if (typeof saved.pinStrip === 'boolean') pinHold.strip = saved.pinStrip;
     Object.assign(printPlan, planChoice(saved.printPlan));
     Object.assign(defaults, saved.defaults ?? {});
     if (!BUNDLED_FONTS.some((f) => f.id === defaults.fontId)) defaults.fontId = 'inter';
@@ -256,7 +261,7 @@ function loadSettings() {
 
 function saveSettings() {
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ printing, printPlan, defaults, bed, splitDefaults }));
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ printing, pinStrip: pinHold.strip, printPlan, defaults, bed, splitDefaults }));
   } catch {
     /* private mode etc. */
   }
@@ -1193,7 +1198,7 @@ async function showResult(on, { keep = false } = {}) {
   if (split) setSplitPending(true);
   try {
     if (!(await syncBase())) return; // the model is still being re-derived for a newer change, which re-renders
-    const r = await client.result(doc.items, version(), { printing, split, bed: usableBed(bed), ...largestOf() });
+    const r = await client.result(doc.items, version(), { printing: splitPrinting(), split, bed: usableBed(bed), ...largestOf() });
     if (!r || !$('resultToggle').checked || lastContentKey !== requestedFor || lastSplitKey !== splitFor) return; // stale
     const entering = viewer.viewMode !== 'pieces';
     if (r.pieces) viewer.setPieces(r.display, r.pieces, r.grid, waysOf(r.seams));
@@ -1297,7 +1302,7 @@ async function download() {
   try {
     if (!(await syncBase())) return setStatus('The model is still being updated – try the download again in a moment.', '');
     const r = await client.export(doc.items, version(), name, {
-      printing,
+      printing: splitPrinting(),
       split,
       bed: usableBed(bed),
       printer: { size: bedSize(bed), margin: bed.margin, corner: bedCorner(usableBed(bed)) }, // names the printer on the glue sheet
@@ -4650,7 +4655,7 @@ async function downloadFitTest() {
   setSplitPending(true);
   try {
     if (!(await syncBase())) return setStatus('The model is still being updated – try again in a moment.', '');
-    const r = await client.fitTest(doc.items, version(), { printing, split, bed: usableBed(bed), name: splitName() });
+    const r = await client.fitTest(doc.items, version(), { printing: splitPrinting(), split, bed: usableBed(bed), name: splitName() });
     if (!r) return;
     // it worked the split out and found no pins (or no pegs, or no lip) in it: the cuts planned to have them have none
     // (nor tabs, with no file)
@@ -4718,7 +4723,9 @@ async function downloadFitTest() {
     const lock = r.apart === 'lock'
       ? `${checks.length ? ' The lid' : ' the lid'} should lock onto the box and come off only with a firm pull – too stiff to open, raise the clearance by 0.05 mm; too loose, lower it.`
       : '';
-    setStatus(`Downloaded ${file.name} (${file.kb} KB).${tried}${lock}${rings}`, 'ok');
+    // its pin lies on the same thin strip as the pins of the pins file
+    const held = r.strip ? ' The pin comes on a thin strip that holds it to the bed: print with a 0.2 mm first layer and no brim, then peel the strip off and snap the pin out.' : '';
+    setStatus(`Downloaded ${file.name} (${file.kb} KB).${tried}${lock}${rings}${held}`, 'ok');
   } catch (err) {
     setStatus(friendly(err), 'error');
   } finally {
@@ -5202,7 +5209,7 @@ function render() {
   const shapeKey = stableKey({ items: doc.items, base: doc.state.baseVersion, nozzle: printing.nozzle });
   lastShapeKey = shapeKey;
   // the pieces also depend on the split, the printer and the nozzle – none of which is content the previews depend on
-  const splitKey = stableKey({ split: activeSplit(), bed: usableBed(bed), nozzle: printing.nozzle, ...largestOf() });
+  const splitKey = stableKey({ split: activeSplit(), bed: usableBed(bed), nozzle: printing.nozzle, pinStrip: pinHold.strip, ...largestOf() });
   const splitChanged = splitKey !== lastSplitKey;
   lastSplitKey = splitKey;
   // selecting an item lets go of the cut, and an undo can take the cut away
@@ -5419,6 +5426,14 @@ function bindControls() {
       refitParts(null);
     });
   }
+
+  // the strip under printed pins: remembered, and the pieces list, the pins files and the fit test follow
+  $('pinStrip').checked = pinHold.strip;
+  $('pinStrip').addEventListener('change', () => {
+    pinHold.strip = $('pinStrip').checked;
+    saveSettings();
+    render();
+  });
 
   // the material and infill of the print estimate: remembered, and the estimates follow at once (no file changes)
   $('planMaterial').replaceChildren(...Object.entries(MATERIALS).map(([id, m]) => new Option(m.name, id)));

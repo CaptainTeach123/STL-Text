@@ -545,6 +545,7 @@
             <label class="field inline"><span>Infill</span><input type="number" id="planInfill" min="0" max="100" step="5" value="15" /><span class="unit">%</span></label>
           </div>
           <p class="hint plan-note">For the print estimate only (weight, filament, rough time), which takes 2 walls. Downloads are solid models: the slicer makes them mostly hollow, with the infill you set there.</p>
+          <label class="check" title="Printed pins lie on a narrow flat and can come off the bed. With this on, each column of pins in a pins file (and the pin of the fit test) comes on a strip 0.2 mm thick that reaches 5 mm past the pins: print with a 0.2 mm first layer and no brim, then peel the strip off and snap the pins out. The pins themselves are the same either way"><input type="checkbox" id="pinStrip" checked /> Hold printed pins down with a thin strip</label>
           <div class="tools">
             <label class="field inline" title="The printer the pieces of a split must fit"><span>Printer</span><select id="bedPreset"></select></label>
             <p class="hint tiny" id="bedCornerHint" hidden>Keeps its front-left corner clear, as Bambu Studio does.</p>

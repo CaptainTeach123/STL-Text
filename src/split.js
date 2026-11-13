@@ -5206,12 +5206,15 @@ const NOTE_TEXT = {
     if (apart.length) s += ` ${apart.length > 1 ? `Cuts ${listOf(apart)} come apart – don't glue them.` : `Cut ${apart[0]} comes apart – don't glue it.`}`;
     return s;
   },
-  PINS: ({ count, spares = 0, diameter, length, own = false, sheets = 1 }) => {
+  PINS: ({ count, spares = 0, diameter, length, own = false, sheets = 1, strip = false }) => {
     if (diameter === FILAMENT) return `No pins file – cut ${plural(count, 'piece')} of 1.75 mm filament ${mm(length)} mm long.`;
     if (own) return `No pins file – cut ${count} Ø${mm(diameter)} mm dowels to ${mm(length)} mm.`;
     const spare = spares ? `, ${spares === 1 ? 'one spare' : `${spares} spares`}` : '';
     const files = sheets > 1 ? `the ${sheets} pins files` : 'the pins file';
-    return `Print ${files} (${plural(count + spares, 'pin')}${spare}) lying flat – or use Ø${mm(diameter)} mm wooden dowels cut to ${mm(length)} mm.`;
+    const held = strip
+      ? ` The pins come on a thin strip that holds them to the bed: print ${sheets > 1 ? 'each file' : 'it'} with a 0.2 mm first layer and no brim, where the file puts it (no auto-arrange), then peel the strip off and snap the pins out.`
+      : '';
+    return `Print ${files} (${plural(count + spares, 'pin')}${spare}) lying flat – or use Ø${mm(diameter)} mm wooden dowels cut to ${mm(length)} mm.${held}`;
   },
   DOVETAIL: ({ letter, tabs, pieces = [], pegs = false, apart = false }) => {
     const [lower, upper] = [pieces[0] ?? 1, pieces[1] ?? 2];
@@ -5347,8 +5350,9 @@ const NOTE_TEXT = {
       : `${pieceName(pieceIndex)} has nothing flat to stand on where it fits your printer – it rests on a curve or an edge and needs supports. Another cut through it gives it a flat face to lie on.`;
   },
   PRINT_CHECK: ({ pieceIndex, whole = false, auto = false, ...found }) => checkNoteWords(whole ? 'The model' : pieceName(pieceIndex), { ...found, whole, auto }),
-  PART_TOO_BIG: ({ name, size, bed, pins = false }) => {
+  PART_TOO_BIG: ({ name, size, bed, pins = false, strip = false }) => {
     const room = `${formatSize(size)}${bed ? `; the printer has room for ${roomWords(bed)}` : ''}`;
+    if (pins && strip) return `The pins fit your printer, but not on the strip that holds them to the bed (${room}) – turn off "Hold printed pins down with a thin strip" under Printing, or use wooden dowels.`;
     return pins
       ? `The pins are too long for your printer (${room}) – use wooden dowels, or a smaller pin size.`
       : `${quoted(name)} prints separately and is too big for your printer (${room}) – make it smaller, or join it to the model without pegs so it is cut with the pieces.`;
@@ -5578,7 +5582,7 @@ const NOTE_TEXT = {
  * pegSize, pegSizes: [{ size, count }] (when the built-in pegs come in more than one size), dovetails,
  * pairs: ['1A ↔ 2A'], apart: ['A'] }` (`dowels` counts every pin, `diameter` and `length` are the main size's; `pegs`
  * every peg; `apart` the letters of the cuts that come apart);
- * PINS `{ count, spares, diameter, length, own, sheets }` (`sheets`: how many pins files the bed needs); DOVETAIL `{ letter, tabs, pieces, pegs, apart }` (`pegs`: the joints are
+ * PINS `{ count, spares, diameter, length, own, sheets, strip }` (`sheets`: how many pins files the bed needs; `strip`: the pins stand on the thin strip that holds them to the bed); DOVETAIL `{ letter, tabs, pieces, pegs, apart }` (`pegs`: the joints are
  * built-in pegs; `apart`: the cut comes apart, its tabs unglued);
  * APART `{ letter, cutId, axis, above, male, female, hold, clips, height, faces, flat, lying }` (a cut that comes
  * apart: `male` the pieces its lip stands out of, `female` those with its groove, `above` that the male is the piece
@@ -5637,7 +5641,7 @@ const NOTE_TEXT = {
  * in one piece, found worth saying: printCheck.js `checkNote`; one a piece at most, and `warn` where the piece may
  * tip; `auto` where the piece is laid the best side down, and so not told to lay it another way for its supports);
  * PIECE_UNSTABLE `{ pieceIndex, pegs, lip }` (`pegs`, `lip`: only the
- * face its pegs or its lip stand out of was flat); PART_TOO_BIG `{ name, size, bed, pins }`
+ * face its pegs or its lip stand out of was flat); PART_TOO_BIG `{ name, size, bed, pins, strip }` (`strip`: the pins fit, their holding strip does not)
  * (a part printed separately, or with `pins` a single pin, too big for the bed); SPLIT_NOT_NEEDED `{ yaw, down, apart }`
  * (down other than '-z' when it fits only on its side; `apart` the letters of the cuts that come apart, when the pieces
  * they make fit); BED_TOO_SMALL `{ size, bed, pieces, corner, cap }` (`bed` the printer's own size; `corner` its sides
@@ -5986,12 +5990,12 @@ function fitWords(fit) {
  * them (or that nothing is glued, when no other cut is).
  * @param {{ name: string, pieces: { index: number, cell: number[], size: number[], lies: string, yaw?: number, fits?: boolean, shells?: number,
  *   part?: string, name?: string, lids?: string[], check?: object, holes?: object }[],
- *   seams: object[], pins?: { d: number, length: number, count: number, spares?: number, own?: boolean, sheets?: number }[],
+ *   seams: object[], pins?: { d: number, length: number, count: number, spares?: number, own?: boolean, sheets?: number, strip?: number }[],
  *   parts?: { name: string }[], clearance?: number, bed?: number[], printer?: { size: number[], margin: number, corner?: number[]|null }|null, steps?: object[],
  *   bridges?: number[], fit?: object|null }} plan
  *   `seams` as for `assemblySteps`; a piece that is a part taken out has its cut's id (`part`), its `name` and the
  *   cut's letter (`lids`); a piece's print check (`check`, printCheck.js `checkRow`) and its pin holes by how they print
- *   (`holes`, `holeSummary`) are said in a clause on its line; `pins` one group per pin size (count without spares, `sheets` its pins files); `bed` the usable bed (with the
+ *   (`holes`, `holeSummary`) are said in a clause on its line; `pins` one group per pin size (count without spares, `sheets` its pins files, `strip` the volume of the strips that hold them to the bed, when they get them); `bed` the usable bed (with the
  *   corner it keeps clear, the pieces that must be moved clear of it are told so); `printer` the printer itself, when
  *   known, for the heading (`corner` the sides of the corner it keeps clear); `bridges` the clips' bridges' lengths as built (each
  *   hold's own on a 1.6 mm tongue when not given); `fit` the PART_FIT note's fields, for what the fit test holds;
@@ -6079,6 +6083,11 @@ export function howToGlueText(plan) {
       const spare = spares ? ` (${spares === 1 ? 'one spare' : `${spares} spares`})` : '';
       const files = g.sheets > 1 ? `, in ${g.sheets} pins files` : '';
       out.push(`  ${pad('pins', 12)}${g.count + spares} × Ø${mm(g.d)} × ${mm(g.length)} mm${spare}${files}, lying on a flat side, solid (4+ walls)`);
+      if (g.strip > 0) {
+        // the strip is one first layer thick: a brim would weld it to its neighbours, and arranging would crowd them
+        out.push(`${indent}on a thin strip that holds them to the bed: print with a 0.2 mm first layer and no brim,`);
+        out.push(`${indent}where the file puts them (no auto-arrange); then peel the strip off and snap the pins out`);
+      }
       out.push(`${indent}or Ø${mm(g.d)} mm wooden dowels cut to ${mm(g.length)} mm`);
     }
   }

@@ -11,14 +11,14 @@ import {
   percentOf, pickPart, noLockOf, noLockTitle, sizeGains, snapTolerance, snappedWords, spotLabel, throughWords, wayCaption, widthWords,
 } from './aim.js';
 import { TEA_LIGHT, gminOf, offerPercent, roundZ } from './locks.js';
-import { checkWords } from './printCheck.js';
+import { angleWords, checkWords } from './printCheck.js';
 import { MATERIALS, PLAN_DEFAULTS, adviseJob, estimateJob, estimateWords, jobWords, planOptions, wholeWords } from './printPlan.js';
 import { SIDES, placementMatrix, snapPartTo } from './placement.js';
 import { BUNDLED_FONTS, canQueryLocalFonts, fetchBundledFont, listLocalFonts, localFontBytes } from './fontCatalog.js';
 import {
   BED_DEFAULTS, BED_PRESETS, FAST_PRESETS, FILAMENT, KEEP_LIMIT, PIECE_COLORS, PRESET_ALIASES, SPLIT_LIMITS, SPLIT_NOTE_CODES, axisCuts, bedCorner, bedSize, capOf, cellFits, cellSizes,
   clampLargest, cutPlane, fitPieces, formatSize, keepName, keepsOf, keepsThrough, letterFor, nextCut, noSeatWords, pegSizeOf, pieceColorIndex, pieceColors, planEnds,
-  layOptions, presetOf, reachesCorner, sheetName, splitActive, splitNote, usableBed, wayStep, wideKeeps,
+  layOptions, presetOf, reachesCorner, sheetName, splitActive, splitNote, tipOption, usableBed, wayStep, wideKeeps,
 } from './split.js';
 
 const $ = (id) => document.getElementById(id);
@@ -2959,7 +2959,7 @@ function renderPieces() {
       cell: p.cell,
       size: p.size,
       fits: p.fits,
-      lies: `lies ${p.lies}${p.yaw ? `, turned ${p.yaw}°` : ''}`,
+      lies: `lies ${p.lies}${p.tip?.used ? `, tipped ${angleWords(p.tip.angle)}°` : ''}${p.yaw ? `, turned ${p.yaw}°` : ''}`,
       extra: [
         // longer than the Largest piece: a cut by hand may make it so, and Fit to keep a detail whole
         over(p.size, p.cell && boxes?.get(p.cell.join(',')), !!p.part),
@@ -2977,12 +2977,14 @@ function renderPieces() {
         ...(locks.get(p.index) ?? []),
       ].filter(Boolean),
       // the print check of the piece as its file lies: supports, step lines, what it stands on, its pin holes
-      check: checkWords(p.check ?? null, p.holes ?? null),
+      check: checkWords(p.check ?? null, p.holes ?? null, p.tip?.used ? { tip: true } : {}),
       estimate: estimates.get(p.index) ?? [],
       // the side it lies on, to choose: what the document holds shows at once, the new pieces follow
       // pieces of other boxes than the cuts make now (a cut added since) are not to choose for: their numbers are not
       lay: layOptions(p.lay ?? null, p.down, p.lay?.key ? doc.split?.lay?.[p.lay.key] ?? null : null, { current: piecesCurrent() }),
       layOld: computed.cells !== cellsKey(doc.split),
+      // the tick box that tips it so that its big leaning face prints level, where it has such a face or was asked to
+      tip: tipOption(p.tip ?? null, p.tip?.key ? Boolean(doc.split?.tip?.[p.tip.key]) : false, { current: piecesCurrent() }),
     }));
   } else if (active) {
     // a box whose loose parts print apart (a bookcase's shelves between two cuts) says how many pieces it makes
@@ -3015,6 +3017,7 @@ function renderPieces() {
   const colours = pieceColors(rows);
   // a side just chosen from the keyboard keeps its place: the list is drawn anew, and the choice is taken up again
   const focused = list.contains(document.activeElement) ? document.activeElement.dataset.lay : null;
+  const focusedTip = list.contains(document.activeElement) ? document.activeElement.dataset.tip : null;
   list.replaceChildren(
     ...rows.map((row) => {
       const li = document.createElement('li');
@@ -3048,6 +3051,7 @@ function renderPieces() {
         text.append(estimate);
       }
       if (row.lay) text.append(layChoice(row));
+      if (row.tip) text.append(tipChoice(row));
       li.append(swatch, text);
       if (!row.predicted) {
         // a piece pointed at stands out, and the locks it has glow on it and on the piece each one holds
@@ -3064,6 +3068,47 @@ function renderPieces() {
     }),
   );
   if (focused) [...list.querySelectorAll('select[data-lay]')].find((s) => s.dataset.lay === focused)?.focus();
+  if (focusedTip) [...list.querySelectorAll('input[data-tip]')].find((s) => s.dataset.tip === focusedTip)?.focus();
+}
+
+/**
+ * The tick box that tips a piece in its file so that its big leaning face prints level, on a line of its own under
+ * the piece. Off unless ticked; greyed out, with why, where the piece cannot be tipped.
+ */
+function tipChoice(row) {
+  const { key, checked, disabled, text, tag } = row.tip;
+  const label = document.createElement('label');
+  label.className = 'piece-tip';
+  label.title = 'Turns this piece a few degrees in its file, so that its big leaning face lies level and prints without step lines. The piece then rests on an edge and needs supports under it; its pin holes are shaped for lying tipped. Off unless you tick it.';
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.dataset.tip = key;
+  box.checked = checked;
+  box.disabled = disabled || !!row.layOld;
+  box.setAttribute('aria-label', `Tip piece ${row.index} so that its big face prints level`);
+  box.addEventListener('change', () => setPieceTip(key, box.checked));
+  const words = document.createElement('span');
+  words.textContent = text;
+  label.append(box, words);
+  if (tag) {
+    const own = document.createElement('span');
+    own.className = 'piece-lay-own';
+    own.textContent = tag;
+    label.append(own);
+  }
+  return label;
+}
+
+/**
+ * Tip a piece so that its big leaning face prints level (`on`), or lay it flat again: the pieces are worked out again
+ * with its pin holes shaped for the way it then lies, and stay in view while they are.
+ */
+function setPieceTip(key, on) {
+  if (!$('resultToggle').checked) {
+    $('resultToggle').checked = true;
+    endAim();
+  }
+  doc.setPieceTip(key, on);
 }
 
 /**
@@ -3192,18 +3237,23 @@ const splitNoteActions = (() => {
   };
 })();
 
-let layHeld = { count: 0, cells: '', place: '' }; // the sides chosen by hand as the page last saw them, and what they went by
+let layHeld = { count: 0, tips: 0, cells: '', place: '' }; // the sides chosen by hand (and the pieces asked to be tipped) as the page last saw them, and what they went by
 let layDropped = null; // { count, why: 'cuts' | 'model' } the sides chosen by hand that were dropped, until it is read
+let tipsDropped = null; // the same for the pieces asked to be tipped
 /**
  * Whether the sides chosen by hand have just gone with the boxes they were chosen for (a cut added, removed or
  * turned; the model moved), for the note that says so. Handed back to the app one by one, they are not dropped.
  */
 function trackLay() {
   const split = splitActive(doc.split) ? doc.split : null;
-  const now = { count: Object.keys(split?.lay ?? {}).length, cells: cellsKey(split), place: modelPlacementKey(doc.state.base) };
+  const now = { count: Object.keys(split?.lay ?? {}).length, tips: Object.keys(split?.tip ?? {}).length, cells: cellsKey(split), place: modelPlacementKey(doc.state.base) };
   if (!split || now.count) layDropped = null;
   else if (layHeld.count && now.cells !== layHeld.cells) layDropped = { count: layHeld.count, why: 'cuts' };
   else if (layHeld.count && now.place !== layHeld.place) layDropped = { count: layHeld.count, why: 'model' };
+  // a piece laid on another side by hand is no longer tipped either, but that is the choice just made: nothing to say
+  if (!split || now.tips) tipsDropped = null;
+  else if (layHeld.tips && now.cells !== layHeld.cells) tipsDropped = { count: layHeld.tips, why: 'cuts' };
+  else if (layHeld.tips && now.place !== layHeld.place) tipsDropped = { count: layHeld.tips, why: 'model' };
   layHeld = now;
 }
 
@@ -3224,6 +3274,7 @@ function renderSplitNotes() {
     notes = [...planNotes.notes.filter((n) => !pieced || (n.code !== 'BARELY_HELD' && n.code !== 'KEEP_KEPT' && n.code !== 'CORNER_PLACE')), ...own];
   }
   // the sides chosen by hand that went with the boxes they were chosen for: said until it is read or chosen again
+  if (active && tipsDropped) notes = [splitNote('TIPS_DROPPED', tipsDropped), ...notes];
   if (active && layDropped) notes = [splitNote('LAYS_DROPPED', layDropped), ...notes];
   const shown = JSON.stringify(notes.map((n) => [n.code, n.text]));
   if (shown === splitNotesShown) return;
@@ -3234,6 +3285,13 @@ function renderSplitNotes() {
       label: 'OK',
       run: () => {
         layDropped = null;
+        renderSplitNotes();
+      },
+    }),
+    TIPS_DROPPED: () => ({
+      label: 'OK',
+      run: () => {
+        tipsDropped = null;
         renderSplitNotes();
       },
     }),
@@ -5282,11 +5340,15 @@ function renderSelectedInfo() {
 
 /**
  * What the pieces depend on besides the content, as one key: the split, the printer, the nozzle and the pins' strip.
- * With `lay` false, without the sides chosen by hand for pieces to lie on: the same while only those change.
+ * With `lay` false, without the sides chosen by hand for pieces to lie on and the pieces asked to be tipped: the same
+ * while only those change.
  */
 function splitKeyNow({ lay = true } = {}) {
   const split = activeSplit();
-  if (split && !lay) delete split.lay;
+  if (split && !lay) {
+    delete split.lay;
+    delete split.tip;
+  }
   return stableKey({ split, bed: usableBed(bed), nozzle: printing.nozzle, pinStrip: pinHold.strip, ...largestOf() });
 }
 let lastCutsKey = null; // `splitKeyNow` without the sides chosen by hand, as of the last render

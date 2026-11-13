@@ -21,9 +21,9 @@ import {
   applyMat4, transposeMat4, keepCrossed, keepsOf, keepsThrough, cornerPlaceNote, fitReachesCorner, bedCorner, capOf, slabCap, withinCap, wideKeeps, pickGroup,
   chooseOffsets, planEnds,
   AXES, CLIP, LIP, SPOT, catchSizes, comesOffOf, endShape, endsAsWell, keepsTo, locateBend, locateSeam, pickSpots, profileSeams, seamKind, spotScore, spotSide,
-  spotStart, spotWhy, socketsAsWell, flatLift, holeSummary, printCheckNote, LAY_DOWN,
+  spotStart, spotWhy, socketsAsWell, flatLift, holeSummary, printCheckNote, LAY_DOWN, tipTransform, tipTurn, tipWays,
 } from './split.js';
-import { checkRow, printCheck, shownFaces } from './printCheck.js';
+import { checkRow, levelFace, printCheck, shownFaces, tipBarred, tipWorse } from './printCheck.js';
 import {
   buildSplitDisplay, carveParts, checkPart, clearSplitCaches, couponRow, cutPieces, drillPiece, fitTestCoupon, layoutSplit, lockFaces, lockMatrix, lockPieces, lockPoints, partFrame, partInFrame, partedSolids,
   partRows, pinAt, pinSheet, pinSpares, pinStripVolume, pinsPerSheet, placePart, planDovetails, probeLip, shellCounts, tabsAcross, wayOverlaps,
@@ -2561,7 +2561,10 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * A piece that carries built-in pegs is laid again once they are placed:
    * they stand out of it, and never point down; so is one a take-apart
    * cut's lip stands out of, the one way that keeps the lip standing up
-   * (the layout chose it, before the other cuts' pins). Returns null
+   * (the layout chose it, before the other cuts' pins). A piece asked to be
+   * tipped so that a big leaning face prints level (`split.tip`) is tipped
+   * last of all, where it can be (`tipChoices`): its pin holes are drilled
+   * for the way that is then up, and its check is of it lying tipped. Returns null
    * without cuts; `{ notes }` when the model is exported whole after all (it
    * cannot be split, or every cut missed); else the split.
    */
@@ -2569,7 +2572,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     if (!splitActive(split)) return null;
     if (base.kind !== 'none' && !base.current?.watertight) return { notes: [splitNote('SPLIT_UNAVAILABLE')] };
     if (!final.solid) return { notes: [] }; // nothing solid to cut: the unrepaired triangles are exported as they are
-    const { spec, cuts, parts, notes: listed, keeps = [], lay = null } = normaliseSplit(split, splitBounds(final));
+    const { spec, cuts, parts, notes: listed, keeps = [], lay = null, tip = null } = normaliseSplit(split, splitBounds(final));
     // the parts that come off are taken out first: the cuts then cut the body that is left, as they would the model
     const parted = partStage(final, parts, cuts, spec, printing, progress);
     const given = parted.notes.length ? [...listed, ...parted.notes] : listed;
@@ -2588,14 +2591,98 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     // way up as for one the app chose (the way each piece prints up is in the drilling's key)
     const laid = layPieces(cut.pieces, U, spec.orient, { flat, soups: cut.fragments, lay });
     const hl = printing?.layerHeight ?? 0.2;
-    const drill = drillStage(work, cut, laid, { cuts, spec, joints: plan.joints, nozzle, hl, U, flat, parted: parted.carved ? parted : null }, progress);
-    const lying = layGrown(laid, drill.layout, U, spec.orient, { flat }).map((o, i) => lowered(o, drill.heights?.get(laid[i].index)));
+    const stage = { cuts, spec, joints: plan.joints, nozzle, hl, U, flat, parted: parted.carved ? parted : null };
+    // the pieces drilled, and how each lies once what its joints stand out of it is counted
+    const run = (pieces) => {
+      const drilled = drillStage(work, cut, pieces, stage, progress);
+      return { drill: drilled, lying: layGrown(pieces, drilled.layout, U, spec.orient, { flat }).map((o, i) => lowered(o, drilled.heights?.get(pieces[i].index))) };
+    };
+    // the pieces asked to be tipped so that a big leaning face prints level: whether each can be is found on the
+    // pieces as they lie (drilled, and checked), and those that can are drilled again with their pin holes shaped
+    // for the way that is up once they are tipped. What was found is kept, so only the first result does both
+    const asked = tip ? laid.map((p, i) => i).filter((i) => tip.includes(laid[i].cell.join(','))) : [];
+    let tips = null;
+    if (asked.length) {
+      const state = splitState(work);
+      const key = `${drillStage(work, cut, laid, { ...stage, peek: true })}|tip:${stableKey({ asked: asked.map((i) => laid[i].index), hl, U })}`;
+      if (state.tips?.key !== key) {
+        const first = run(laid);
+        const lain = { final: work, cut, laid, lying: first.lying, drill: first.drill, cuts };
+        state.tips = { key, found: tipChoices(final, lain, pieceChecks(final, lain, progress), asked, { hl, U }, progress) };
+      }
+      tips = state.tips.found;
+    }
+    const shaped = () => (tips ? laid.map((p, i) => (tips.get(i)?.ok ? { ...p, tip: tips.get(i).up } : p)) : laid);
+    let pieces = shaped();
+    let { drill, lying } = run(pieces);
+    // a piece that lies another way once it is drilled for the tip (nothing is known to make it) is not tipped
+    const turned = tips ? [...tips].filter(([i, t]) => t.ok && lying[i].down !== t.down) : [];
+    if (turned.length) {
+      for (const [i] of turned) tips.set(i, { ok: false, why: 'lock' });
+      pieces = shaped();
+      ({ drill, lying } = run(pieces));
+    }
+    if (tips) lying = lying.map((o, i) => (tips.get(i)?.ok ? tippedLying(o, tips.get(i)) : o));
     // a move a note suggests keeps the pieces within the Largest piece, but where a detail kept whole is longer
     const cap = capOf(largest);
     const wide = cap < Infinity && keeps.length ? wideKeeps(keeps, cap, withSoup(splitBounds(work), work.passthrough), planEnds(spec, nozzle).minEnd) : null;
     // what each finished piece asks of the printer, lying as its file lies
-    const checks = pieceChecks(final, { final: work, cut, laid, lying, drill, cuts }, progress);
-    return summarise({ final: work, spec, cuts, U, given, plan, cut, laid, lying, drill, parted: parted.carved ? parted : null, keeps, cap, wide, checks, hl, strip: pinStripOf(printing) });
+    const checks = pieceChecks(final, { final: work, cut, laid: pieces, lying, drill, cuts }, progress);
+    return summarise({ final: work, spec, cuts, U, given, plan, cut, laid: pieces, lying, drill, parted: parted.carved ? parted : null, keeps, cap, wide, checks, hl, strip: pinStripOf(printing), tips });
+  }
+
+  /** How a piece lies (`chooseOrientation`'s answer) once it is tipped: its place on the bed and its size as tipped. */
+  const tippedLying = (o, t) => ({
+    ...o, printMatrix: t.printMatrix, matrix: t.matrix, size: t.size, yaw: t.yaw, fits: true, tip: { turn: t.turn, angle: t.angle, area: t.area },
+  });
+
+  /**
+   * Whether each piece asked to be tipped (`asked`, its place in `laid`) can be, so that its big leaning face prints
+   * level, from the pieces as they lie, drilled, and their print checks: one the layout has nothing against
+   * (`tipWays`), with such a face and a steady foot (`tipBarred`), is turned (`tipTurn`), set down on the bed by its
+   * own points (`tipTransform`) and checked again as it then lies – and is tipped where it fits the printer so and
+   * prints no worse than the step lines cured (`tipWorse`). A piece's outside is the same whichever way its pin
+   * holes point, so what is found here holds for the piece drilled again for the tip.
+   * @returns {Map<number, object>} by the piece's place in `laid`: `{ ok: true, down, turn, up, angle, area,
+   *   printMatrix, matrix, size, yaw }`, or `{ ok: false, why, angle?, area?, extra? }`
+   */
+  function tipChoices(final, split, checks, asked, { hl, U }, progress) {
+    const { cut, laid, lying, drill, cuts } = split;
+    const ways = tipWays(laid, drill.layout, { parts: new Set(cut.pieces.filter((p) => p.part).map((p) => p.index)) });
+    const found = new Map();
+    const wanted = [];
+    for (const i of asked) {
+      if (!ways[i].key) continue;
+      const check = checks.get(laid[i].index) ?? null;
+      const face = levelFace(check, hl);
+      const why = ways[i].why ?? tipBarred(check, face) ?? (lying[i].fits ? null : 'bed');
+      if (why) found.set(i, { ok: false, why, ...(face ? { angle: face.tilt, area: face.area } : {}) });
+      else wanted.push({ i, face, check });
+    }
+    if (!wanted.length) return found;
+    progress?.('Tipping pieces so their big faces print level…');
+    const own = ownFaces(final);
+    const planes = cuts.map(cutPlane).filter(Boolean);
+    const held = drill.solids ?? drill.transient;
+    const { solids, owned } = held ? { solids: held, owned: false } : drilledSolids(split.final, split, progress);
+    try {
+      for (const { i, face, check } of wanted) {
+        const mesh = solids[i].getMesh();
+        const { turn, up, angle } = tipTurn(lying[i].down, face.normal);
+        const place = tipTransform(turn, [{ points: mesh.vertProperties, stride: mesh.numProp }, laid[i].soup], { U });
+        const told = { angle, area: face.area };
+        if (!place.fits) {
+          found.set(i, { ok: false, why: 'bed', ...told });
+          continue;
+        }
+        const worse = tipWorse(check, checkOf(mesh, { turn, planes, made: madeFaces(mesh, own), skirt: false }), face, hl);
+        if (worse) found.set(i, { ok: false, ...worse, ...told });
+        else found.set(i, { ok: true, down: lying[i].down, turn, up, ...told, printMatrix: place.printMatrix, matrix: place.matrix, size: place.size, yaw: place.yaw });
+      }
+    } finally {
+      if (owned) solids.forEach((m) => m.delete());
+    }
+    return found;
   }
 
   /**
@@ -2635,7 +2722,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const { drill, laid, lying, cuts } = split;
     drill.checks ??= new Map();
     drill.measures ??= new Map();
-    const stale = (i) => drill.checks.get(laid[i].index)?.down !== lying[i].down;
+    const stale = (i) => drill.checks.get(laid[i].index)?.down !== lying[i].down || drill.checks.get(laid[i].index)?.tip !== tipKey(lying[i]);
     const wanted = laid.map((p, i) => i).filter((i) => stale(i) || !drill.measures.has(laid[i].index));
     if (wanted.length) {
       progress?.('Checking how each piece prints…');
@@ -2649,8 +2736,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
           if (!drill.measures.has(laid[i].index)) drill.measures.set(laid[i].index, measureOf(solids[i]));
           if (!stale(i)) continue;
           const mesh = solids[i].getMesh();
-          const check = checkOf(mesh, { turn: LAY_DOWN[lying[i].down], planes, made: madeFaces(mesh, own), faces: true });
-          drill.checks.set(laid[i].index, { down: lying[i].down, check });
+          // a tipped piece is checked as it lies tipped: its flat underside, rising off the bed, is no rounded edge
+          const check = checkOf(mesh, { turn: lying[i].tip?.turn ?? LAY_DOWN[lying[i].down], planes, made: madeFaces(mesh, own), faces: true, ...(lying[i].tip ? { skirt: false } : {}) });
+          drill.checks.set(laid[i].index, { down: lying[i].down, tip: tipKey(lying[i]), check });
         }
       } finally {
         if (owned) solids.forEach((m) => m.delete());
@@ -2659,6 +2747,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     // a piece whose check could not be made has none: its row goes without
     return new Map(laid.map((p) => [p.index, drill.checks.get(p.index).check]).filter(([, check]) => check));
   }
+
+  /** How a piece is tipped in its file, as a key: empty where it is not. */
+  const tipKey = (o) => (o.tip ? o.tip.turn.join(',') : '');
 
   /**
    * How many parts' checks a result keeps (plain data: each part's face, kind, ends, lock and way out), failed carves
@@ -3130,8 +3221,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * the latter each such cut's hold and the layer height (a cut whose lip gets no clips takes the collar twist-lock,
    * its heights whole layers). The parts taken out (`parted`) add their locks (`layout.locks`): each part's side and
    * the side of the piece it comes out of, built in the drilling, beside the twist-locks of the full-plane cuts.
+   * With `peek` only the stage's key is given, and nothing is made.
    */
-  function drillStage(final, cut, laid, { cuts, spec, joints, nozzle, hl = 0.2, U, flat, parted = null }, progress) {
+  function drillStage(final, cut, laid, { cuts, spec, joints, nozzle, hl = 0.2, U, flat, parted = null, peek = false }, progress) {
     const state = splitState(final);
     const { joint, diameter, depth, clearance, count, labels, orient } = spec;
     const font = labels ? fontFor('inter') : null;
@@ -3148,9 +3240,12 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       ...(locks.length ? { locks } : {}),
       // a side chosen by hand holds its piece to it: which piece of a pair then carries the pegs follows
       ...(laid.some((p) => p.chosen) ? { chosen: laid.map((p) => p.chosen ?? null) } : {}),
+      // a piece tipped in its file has its pin holes' points where up is then
+      ...(laid.some((p) => p.tip) ? { tips: laid.map((p) => p.tip ?? null) } : {}),
     };
     // the layer height is in it too, as far as it shapes a hole: the lift of a flat-topped teardrop's roof
     const key = `${cut.key}|drill:${stableKey({ joint, diameter, depth, clearance, count, labels, nozzle, lift: flatLift(hl), ups, groups, font: font?.key ?? null, ...onBed })}`;
+    if (peek) return key;
     if (state.drill?.key === key) return state.drill;
     disposeSplitStage(state.drill);
     state.drill = null;
@@ -3189,7 +3284,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const pieces = laid.map((p) => {
       // the bits it took across a cut, and the faces of the bits kept loose in it that hook round their box
       const { joined, loose } = bitsOf(cut, p);
-      return { index: p.index, cell: p.cell, up: p.lying.up, boxes: p.boxes, volume: p.volume, ...(joined.length ? { joined } : {}), ...(loose.length ? { loose } : {}) };
+      return { index: p.index, cell: p.cell, up: p.lying.up, ...(p.tip ? { tip: p.tip } : {}), boxes: p.boxes, volume: p.volume, ...(joined.length ? { joined } : {}), ...(loose.length ? { loose } : {}) };
     });
     const cells = new Set(laid.map((p) => p.cell.join(',')));
     if (cells.size === laid.length && !pieces.some((p) => p.joined)) return layoutSplit(final.solid, cuts, pieces, spec, options);
@@ -3414,9 +3509,14 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * built after all (`drillAll`) has its lip, and says what the lip gives.
    * What the cuts leave loose (`keptBits`) and what they leave held on only
    * next to them (`heldNotes`, the slice graph) have notes of their own.
+   * A piece that has a big leaning face on top, or was asked to be tipped so
+   * that it prints level (`tips`, `tipChoices`), carries what its tick box in
+   * the list says (`tip`: `key` its box, `asked`, `used`, the face's `angle`
+   * and `area`, `why` it is not or cannot be tipped, and tipped its `turn`),
+   * with a note where it is tipped (PIECE_TIPPED) or was refused (TIP_REFUSED).
    */
   function summarise(split) {
-    const { final, spec, cuts, U, given, plan, cut, laid, lying, drill, parted = null, keeps = [], cap = Infinity, wide = null, checks = null, hl = 0.2, strip = false } = split;
+    const { final, spec, cuts, U, given, plan, cut, laid, lying, drill, parted = null, keeps = [], cap = Infinity, wide = null, checks = null, hl = 0.2, strip = false, tips = null } = split;
     const { layout } = drill;
     const measures = drill.measures ?? new Map();
     const n = laid.length;
@@ -3435,8 +3535,24 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const holes = new Map(holeSummary(laid.map((p, i) => ({ index: p.index, up: lying[i].up })), layout.seams).map((h) => [h.index, h]));
     // the sides each piece may be told to lie on by hand, and the one it was
     const offered = layWays(laid, layout, U, { parts: partOf, lying, pegs: spec.joint === 'pegs' });
+    // which pieces may be tipped so that a big leaning face prints level, as far as the layout tells
+    const tippable = tipWays(laid, layout, { parts: partOf });
+    // a piece's tick box for it: one asked to be tipped says whether it is, and why not; one not asked is offered
+    // it where its check finds such a face, greyed out with the reason where it cannot be
+    const tipRow = (p, i) => {
+      const { key, why } = tippable[i];
+      if (!key) return null;
+      const t = tips?.get(i);
+      if (t) return { key, asked: true, used: t.ok, ...(t.ok ? { turn: t.turn } : { why: t.why }), ...(t.angle != null ? { angle: t.angle, area: t.area } : {}), ...(t.extra ? { extra: t.extra } : {}) };
+      const check = checks?.get(p.index) ?? null;
+      const face = why === 'apart' ? null : levelFace(check, hl);
+      if (!face) return null;
+      const barred = why ?? tipBarred(check, face);
+      return { key, asked: false, used: false, angle: face.tilt, area: face.area, ...(barred ? { why: barred } : {}) };
+    };
     const pieces = laid.map((p, i) => {
       const o = lying[i];
+      const tip = tipRow(p, i);
       // a cut's lip may stand out of a piece on more than one face: one entry a cut, its clips added up. What comes off
       // is the top of a Z cut, whichever piece has the lip (a box's lid may), and across X or Y the piece that goes on
       // the other's lip
@@ -3477,6 +3593,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         down: o.down,
         up: o.up,
         lay: offered[i],
+        ...(tip ? { tip } : {}),
         dowels: layout.dowels.filter((d) => d.sides.some((s) => s.piece === p.index)).length,
         // its pin holes by how they print: standing up (round), lying with a pointed teardrop or a flat-topped one
         holes: { upright: holes.get(p.index).upright, pointed: holes.get(p.index).pointed, flat: holes.get(p.index).flat, round: holes.get(p.index).round },
@@ -3676,6 +3793,12 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     // what the print check found worth saying comes last, one note a piece at most; a piece told it has nothing flat
     // to stand on is not told of supports twice
     for (const p of pieces) {
+      // a piece tipped in its file is told what the tip costs, all in one note; one asked to be and not tipped, why
+      if (p.tip?.used && p.check) {
+        notes.push(splitNote('PIECE_TIPPED', { pieceIndex: p.index, angle: p.tip.angle, area: p.tip.area, check: p.check }));
+        continue;
+      }
+      if (p.tip?.asked && !p.tip.used) notes.push(splitNote('TIP_REFUSED', { pieceIndex: p.index, why: p.tip.why, ...(p.tip.angle != null ? { angle: p.tip.angle, area: p.tip.area } : {}), ...(p.tip.extra ? { extra: p.tip.extra } : {}) }));
       const note = printCheckNote(p.check ?? null, { pieceIndex: p.index, auto: spec.orient === 'auto' && !byHand.includes(p.index), unstable: notes.some((x) => x.code === 'PIECE_UNSTABLE' && x.pieceIndex === p.index) });
       if (note) notes.push(note);
     }
@@ -3813,8 +3936,11 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const copy = d.lighter.get(p.index);
       if (copy && own) {
         let kept = drill.lighterChecks.get(p.index);
-        if (kept?.down !== lying[i].down) {
-          kept = { down: lying[i].down, check: checkOf(copy.mesh, { turn: LAY_DOWN[lying[i].down], planes: cuts.map(cutPlane).filter(Boolean), made: copy.made, faces: true }) };
+        if (kept?.down !== lying[i].down || kept?.tip !== tipKey(lying[i])) {
+          kept = {
+            down: lying[i].down, tip: tipKey(lying[i]),
+            check: checkOf(copy.mesh, { turn: lying[i].tip?.turn ?? LAY_DOWN[lying[i].down], planes: cuts.map(cutPlane).filter(Boolean), made: copy.made, faces: true, ...(lying[i].tip ? { skirt: false } : {}) }),
+          };
           drill.lighterChecks.set(p.index, kept);
         }
         check = kept.check;
@@ -3845,9 +3971,12 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     try {
       laid.forEach((p, i) => {
         progress?.('Writing piece files…', { done: i + 1, total: n });
-        const { printMatrix, matrix, size, fits, lies, yaw } = lying[i];
+        const { size, fits, lies, yaw, tip } = lying[i];
         const frags = p.soup;
-        const moved = applyToSoup(manifoldToSoup(solids[i]), printMatrix);
+        const raw = manifoldToSoup(solids[i]);
+        // a tipped piece is set down on the bed by the very points written: its lowest one is on the bed
+        const { printMatrix, matrix } = tip ? tipTransform(tip.turn, [raw, frags], { yaw }) : lying[i];
+        const moved = applyToSoup(raw, printMatrix);
         const soup = concatSoups([withoutCollapsed(moved), frags ? applyToSoup(frags, printMatrix) : null]);
         add(pieceFileName(name, p.index, n), soup, { kind: 'piece', index: p.index, size, fits, lies, yaw, matrix });
       });

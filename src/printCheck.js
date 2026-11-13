@@ -49,6 +49,9 @@ const RAD = Math.PI / 180;
  * - `note`, `noteSeam`: this much overhang (mm²) on the model's own faces, or this much on glue faces, is worth a
  *   note; less is said on the piece's line only.
  * - `steps`: how many leaning faces a piece's row keeps, the largest first.
+ * - `tipMax`: a piece is tipped in its file to print a leaning face level (`levelFace`) only where the face leans
+ *   this many degrees at most: tipped further, too much of it would hang over the bed.
+ * - `tipGain`: and only where, tipped, it shows step lines on less than this share of what it shows them on now.
  */
 export const PRINT_CHECK = Object.freeze({
   angle: 45,
@@ -89,6 +92,8 @@ export const PRINT_CHECK = Object.freeze({
   note: 500,
   noteSeam: 100,
   steps: 3,
+  tipMax: 8,
+  tipGain: 0.5,
 });
 
 /** A face whose normal's z, as it prints, is under this may need supports: more than 46.5° from upright. */
@@ -297,6 +302,7 @@ function leaningFaces(bins, least) {
       tilt: Math.acos(Math.min(1, Math.abs(face.n[2]) / len)) / RAD,
       area: face.area,
       rise: face.hi - face.lo,
+      normal: face.n.map((v) => v / len),
       bins: face.bins,
     });
   }
@@ -315,18 +321,19 @@ function leaningFaces(bins, least) {
  * @param {number} numProp
  * @param {Uint32Array|number[]} triVerts three points a triangle; triangles that meet share their points
  * @param {{ turn?: number[]|null, planes?: { axis: number, at: number }[], made?: ArrayLike<number>|null,
- *   work?: number, faces?: boolean }} options
+ *   work?: number, faces?: boolean, skirt?: boolean }} options
  *   `turn` the 4 × 4 matrix (column-major) that turns the piece the way it prints, +z up – only its turn is used, the
  *   piece's lowest point is the bed; `planes` the cuts the piece touches, as it is in the model: a face on one is a
  *   glue face; `made` one number a triangle, not 0 for a face the app made for a joint (a hole, a socket, a lip, a
  *   lock, a label): those print without supports by design and are counted apart; `work` how many steps
  *   one ceiling's spans may take before near faces share a measure (`PRINT_CHECK.spanWork`); `faces: true` also
  *   gives `faces`, what each triangle was counted as (`FACE`, `faceKind`, `faceLean`): the very triangles the areas
- *   below are sums of, for a picture that says what the words say
+ *   below are sums of, for a picture that says what the words say; `skirt: false` leaves no narrow band at the bed
+ *   out as a rounded bottom edge – for a piece tipped in its file, whose flat underside rises off the bed like one
  * @returns {{ height: number, box: number[], faces?: Uint8Array,
  *   supports: { area: number, skin: number, seam: number, bed: number, piece: number, shallow: number, places: number,
  *   bridged: number, span: number, reach: number, joints: number },
- *   leaning: { facing: 'up'|'down', tilt: number, area: number, rise: number }[],
+ *   leaning: { facing: 'up'|'down', tilt: number, area: number, rise: number, normal: number[] }[],
  *   foot: { contact: number, across: number[]|null, base: number, ratio: number, flat: boolean, tip: boolean,
  *   small: boolean, strip: boolean, off: boolean } }}
  *   `height` and `box` (its two sides on the bed) as it lies. `supports`, all mm² as seen from below: `area` what may
@@ -337,12 +344,12 @@ function leaningFaces(bins, least) {
  *   `joints` the area of the joints' own faces left out. A glue face among them (`seam`) is a safeguard: a straight
  *   cut's face that looks down is what its piece lies on, so the pieces of a split do not normally have one.
  *   `leaning` the big faces a little off level, largest first (`tilt` degrees off level,
- *   `rise` how far the face climbs, mm). `foot`: `contact` the area on the bed, `across` the two sides of the box it
+ *   `rise` how far the face climbs, mm, `normal` the way it looks as the piece lies, one long). `foot`: `contact` the area on the bed, `across` the two sides of the box it
  *   spans, `base` the shorter of them, `ratio` the piece's height over that, `flat` whether it has a flat foot at
  *   all, `tip` whether it may tip, `small` whether its foot is small, `strip` whether it is a narrow strip under a
  *   wider piece (a round bar lying down), `off` whether its weight hangs past its foot
  */
-export function printCheck(vertProperties, numProp, triVerts, { turn = null, planes = [], made = null, work = PRINT_CHECK.spanWork, faces: tell = false } = {}) {
+export function printCheck(vertProperties, numProp, triVerts, { turn = null, planes = [], made = null, work = PRINT_CHECK.spanWork, faces: tell = false, skirt = true } = {}) {
   const P = vertProperties;
   const T = triVerts;
   const count = Math.floor(P.length / numProp);
@@ -521,7 +528,7 @@ export function printCheck(vertProperties, numProp, triVerts, { turn = null, pla
     for (const place of places.values()) {
       if (place.area < R.place) continue;
       // a rounded bottom edge: a narrow band that starts on the first layer and is steep enough a little way up
-      if (place.lo <= R.firstLayer + 1e-6 && place.hi <= R.skirt && 2 * place.area <= R.skirtWide * place.round) {
+      if (skirt && place.lo <= R.firstLayer + 1e-6 && place.hi <= R.skirt && 2 * place.area <= R.skirtWide * place.round) {
         supports.bridged++;
         continue;
       }
@@ -620,6 +627,64 @@ export function stepLines(leaning, layer = 0.2) {
 }
 
 const round1 = (v) => Math.round(v * 10) / 10;
+
+/**
+ * The face a piece would be tipped to print level: the largest of its big leaning faces on top that shows step lines
+ * at a layer height – the one its line in the list tells of. Null when it has none.
+ * @param {object|null} check from `printCheck`
+ * @param {number} layer the layer height, mm
+ * @returns {{ normal: number[], tilt: number, area: number }|null} `normal` the way the face looks as the piece lies
+ */
+export function levelFace(check, layer = 0.2) {
+  const h = layer > 0 ? layer : 0.2;
+  const top = (check?.leaning ?? [])
+    .filter((f) => f.facing === 'up' && f.normal && Math.floor(f.rise / h + 1e-6) >= PRINT_CHECK.stepCount)
+    .sort((p, q) => q.area - p.area)[0];
+  return top ? { normal: [...top.normal], tilt: top.tilt, area: top.area } : null;
+}
+
+/**
+ * Why a piece is not tipped to print `face` (`levelFace`) level, as far as its check as it lies tells: 'none' without
+ * such a face, 'steep' where the face leans more than `tipMax` degrees, 'foot' where the piece stands on little as
+ * it lies (nothing flat, a small foot, a strip, or it may tip) – tipped it would rest on an edge of that. Null where
+ * the check has nothing against it.
+ * @param {object|null} check from `printCheck`, of the piece as it lies
+ * @param {{ tilt: number }|null} face
+ * @returns {'none'|'steep'|'foot'|null}
+ */
+export function tipBarred(check, face) {
+  if (!check || !face) return 'none';
+  if (face.tilt > PRINT_CHECK.tipMax) return 'steep';
+  const f = check.foot;
+  return !f.flat || f.tip || f.small || f.strip ? 'foot' : null;
+}
+
+/**
+ * Whether tipping a piece to print `face` level would make it print worse than the step lines it cures, from its
+ * check as it lies (`before`) and tipped (`after`). The rules: tipped, it must show step lines on less than half as
+ * much of its top as it does now (`tipGain`), or too little is gained ('steps': levelling one face of a shallow
+ * roof makes the other lean twice as much); the supports it needs besides those under what it lay on may not grow by
+ * more than the face it makes level ('supports', with that growth as `extra`, mm²); and it may not stand more than
+ * `tipRatio` times as tall as it is wide on the bed ('tall'). The supports under the face it lay on are the tip's
+ * known price, told on the piece's line and in its note, and no reason to refuse it.
+ * @param {object} before from `printCheck`
+ * @param {object|null} after from `printCheck`, the piece turned as tipped
+ * @param {{ area: number }} face
+ * @param {number} layer the layer height, mm
+ * @returns {{ why: 'steps'|'supports'|'tall'|'unknown', extra?: number }|null} null where it may be tipped
+ */
+export function tipWorse(before, after, face, layer = 0.2) {
+  if (!after) return { why: 'unknown' };
+  // (a hair is given: the two sides of a roof are the same size but for how their numbers round)
+  if (stepArea(after, layer) >= PRINT_CHECK.tipGain * stepArea(before, layer) * (1 - 1e-6)) return { why: 'steps' };
+  const extra = after.supports.area - before.supports.area - before.foot.contact;
+  if (extra > face.area) return { why: 'supports', extra };
+  if (after.height > PRINT_CHECK.tipRatio * Math.min(after.box[0], after.box[1])) return { why: 'tall' };
+  return null;
+}
+
+/** How much of a piece's top shows step lines at a layer height (mm²): its big leaning faces that look up. */
+export const stepArea = (check, layer = 0.2) => stepLines(check?.leaning, layer).reduce((sum, f) => sum + (f.facing === 'up' ? f.area : 0), 0);
 
 /** Every leaning face that shows step lines at a layer height, with them. `face` is its number in `leaning`, from 1. */
 function leaningRows(leaning, layer) {
@@ -846,27 +911,32 @@ function seamWords(s) {
 
 /**
  * A piece's check in a few short clauses, for its line in the pieces list and on the sheet: supports, step lines,
- * what it stands on, and how its pin holes print.
+ * what it stands on, and how its pin holes print. A piece tipped in its file to print a leaning face level (`tip`;
+ * how it lies says that it is) is told what that costs it: the supports it then needs, not only may need, under
+ * what it lay on, and that it rests on an edge.
  * @param {object|null} row from `checkRow`
  * @param {{ upright?: number, pointed?: number, flat?: number, round?: number }|null} holes the piece's pin holes by
  *   how they print (split.js `holeSummary`)
- * @param {{ fine?: boolean }} say `fine: false` leaves out the clause for pin holes that all print without supports,
- *   where that is said once for all the pieces (the sheet's heading)
+ * @param {{ fine?: boolean, tip?: boolean }} say `fine: false` leaves out the clause for pin holes that
+ *   all print without supports, where that is said once for all the pieces (the sheet's heading); `tip` for a piece
+ *   that is tipped
  * @returns {string[]} empty without a check and without holes
  */
-export function checkWords(row, holes = null, { fine = true } = {}) {
+export function checkWords(row, holes = null, { fine = true, tip = false } = {}) {
   const out = [];
   if (row) {
     const s = row.supports;
     if (s.area < PRINT_CHECK.none) out.push('no supports needed');
-    else out.push(`may need supports: ${[areaWords(s.area), seamWords(s), standWords(s)].filter(Boolean).join(', ')}`);
+    else out.push(`${tip ? 'needs' : 'may need'} supports: ${[areaWords(s.area), seamWords(s), standWords(s)].filter(Boolean).join(', ')}`);
     if ((s.span ?? 0) >= PRINT_CHECK.none) out.push(`bridges a level span of about ${s.reach} mm`);
     const top = row.steps.find((f) => f.facing === 'up');
     if (top) out.push(`step lines ${everyWords(top.every)} on a big face on top`);
-    if (!row.foot.flat) out.push('nothing flat to stand on');
+    if (tip && !row.foot.flat) out.push(`rests on an edge: add a brim, ${tipBrim(row)} mm wide`);
+    else if (!row.foot.flat) out.push('nothing flat to stand on');
     else if (row.foot.strip) out.push(`rests on a narrow strip: add a brim, ${row.foot.brim} mm wide`);
     else if (row.foot.tip) out.push(`may tip: add a brim, ${row.foot.brim} mm wide`);
     else if (row.foot.small) out.push(`small foot: add a brim, ${row.foot.brim} mm wide`);
+    else if (tip) out.push(`${areaWords(row.foot.contact)} on the bed: add a brim, ${tipBrim(row)} mm wide`);
   }
   const n = holes ? (holes.upright ?? 0) + (holes.pointed ?? 0) + (holes.flat ?? 0) + (holes.round ?? 0) : 0;
   if (n) {
@@ -875,6 +945,36 @@ export function checkWords(row, holes = null, { fine = true } = {}) {
     else if (fine) out.push(`${n === 1 ? 'its pin hole needs' : `its ${n} pin holes need`} no supports`);
   }
   return out;
+}
+
+/** An angle in plain words, as a leaning face's is told: whole degrees from 3 up, to half a degree under it. */
+export const angleWords = (deg) => lengthWords(deg);
+
+/** The brim a tipped piece wants (mm): what its foot asks for where it has one that is risky, else the usual one. */
+const tipBrim = (row) => row.foot.brim || PRINT_CHECK.brim;
+
+/**
+ * The words of the note for a piece tipped in its file so that a big leaning face prints level (split.js
+ * `PIECE_TIPPED`), after the piece's name: what was done, what it costs – the supports under what it lay on, a glue
+ * face printed on them, what is left on the bed – and what to set in the slicer.
+ * @param {string} who "Piece 3"
+ * @param {{ angle: number, area: number, check: object }} fields the angle it is tipped by (degrees), the area of the
+ *   face that prints level (mm²) and the tipped piece's check (`checkRow`)
+ * @returns {string}
+ */
+export function tipNoteWords(who, { angle = 0, area = 0, check = null }) {
+  const out = [`${who} is tipped ${angleWords(angle)}° in its file so that its big face on top (${areaWords(area)}) prints level, without step lines.`];
+  if (!check) return out[0];
+  const s = check.supports;
+  const rests = check.foot.flat ? `rests on ${areaWords(check.foot.contact)} of the bed` : 'rests on an edge';
+  if (s.area >= PRINT_CHECK.none) {
+    out.push(`What that costs: it no longer lies flat – it ${rests}, and ${areaWords(s.area)} under it prints on supports, ${standWords(s)}.`);
+    if (s.seam >= PRINT_CHECK.none) out.push(`${s.seam >= 0.9 * s.area ? 'That is a glue face' : `${areaWords(s.seam)} of that is a glue face`}: on supports it prints rough and may want light sanding before you glue it.`);
+  } else out.push(`What that costs: it no longer lies flat – it ${rests}.`);
+  const where = s.piece < 0.1 * s.area ? '"on build plate only" is enough' : 'everywhere, not only on the build plate';
+  out.push(`In your slicer turn off auto-orient and don't use "lay on face" for it${s.area >= PRINT_CHECK.none ? `, turn supports on (${where})` : ''} and add a brim about ${tipBrim(check)} mm wide.`);
+  out.push('Its pin holes are shaped for lying tipped. Untick "Tip this piece" in the pieces list to print it flat again, with the step lines.');
+  return out.join(' ');
 }
 
 /**

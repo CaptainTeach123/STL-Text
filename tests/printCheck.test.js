@@ -1,8 +1,9 @@
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { manifold } from '../src/manifold.js';
-import { LAY_DOWN, printTransform, yawMat4 } from '../src/split.js';
+import { LAY_DOWN, printTransform, tipTurn, yawMat4 } from '../src/split.js';
 import {
-  FACE, OVERHANG_NZ, PRINT_CHECK, areaWords, checkNote, checkNoteWords, checkRow, checkWords, everyWords, faceKind, faceLean, LEAN_REST, printCheck, shownFaces, stepLines, stepSegments, stepsApart,
+  FACE, OVERHANG_NZ, PRINT_CHECK, angleWords, areaWords, checkNote, checkNoteWords, checkRow, checkWords, everyWords, faceKind, faceLean, LEAN_REST, levelFace, printCheck, shownFaces, stepArea,
+  stepLines, stepSegments, stepsApart, tipBarred, tipNoteWords, tipWorse,
 } from '../src/printCheck.js';
 import { setup } from './helpers.js';
 
@@ -958,5 +959,126 @@ describe('step lines are drawn where the line tells of them, and all over a roun
     expect(marked(top.c, 0.2, under.c)).toBe(0);
     // and where the copy has lost its leaning face there is nothing to draw on, whatever the piece's line says
     expect(marked(none.c, 0.2, top.c)).toBe(0);
+  });
+});
+
+describe('tipping a piece so that its big leaning face prints level', () => {
+  /** The check of a solid tipped so that `face` is level, as the engine makes it. */
+  const tipped = (solid, face, down = '-z', options = {}) => check(solid, down, { turn: tipTurn(down, face.normal).turn, skirt: false, ...options });
+  /** A shallow roof 100 × 80: two faces, each leaning `deg` degrees down from the ridge along the middle. */
+  const roof = (deg) => {
+    const rise = 50 * Math.tan((deg * Math.PI) / 180);
+    return hull([[0, 0, 0], [100, 0, 0], [0, 80, 0], [100, 80, 0], [0, 0, 20], [100, 0, 20], [0, 80, 20], [100, 80, 20], [50, 0, 20 + rise], [50, 80, 20 + rise]]);
+  };
+
+  it('a leaning face is told with the way it looks, and the face to level is the largest on top that shows step lines', () => {
+    const c = check(leaning(3));
+    const rad = (3 * Math.PI) / 180;
+    expect(c.leaning).toHaveLength(1);
+    expect(Math.hypot(...c.leaning[0].normal)).toBeCloseTo(1, 9);
+    c.leaning[0].normal.forEach((v, a) => expect(v).toBeCloseTo([-Math.sin(rad), 0, Math.cos(rad)][a], 5));
+    const face = levelFace(c, 0.2);
+    expect(face).toMatchObject({ tilt: expect.closeTo(3, 3), area: expect.closeTo(8011, 0) });
+    expect(face.normal).toEqual(c.leaning[0].normal);
+    expect(stepArea(c, 0.2)).toBeCloseTo(face.area, 6);
+    // none on a plain block, none for a face that looks down, none where the face climbs less than two layers
+    expect(levelFace(check(block([0, 0, 0], [100, 80, 20])), 0.2)).toBeNull();
+    expect(levelFace(check(leaning(3, false)), 0.2)).toBeNull();
+    expect(levelFace(check(leaning(0.3)), 0.4)).toBeNull();
+    expect(levelFace(null)).toBeNull();
+    // of two, the larger
+    const two = check(join(leaning(3), own(leaning(5).scale([0.5, 0.5, 1]).translate([200, 0, 0]))));
+    expect(levelFace(two, 0.2).tilt).toBeCloseTo(3, 3);
+  });
+
+  it('is barred without such a face, for one that leans more than 8°, and for a piece that stands on little as it lies', () => {
+    const c = check(leaning(3));
+    expect(tipBarred(c, levelFace(c))).toBeNull();
+    expect(tipBarred(c, null)).toBe('none');
+    expect(tipBarred(null, levelFace(c))).toBe('none');
+    const steep = check(leaning(10));
+    expect(PRINT_CHECK.tipMax).toBe(8);
+    expect(tipBarred(steep, levelFace(steep))).toBe('steep');
+    expect(tipBarred(check(leaning(8)), levelFace(check(leaning(8))))).toBe('steep'); // 8° and a hair, as it is meshed
+    expect(tipBarred(check(leaning(7.9)), levelFace(check(leaning(7.9))))).toBeNull();
+    // a tall post with a leaning top may tip as it stands
+    const post = check(hull([[0, 0, 0], [30, 0, 0], [0, 30, 0], [30, 30, 0], [0, 0, 200], [30, 0, 202], [0, 30, 200], [30, 30, 202]]));
+    expect(post.foot.tip).toBe(true);
+    expect(tipBarred(post, { tilt: 3.8, area: 900, normal: [0, 0, 1] })).toBe('foot');
+  });
+
+  it('tipped, the face is level and what the piece lay on needs supports: that is its price, and no reason to refuse', () => {
+    const solid = leaning(3);
+    const before = check(solid);
+    const face = levelFace(before);
+    const after = tipped(solid, face);
+    expect(stepArea(after, 0.2)).toBe(0);
+    expect(after.leaning.filter((f) => f.facing === 'up')).toEqual([]);
+    // the whole underside hangs over the bed now, 3° off it, and the piece rests on an edge
+    expect(after.supports.area).toBeCloseTo(8000 * Math.cos((3 * Math.PI) / 180), 0);
+    expect(after.supports).toMatchObject({ places: 1, piece: 0, bridged: 0 });
+    expect(after.supports.bed).toBeCloseTo(after.supports.area, 6);
+    expect(after.foot).toMatchObject({ flat: false, contact: 0 });
+    expect(tipWorse(before, after, face, 0.2)).toBeNull();
+    // a check that could not be made is no leave to tip
+    expect(tipWorse(before, null, face, 0.2)).toEqual({ why: 'unknown' });
+  });
+
+  it('is worse where another face would lean instead, where new supports elsewhere outgrow the face, or where it would stand tall on an edge', () => {
+    // a shallow roof: level one face and the other leans twice as much – half its top still shows step lines
+    const ridge = roof(3);
+    const before = check(ridge);
+    const face = levelFace(before);
+    expect(before.leaning.filter((f) => f.facing === 'up')).toHaveLength(2);
+    const after = tipped(ridge, face);
+    expect(stepArea(after, 0.2)).toBeCloseTo(stepArea(before, 0.2) / 2, -1);
+    expect(tipWorse(before, after, face, 0.2)).toEqual({ why: 'steps' });
+    // supports: as much again under faces that were not on the bed, and more than the face levelled
+    const plain = check(leaning(3));
+    const wedge = levelFace(plain);
+    const more = { ...tipped(leaning(3), wedge), supports: { ...plain.supports, area: plain.foot.contact + wedge.area + 1 } };
+    expect(tipWorse(plain, more, wedge, 0.2)).toEqual({ why: 'supports', extra: expect.closeTo(wedge.area + 1, 6) });
+    expect(tipWorse(plain, { ...more, supports: { ...plain.supports, area: plain.foot.contact + wedge.area - 1 } }, wedge, 0.2)).toBeNull();
+    // tall: more than five times as tall as it is wide on the bed
+    expect(tipWorse(plain, { ...tipped(leaning(3), wedge), height: 401, box: [100, 80] }, wedge, 0.2)).toEqual({ why: 'tall' });
+    expect(tipWorse(plain, { ...tipped(leaning(3), wedge), height: 399, box: [100, 80] }, wedge, 0.2)).toBeNull();
+  });
+
+  it('a tipped piece on a narrow ring is still told of its supports: its underside is no rounded bottom edge', () => {
+    // a frame 100 × 80 with walls 2 mm thick, its top leaning 1.5°: tipped, its underside rises 2.6 mm off the bed
+    const frame = own(leaning(1.5).subtract(block([2, 2, -1], [98, 78, 60])));
+    const before = check(frame);
+    const face = levelFace(before);
+    expect(face).not.toBeNull();
+    const turn = tipTurn('-z', face.normal).turn;
+    // as an ordinary piece the narrow band rising off the bed would be left out
+    expect(check(frame, '-z', { turn }).supports.area).toBeLessThan(check(frame, '-z', { turn, skirt: false }).supports.area);
+    expect(check(frame, '-z', { turn, skirt: false }).supports.area).toBeGreaterThan(0.75 * before.foot.contact); // all but the wall along the edge it rests on
+  });
+
+  it("the piece's line and its note say what the tip costs", () => {
+    const solid = leaning(3);
+    const before = check(solid);
+    const face = levelFace(before);
+    const row = checkRow(tipped(solid, face), 0.2);
+    expect(checkWords(row, null, { tip: true })).toEqual(['needs supports: about 80 cm², standing on the bed', 'rests on an edge: add a brim, 5 mm wide']);
+    // not tipped, the same row would only be told it may need them
+    expect(checkWords(row)[0]).toBe('may need supports: about 80 cm², standing on the bed');
+    expect(angleWords(2.9999)).toBe('3');
+    expect(angleWords(1.4)).toBe('1.5');
+    expect(tipNoteWords('Piece 2', { angle: face.tilt, area: face.area, check: row })).toBe(
+      'Piece 2 is tipped 3° in its file so that its big face on top (about 80 cm²) prints level, without step lines. '
+      + 'What that costs: it no longer lies flat – it rests on an edge, and about 80 cm² under it prints on supports, standing on the bed. '
+      + 'In your slicer turn off auto-orient and don\'t use "lay on face" for it, turn supports on ("on build plate only" is enough) and add a brim about 5 mm wide. '
+      + 'Its pin holes are shaped for lying tipped. Untick "Tip this piece" in the pieces list to print it flat again, with the step lines.',
+    );
+    // what it lay on was a glue face: said, with what to do about it
+    const seam = checkRow(tipped(solid, face, '-z', { planes: [{ axis: 2, at: 0 }] }), 0.2);
+    expect(seam.supports.seam).toBe(seam.supports.area);
+    expect(checkWords(seam, { upright: 2 }, { tip: true })).toEqual(['needs supports: about 80 cm², under a glue face, standing on the bed', 'rests on an edge: add a brim, 5 mm wide', 'its 2 pin holes need no supports']);
+    expect(tipNoteWords('Piece 1', { angle: 3, area: 8011, check: seam })).toContain('That is a glue face: on supports it prints rough and may want light sanding before you glue it.');
+    // supports that would stand on the piece itself want supports everywhere
+    const onPiece = { ...row, supports: { ...row.supports, piece: row.supports.area, bed: 0 } };
+    expect(tipNoteWords('Piece 1', { angle: 3, area: 8011, check: onPiece })).toContain('turn supports on (everywhere, not only on the build plate)');
   });
 });

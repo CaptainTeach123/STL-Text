@@ -17,9 +17,9 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const out = path.join(root, 'e2e', 'out');
 fs.mkdirSync(out, { recursive: true });
 
-// the lines under a piece in the pieces list that are not its own: its print check, its estimate, and the choice of
-// the side it lies on with its entries (a list's text includes them)
-const UNDER_PIECE = /^((Print check|Estimate): |Lies on$|The app's choice|As in the model|Upside down|On its (left side|right side|front|back)|set by you)/;
+// the lines under a piece in the pieces list that are not its own: its print check, its estimate, the choice of
+// the side it lies on with its entries (a list's text includes them) and the tick box that tips it
+const UNDER_PIECE = /^((Print check|Estimate): |Lies on$|The app's choice|As in the model|Upside down|On its (left side|right side|front|back)|set by you|Tip this piece|Can't be tipped|tipped – |asked for, but not tipped)/;
 
 let failures = 0;
 const check = (ok, label, extra = '') => {
@@ -6627,6 +6627,179 @@ try {
     const back = await rows();
     check(back.length === 2 && back[1].value === '-y' && back[1].own, 'Undo brings the choice back with the cuts', JSON.stringify(back.map((r) => [r.value, r.own])));
     check(layProblems.length === 0, 'no page errors while choosing how pieces lie', layProblems.join(' | '));
+    await ctx.close();
+  }
+
+  // --- a piece tipped in its file so that its big leaning face prints level --------------------------------------
+  console.log('\ntip this piece');
+  {
+    // a desk 300 mm long whose top leans 3° across its width: cut in two and laid as modelled, both halves show step lines
+    const rise = 80 * Math.tan((3 * Math.PI) / 180);
+    const tipDesk = Manifold.hull([[-150, 0, 0], [150, 0, 0], [-150, 80, 0], [150, 80, 0], [-150, 0, 30], [150, 0, 30], [-150, 80, 30 + rise], [150, 80, 30 + rise]]);
+    const tipFile = writeFixture('tipdesk.stl', soupOf(tipDesk));
+    tipDesk.delete();
+    const ctx = await browser.newContext({ viewport: { width: 1400, height: 1000 }, acceptDownloads: true });
+    const q = await ctx.newPage();
+    const tipProblems = [];
+    q.on('pageerror', (e) => tipProblems.push(e.message));
+    q.on('console', (m) => m.type() === 'error' && tipProblems.push(m.text()));
+    await q.goto(url);
+    const settle = async () => {
+      for (let i = 0; i < 2; i++) {
+        await q.waitForTimeout(60);
+        await q.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+      }
+    };
+    const worked = async () => {
+      await q.waitForFunction(() => document.querySelector('#pieceList li:not(.predicted)') && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 120000 });
+      await settle();
+    };
+    const rows = () =>
+      q.locator('#pieceList li').evaluateAll((els) =>
+        els.map((li) => {
+          const box = li.querySelector('.piece-tip input');
+          return {
+            text: li.querySelector('span:nth-child(2)').firstChild.textContent,
+            check: li.querySelector('.print-check')?.textContent ?? '',
+            tip: li.querySelector('.piece-tip span')?.textContent ?? null,
+            ticked: box?.checked ?? null,
+            off: box?.disabled ?? null,
+            tag: li.querySelector('.piece-tip .piece-lay-own')?.textContent ?? '',
+          };
+        }),
+      );
+    const notes = async () => (await q.locator('#splitNotes li .text').allInnerTexts()).join(' / ');
+    const tick = (n) => q.click(`#pieceList li:nth-child(${n}) .piece-tip input`);
+    const tagged = (n, pattern) =>
+      q.waitForFunction(([i, re]) => new RegExp(re).test(document.querySelector(`#pieceList li:nth-child(${i}) .piece-tip .piece-lay-own`)?.textContent ?? '') && !document.querySelector('#pieceList').classList.contains('stale'), [n, pattern], { timeout: 120000 });
+    await settle();
+    await q.setInputFiles('#stlFile', tipFile);
+    await q.waitForFunction(() => document.querySelector('#modelInfo').textContent.startsWith('tipdesk:'));
+    await settle();
+    await q.click('#deleteBtn'); // the desk alone, without the text it opens with
+    await settle();
+    await q.click('#addCutBtn');
+    await settle();
+    await q.evaluate(() => {
+      const el = document.querySelector('[data-split="orient"]');
+      el.value = 'model';
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await settle();
+    await q.click('#resultToggle');
+    await worked();
+    const before = await rows();
+    check(
+      before.length === 2 && before.every((r) => r.ticked === false && r.off === false && r.tip === 'Tip this piece so that face prints level (about 120 cm², leaning 3°)' && !r.tag && /step lines about every 4 mm on a big face on top/.test(r.check)),
+      'each half shows step lines and has a tick box to tip it so that the face prints level – unticked',
+      JSON.stringify(before.map((r) => [r.tip, r.ticked, r.off, r.check])),
+    );
+    check(!/tipped/.test(await notes()), 'nothing is tipped until it is asked for', (await notes()).slice(0, 160));
+    // tick it for piece 1: its row, its print check and the notes are of the piece lying tipped
+    await tick(1);
+    await tagged(1, '^tipped – needs supports');
+    await settle();
+    const tipped = await rows();
+    check(
+      /lies flat as modelled, tipped 3°/.test(tipped[0].text) && tipped[0].ticked && tipped[0].tag === 'tipped – needs supports, see the notes',
+      'ticked, piece 1 lies tipped 3°, and its row says so',
+      JSON.stringify([tipped[0].text, tipped[0].ticked, tipped[0].tag]),
+    );
+    check(
+      /^Print check: needs supports: about 120 cm², standing on the bed · rests on an edge: add a brim, 5 mm wide · its \d pin holes need no supports$/.test(tipped[0].check) && !/step lines/.test(tipped[0].check),
+      'its print check says what the tip costs: supports under what it lay on, resting on an edge – and no step lines',
+      tipped[0].check,
+    );
+    check(tipped[1].text === before[1].text && tipped[1].check === before[1].check && tipped[1].ticked === false, 'piece 2 lies as it did, with its step lines', tipped[1].check);
+    const said = await notes();
+    check(
+      /Piece 1 is tipped 3° in its file so that its big face on top \(about 120 cm²\) prints level, without step lines\. What that costs: it no longer lies flat – it rests on an edge, and about 120 cm² under it prints on supports, standing on the bed\./.test(said) &&
+        /turn off auto-orient and don't use "lay on face" for it, turn supports on \("on build plate only" is enough\) and add a brim/.test(said) && /Piece 2 has a big face on top/.test(said) && !/Piece 1 has a big face on top/.test(said),
+      'the notes say what was done, what it costs and what to set in the slicer',
+      said.slice(0, 400),
+    );
+    check(await q.isChecked('#resultToggle'), 'the pieces stay in view while they are worked out again');
+    // as printed the tipped piece is shown as its file lies
+    await q.click('#asPrintedToggle');
+    await q.waitForTimeout(400);
+    await q.screenshot({ path: path.join(out, 'tip-as-printed.png') });
+    check(await q.isChecked('#asPrintedToggle'), 'As printed shows the piece tipped');
+    await q.click('#asPrintedToggle');
+    // the download: piece 1's top is level in its file, the file stands on the bed, and the sheet says how to print it
+    const [dl] = await Promise.all([q.waitForEvent('download'), q.click('#downloadBtn')]);
+    const tipZip = path.join(out, 'tipdesk.zip');
+    await dl.saveAs(tipZip);
+    await settle();
+    const entries = unzipSync(new Uint8Array(fs.readFileSync(tipZip)));
+    const names = Object.keys(entries);
+    const sheetText = strFromU8(entries[names.find((n) => /how-to-glue\.txt$/.test(n))] ?? new Uint8Array());
+    check(
+      /piece 1 of 2 .* lies flat as modelled, tipped 3° {3}fits – needs supports: about 120 cm², standing on the bed; rests on an edge: add a brim, 5 mm wide/.test(sheetText) &&
+        sheetText.includes('  Piece 1 is meant to lie tipped, as its file has it: one big face is then level and prints without step lines, and the piece rests on an edge.') &&
+        sheetText.includes('  For it, turn off auto-orient in your slicer and do not use "lay on face"; turn supports on (on build plate only is enough) and add a brim.'),
+      'the sheet says piece 1 is meant to lie tipped, to turn off auto-orient and lay-on-face, and to use supports on the build plate',
+      sheetText.split('\n').filter((l) => /tipped|auto-orient/.test(l)).join(' / '),
+    );
+    const levelArea = (name) => {
+      const bytes = Buffer.from(entries[names.find((n) => n.endsWith(name))]);
+      const count = bytes.readUInt32LE(80);
+      let area = 0;
+      let low = Infinity;
+      for (let t = 0; t < count; t++) {
+        const at = 84 + 50 * t + 12;
+        const v = [0, 1, 2].map((k) => [0, 1, 2].map((a) => bytes.readFloatLE(at + 12 * k + 4 * a)));
+        const u = v[1].map((x, a) => x - v[0][a]);
+        const w = v[2].map((x, a) => x - v[0][a]);
+        const n = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+        const len = Math.hypot(...n);
+        low = Math.min(low, v[0][2], v[1][2], v[2][2]);
+        if (len > 0 && n[2] / len > 1 - 1e-6) area += len / 2;
+      }
+      return { area, low };
+    };
+    const [file1, file2] = [levelArea('piece-1-of-2.stl'), levelArea('piece-2-of-2.stl')];
+    check(
+      Math.abs(file1.area - (150 * 80) / Math.cos((3 * Math.PI) / 180)) < 1 && Math.abs(file1.low) < 1e-4 && file2.area < 100,
+      "in piece 1's file the whole top is level and the lowest point is on the bed; piece 2's top still leans",
+      JSON.stringify({ file1, file2 }),
+    );
+    // built-in pegs are shaped for the way a piece lies: asked for, the tip is refused with the reason, and the other
+    // piece's box is greyed out
+    await q.click('#splitSettings label:has(input[data-split="joint"][value="pegs"])');
+    await tagged(1, '^asked for, but not tipped: its built-in pegs');
+    await settle();
+    const pegged = await rows();
+    check(
+      pegged[0].ticked && !/tipped/.test(pegged[0].text) && /step lines/.test(pegged[0].check) && pegged[1].off === true && /^Can't be tipped to print its big face level: its built-in pegs/.test(pegged[1].tip ?? ''),
+      'with built-in pegs piece 1 is not tipped and says why, and piece 2 cannot be ticked',
+      JSON.stringify([pegged[0].tag, pegged[0].text, pegged[1].tip, pegged[1].off]),
+    );
+    check(/Piece 1 is not tipped, though you asked for it in the pieces list: its built-in pegs and their sockets are shaped to print the way it lies/.test(await notes()), 'a note says so too', (await notes()).slice(0, 200));
+    await q.click('#splitSettings label:has(input[data-split="joint"][value="auto"])');
+    await tagged(1, '^tipped – needs supports');
+    await settle();
+    // it lasts while the cuts stay: another cut drops it, with a note; Undo brings it back
+    await q.click('#addCutBtn');
+    await settle();
+    const dropped = await notes();
+    check(/^The cuts changed, so the pieces are no longer the same ones: the piece you asked to tip is not tipped any more/.test(dropped), 'another cut drops the tip, and a note says so', dropped.slice(0, 160));
+    await worked();
+    const fresh = await rows();
+    check(fresh.length === 3 && fresh.every((r) => !r.ticked && !/tipped/.test(r.text)), 'the three pieces all lie flat again', JSON.stringify(fresh.map((r) => [r.ticked, r.text])));
+    await q.click('#splitNotes li button:text-is("OK")');
+    check(!/The cuts changed/.test(await notes()), 'OK takes the note away');
+    await q.click('#undoBtn');
+    await tagged(1, '^tipped – needs supports');
+    await settle();
+    const back = await rows();
+    check(back.length === 2 && back[0].ticked && /tipped 3°/.test(back[0].text), 'Undo brings the tip back with the cuts', JSON.stringify(back.map((r) => [r.ticked, r.text])));
+    // choosing another side for the piece lays it there untipped; unticking lays it flat again
+    await tick(1);
+    await q.waitForFunction(() => !document.querySelector('#pieceList li .piece-tip .piece-lay-own') && !document.querySelector('#pieceList').classList.contains('stale') && !/tipped/.test(document.querySelector('#pieceList li').textContent), null, { timeout: 120000 });
+    await settle();
+    const flat = await rows();
+    check(flat[0].ticked === false && flat[0].text === before[0].text && flat[0].check === before[0].check && !/is tipped/.test(await notes()), 'unticked, piece 1 lies flat again with its step lines', JSON.stringify([flat[0].text, flat[0].check]));
+    check(tipProblems.length === 0, 'no page errors while tipping pieces', tipProblems.join(' | '));
     await ctx.close();
   }
 

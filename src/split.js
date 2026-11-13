@@ -22,7 +22,7 @@
  *  - piece numbers are 1-based, as in "piece 2 of 3" and the label "2A".
  */
 import { TEA_LIGHT, roundAngle, roundOpening, wayWords } from './locks.js';
-import { OVERHANG_NZ, PRINT_CHECK, checkNote, checkNoteWords, checkWords, areaWords } from './printCheck.js';
+import { OVERHANG_NZ, PRINT_CHECK, angleWords, checkNote, checkNoteWords, checkWords, areaWords, tipNoteWords } from './printCheck.js';
 import { planSheetLines } from './printPlan.js';
 import { boxHang, columnGraph, columnsOf, HANG, hangAt, looseTable, planeGrid, rasterRings, sampleWidths } from './hang.js';
 
@@ -375,7 +375,8 @@ export function keepsThrough(keeps, cut) {
  *   `spec` holds the clamped settings (no cuts), `grid` the number of cuts on each axis; `apart` only on a cut that comes
  *   apart; `seat` only on a part whose base is to have a tea-light seat; `keeps` the details kept whole (`keepsOf`), only
  *   when there are some; `lay` the sides chosen by hand for pieces to lie on (`layOf`), only when there are some and
- *   every cut cuts (else a `LAY_WAITS` note). No
+ *   every cut cuts (else a `LAY_WAITS` note); `tip` the boxes of the pieces asked to be tipped so that a leaning
+ *   face prints level (`tipOf`), likewise (else a `TIP_WAITS` note). No
  *   cuts left means: export unsplit, with the notes.
  * @throws {SplitError} `SPLIT_INVALID` for more than 12 cuts and parts or 64 pieces
  */
@@ -457,7 +458,24 @@ export function normaliseSplit(split, bounds = null) {
   // and that they wait is said, or a piece would seem to lie as chosen
   const waiting = whole ? 0 : Object.keys(layOf(s.lay, [Infinity, Infinity, Infinity]) ?? {}).length;
   if (waiting) notes.push(splitNote('LAY_WAITS', { count: waiting }));
-  return { spec, cuts, parts, notes, grid, ...(keeps.length ? { keeps } : {}), ...(lay ? { lay } : {}) };
+  // the pieces asked to be tipped go by their boxes too, and wait as the sides do
+  const tip = whole ? tipOf(s.tip, grid) : null;
+  const tips = whole ? 0 : (tipOf(s.tip, [Infinity, Infinity, Infinity]) ?? []).length;
+  if (tips) notes.push(splitNote('TIP_WAITS', { count: tips }));
+  return { spec, cuts, parts, notes, grid, ...(keeps.length ? { keeps } : {}), ...(lay ? { lay } : {}), ...(tip ? { tip } : {}) };
+}
+
+/**
+ * The pieces asked to be tipped so that a leaning face prints level (`split.tip`: by the piece's box, 'i,j,k'), those
+ * that name a box of the grid, in order; null when none is left.
+ * @param {Object<string, boolean>|null|undefined} tip as stored
+ * @param {number[]} grid the number of cuts on each axis
+ * @returns {string[]|null}
+ */
+export function tipOf(tip, grid) {
+  if (!tip || typeof tip !== 'object') return null;
+  const out = Object.keys(tip).sort().filter((key) => tip[key] === true && /^\d+,\d+,\d+$/.test(key) && !key.split(',').some((v, a) => Number(v) > grid[a]));
+  return out.length ? out : null;
 }
 
 /**
@@ -711,9 +729,35 @@ export function flatInset(s, lift = FLAT_TOP_LIFT) {
   return flatTop(s.a, lift).corner + s.wall;
 }
 
-/** The world direction of a horizontal hole's teardrop point (the piece's up), or null when its piece prints the hole upright. */
-export function teardropApex(up, axis) {
-  return dirAxis(up) === axis ? null : [...DIRECTIONS[up]];
+/**
+ * The world direction of a horizontal hole's teardrop point (the piece's up), or null when its piece prints the hole
+ * upright. A piece tipped a little in its file (`tip`: the way that is up once it is tipped, one long) has the point
+ * where up is then, seen along the hole: a few degrees round from the side that is up as it lies. Its upright holes
+ * lean as little, and stay round.
+ * @param {string} up the side of the piece that faces up as it lies ('+z', …)
+ * @param {number} axis the hole's axis
+ * @param {number[]|null} tip
+ * @returns {number[]|null} one long, square to the hole
+ */
+export function teardropApex(up, axis, tip = null) {
+  if (dirAxis(up) === axis) return null;
+  if (!tip) return [...DIRECTIONS[up]];
+  const flat = tip.map((v, a) => (a === axis ? 0 : v));
+  const len = Math.hypot(...flat);
+  return len > 1e-9 ? flat.map((v) => v / len) : [...DIRECTIONS[up]];
+}
+
+/**
+ * Local → world frame of a half-hole whose teardrop points a way that is along no axis (`teardropApex` of a tipped
+ * piece): as `localFrame`, z into the piece along an axis and y towards the point, which is square to it.
+ * @param {string} z the direction into the piece ('+x', …)
+ * @param {number[]} y one long, square to z
+ * @returns {number[]} column-major 4×4, moved to `origin`
+ */
+export function leaningFrame(z, y, origin = [0, 0, 0]) {
+  const Z = axisVector(z);
+  const X = cross(y, Z);
+  return [...X, 0, y[0] + 0, y[1] + 0, y[2] + 0, 0, ...Z, 0, origin[0] + 0, origin[1] + 0, origin[2] + 0, 1];
 }
 
 /**
@@ -3491,6 +3535,81 @@ export function printTransform(bbox, down = '-z', yaw = 0) {
 }
 
 /**
+ * The turn that lays a piece `down` and then tips it by the least angle that makes a face of it level: `normal` the
+ * way that face looks as the piece lies (print frame, one long, looking up), as `printCheck` gives it. The face then
+ * looks straight up.
+ * @param {string} down the side the piece lies on
+ * @param {number[]} normal
+ * @returns {{ turn: number[], up: number[], angle: number }} `turn` column-major 4×4, a turn only; `up` the way in
+ *   the model that is up once the piece is tipped (the face's own normal there), one long; `angle` degrees
+ */
+export function tipTurn(down, normal) {
+  const L = LAY_DOWN[down];
+  const len = Math.hypot(...normal) || 1;
+  const [x, y, z] = normal.map((v) => v / len);
+  const s = Math.hypot(x, y);
+  let T = [...IDENTITY];
+  if (s > 1e-12) {
+    // about the level line of the face, (y, −x, 0) / s, by the angle between its normal and straight up
+    const [ax, ay] = [y / s, -x / s];
+    const k = 1 - z;
+    T = [
+      z + ax * ax * k, ax * ay * k, -ay * s, 0,
+      ax * ay * k, z + ay * ay * k, ax * s, 0,
+      ay * s, -ax * s, z, 0,
+      0, 0, 0, 1,
+    ];
+  }
+  // the way up in the model: what the turn takes to +z
+  const turn = mulMat4(T, L);
+  return { turn, up: [turn[2], turn[6], turn[10]], angle: (Math.atan2(s, z) * 180) / Math.PI };
+}
+
+/**
+ * The world → print transform of a piece tipped in its file (`tipTurn`), from the piece's own points: turned, then
+ * `yaw` degrees about +z, then set down so that its lowest point is on z = 0 and its middle over x = y = 0. A tipped
+ * piece's box is no measure of it – its lowest corner would be under the bed – so its size and its place on the bed
+ * are those of its points as they lie.
+ * @param {number[]} turn the piece's turn (`tipTurn`)
+ * @param {(ArrayLike<number>|{ points: ArrayLike<number>, stride: number })[]} lists the piece's points: x, y, z each
+ *   (or the first three of `stride` numbers); empty ones are skipped
+ * @param {{ U?: number[]|null, yaw?: number|null }} options `U` the usable bed, to turn the piece on it so that it
+ *   fits; `yaw` that turn where it is known already
+ * @returns {{ printMatrix: number[], matrix: number[], size: number[], yaw: number, fits: boolean }} as
+ *   `chooseOrientation` gives them: `size` its sides as it lies, before a diagonal turn; `fits` false where it fits
+ *   the bed no way round
+ */
+export function tipTransform(turn, lists, { U = null, yaw = null } = {}) {
+  const spans = (R) => {
+    const lo = [Infinity, Infinity, Infinity];
+    const hi = [-Infinity, -Infinity, -Infinity];
+    for (const list of lists) {
+      if (!list) continue;
+      const points = list.points ?? list;
+      const stride = list.stride ?? 3;
+      for (let i = 0; i + 2 < points.length; i += stride) {
+        const [x, y, z] = [points[i], points[i + 1], points[i + 2]];
+        for (let a = 0; a < 3; a++) {
+          const v = R[a] * x + R[4 + a] * y + R[8 + a] * z;
+          if (v < lo[a]) lo[a] = v;
+          if (v > hi[a]) hi[a] = v;
+        }
+      }
+    }
+    if (!(lo[0] <= hi[0])) return { lo: [0, 0, 0], hi: [0, 0, 0] };
+    return { lo, hi };
+  };
+  const flat = spans(turn);
+  const [a, b, h] = flat.hi.map((v, k) => v - flat.lo[k]);
+  const found = yaw ?? (U ? (h <= U[2] + EPS ? footprintYaw(a, b, U) : null) : 0);
+  const fits = found !== null;
+  const R = mulMat4(yawMat4(found ?? 0), turn);
+  const { lo, hi } = found ? spans(R) : flat;
+  const printMatrix = mulMat4(translationMat4([-(lo[0] + hi[0]) / 2, -(lo[1] + hi[1]) / 2, -lo[2]]), R);
+  return { printMatrix, matrix: invertRigid(printMatrix), size: found === 90 ? [b, a, h] : [a, b, h], yaw: found ?? 0, fits };
+}
+
+/**
  * How a piece is printed: of the allowed ways down that fit the bed (turned
  * straight, a quarter turn or across the diagonal), those that need about
  * the least support (within 10 % or 25 mm², slender towers and points
@@ -5013,6 +5132,93 @@ export function layWays(laid, layout = {}, U, { parts = null, lying = null, pegs
   });
 }
 
+/**
+ * Whether each laid piece may be tipped in its file so that a big leaning face of it prints level, as far as the
+ * layout tells: a piece is not tipped where it may only lie flat ('flat': a thin plate, a piece beside a dovetail
+ * seam) or stand as modelled ('stand'), where a lip or a twist-lock neck stands out of it ('lip'), where a
+ * twist-lock's socket is cut into it or its pin holes keep the way a take-apart cut laid it ('lock'), where it
+ * carries built-in pegs or has sockets for them ('pegs': they are shaped to print the way it lies) and where it is
+ * more than one part, each of which has to rest on the bed ('parts'). A part taken out, and a piece of a box that
+ * prints as several, is not offered it at all – but the first piece of such a box keeps its `key`, so that a tip
+ * asked for the box before can be handed back ('apart').
+ * @param {object[]} laid from `layPieces`
+ * @param {object} layout `layoutSplit`'s, as for `layGrown`
+ * @param {{ parts?: { has: function }|null }} options `parts` the pieces of the cut stage that are parts taken out
+ * @returns {{ key: string|null, why: string|null }[]} per piece of `laid`: `key` its box ('i,j,k', what `split.tip`
+ *   goes by), null where it has no say; `why` why it is not tipped, null where the layout has nothing against it
+ */
+export function tipWays(laid, layout = {}, { parts = null } = {}) {
+  const carried = carriedBy(layout);
+  const perCell = new Map();
+  for (const p of laid) perCell.set(p.cell.join(','), (perCell.get(p.cell.join(',')) ?? 0) + 1);
+  const first = new Set();
+  return laid.map((p) => {
+    if (parts?.has(p.from)) return { key: null, why: 'part' };
+    const key = p.cell.join(',');
+    if (perCell.get(key) > 1) {
+      const lead = !first.has(key);
+      first.add(key);
+      return { key: lead ? key : null, why: 'apart' };
+    }
+    const free = p.free ?? (p.stats.allowed?.length ? p.stats.allowed : DIR_KEYS);
+    const { own, tongues, sockets, holed } = carried(p);
+    const socketed = (layout.pegs ?? []).some((g) => g.sides.some((x) => !x.peg && x.piece === p.index));
+    const why = free.length === 1 ? 'stand' : free.length < DIR_KEYS.length ? 'flat'
+      : tongues.length ? 'lip' : sockets.length || holed ? 'lock'
+        : own.length || socketed ? 'pegs' : p.shells > 1 ? 'parts' : null;
+    return { key, why };
+  });
+}
+
+/**
+ * Why a piece is not tipped so that its big face prints level (`tipWays`' `why`, and what the engine finds once it
+ * is asked for), in plain words.
+ * @param {string} why
+ * @param {{ angle?: number, area?: number, extra?: number }} of the face's lean (degrees) and area (mm²), and the new
+ *   supports the tip would ask for besides the face the piece lies on (mm²), where they are the reason
+ */
+export function tipRefusedWords(why, { angle = 0, area = 0, extra = 0 } = {}) {
+  switch (why) {
+    case 'flat': return 'it has to lie flat (a thin plate, or one beside a dovetail joint)';
+    case 'stand': return 'a part comes off it, so it prints standing as modelled';
+    case 'lip': return 'its lip has to print standing straight up';
+    case 'lock': return 'its take-apart joint is made to print the way it lies';
+    case 'pegs': return 'its built-in pegs and their sockets are shaped to print the way it lies';
+    case 'parts': return 'it is more than one part, and each has to rest on the bed';
+    case 'apart': return 'that part of the model prints as more than one piece';
+    case 'none': return 'the way it lies now it has no big face on top that leans a little off level';
+    case 'steep': return `its big face leans ${angleWords(angle)}° – more than ${PRINT_CHECK.tipMax}°, and tipped that far too much of it would hang over the bed`;
+    case 'foot': return 'it stands on little as it lies, and tipped it would rest on an edge of that';
+    case 'bed': return "tipped it doesn't fit your printer";
+    case 'steps': return 'tipped, another big face on top would lean instead, and it would show step lines on half as much of its top or more';
+    case 'supports': return `tipped it would need supports under ${areaWords(extra)} more than the face it lies on – more than the face it would make level (${areaWords(area)})`;
+    case 'tall': return 'tipped it would stand tall on an edge and may fall over while printing';
+    default: return 'it cannot print tipped';
+  }
+}
+
+/**
+ * The tick box that tips a piece so that its big leaning face prints level, for its row in the pieces list: what it
+ * says, whether it is ticked, and whether it can be. A piece that cannot be tipped says why; one that was asked to
+ * be and is not stays ticked, so that it can be unticked.
+ * @param {object|null} tip a piece's `tip` (the engine's: `key`, `asked`, `used`, `angle`, `area`, `why`, `extra`)
+ * @param {boolean} asked whether the document holds a tip for it, where that is newer than `tip`
+ * @param {{ current?: boolean }} options `current` false while the pieces are being worked out again
+ * @returns {{ key: string, checked: boolean, disabled: boolean, text: string, tag: string }|null} null without `tip`
+ */
+export function tipOption(tip, asked = tip?.asked ?? false, { current = true } = {}) {
+  if (!tip?.key) return null;
+  const face = tip.area ? ` (${areaWords(tip.area)}, leaning ${angleWords(tip.angle)}°)` : '';
+  const refused = tip.why ? tipRefusedWords(tip.why, tip) : '';
+  // what the document holds may be newer than the pieces: only a tip the pieces were worked out for can be unused
+  const unused = asked && current && tip.asked && !tip.used;
+  if (!asked && tip.why) return { key: tip.key, checked: false, disabled: true, text: `Can't be tipped to print its big face level: ${refused}`, tag: '' };
+  return {
+    key: tip.key, checked: asked, disabled: false, text: `Tip this piece so that face prints level${face}`,
+    tag: unused ? `asked for, but not tipped: ${refused}` : asked && current && tip.used ? 'tipped – needs supports, see the notes' : '',
+  };
+}
+
 /** Why a side is not on offer for a piece to lie on (`layWays`' `why`), as its entry in the choice says it. */
 const LAY_REFUSED = Object.freeze({
   flat: 'it has to lie flat (a thin plate, or one beside a dovetail joint)',
@@ -5421,6 +5627,10 @@ const NOTE_LEVELS = Object.freeze({
   LAY_IGNORED: 'info',
   LAYS_DROPPED: 'info',
   LAY_WAITS: 'info',
+  PIECE_TIPPED: 'info',
+  TIP_REFUSED: 'info',
+  TIP_WAITS: 'info',
+  TIPS_DROPPED: 'info',
   PEGS_SMALLER: 'info',
   PEGS_UPRIGHT: 'info',
   APART: 'info',
@@ -5550,6 +5760,13 @@ const NOTE_TEXT = {
   LAYS_DROPPED: ({ count = 1, why = 'cuts' }) => {
     const what = why === 'model' ? 'The model was turned, moved or resized' : 'The cuts changed';
     return `${what}, so the pieces are no longer the same ones: the side you chose for ${count === 1 ? 'a piece' : `${count} pieces`} to lie on was dropped, and the app lays ${count === 1 ? 'it' : 'them'} again. Choose again in the pieces list if you like (Undo brings the choice back with the ${why === 'model' ? 'model as it was' : 'cuts as they were'}).`;
+  },
+  PIECE_TIPPED: ({ pieceIndex, angle, area, check }) => tipNoteWords(pieceName(pieceIndex), { angle, area, check }),
+  TIP_REFUSED: ({ pieceIndex, why, ...of }) => `${pieceName(pieceIndex)} is not tipped, though you asked for it in the pieces list: ${tipRefusedWords(why, of)}. It prints as it lies – untick "Tip this piece" for it to clear this note.`,
+  TIP_WAITS: ({ count = 1 }) => `A cut misses the model, or lies where another cut is, so the pieces are not the ones you asked to tip: ${count === 1 ? 'the piece is' : 'they are'} not tipped until that cut is moved or removed.`,
+  TIPS_DROPPED: ({ count = 1, why = 'cuts' }) => {
+    const what = why === 'model' ? 'The model was turned, moved or resized' : 'The cuts changed';
+    return `${what}, so the pieces are no longer the same ones: ${count === 1 ? 'the piece you asked to tip is' : `the ${count} pieces you asked to tip are`} not tipped any more. Tick it again in the pieces list if you like (Undo brings it back with the ${why === 'model' ? 'model as it was' : 'cuts as they were'}).`;
   },
   HOLES_KEEP_LAY: ({ pieceIndex, lies }) => `${pieceName(pieceIndex)} lies ${lies}: its pin holes were made to print that way, so don't turn it in your slicer.`,
   PEGS_SMALLER: ({ letter, asked = null, pegSizes = [] }) => {
@@ -5964,6 +6181,11 @@ const NOTE_TEXT = {
  * the sides chosen by hand were dropped with the boxes they went by, `why` 'cuts' or 'model'); LAY_IGNORED `{ pieceIndex, down, why, lies,
  * joint }` (a side chosen by hand that the piece cannot take: `why` 'flat', 'stand', 'rest', 'bed' or 'apart', and with `joint`
  * 'lip', 'lock' or 'pegs': what it carries lays it another way);
+ * PIECE_TIPPED `{ pieceIndex, angle, area, check }` (a piece tipped in its file so that a big leaning face prints
+ * level: by how many degrees, the face's area and the tipped piece's print check); TIP_REFUSED `{ pieceIndex, why,
+ * angle, area, extra }` (a piece asked to be tipped that is not: `tipRefusedWords`); TIP_WAITS `{ count }` (pieces
+ * asked to be tipped that are not while a cut misses or is merged); TIPS_DROPPED `{ count, why }` (the page's own, as
+ * LAYS_DROPPED);
  * ORIENT_FALLBACK `{ pieceIndex, mode, lies }`; HOLES_KEEP_LAY `{ pieceIndex, lies }` (a piece kept the way a lip or
  * a twist-lock that was not built laid it, as its pin holes were shaped for that); PRINT_CHECK `{ pieceIndex, whole,
  * auto, supports, steps, foot, layer, height }` (what the print check of a piece, or with `whole` of a model printed
@@ -6323,7 +6545,7 @@ function fitWords(fit) {
  *   parts?: { name: string }[], clearance?: number, bed?: number[], printer?: { size: number[], margin: number, corner?: number[]|null }|null, steps?: object[],
  *   bridges?: number[], fit?: object|null }} plan
  *   `seams` as for `assemblySteps`; a piece that is a part taken out has its cut's id (`part`), its `name` and the
- *   cut's letter (`lids`); one lying on a side chosen by hand (`lay.used`, `layWays`) is said to lie so as chosen; a piece's print check (`check`, printCheck.js `checkRow`) and its pin holes by how they print
+ *   cut's letter (`lids`); one lying on a side chosen by hand (`lay.used`, `layWays`) is said to lie so as chosen; one tipped in its file so that a big face prints level (`tip.used`, with its `angle`) is said to be, with what to set in the slicer for it; a piece's print check (`check`, printCheck.js `checkRow`) and its pin holes by how they print
  *   (`holes`, `holeSummary`) are said in a clause on its line; `pins` one group per pin size (count without spares, `sheets` its pins files, `strip` the volume of the strips that hold them to the bed, when they get them); `bed` the usable bed (with the
  *   corner it keeps clear, the pieces that must be moved clear of it are told so); `printer` the printer itself, when
  *   known, for the heading (`corner` the sides of the corner it keeps clear); `bridges` the clips' bridges' lengths as built (each
@@ -6390,9 +6612,21 @@ export function howToGlueText(plan) {
     for (const x of seated) if (x.pieces[1] === p.index) extra.push(`tea-light seat Ø ${mm1(x.apart.seat.d)} mm on top`);
     // what the print check found, one clause each; of its pin holes only what the heading does not say: those that
     // may need supports
-    const checked = checkWords(p.check ?? null, p.holes ?? null, { fine: false });
-    out.push(`  ${pad(`piece ${p.index} of ${n}`, 12)}${pad(size1(p.size), width)}${pad(`lies ${p.lies}${p.lay?.used ? ', as you chose' : ''}`, 0)}${extra.join(', ')}${checked.length ? ` – ${checked.join('; ')}` : ''}`);
+    const tipped = p.tip?.used ? { angle: p.tip.angle } : null;
+    const checked = checkWords(p.check ?? null, p.holes ?? null, { fine: false, ...(tipped ? { tip: true } : {}) });
+    out.push(`  ${pad(`piece ${p.index} of ${n}`, 12)}${pad(size1(p.size), width)}${pad(`lies ${p.lies}${p.lay?.used ? ', as you chose' : ''}${tipped ? `, tipped ${angleWords(tipped.angle)}°` : ''}`, 0)}${extra.join(', ')}${checked.length ? ` – ${checked.join('; ')}` : ''}`);
   });
+  // a piece tipped in its file is meant to lie so: a slicer that lays it flat again brings the step lines back
+  const tipped = [...pieces].filter((p) => p.tip?.used).sort((p, q) => p.index - q.index);
+  if (tipped.length) {
+    const many = tipped.length > 1;
+    const plate = tipped.every((p) => !p.check || p.check.supports.piece < 0.1 * p.check.supports.area);
+    out.push(`  ${many ? `Pieces ${listOf(tipped.map((p) => p.index))} are` : `Piece ${tipped[0].index} is`} meant to lie tipped, as ${many ? 'their files have them' : 'its file has it'}: one big face is then level and prints without step lines, and the piece rests on an edge.`);
+    out.push(`  For ${many ? 'them' : 'it'}, turn off auto-orient in your slicer and do not use "lay on face"; turn supports on${plate ? ' (on build plate only is enough)' : ''} and add a brim.`);
+    // what a tipped piece lay on prints on supports now: where that is a glue face, it wants sanding
+    const rough = tipped.filter((p) => p.check?.supports.seam >= PRINT_CHECK.none).map((p) => p.index);
+    if (rough.length) out.push(`  The glue face under ${rough.length > 1 ? `pieces ${listOf(rough)}` : `piece ${rough[0]}`} prints on supports and comes out rough: sand it lightly before you glue it.`);
+  }
   // the holes and the joints are shaped for the way each file lies, and the check above is of that way; spinning a
   // piece on the bed changes neither
   out.push(`  Print each piece lying the way its file lies – do not tip it onto another side in your slicer (spinning it flat on the bed is fine)${unsupported.length ? `: its ${listOf(unsupported)} are shaped to print that way` : ''}.`);

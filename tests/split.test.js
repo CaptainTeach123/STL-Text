@@ -10,7 +10,7 @@ import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
 import {
   APART_HOLDS, DIRECTIONS, FILAMENT, SPLIT_DEFAULTS, dirAxis, TO_PLANE, cellSizes, cellSupport, cutPlane, fitPieces, fitsBed, isSymmetric, keepCrossed, orientationStats, pegSizesFor,
-  reachesCorner, sizesFor, oppositeDir, layOptions,
+  reachesCorner, sizesFor, oppositeDir, layOptions, applyMat4, tipOption,
 } from '../src/split.js';
 import { FACE, OVERHANG_NZ, PRINT_CHECK, faceKind, faceLean } from '../src/printCheck.js';
 import { adviseJob, estimateJob, gramsWords, planOptions, planSheetLines } from '../src/printPlan.js';
@@ -4323,5 +4323,281 @@ describe('the print plan', () => {
     const torn = await client.result([], version, { printing });
     expect(torn.measures.whole.partial).toBe(true);
     expect(torn.measures.whole.volume).toBeCloseTo(plain, 3);
+  });
+});
+
+describe('tipping a piece so that its big leaning face prints level', () => {
+  const sheetOf = (ex) => ex.files.find((f) => f.kind === 'text').text;
+  const rad = (deg) => (deg * Math.PI) / 180;
+  const bytes = (ex) => ex.files.map((f) => [f.name, f.stl ? Buffer.from(f.stl).toString('base64') : f.text]);
+  const texts = (ex) => ex.notes.map((n) => `${n.code}: ${n.text}`);
+  /** A block 100 × 80 whose top leans `deg` degrees across its width (rising towards +y): both halves of a cut across x have it. */
+  const leaningBlock = (deg) => {
+    const rise = 80 * Math.tan(rad(deg));
+    return own(wasm.Manifold.hull([[-50, -40, 0], [50, -40, 0], [-50, 40, 0], [50, 40, 0], [-50, -40, 20], [50, -40, 20], [-50, 40, 20 + rise], [50, 40, 20 + rise]]));
+  };
+  // laid flat as modelled, the leaning top is on top of both halves: the case the tip is for
+  const flat = (patch = {}) => S({ labels: false, orient: 'model', ...patch });
+  /** Every hole keeps its wall from the outside of the model. */
+  const expectWalls = (solid, r) => {
+    const b = boxOf(solid);
+    const air = own(cube(b.size.map((v) => v + 40), b.min.map((v, a) => (v + b.max[a]) / 2)).subtract(solid));
+    for (const { dowel, m } of holesOf(r)) expect(m.minGap(air, sizesFor(dowel.d).wall + 1)).toBeGreaterThanOrEqual(sizesFor(dowel.d).wall - 1e-6);
+  };
+  /** A file's triangles that look straight up: their area, and the lowest and highest of their points. */
+  const levelTop = (f) => {
+    const pos = parseSTL(f.stl).attributes.position.array;
+    let area = 0, lo = Infinity, hi = -Infinity, low = Infinity;
+    for (let t = 0; t < pos.length; t += 9) {
+      const u = [pos[t + 3] - pos[t], pos[t + 4] - pos[t + 1], pos[t + 5] - pos[t + 2]];
+      const w = [pos[t + 6] - pos[t], pos[t + 7] - pos[t + 1], pos[t + 8] - pos[t + 2]];
+      const n = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+      const len = Math.hypot(...n);
+      low = Math.min(low, pos[t + 2], pos[t + 5], pos[t + 8]);
+      if (!(len > 0) || Math.abs(n[2] / len - 1) > 1e-6) continue;
+      area += len / 2;
+      lo = Math.min(lo, pos[t + 2], pos[t + 5], pos[t + 8]);
+      hi = Math.max(hi, pos[t + 2], pos[t + 5], pos[t + 8]);
+    }
+    return { area, lo, hi, low };
+  };
+  /** Where two solids differ, away from the pin holes: what is left of each without the other, outside a sleeve round each hole. */
+  const differsAwayFromHoles = (a, b, dowels) => {
+    const sleeves = dowels.map((d) => {
+      const s = sizesFor(d.d);
+      const along = own(wasm.Manifold.cylinder(2 * (s.reach + 1), Math.SQRT2 * s.a + 0.5, Math.SQRT2 * s.a + 0.5, 48, true));
+      const turned = d.axis === 0 ? own(along.rotate([0, 90, 0])) : d.axis === 1 ? own(along.rotate([90, 0, 0])) : along;
+      return own(turned.translate(d.centre));
+    });
+    const sleeve = own(wasm.Manifold.union(sleeves));
+    return own(own(a.subtract(b)).subtract(sleeve)).volume() + own(own(b.subtract(a)).subtract(sleeve)).volume();
+  };
+
+  it('is off unless asked for: every file is the very same, and a piece with such a face is only offered it', async () => {
+    await load(leaningBlock(5), 'desk');
+    const base = await exportSplit(flat(), { name: 'desk' });
+    expect(base.pieces.map((p) => p.lies)).toEqual(['flat as modelled', 'flat as modelled']);
+    // each half has the leaning top, and is offered the tip – unticked
+    for (const p of base.pieces) {
+      expect(p.tip).toEqual({ key: p.cell.join(','), asked: false, used: false, angle: expect.closeTo(5, 4), area: expect.closeTo((50 * 80) / Math.cos(rad(5)), 0) });
+      expect(tipOption(p.tip)).toMatchObject({ checked: false, disabled: false, text: 'Tip this piece so that face prints level (about 40 cm², leaning 5°)' });
+    }
+    expect(codes(base)).toEqual(['SPLIT', 'PINS', 'PRINT_CHECK', 'PRINT_CHECK']);
+    expect(sheetOf(base)).not.toMatch(/tipped|auto-orient/);
+    // nothing asked – none, an empty list, a box that is not there, a piece unticked – every file is what it was
+    for (const tip of [{}, { '5,0,0': true }, { '0,0,0': false }, { '0,0,0': 'yes' }]) {
+      const ex = await exportSplit(flat({ tip }), { name: 'desk' });
+      expect(bytes(ex), JSON.stringify(tip)).toEqual(bytes(base));
+      expect(texts(ex), JSON.stringify(tip)).toEqual(texts(base));
+    }
+    // a piece with no such face is offered nothing
+    await load(cube([100, 80, 20]), 'slab');
+    const plain = await exportSplit(flat(), { name: 'slab' });
+    expect(plain.pieces.some((p) => 'tip' in p)).toBe(false);
+  });
+
+  it('a piece asked to be tipped has its face level, stands on its own lowest points, and still goes together exactly', async () => {
+    const model = leaningBlock(5);
+    await load(model, 'desk');
+    const base = await exportSplit(flat(), { name: 'desk' });
+    const ex = await exportSplit(flat({ tip: { '0,0,0': true } }), { name: 'desk' });
+    const [one, two] = ex.pieces;
+    const area = (50 * 80) / Math.cos(rad(5));
+    // tipped 5°, by the size of its own points: as tall as its low back corner is under the top, not as its box tipped
+    const tall = 80 * Math.sin(rad(5)) + 20 * Math.cos(rad(5));
+    expect(one).toMatchObject({ lies: 'flat as modelled', down: '-z', up: '+z', fits: true, yaw: 0, tip: { key: '0,0,0', asked: true, used: true, angle: expect.closeTo(5, 4), area: expect.closeTo(area, 0) } });
+    expect(one.size[0]).toBeCloseTo(50, 4);
+    expect(one.size[1]).toBeCloseTo(80 * Math.cos(rad(5)) + 20 * Math.sin(rad(5)) + (80 * Math.tan(rad(5))) * Math.sin(rad(5)), 3);
+    expect(one.size[2]).toBeCloseTo(tall, 3);
+    expect(one.size[2]).toBeLessThan(base.pieces[0].size[2]);
+    expect(two.tip).toMatchObject({ asked: false, used: false });
+    expect(two.size).toEqual(base.pieces[1].size);
+    // its file: the whole top looks straight up at one height, and the lowest point of the file is on the bed
+    const [f1, f2] = piecesOf(ex);
+    const top = levelTop(f1);
+    expect(top.area).toBeCloseTo(area, 1);
+    expect(top.hi - top.lo).toBeLessThan(1e-4);
+    expect(top.hi).toBeCloseTo(tall, 3);
+    expect(Math.abs(top.low)).toBeLessThan(1e-5);
+    expect(f1.size).toEqual(one.size);
+    expect(boxOf(pieceSolid(f1)).size.map((v) => Math.round(v * 1000) / 1000)).toEqual(one.size.map((v) => Math.round(v * 1000) / 1000));
+    expect(levelTop(piecesOf(base)[0]).area).toBeLessThan(1); // as it lay, none of its top was level
+    // the other piece's file is the very same, byte for byte
+    expect(Buffer.from(f2.stl).equals(Buffer.from(piecesOf(base)[1].stl))).toBe(true);
+    // the same pins in the same places; the tipped piece's holes point where up is once it is tipped – 5° round the
+    // hole from straight up – and the other piece's straight up
+    expect(dowelsOf(ex).map((d) => [d.centre, d.d, d.depth, d.flat ?? false])).toEqual(dowelsOf(base).map((d) => [d.centre, d.d, d.depth, d.flat ?? false]));
+    const up = [one.tip.turn[2], one.tip.turn[6], one.tip.turn[10]];
+    expect(up[0]).toBeCloseTo(0, 6);
+    expect(up[1]).toBeCloseTo(-Math.sin(rad(5)), 6);
+    for (const d of dowelsOf(ex)) {
+      expect(d.sides[0]).toMatchObject({ piece: 1, tear: true });
+      d.sides[0].apex.forEach((v, a) => expect(v).toBeCloseTo(up[a], 6));
+      expect(d.sides[1]).toMatchObject({ piece: 2, tear: true, apex: [0, 0, 1] });
+      // as the piece lies tipped, the point is straight up
+      expect(applyMat4([...one.tip.turn.slice(0, 12), 0, 0, 0, 1], d.sides[0].apex)[2]).toBeCloseTo(1, 9);
+    }
+    expect(ex.pieces.map((p) => p.holes)).toEqual(base.pieces.map((p) => p.holes));
+    expectWalls(model, ex);
+    // put back where it was in the model, the tipped piece is the piece as it was, but for the points of its holes:
+    // the cut face, the hole mouths and every other face are where they were
+    const was = assembled(piecesOf(base)[0]);
+    const back = assembled(f1);
+    expect(back.volume()).toBeCloseTo(was.volume(), 0);
+    expect(differsAwayFromHoles(was, back, dowelsOf(ex))).toBeLessThan(0.05);
+    expect(own(was.subtract(back)).volume()).toBeGreaterThan(1); // the points did move
+    expect(boxOf(back).max[0]).toBeCloseTo(0, 4);
+    expect(overlap(back, assembled(f2))).toBeLessThan(0.01);
+    // and the pins go into both pieces as before
+    for (const d of dowelsOf(ex)) {
+      const pin = own(pinAt(d));
+      expect(overlap(pin, back)).toBeLessThan(1e-3);
+      expect(overlap(pin, assembled(f2))).toBeLessThan(1e-3);
+    }
+    // the print check is of the piece as it lies tipped: no step lines, the whole underside on supports, on an edge
+    expect(one.check.steps.filter((x) => x.facing === 'up')).toEqual([]);
+    expect(one.check.supports).toMatchObject({ area: Math.round(50 * 80 * Math.cos(rad(5))), seam: 0, piece: 0, places: 1 });
+    expect(one.check.foot).toMatchObject({ flat: false, contact: 0 });
+    expect(codes(ex)).toEqual(['SPLIT', 'PINS', 'PIECE_TIPPED', 'PRINT_CHECK']);
+    expect(noteOf(ex, 'PIECE_TIPPED')).toMatchObject({
+      level: 'info', pieceIndex: 1,
+      text: 'Piece 1 is tipped 5° in its file so that its big face on top (about 40 cm²) prints level, without step lines. '
+        + 'What that costs: it no longer lies flat – it rests on an edge, and about 40 cm² under it prints on supports, standing on the bed. '
+        + 'In your slicer turn off auto-orient and don\'t use "lay on face" for it, turn supports on ("on build plate only" is enough) and add a brim about 5 mm wide. '
+        + 'Its pin holes are shaped for lying tipped. Untick "Tip this piece" in the pieces list to print it flat again, with the step lines.',
+    });
+    expect(noteOf(ex, 'PRINT_CHECK')).toMatchObject({ pieceIndex: 2 });
+    const sheet = sheetOf(ex);
+    expect(sheet).toMatch(/ {2}piece 1 of 2 .* lies flat as modelled, tipped 5° {3}fits – needs supports: about 40 cm², standing on the bed; rests on an edge: add a brim, 5 mm wide\n/);
+    expect(sheet).toContain('\n  Piece 1 is meant to lie tipped, as its file has it: one big face is then level and prints without step lines, and the piece rests on an edge.\n');
+    expect(sheet).toContain('\n  For it, turn off auto-orient in your slicer and do not use "lay on face"; turn supports on (on build plate only is enough) and add a brim.\n');
+    // the pieces view has the same rows, and paints the tipped piece's underside as needing supports
+    const shown = await resultSplit(flat({ tip: { '0,0,0': true } }));
+    expect(shown.pieces[0].tip).toEqual(one.tip);
+    expect(shown.pieces[0].check).toEqual(one.check);
+    const [from, count] = shown.display.ranges[0];
+    expect([...shown.display.printed.subarray(from, from + count)].filter((b) => faceKind(b) === FACE.skin).length).toBeGreaterThan(0);
+    // asked again, nothing is drilled or tipped again; unticked, the files are what they were
+    stages.length = 0;
+    const again = await exportSplit(flat({ tip: { '0,0,0': true } }), { name: 'desk' });
+    expect(stages.some((x) => /Cutting|Drilling|Tipping/.test(x))).toBe(false);
+    expect(bytes(again)).toEqual(bytes(ex));
+    expect(bytes(await exportSplit(flat(), { name: 'desk' }))).toEqual(bytes(base));
+    // both tipped: each on its own, and they still meet on the cut
+    const both = await exportSplit(flat({ tip: { '0,0,0': true, '1,0,0': true } }), { name: 'desk' });
+    expect(both.pieces.map((p) => p.tip.used)).toEqual([true, true]);
+    expect(Buffer.from(piecesOf(both)[0].stl).equals(Buffer.from(f1.stl))).toBe(true);
+    const [b1, b2] = piecesOf(both).map(assembled);
+    expect(overlap(b1, b2)).toBeLessThan(0.01);
+    expect(differsAwayFromHoles(assembled(piecesOf(base)[1]), b2, dowelsOf(both))).toBeLessThan(0.05);
+    expect(sheetOf(both)).toContain('\n  Pieces 1 and 2 are meant to lie tipped, as their files have them: one big face is then level and prints without step lines, and the piece rests on an edge.\n');
+  });
+
+  it('holes close to an edge keep their flat tops, turned with the piece so that the roof is level as it lies tipped', async () => {
+    // a bar 11 to 12 mm thick takes its Ø5 pins on flat-topped teardrops; its top leans 1.5° across its width
+    const rise = 40 * Math.tan(rad(1.5));
+    const model = own(wasm.Manifold.hull([[-150, -20, 0], [150, -20, 0], [-150, 20, 0], [150, 20, 0], [-150, -20, 11], [150, -20, 11], [-150, 20, 11 + rise], [150, 20, 11 + rise]]));
+    await load(model, 'bar');
+    const split = (patch = {}) => S({ diameter: 5, labels: false, orient: 'model', ...patch });
+    const base = await exportSplit(split(), { name: 'bar' });
+    expect(dowelsOf(base).map((d) => d.flat)).toEqual([true, true]);
+    const ex = await exportSplit(split({ tip: { '0,0,0': true } }), { name: 'bar' });
+    expect(ex.pieces[0].tip).toMatchObject({ used: true, angle: expect.closeTo(1.5, 3) });
+    expect(dowelsOf(ex).map((d) => [d.centre, d.flat, d.lift])).toEqual(dowelsOf(base).map((d) => [d.centre, d.flat, d.lift]));
+    expect(ex.pieces.map((p) => p.holes)).toEqual([{ upright: 0, pointed: 0, flat: 2, round: 0 }, { upright: 0, pointed: 0, flat: 2, round: 0 }]);
+    for (const d of dowelsOf(ex)) {
+      expect(d.sides[0].apex[1]).toBeCloseTo(-Math.sin(rad(1.5)), 5);
+      expect(d.sides[0].apex[2]).toBeCloseTo(Math.cos(rad(1.5)), 5);
+      expect(d.sides[1].apex).toEqual([0, 0, 1]);
+    }
+    expectWalls(model, ex);
+    expect(codes(ex)).toContain('HOLES_FLAT_TOP');
+    // put back, it differs from the piece as it was only in its holes, and the pins still go in
+    const back = assembled(piecesOf(ex)[0]);
+    expect(differsAwayFromHoles(assembled(piecesOf(base)[0]), back, dowelsOf(ex))).toBeLessThan(0.05);
+    for (const d of dowelsOf(ex)) expect(overlap(own(pinAt(d)), back)).toBeLessThan(1e-3);
+    // in the file the roofs of its holes are level: a flat face looking down, a hole's width across, over each hole
+    const pos = parseSTL(piecesOf(ex)[0].stl).attributes.position.array;
+    let roofs = 0;
+    for (let t = 0; t < pos.length; t += 9) {
+      const u = [pos[t + 3] - pos[t], pos[t + 4] - pos[t + 1], pos[t + 5] - pos[t + 2]];
+      const w = [pos[t + 6] - pos[t], pos[t + 7] - pos[t + 1], pos[t + 8] - pos[t + 2]];
+      const n = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+      const len = Math.hypot(...n);
+      if (len > 0 && n[2] / len < -1 + 1e-6 && Math.min(pos[t + 2], pos[t + 5], pos[t + 8]) > 1) roofs += len / 2;
+    }
+    expect(roofs).toBeGreaterThan(10);
+  });
+
+  it('a piece lying on its cut face says its glue face prints on supports, and its upright holes stay round', async () => {
+    // a block 60 × 60 cut across its height: the upper piece lies on the cut, and its top leans 4°
+    const rise = 60 * Math.tan(rad(4));
+    const model = own(wasm.Manifold.hull([[-30, -30, 0], [30, -30, 0], [-30, 30, 0], [30, 30, 0], [-30, -30, 40], [30, -30, 40], [-30, 30, 40 + rise], [30, 30, 40 + rise]]));
+    await load(model, 'block');
+    const split = (patch = {}) => S({ cuts: [cutAt(2, 20)], labels: false, ...patch });
+    const base = await exportSplit(split(), { name: 'block' });
+    expect(base.pieces.map((p) => [p.lies, 'tip' in p])).toEqual([['flat as modelled', false], ['on a cut face', true]]);
+    const ex = await exportSplit(split({ tip: { '0,0,1': true } }), { name: 'block' });
+    const upper = ex.pieces[1];
+    expect(upper).toMatchObject({ lies: 'on a cut face', tip: { used: true, angle: expect.closeTo(4, 4) }, holes: base.pieces[1].holes });
+    expect(upper.holes).toMatchObject({ pointed: 0, flat: 0, round: 0 });
+    expect(dowelsOf(ex).map((d) => d.centre)).toEqual(dowelsOf(base).map((d) => d.centre));
+    for (const d of dowelsOf(ex)) expect(d.sides.map((x) => x.tear)).toEqual([false, false]);
+    // the holes are the holes they were: nothing of the piece differs at all, put back where it was
+    const [, f2] = piecesOf(ex);
+    expect(differsAwayFromHoles(assembled(piecesOf(base)[1]), assembled(f2), [])).toBeLessThan(0.05);
+    expect(Buffer.from(piecesOf(ex)[0].stl).equals(Buffer.from(piecesOf(base)[0].stl))).toBe(true);
+    const top = levelTop(f2);
+    expect(top.area).toBeCloseTo(3600 / Math.cos(rad(4)), 1);
+    expect(Math.abs(top.low)).toBeLessThan(1e-5);
+    // what it lay on is the glue face, all of it on supports now
+    expect(upper.check.supports.seam).toBeGreaterThan(0.95 * upper.check.supports.area);
+    expect(upper.check.supports.area).toBeGreaterThan(3300); // all of it but the hole mouths and what lies in the first layer
+    const note = noteOf(ex, 'PIECE_TIPPED');
+    expect(note.pieceIndex).toBe(2);
+    expect(note.text).toContain('it rests on an edge, and about 34 cm² under it prints on supports, standing on the bed. That is a glue face: on supports it prints rough and may want light sanding before you glue it.');
+    expect(sheetOf(ex)).toMatch(/piece 2 of 2 .* lies on a cut face, tipped 4° {3}fits – needs supports: about 34 cm², under a glue face, standing on the bed; rests on an edge: add a brim, 5 mm wide\n/);
+    expect(sheetOf(ex)).toContain('\n  The glue face under piece 2 prints on supports and comes out rough: sand it lightly before you glue it.\n');
+    // the plan's suggestions name it too
+    const plan = adviseJob(ex.pieces, planOptions({}));
+    expect(plan.some((line) => /^Piece 2: tipped in its file so that a big face prints level – turn off auto-orient for it, keep supports on and add a brim about 5 mm wide, as it rests on an edge\.$/.test(line))).toBe(true);
+  });
+
+  it('is refused, with the reason, where the piece would print worse or break a rule – and the files stay as they were', async () => {
+    const refused = (ex, index = 1) => ex.notes.find((n) => n.code === 'TIP_REFUSED' && n.pieceIndex === index);
+    const same = async (split, options, why, words) => {
+      const base = await exportSplit(split(), options);
+      const ex = await exportSplit(split({ tip: { '0,0,0': true } }), options);
+      expect(refused(ex), why).toMatchObject({ level: 'info', why });
+      expect(refused(ex).text, why).toBe(`Piece 1 is not tipped, though you asked for it in the pieces list: ${words}. It prints as it lies – untick "Tip this piece" for it to clear this note.`);
+      expect(ex.pieces[0].tip, why).toMatchObject({ key: '0,0,0', asked: true, used: false, why });
+      expect(tipOption(ex.pieces[0].tip), why).toMatchObject({ checked: true, disabled: false, tag: `asked for, but not tipped: ${words}` });
+      expect(codes(ex).filter((c) => c !== 'TIP_REFUSED'), why).toEqual(codes(base));
+      expect(bytes(ex).filter(([name]) => !/how-to/.test(name)), why).toEqual(bytes(base).filter(([name]) => !/how-to/.test(name)));
+      expect(sheetOf(ex), why).toBe(sheetOf(base));
+      return { base, ex };
+    };
+    // built-in pegs and their sockets are shaped for the way the piece lies
+    await load(leaningBlock(5), 'desk');
+    await same((p) => flat({ joint: 'pegs', ...p }), { name: 'desk' }, 'pegs', 'its built-in pegs and their sockets are shaped to print the way it lies');
+    // tipped it is longer than it was: on a bed it only just fitted, it no longer fits
+    await same(flat, { name: 'desk', bed: [60, 81, 249] }, 'bed', "tipped it doesn't fit your printer");
+    // a face that leans more than 8°: said before it is asked for, greyed out
+    await load(leaningBlock(10), 'ramp');
+    const { base: ramp } = await same(flat, { name: 'ramp' }, 'steep', 'its big face leans 10° – more than 8°, and tipped that far too much of it would hang over the bed');
+    expect(tipOption(ramp.pieces[0].tip)).toMatchObject({ checked: false, disabled: true, text: "Can't be tipped to print its big face level: its big face leans 10° – more than 8°, and tipped that far too much of it would hang over the bed" });
+    // no leaning face at all
+    await load(cube([100, 80, 20]), 'slab');
+    await same(flat, { name: 'slab' }, 'none', 'the way it lies now it has no big face on top that leans a little off level');
+    // a shallow roof: level one side and the other leans twice as much
+    const ridge = 50 * Math.tan(rad(3));
+    await load(own(wasm.Manifold.hull([[-50, -40, 0], [50, -40, 0], [-50, 40, 0], [50, 40, 0], [-50, -40, 20], [50, -40, 20], [-50, 40, 20], [50, 40, 20], [0, -40, 20 + ridge], [0, 40, 20 + ridge]])), 'roof');
+    await same((p) => flat({ cuts: [cutAt(1, 0)], ...p }), { name: 'roof' }, 'steps', 'tipped, another big face on top would lean instead, and it would show step lines on half as much of its top or more');
+    // a piece that stands on little as it lies: a post with a leaning top
+    await load(own(wasm.Manifold.hull([[-12, -12, 0], [12, -12, 0], [-12, 12, 0], [12, 12, 0], [-12, -12, 300], [12, -12, 300], [-12, 12, 302], [12, 12, 302]])), 'post');
+    const post = (p) => S({ cuts: [cutAt(2, 150)], labels: false, orient: 'model', ...p });
+    const stands = await exportSplit(post({ tip: { '0,0,1': true } }), { name: 'post' });
+    expect(refused(stands, 2)).toMatchObject({ why: 'foot', text: expect.stringContaining('it stands on little as it lies, and tipped it would rest on an edge of that') });
+    expect(bytes(stands).filter(([name]) => !/how-to/.test(name))).toEqual(bytes(await exportSplit(post(), { name: 'post' })).filter(([name]) => !/how-to/.test(name)));
   });
 });

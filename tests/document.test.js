@@ -710,6 +710,125 @@ describe('the side a piece lies on, chosen by hand', () => {
   });
 });
 
+describe('pieces asked to be tipped so that a leaning face prints level', () => {
+  const X = [1, 0, 0];
+  const Z = [0, 0, 1];
+
+  it('a piece is asked to be tipped in one undo step, and with none the split is the split it always was', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'bar');
+    doc.addCut({ position: [0, 0, 0], normal: X });
+    const before = JSON.stringify(doc.split);
+    const v0 = doc.state.baseVersion;
+    expect('tip' in doc.split).toBe(false);
+    doc.setPieceTip('0,0,0', true);
+    expect(doc.split.tip).toEqual({ '0,0,0': true });
+    expect(doc.history).toHaveLength(2);
+    doc.setPieceTip('0,0,0', true); // asked already: no step
+    doc.setPieceTip('1,0,0', false); // not asked: no step
+    doc.setPieceTip('nonsense', true); // no box
+    expect(doc.history).toHaveLength(2);
+    doc.setPieceTip('1,0,0', true);
+    doc.setPieceTip('0,0,0', false);
+    expect(doc.split.tip).toEqual({ '1,0,0': true });
+    doc.setPieceTip('1,0,0', false);
+    // the last one gone, the list goes too: the JSON and every key are what they were
+    expect('tip' in doc.split).toBe(false);
+    expect(JSON.stringify(doc.split)).toBe(before);
+    expect(stableKey(doc.split)).toBe(stableKey(JSON.parse(before)));
+    expect('tip' in normaliseSplit(doc.split)).toBe(false);
+    expect(doc.undo()).toBe(true);
+    expect(doc.split.tip).toEqual({ '1,0,0': true });
+    // the history holds its own copy, and none of it is a new model version
+    doc.setPieceTip('0,0,0', true);
+    delete doc.split.tip['1,0,0'];
+    doc.undo();
+    expect(doc.split.tip).toEqual({ '1,0,0': true });
+    expect(doc.state.baseVersion).toBe(v0);
+    const bare = new Document();
+    bare.setPieceTip('0,0,0', true);
+    expect(bare.split).toBeNull();
+    // a split given tips that cannot be keeps only those that can
+    doc.setSplit({ tip: { '0,0,0': true, '1,0,0': 'yes', 'a,b': true, '1,0': true, '2,0,0': false } });
+    expect(doc.split.tip).toEqual({ '0,0,0': true });
+    doc.setSplit({ tip: { x: 1 } });
+    expect('tip' in doc.split).toBe(false);
+  });
+
+  it('it lasts while the cuts make the same boxes and the piece lies on the same side, and goes when they do not', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'bar');
+    const a = doc.addCut({ position: [0, 0, 0], normal: X });
+    const b = doc.addCut({ position: [50, 0, 0], normal: X });
+    doc.setPieceTip('0,0,0', true);
+    doc.setPieceTip('2,0,0', true);
+    const tip = { '0,0,0': true, '2,0,0': true };
+    // a cut dragged, one set to come apart, a setting changed: the boxes are the same ones
+    doc.updateCut(a, { position: [10, 0, 0] });
+    doc.setCutJoint(b, { hold: 'snap' });
+    doc.setSplit({ joint: 'dowels', diameter: 5 });
+    expect(doc.split.tip).toEqual(tip);
+    // a cut dragged past the other, turned, removed, added, the cuts replaced: other boxes – and Undo brings it back
+    for (const change of [
+      () => doc.updateCut(a, { position: [60, 0, 0] }),
+      () => doc.updateCut(a, { normal: Z }),
+      () => doc.removeCut(b),
+      () => doc.addCut({ position: [0, 0, 5], normal: Z }),
+      () => doc.setSplit({ cuts: [{ position: [0, 0, 0], normal: X }] }),
+      () => doc.transformBase(new Matrix4().makeRotationZ(Math.PI / 2)),
+    ]) {
+      change();
+      expect('tip' in doc.split).toBe(false);
+      doc.undo();
+      expect(doc.split.tip).toEqual(tip);
+    }
+    // the same cuts asked for again (Fit to my printer, nothing changed) keep it, with no step
+    const steps = doc.history.length;
+    doc.setSplit({ cuts: doc.split.cuts.map(({ id, ...c }) => c) });
+    expect(doc.history).toHaveLength(steps);
+    expect(doc.split.tip).toEqual(tip);
+    // a side chosen by hand for a tipped piece: it was tipped for a face of the side it lay on, so it is asked again
+    doc.setPieceLay('0,0,0', '-y');
+    expect(doc.split).toMatchObject({ lay: { '0,0,0': '-y' }, tip: { '2,0,0': true } });
+    doc.setPieceLay('2,0,0', '+x');
+    expect('tip' in doc.split).toBe(false);
+    doc.undo();
+    expect(doc.split.tip).toEqual({ '2,0,0': true });
+    // tipped on the side chosen, both go by the boxes and both go with them
+    doc.setPieceTip('0,0,0', true);
+    doc.removeCut(b);
+    expect('tip' in doc.split || 'lay' in doc.split).toBe(false);
+    doc.undo();
+    expect(doc.split).toMatchObject({ lay: { '0,0,0': '-y' }, tip: { '0,0,0': true, '2,0,0': true } });
+  });
+
+  it('a cut dragged past another and back in one drag keeps the tip, with a side chosen or without', () => {
+    const bar = new Document();
+    bar.setBase('stl', 'bar');
+    const a = bar.addCut({ position: [0, 0, 0], normal: X });
+    bar.addCut({ position: [50, 0, 0], normal: X });
+    bar.setPieceTip('2,0,0', true);
+    const drag = { coalesce: `split:at:${a}` };
+    bar.updateCut(a, { position: [60, 0, 0] }, drag);
+    expect('tip' in bar.split).toBe(false);
+    bar.updateCut(a, { position: [20, 0, 0] }, drag);
+    expect(bar.split.tip).toEqual({ '2,0,0': true });
+    expect('lay' in bar.split).toBe(false);
+    bar.endCoalescing();
+    bar.setPieceLay('0,0,0', '-z');
+    bar.updateCut(a, { position: [60, 0, 0] }, drag);
+    expect('tip' in bar.split || 'lay' in bar.split).toBe(false);
+    bar.updateCut(a, { position: [20, 0, 0] }, drag);
+    expect(bar.split).toMatchObject({ lay: { '0,0,0': '-z' }, tip: { '2,0,0': true } });
+    // one ticked while the cut is on the far side is not overwritten by what was set aside
+    bar.endCoalescing();
+    bar.updateCut(a, { position: [60, 0, 0] }, drag);
+    bar.setPieceTip('1,0,0', true);
+    bar.updateCut(a, { position: [20, 0, 0] }, drag);
+    expect('tip' in bar.split || 'lay' in bar.split).toBe(false);
+  });
+});
+
 describe('details kept whole', () => {
   const box = { min: [-72, -47, 112], max: [72, 7, 150] };
   const mark = { point: [0, -47, 135], normal: [0, -1, 0], box };

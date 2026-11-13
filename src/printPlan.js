@@ -345,11 +345,17 @@ export function adviseJob(pieces, o, { pins = [], pegSize = null, clearance = nu
   // a piece's foot, as its print check found it: the brim its line asks for
   const brims = new Map();
   for (const p of pieces) {
-    const brim = p.check?.foot.flat ? p.check.foot.brim : 0;
+    const brim = p.check?.foot.flat && !p.tip?.used ? p.check.foot.brim : 0;
     if (brim > 0) brims.set(brim, [...(brims.get(brim) ?? []), p.index]);
   }
   for (const [brim, list] of [...brims].sort((p, q) => p[0] - q[0])) {
     out.push(`${piecesWords(list)}: add a brim about ${brim} mm wide – ${they(list, 'it stands', 'they stand')} on little and may come loose.`);
+  }
+
+  // a piece tipped in its file so that a big face prints level rests on an edge, and must stay as its file has it
+  const tipped = of((p) => p.tip?.used);
+  if (tipped.length) {
+    out.push(`${piecesWords(tipped)}: tipped in ${they(tipped, 'its file', 'their files')} so that a big face prints level – turn off auto-orient for ${they(tipped, 'it', 'them')}, keep supports on and add a brim about ${PRINT_CHECK.brim} mm wide, as ${they(tipped, 'it rests', 'they rest')} on an edge.`);
   }
 
   // supports, by the same figure as each piece's line: where they would stand says which kind is enough

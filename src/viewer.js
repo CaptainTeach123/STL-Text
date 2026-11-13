@@ -57,7 +57,7 @@ import { clickRadius, surfaceNormalAt } from './surfaceNormal.js';
 import { FACE, faceKind, faceLean, stepSegments, stepsApart } from './printCheck.js';
 import {
   APART_COLOR, CUT_COLOR, PIECE_COLORS, PIN_COLOR, TOO_BIG_COLOR, axisCuts, cellSizes, cutPlane, explodeOffset, letterFor, offsetAlongRay, pieceColorIndex, pieceColors,
-  printTransform, printedFace, printedRow, snapTarget, triangleInBox, wayAt,
+  printTransform, printedFace, printedRow, snapTarget, tipTransform, triangleInBox, wayAt,
 } from './split.js';
 
 Mesh.prototype.raycast = acceleratedRaycast;
@@ -2430,7 +2430,10 @@ export class Viewer {
       const box = new Box3();
       for (const x of shown) if (x.index === e.index) box.union(x.mesh.geometry.boundingBox);
       const p = this.pieceInfo?.get(e.index);
-      const { printMatrix } = printTransform({ min: box.min.toArray(), max: box.max.toArray() }, p?.down ?? '-z', p?.yaw ?? 0);
+      // a piece tipped in its file is set down by its own points: its box, tipped, would reach under the bed
+      const { printMatrix } = p?.tip?.turn
+        ? tipTransform(p.tip.turn, shown.filter((x) => x.index === e.index).map((x) => x.mesh.geometry.attributes.position.array), { yaw: p.yaw ?? 0 })
+        : printTransform({ min: box.min.toArray(), max: box.max.toArray() }, p?.down ?? '-z', p?.yaw ?? 0);
       const M = new Matrix4().fromArray(printMatrix);
       const lying = box.clone().applyMatrix4(M);
       turned.set(e.index, { M, size: lying.getSize(new Vector3()) });
@@ -2464,8 +2467,8 @@ export class Viewer {
       if (!e.cls) continue;
       const p = this.pieceInfo?.get(e.index);
       const box = e.mesh.geometry.boundingBox;
-      const { printMatrix } = printTransform({ min: box.min.toArray(), max: box.max.toArray() }, p?.down ?? '-z', p?.yaw ?? 0);
-      R.fromArray(printMatrix);
+      if (p?.tip?.turn) R.copy(turned.get(e.index).M);
+      else R.fromArray(printTransform({ min: box.min.toArray(), max: box.max.toArray() }, p?.down ?? '-z', p?.yaw ?? 0).printMatrix);
       const overAt = [e.mesh.material].flat().indexOf(e.over);
       const lockAt = new Set(e.slots.map((s) => [e.mesh.material].flat().indexOf(s.material)));
       const printed = e.cls.slice();

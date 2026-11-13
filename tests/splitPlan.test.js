@@ -17,6 +17,7 @@ import {
   PRESET_ALIASES, bedCorner, cornerPlaceNote, fitReachesCorner, presetOf, reachesCorner, roomWords, turnedFootprint,
   GUARD, LARGEST_MIN, capOf, clampLargest, detailClean, pickGroup, planEnds, slabCap, wideKeeps, withinCap,
   FLAT_TOP_LIFT, flatInset, flatLift, flatTop, holeSummary, LAY_SIDES, layOf, layOptions, layPieces, layWays,
+  leaningFrame, tipOf, tipOption, tipRefusedWords, tipTransform, tipTurn, tipWays,
 } from '../src/split.js';
 import { boxHang, columnGraph, columnsOf, looseTable, planeGrid, rasterRings, sampleWidths } from '../src/hang.js';
 
@@ -2045,6 +2046,225 @@ describe('the side a piece lies on, chosen by hand', () => {
       text: 'The cuts changed, so the pieces are no longer the same ones: the side you chose for a piece to lie on was dropped, and the app lays it again. Choose again in the pieces list if you like (Undo brings the choice back with the cuts as they were).',
     });
     expect(splitNote('LAYS_DROPPED', { count: 3, why: 'model' }).text).toBe('The model was turned, moved or resized, so the pieces are no longer the same ones: the side you chose for 3 pieces to lie on was dropped, and the app lays them again. Choose again in the pieces list if you like (Undo brings the choice back with the model as it was).');
+  });
+});
+
+describe('a piece tipped so that its big leaning face prints level', () => {
+  const cutX = (at, id) => ({ id, position: [at, 0, 10], normal: [1, 0, 0] });
+  const rad = (deg) => (deg * Math.PI) / 180;
+  const halves = () => [
+    { index: 1, cell: [0, 0, 0], shells: 1, volume: 72000, bbox: { min: [0, 0, 0], max: [60, 40, 30] }, cuts: ['c1'], stats: boxStats([60, 40, 30], ['+x']) },
+    { index: 2, cell: [1, 0, 0], shells: 1, volume: 72000, bbox: { min: [0, 0, 0], max: [60, 40, 30] }, cuts: ['c1'], stats: boxStats([60, 40, 30], ['-x']) },
+  ];
+  /** The eight corners of a box 100 × 80 whose top leans `deg` degrees along x, as points. */
+  const wedge = (deg) => {
+    const rise = 100 * Math.tan(rad(deg));
+    return Float64Array.from([[0, 0, 0], [100, 0, 0], [0, 80, 0], [100, 80, 0], [0, 0, 20], [100, 0, 20 + rise], [0, 80, 20], [100, 80, 20 + rise]].flat());
+  };
+
+  it('normaliseSplit hands on the boxes asked to be tipped, and none while a cut misses or is merged', () => {
+    const cuts = [cutX(0, 'c1'), cutX(50, 'c2')];
+    const tip = { '2,0,0': true, '0,0,0': true, '3,0,0': true, '1,0,0': false, '0,1,0': 'yes', nonsense: true };
+    expect(normaliseSplit({ cuts, tip }, bounds300).tip).toEqual(['0,0,0', '2,0,0']);
+    expect('tip' in normaliseSplit({ cuts }, bounds300)).toBe(false);
+    expect('tip' in normaliseSplit({ cuts, tip: { '5,0,0': true } }, bounds300)).toBe(false);
+    expect('tip' in normaliseSplit({ cuts, tip: { '0,0,0': false } }, bounds300)).toBe(false);
+    expect('tip' in normaliseSplit({ cuts, tip }, bounds300).spec).toBe(false);
+    expect(normaliseSplit({ cuts, tip }, bounds300).notes).toEqual([]);
+    const missed = normaliseSplit({ cuts: [...cuts, cutX(400, 'c3')], tip }, bounds300);
+    expect('tip' in missed).toBe(false);
+    expect(missed.notes.map((n) => n.code)).toEqual(['CUT_MISSES', 'TIP_WAITS']);
+    expect(missed.notes[1]).toMatchObject({ level: 'info', count: 3, text: 'A cut misses the model, or lies where another cut is, so the pieces are not the ones you asked to tip: they are not tipped until that cut is moved or removed.' });
+    expect(normaliseSplit({ cuts: [...cuts, cutX(400, 'c3')], tip: { '0,0,0': true } }, bounds300).notes[1].text).toMatch(/asked to tip: the piece is not tipped until/);
+    expect(tipOf(null, [1, 0, 0])).toBeNull();
+    expect(tipOf({ '1,0,0': true }, [1, 0, 0])).toEqual(['1,0,0']);
+  });
+
+  it('the turn takes the face straight up by the least angle, whichever side the piece lies on', () => {
+    for (const down of Object.keys(DIRECTIONS)) {
+      for (const [lean, round] of [[3, 0], [5, 70], [0.5, 200], [8, 315]]) {
+        // the way the face looks as the piece lies: `lean` degrees off straight up, towards `round` degrees
+        const normal = [Math.sin(rad(lean)) * Math.cos(rad(round)), Math.sin(rad(lean)) * Math.sin(rad(round)), Math.cos(rad(lean))];
+        const { turn, up, angle } = tipTurn(down, normal);
+        expect(angle).toBeCloseTo(lean, 9);
+        expect(det3(turn)).toBeCloseTo(1, 12);
+        closeVec(mulMat4(turn, transposeMat4(turn)), IDENTITY, 12);
+        // the face's own normal in the model is what is up once it is tipped, and the turn takes it to +z
+        const inModel = applyMat4(transposeMat4(LAY_DOWN[down]), normal);
+        closeVec(up, inModel, 12);
+        closeVec(applyMat4(turn, inModel), [0, 0, 1], 12);
+        // the least turn: what lies along the level line of the face stays where laying the piece put it
+        const level = applyMat4(transposeMat4(LAY_DOWN[down]), [-Math.sin(rad(round)), Math.cos(rad(round)), 0]);
+        closeVec(applyMat4(turn, level), applyMat4(LAY_DOWN[down], level), 12);
+      }
+    }
+    // a face that is level already: no turn beyond laying the piece
+    expect(tipTurn('-x', [0, 0, 1])).toMatchObject({ turn: [...LAY_DOWN['-x']], angle: 0 });
+    // a normal of any length will do
+    closeVec(tipTurn('-z', [0, 3, 30]).turn, tipTurn('-z', [0, 0.3, 3]).turn, 12);
+  });
+
+  it('a tipped piece is set down by its own points, never by its box: its lowest point is on the bed', () => {
+    const points = wedge(3);
+    const normal = [-Math.sin(rad(3)), 0, Math.cos(rad(3))];
+    const { turn } = tipTurn('-z', normal);
+    const t = tipTransform(turn, [points], { U });
+    const laid = applyToSoup(points, t.printMatrix);
+    const span = (a) => [Math.min(...laid.filter((_, i) => i % 3 === a)), Math.max(...laid.filter((_, i) => i % 3 === a))];
+    expect(span(2)[0]).toBeCloseTo(0, 9);
+    expect(span(0)[0]).toBeCloseTo(-span(0)[1], 9);
+    expect(span(1)[0]).toBeCloseTo(-span(1)[1], 9);
+    // its size is that of the points as they lie, and the top is level: both top corners at one height
+    expect(t.size).toEqual([span(0)[1] - span(0)[0], span(1)[1] - span(1)[0], span(2)[1]].map((v) => expect.closeTo(v, 9)));
+    expect(laid[4 * 3 + 2]).toBeCloseTo(laid[5 * 3 + 2], 9);
+    expect(t).toMatchObject({ yaw: 0, fits: true });
+    closeVec(mulMat4(t.matrix, t.printMatrix), IDENTITY, 9);
+    expect(det3(t.printMatrix)).toBeCloseTo(1, 12);
+    // the box of the piece, tipped, would put the piece in the air and make it larger than it is: its low corner is
+    // the corner under the top's high edge, where the piece has nothing
+    const box = { min: [0, 0, 0], max: [100, 80, 20 + 100 * Math.tan(rad(3))] };
+    const corners = [0, 1, 2, 3, 4, 5, 6, 7].map((c) => applyMat4(turn, [c & 1 ? box.max[0] : box.min[0], c & 2 ? box.max[1] : box.min[1], c & 4 ? box.max[2] : box.min[2]]));
+    const boxTall = Math.max(...corners.map((p) => p[2])) - Math.min(...corners.map((p) => p[2]));
+    expect(boxTall).toBeGreaterThan(t.size[2] + 4);
+    // points given with other numbers after them (a mesh's), a missing list and an empty one
+    const wide = [];
+    for (let i = 0; i < points.length; i += 3) wide.push(points[i], points[i + 1], points[i + 2], 7, 7);
+    expect(tipTransform(turn, [{ points: wide, stride: 5 }, null, new Float32Array(0)], { U })).toEqual(t);
+    // two lists are one piece: a loose triangle under the rest lowers the bed
+    const lower = tipTransform(turn, [points, [50, 40, -10, 51, 40, -10, 50, 41, -10]], { U });
+    expect(lower.fits).toBe(true);
+    expect(lower.size[2]).toBeGreaterThan(t.size[2] + 1);
+    // turned on the bed where it fits only so, with the size as a quarter turn has it; too big every way is said
+    expect(tipTransform(turn, [points], { U: [90, 120, 100] })).toMatchObject({ yaw: 90, fits: true, size: [t.size[1], t.size[0], t.size[2]].map((v) => expect.closeTo(v, 9)) });
+    expect(tipTransform(turn, [points], { U: [90, 90, 100] }).fits).toBe(false);
+    expect(tipTransform(turn, [points], { U: [210, 210, 20] }).fits).toBe(false);
+    // a turn known already is taken as it is, and with nothing to fit there is none
+    expect(tipTransform(turn, [points], { yaw: 90 })).toMatchObject({ yaw: 90, fits: true });
+    expect(tipTransform(turn, [points])).toMatchObject({ yaw: 0, fits: true });
+    const quarter = applyToSoup(points, tipTransform(turn, [points], { yaw: 90 }).printMatrix);
+    expect(Math.min(...quarter.filter((_, i) => i % 3 === 2))).toBeCloseTo(0, 9);
+  });
+
+  it("a tipped piece's lying holes point where up is then, and its upright holes stay round", () => {
+    const up = [0, -Math.sin(rad(5)), Math.cos(rad(5))];
+    // a hole along x in a piece lying flat: the point turns 5° round the hole with the piece
+    closeVec(teardropApex('+z', 0, up), up, 12);
+    // a hole along y: the tip is along the hole, which leans with it – the point stays straight up
+    expect(teardropApex('+z', 1, up)).toEqual([0, 0, 1]);
+    // one long whatever is left of up across the hole
+    const skew = [Math.sin(rad(4)) * Math.SQRT1_2, Math.sin(rad(4)) * Math.SQRT1_2, Math.cos(rad(4))];
+    expect(Math.hypot(...teardropApex('+z', 0, skew))).toBeCloseTo(1, 12);
+    expect(teardropApex('+z', 0, skew)[0]).toBe(0);
+    // a hole standing up stays round, tipped or not; and without a tip nothing changes
+    expect(teardropApex('+z', 2, up)).toBeNull();
+    expect(teardropApex('+z', 0)).toEqual([0, 0, 1]);
+    expect(teardropApex('-y', 0, null)).toEqual([0, -1, 0]);
+    // the frame of such a hole: z into the piece along its axis, y to the point, x = y × z, a turn
+    const frame = leaningFrame('-x', up, [1, 2, 3]);
+    closeVec(applyMat4(frame, [0, 0, 1]), [0, 2, 3], 12);
+    closeVec(applyMat4(frame, [0, 1, 0]), [1, 2 + up[1], 3 + up[2]], 12);
+    expect(det3(frame)).toBeCloseTo(1, 12);
+    // with the point along an axis it is the frame every other hole has
+    closeVec(leaningFrame('-x', [0, 0, 1], [1, 2, 3]), localFrame('-x', '+z', [1, 2, 3]), 12);
+  });
+
+  it('the layout says which pieces may not be tipped, and why', () => {
+    const laid = layPieces(halves(), U);
+    expect(tipWays(laid, {})).toEqual([{ key: '0,0,0', why: null }, { key: '1,0,0', why: null }]);
+    // a thin plate, or a piece beside a dovetail seam, lies flat; the piece a part comes out of stands as modelled
+    const flat = halves();
+    flat[0].stats = { ...flat[0].stats, allowed: ['-z', '+z'] };
+    flat[1].stats = { ...flat[1].stats, allowed: ['-z'] };
+    expect(tipWays(layPieces(flat, U), {}).map((w) => w.why)).toEqual(['flat', 'stand']);
+    // a side chosen by hand holds the piece to it, but is no reason: what it might lie on without the choice counts
+    expect(tipWays(layPieces(halves(), U, 'auto', { lay: { '0,0,0': '-z' } }), {})[0]).toEqual({ key: '0,0,0', why: null });
+    // a lip or a twist-lock's neck, the piece with the lock's socket, pin holes kept for a lip that was not built
+    const lip = { cutId: 'c1', axis: 0, dir: 1, male: 0, down: '-x', H: 6, sides: [{ piece: 1, male: true }, { piece: 2, male: false }] };
+    expect(tipWays(laid, { lips: [lip] }).map((w) => w.why)).toEqual(['lip', null]);
+    const lock = { kind: 'full', cutId: 'c1', down: '-x', S: { H: 2.4 }, sides: [{ piece: 1, role: 'body' }, { piece: 2, role: 'part' }] };
+    expect(tipWays(laid, { lips: [{ ...lip, twist: true }], locks: [lock] }).map((w) => w.why)).toEqual(['lip', 'lock']);
+    const dowels = [{ sides: [{ piece: 1 }, { piece: 2 }] }];
+    expect(tipWays(laid, { dowels, lays: [{ piece: 2, down: '+z' }] }).map((w) => w.why)).toEqual([null, 'lock']);
+    // built-in pegs, and the sockets for them
+    const pegs = [{ axis: 0, at: 60, centre: [60, 20, 15], s: 6, length: 9, dir: 1, sides: [{ piece: 1, peg: true }, { piece: 2, peg: false }] }];
+    expect(tipWays(laid, { pegs }).map((w) => w.why)).toEqual(['pegs', 'pegs']);
+    // more than one part in the file
+    const two = halves();
+    two[0].shells = 2;
+    expect(tipWays(layPieces(two, U), {})[0].why).toBe('parts');
+    // a part taken out has no say; of a box that prints as several pieces only the first keeps its key
+    expect(tipWays(laid, {}, { parts: new Map([[2, {}]]) })[1]).toEqual({ key: null, why: 'part' });
+    const apart = [{ ...laid[0] }, { ...laid[1], index: 2, cell: [0, 0, 0] }];
+    expect(tipWays(apart, {})).toEqual([{ key: '0,0,0', why: 'apart' }, { key: null, why: 'apart' }]);
+  });
+
+  it('every reason is said in plain words', () => {
+    for (const why of ['flat', 'stand', 'lip', 'lock', 'pegs', 'parts', 'apart', 'none', 'steep', 'foot', 'bed', 'steps', 'supports', 'tall', 'unknown']) {
+      const words = tipRefusedWords(why, { angle: 10, area: 4000, extra: 5200 });
+      expect(words, why).toMatch(/^[a-z]/);
+      expect(words, why).not.toMatch(/undefined|NaN/);
+    }
+    expect(tipRefusedWords('steep', { angle: 10.2 })).toBe('its big face leans 10° – more than 8°, and tipped that far too much of it would hang over the bed');
+    expect(tipRefusedWords('supports', { area: 4000, extra: 5200 })).toBe('tipped it would need supports under about 52 cm² more than the face it lies on – more than the face it would make level (about 40 cm²)');
+    expect(tipRefusedWords('bed')).toBe("tipped it doesn't fit your printer");
+    expect(splitNote('TIP_REFUSED', { pieceIndex: 2, why: 'pegs' })).toMatchObject({
+      level: 'info',
+      text: 'Piece 2 is not tipped, though you asked for it in the pieces list: its built-in pegs and their sockets are shaped to print the way it lies. It prints as it lies – untick "Tip this piece" for it to clear this note.',
+    });
+    expect(splitNote('TIPS_DROPPED', { count: 1, why: 'cuts' }).text).toBe('The cuts changed, so the pieces are no longer the same ones: the piece you asked to tip is not tipped any more. Tick it again in the pieces list if you like (Undo brings it back with the cuts as they were).');
+    expect(splitNote('TIPS_DROPPED', { count: 2, why: 'model' }).text).toBe('The model was turned, moved or resized, so the pieces are no longer the same ones: the 2 pieces you asked to tip are not tipped any more. Tick it again in the pieces list if you like (Undo brings it back with the model as it was).');
+    for (const code of ['PIECE_TIPPED', 'TIP_REFUSED', 'TIP_WAITS', 'TIPS_DROPPED']) expect(SPLIT_NOTE_CODES).toContain(code);
+  });
+
+  it("the tick box in a piece's row: offered, ticked, greyed out with why, or asked for and not used", () => {
+    expect(tipOption(null)).toBeNull();
+    expect(tipOption({ key: null })).toBeNull();
+    const offer = { key: '0,0,0', asked: false, used: false, angle: 3.0001, area: 4005 };
+    expect(tipOption(offer)).toEqual({ key: '0,0,0', checked: false, disabled: false, text: 'Tip this piece so that face prints level (about 40 cm², leaning 3°)', tag: '' });
+    // ticked in the document, the pieces not worked out again yet: ticked, with nothing said of it
+    expect(tipOption(offer, true, { current: false })).toMatchObject({ checked: true, disabled: false, tag: '' });
+    expect(tipOption(offer, true)).toMatchObject({ checked: true, tag: '' });
+    // tipped
+    expect(tipOption({ ...offer, asked: true, used: true })).toMatchObject({ checked: true, disabled: false, tag: 'tipped – needs supports, see the notes' });
+    // a piece that cannot be: greyed out, with why
+    expect(tipOption({ ...offer, why: 'pegs' })).toEqual({ key: '0,0,0', checked: false, disabled: true, text: "Can't be tipped to print its big face level: its built-in pegs and their sockets are shaped to print the way it lies", tag: '' });
+    // asked for and refused: it stays ticked, to untick, and says why
+    expect(tipOption({ ...offer, asked: true, why: 'bed' })).toEqual({ key: '0,0,0', checked: true, disabled: false, text: 'Tip this piece so that face prints level (about 40 cm², leaning 3°)', tag: "asked for, but not tipped: tipped it doesn't fit your printer" });
+    expect(tipOption({ key: '0,0,0', asked: true, used: false, why: 'none' })).toMatchObject({ checked: true, text: 'Tip this piece so that face prints level', tag: 'asked for, but not tipped: the way it lies now it has no big face on top that leans a little off level' });
+    // unticked in the document since: no longer said to be tipped
+    expect(tipOption({ ...offer, asked: true, used: true }, false)).toMatchObject({ checked: false, disabled: false, tag: '' });
+  });
+
+  it('the sheet says a tipped piece is meant to lie so, and what to set in the slicer for it', () => {
+    const check = (seam) => ({
+      layer: 0.2, height: 22.6,
+      supports: { area: 3995, skin: seam ? 0 : 3995, seam: seam ? 3995 : 0, bed: 3995, piece: 0, shallow: 3995, places: 1, bridged: 0, span: 0, reach: 0 },
+      steps: [], foot: { contact: 0, across: null, flat: false, tip: false, small: false, strip: false, brim: 0 },
+    });
+    const flat = { layer: 0.2, height: 20, supports: { area: 0, skin: 0, seam: 0, bed: 0, piece: 0, shallow: 0, places: 0, bridged: 0, span: 0, reach: 0 }, steps: [], foot: { contact: 4000, across: [50, 80], flat: true, tip: false, small: false, strip: false, brim: 0 } };
+    const piece = (index, tip, c) => ({ index, cell: [index - 1, 0, 0], size: [51.1, 80, 22.6], lies: 'flat as modelled', yaw: 0, fits: true, shells: 1, check: c, ...(tip ? { tip } : {}) });
+    const sheet = (pieces) => howToGlueText({ name: 'desk', pieces, seams: [{ letter: 'A', axis: 0, at: 0, pieces: [1, 2], joint: 'dowels', dowels: 2, labels: ['1A', '2A'] }], pins: [{ d: 6, length: 19, count: 2, spares: 1 }], clearance: 0.15 }).split('\n');
+    const used = { key: '0,0,0', asked: true, used: true, angle: 2.9999, area: 4005 };
+    const one = sheet([piece(1, used, check(true)), piece(2, null, flat)]);
+    expect(one).toContain('  piece 1 of 2   51.1 × 80.0 × 22.6 mm   lies flat as modelled, tipped 3°   fits – needs supports: about 40 cm², under a glue face, standing on the bed; rests on an edge: add a brim, 5 mm wide');
+    expect(one).toContain('  piece 2 of 2   51.1 × 80.0 × 22.6 mm   lies flat as modelled   fits – no supports needed');
+    expect(one).toContain('  Piece 1 is meant to lie tipped, as its file has it: one big face is then level and prints without step lines, and the piece rests on an edge.');
+    expect(one).toContain('  For it, turn off auto-orient in your slicer and do not use "lay on face"; turn supports on (on build plate only is enough) and add a brim.');
+    // what it lay on was a glue face: on supports it wants sanding
+    expect(one).toContain('  The glue face under piece 1 prints on supports and comes out rough: sand it lightly before you glue it.');
+    // the lines come right under the pieces, before the line that says to print each as its file lies
+    expect(one.findIndex((l) => l.startsWith('  Piece 1 is meant to lie tipped'))).toBe(one.findIndex((l) => l.startsWith('  piece 2 of 2')) + 1);
+    expect(one.findIndex((l) => l.startsWith('  Print each piece lying the way its file lies'))).toBe(one.findIndex((l) => l.startsWith('  For it, turn off auto-orient')) + 2);
+    const both = sheet([piece(1, used, check(false)), piece(2, { ...used, key: '1,0,0' }, { ...check(false), supports: { ...check(false).supports, piece: 3995, bed: 0 } })]);
+    expect(both).toContain('  Pieces 1 and 2 are meant to lie tipped, as their files have them: one big face is then level and prints without step lines, and the piece rests on an edge.');
+    // where a support would stand on a piece itself, build plate only is not said to be enough
+    expect(both).toContain('  For them, turn off auto-orient in your slicer and do not use "lay on face"; turn supports on and add a brim.');
+    expect(both.join('\n')).not.toMatch(/glue face under/);
+    const seams = sheet([piece(1, used, check(true)), piece(2, { ...used, key: '1,0,0' }, check(true))]);
+    expect(seams).toContain('  The glue face under pieces 1 and 2 prints on supports and comes out rough: sand it lightly before you glue it.');
+    // asked for and not tipped, or only offered: nothing of it on the sheet
+    const none = sheet([piece(1, { ...used, used: false, why: 'bed' }, flat), piece(2, { key: '1,0,0', asked: false, used: false, angle: 3, area: 4005 }, flat)]).join('\n');
+    expect(none).not.toMatch(/tipped|auto-orient/);
   });
 });
 

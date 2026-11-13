@@ -77,6 +77,9 @@ export const SPLIT_DEFAULTS = Object.freeze({
   // along x, y and z, and the side of it that goes down: '-z' as in the model, '+z' upside down, '-x' | '+x' | '-y' |
   // '+y' a side), is there only while some piece has one, as `keep` is; it is dropped when the boxes are no longer
   // the same ones (`cellsKey`: a cut added, removed, turned or moved past another) or the model is moved
+  // the pieces asked to be tipped a few degrees in their files so that a big leaning face prints level,
+  // `tip: { '0,1,0': true }` (by the piece's box, as `lay`), are there only while some piece is, and are dropped as
+  // `lay` is – and for a piece that is laid on another side by hand
   joint: 'auto', // 'auto' | 'dowels' | 'dovetail' | 'none'
   diameter: 0, // mm: 0 = automatic | 1.75 (filament) | 3 | 4 | 5 | 6 | 8 | 10
   depth: 0, // mm into each piece: 0 = automatic | 3–30
@@ -309,6 +312,18 @@ const copyLay = (lay) => {
 };
 
 /**
+ * The pieces asked to be tipped so that a leaning face prints level, as the document keeps them: its own object, by
+ * box; null for none.
+ */
+const copyTip = (tip) => {
+  const out = {};
+  for (const [key, on] of Object.entries(tip && typeof tip === 'object' ? tip : {})) {
+    if (/^\d+,\d+,\d+$/.test(key) && on === true) out[key] = true;
+  }
+  return Object.keys(out).length ? out : null;
+};
+
+/**
  * Which boxes a split's cuts make, as one key: the cuts across each axis in their order along it, by id. While it
  * stays the same a box's number ('i,j,k') means the same box, wherever the cuts are dragged; a cut added, removed,
  * turned to another axis or moved past another one changes it. A cut that takes out only a part makes no box.
@@ -388,6 +403,9 @@ function mergeSplit(current, patch) {
   const lay = copyLay(next.lay);
   delete next.lay;
   if (lay) next.lay = lay;
+  const tip = copyTip(next.tip);
+  delete next.tip;
+  if (tip) next.tip = tip;
   return next;
 }
 
@@ -414,9 +432,10 @@ function transformKeeps(marks, matrix) {
 
 /**
  * The split moved with the model: its cuts and the details it keeps whole. The sides chosen by hand for pieces to lie
- * on are dropped: turned or resized, a piece is no longer the one the side was chosen for.
+ * on are dropped, and so are the pieces asked to be tipped: turned or resized, a piece is no longer the one the side
+ * was chosen for.
  */
-const transformSplit = ({ lay, ...split }, matrix) => ({
+const transformSplit = ({ lay, tip, ...split }, matrix) => ({
   ...split,
   cuts: transformItems(split.cuts, matrix),
   ...(split.keep ? { keep: transformKeeps(split.keep, matrix) } : {}),
@@ -432,6 +451,7 @@ const clone = (state) => ({
     cuts: state.split.cuts.map((c) => ({ ...c, position: [...c.position], normal: [...c.normal], ...(c.part ? { part: { ...c.part } } : {}) })),
     ...(state.split.keep ? { keep: state.split.keep.map(copyKeep) } : {}),
     ...(state.split.lay ? { lay: { ...state.split.lay } } : {}),
+    ...(state.split.tip ? { tip: { ...state.split.tip } } : {}),
   },
 });
 
@@ -498,13 +518,17 @@ export class Document {
     // the sides chosen by hand for pieces to lie on go by each piece's box: once the cuts make other boxes, a number
     // would name another piece, so the choices are dropped (an undo brings them back with the cuts)
     // – but not ones that arrive with the new cuts
-    const carried = next.split?.lay && JSON.stringify(next.split.lay) === JSON.stringify(this.state.split?.lay ?? null);
+    // and so with the pieces asked to be tipped, which go by their boxes as well
+    const held = (split) => JSON.stringify([split?.lay ?? null, split?.tip ?? null]);
+    const carried = (next.split?.lay || next.split?.tip) && held(next.split) === held(this.state.split);
     if (carried && cellsKey(next.split) !== cellsKey(this.state.split)) {
       // within one drag they are only set aside: a cut dragged past another and back makes the same boxes again
-      if (coalesce) this.layAside = { coalesce, cells: cellsKey(this.state.split), lay: next.split.lay };
+      if (coalesce) this.layAside = { coalesce, cells: cellsKey(this.state.split), lay: next.split.lay ?? null, tip: next.split.tip ?? null };
       delete next.split.lay;
-    } else if (this.layAside && next.split && !next.split.lay && !this.state.split?.lay && cellsKey(next.split) === this.layAside.cells) {
-      next.split.lay = { ...this.layAside.lay };
+      delete next.split.tip;
+    } else if (this.layAside && next.split && !next.split.lay && !next.split.tip && !this.state.split?.lay && !this.state.split?.tip && cellsKey(next.split) === this.layAside.cells) {
+      if (this.layAside.lay) next.split.lay = { ...this.layAside.lay };
+      if (this.layAside.tip) next.split.tip = { ...this.layAside.tip };
       this.layAside = null;
     }
     this.state = next;
@@ -772,6 +796,28 @@ export class Document {
       else delete lay[key];
       if (Object.keys(lay).length) s.split.lay = lay;
       else delete s.split.lay;
+      // tipped, the piece was tipped for a face of the side it lay on: on another side it is asked for again
+      if (s.split.tip?.[key]) {
+        delete s.split.tip[key];
+        if (!Object.keys(s.split.tip).length) delete s.split.tip;
+      }
+    });
+  }
+
+  /**
+   * Ask for a piece to be tipped in its file so that its big leaning face prints level (`on`), or not any more. `key`
+   * is the piece's box between the cuts ('i,j,k'). One undo step; nothing when the piece has that already. It lasts
+   * while the cuts make the same boxes (`cellsKey`) and the piece lies on the same side.
+   */
+  setPieceTip(key, on) {
+    if (!this.state.split || !/^\d+,\d+,\d+$/.test(String(key))) return;
+    if (Boolean(this.state.split.tip?.[key]) === Boolean(on)) return;
+    this.commit((s) => {
+      const tip = { ...(s.split.tip ?? {}) };
+      if (on) tip[key] = true;
+      else delete tip[key];
+      if (Object.keys(tip).length) s.split.tip = tip;
+      else delete s.split.tip;
     });
   }
 

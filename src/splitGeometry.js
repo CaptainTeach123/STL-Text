@@ -71,6 +71,7 @@ import {
   smallPieceNotes,
   splitNote,
   teardropApex,
+  leaningFrame,
   translationMat4,
   transposeMat4,
 } from './split.js';
@@ -762,7 +763,10 @@ export function fitTestCoupon(spec = {}, nozzle = 0.4, { dovetail = spec.joint =
 export function dowelHole(dowel, side) {
   const s = dowel.sides[side];
   const local = cachedHalfHole(dowel.R, dowel.h, dowel.ch, Boolean(s.tear), dowel.flat ? dowel.lift ?? FLAT_TOP_LIFT : 0);
-  return local.transform(localFrame(`${side === 0 ? '-' : '+'}${AXES[dowel.axis]}`, s.tear ? s.apex : null, dowel.centre));
+  const into = `${side === 0 ? '-' : '+'}${AXES[dowel.axis]}`;
+  // a tipped piece's teardrop points where up is once it is tipped: along no axis
+  const leans = s.tear && s.apex && !s.apex.some((v) => Math.abs(v) === 1);
+  return local.transform(leans ? leaningFrame(into, s.apex, dowel.centre) : localFrame(into, s.tear ? s.apex : null, dowel.centre));
 }
 
 // ---------- built-in square pegs ----------
@@ -5288,7 +5292,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
             }
           });
         }
-        patch.apex = patch.skip ? [null, null] : [teardropApex(patch.lo.up ?? '+z', a), teardropApex(patch.hi.up ?? '+z', a)];
+        patch.apex = patch.skip ? [null, null] : [teardropApex(patch.lo.up ?? '+z', a, patch.lo.tip), teardropApex(patch.hi.up ?? '+z', a, patch.hi.tip)];
         patch.dowels = [];
         patch.pegs = [];
         patch.male = null;
@@ -5443,7 +5447,7 @@ export function layoutSplit(solid, cuts, pieces, spec = {}, options = {}) {
       });
       for (const ctx of contexts) {
         for (const patch of ctx.patches) {
-          if (!patch.skip) patch.apex = [teardropApex(patch.lo.up ?? '+z', ctx.cut.axis), teardropApex(patch.hi.up ?? '+z', ctx.cut.axis)];
+          if (!patch.skip) patch.apex = [teardropApex(patch.lo.up ?? '+z', ctx.cut.axis, patch.lo.tip), teardropApex(patch.hi.up ?? '+z', ctx.cut.axis, patch.hi.tip)];
         }
       }
       for (const ctx of lipped) {

@@ -22,7 +22,7 @@
  *  - piece numbers are 1-based, as in "piece 2 of 3" and the label "2A".
  */
 import { TEA_LIGHT, roundAngle, roundOpening, wayWords } from './locks.js';
-import { OVERHANG_NZ, PRINT_CHECK, checkNote, checkNoteWords, checkWords } from './printCheck.js';
+import { OVERHANG_NZ, PRINT_CHECK, checkNote, checkNoteWords, checkWords, areaWords } from './printCheck.js';
 import { planSheetLines } from './printPlan.js';
 import { boxHang, columnGraph, columnsOf, HANG, hangAt, looseTable, planeGrid, rasterRings, sampleWidths } from './hang.js';
 
@@ -374,7 +374,9 @@ export function keepsThrough(keeps, cut) {
  *   auto: boolean, seat?: true }[], notes: object[], grid: number[], keeps?: { id: string, name: string, box: object }[] }}
  *   `spec` holds the clamped settings (no cuts), `grid` the number of cuts on each axis; `apart` only on a cut that comes
  *   apart; `seat` only on a part whose base is to have a tea-light seat; `keeps` the details kept whole (`keepsOf`), only
- *   when there are some. No cuts left means: export unsplit, with the notes.
+ *   when there are some; `lay` the sides chosen by hand for pieces to lie on (`layOf`), only when there are some and
+ *   every cut cuts (else a `LAY_WAITS` note). No
+ *   cuts left means: export unsplit, with the notes.
  * @throws {SplitError} `SPLIT_INVALID` for more than 12 cuts and parts or 64 pieces
  */
 export function normaliseSplit(split, bounds = null) {
@@ -448,7 +450,32 @@ export function normaliseSplit(split, bounds = null) {
     throw new SplitError('SPLIT_INVALID', `A split can have up to ${SPLIT_LIMITS.cuts} cuts and ${SPLIT_LIMITS.cells} pieces – remove some cuts.`, { cuts: count, cells });
   }
   const keeps = keepsOf(s, bounds);
-  return { spec, cuts, parts, notes, grid, ...(keeps.length ? { keeps } : {}) };
+  // the sides chosen by hand count only while every cut cuts: the boxes are numbered by the cuts that do, so with one
+  // that misses or is merged a box's number may be another box's
+  const whole = !notes.some((n) => n.code === 'CUT_NOT_STRAIGHT' || n.code === 'CUT_MISSES' || n.code === 'CUTS_MERGED');
+  const lay = whole ? layOf(s.lay, grid) : null;
+  // and that they wait is said, or a piece would seem to lie as chosen
+  const waiting = whole ? 0 : Object.keys(layOf(s.lay, [Infinity, Infinity, Infinity]) ?? {}).length;
+  if (waiting) notes.push(splitNote('LAY_WAITS', { count: waiting }));
+  return { spec, cuts, parts, notes, grid, ...(keeps.length ? { keeps } : {}), ...(lay ? { lay } : {}) };
+}
+
+/**
+ * The sides chosen by hand for pieces to lie on (`split.lay`: by the piece's box, 'i,j,k', the side that goes down),
+ * those that name a box of the grid and a side; null when none is left.
+ * @param {Object<string, string>|null|undefined} lay as stored
+ * @param {number[]} grid the number of cuts on each axis
+ * @returns {Object<string, string>|null}
+ */
+export function layOf(lay, grid) {
+  if (!lay || typeof lay !== 'object') return null;
+  const out = {};
+  for (const key of Object.keys(lay).sort()) {
+    if (!/^\d+,\d+,\d+$/.test(key) || !DIR_KEYS.includes(lay[key])) continue;
+    if (key.split(',').some((v, a) => Number(v) > grid[a])) continue;
+    out[key] = lay[key];
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 /**
@@ -3426,6 +3453,11 @@ function orientationScore(stats, down) {
   return { need, score: need + 0.5 * cutV };
 }
 
+/** The six sides a piece may be told to lie on, in plain words: the side that goes down, by its direction in the model. */
+export const LAY_SIDES = Object.freeze({
+  '-z': 'as in the model', '+z': 'upside down', '-x': 'on its left side', '+x': 'on its right side', '-y': 'on its front', '+y': 'on its back',
+});
+
 /** How a piece lies, for the piece list and the glue sheet. */
 function liesOf(stats, down) {
   if (stats.dirs[down].cutArea > 1e-6) return 'on a cut face';
@@ -3621,6 +3653,25 @@ function restingGroups(list, U, orient, flat) {
   return groups;
 }
 
+/** Whether a piece laid `down` fits the usable bed `U`, turned straight, a quarter or across the diagonal. */
+function layFits(stats, down, U) {
+  const [a, b, h] = laidDims(stats.dims, down);
+  return h <= U[2] + EPS && footprintYaw(a, b, U) !== null;
+}
+
+/**
+ * Why a piece cannot lie on the side chosen for it by hand, or null when it can: 'flat' where it may only lie flat
+ * (a thin plate, a piece beside a dovetail seam), 'stand' where it may only stand as modelled (the piece a part
+ * comes out of), 'rest' where not every one of its shells would rest on the bed, 'bed'
+ * where it does not fit the printer that way.
+ */
+function layRefused(stats, boxes, down, U) {
+  const allowed = stats.allowed?.length ? stats.allowed : DIR_KEYS;
+  if (!allowed.includes(down)) return allowed.length === 1 ? 'stand' : 'flat';
+  if (!restingOnly(stats, boxes)?.allowed.includes(down)) return 'rest';
+  return layFits(stats, down, U) ? null : 'bed';
+}
+
 /**
  * How the pieces of a cut print. Each is turned to lie its best way
  * (`chooseOrientation`), and a file holds only shells that rest on the bed:
@@ -3634,14 +3685,20 @@ function restingGroups(list, U, orient, flat) {
  *   of a piece with more than one)
  * @param {number[]} U the usable bed
  * @param {'auto'|'cut'|'model'} orient
- * @param {{ flat?: number|null, soups?: Map<number, Float32Array>|null }} options `flat` as for `chooseOrientation`; `soups`
- *   the unrepaired triangles that go with each piece of `pieces`, by its number
+ * @param {{ flat?: number|null, soups?: Map<number, Float32Array>|null, lay?: Object<string, string>|null }} options
+ *   `flat` as for `chooseOrientation`; `soups` the unrepaired triangles that go with each piece of `pieces`, by its
+ *   number; `lay` the side chosen by hand for a piece to lie on, by its box ('i,j,k'), as `normaliseSplit` gives it
  * @returns {{ index: number, cell: number[], from: number, parts: number[]|null, shells: number, volume: number,
- *   bbox: object, boxes: object[], cuts: string[], stats: object, soup: Float32Array|null, lying: object }[]} numbered anew:
+ *   bbox: object, boxes: object[], cuts: string[], stats: object, soup: Float32Array|null, lying: object,
+ *   chosen?: string, free?: string[], auto?: object, refused?: object }[]} numbered anew:
  *   `from` the piece of `pieces` it comes from, `parts` which of its shells (null for all), `boxes` theirs, `lying` from
- *   `chooseOrientation`
+ *   `chooseOrientation`. A piece lying on a side chosen by hand has it as `chosen`, its statistics allow that way only
+ *   (so whatever is worked out from them – how it lies with pegs, which piece of a pair carries them – keeps to it),
+ *   `free` holds the ways it might lie without the choice and `auto` how the app would lay it; one whose choice it cannot take (`layRefused`; a box that
+ *   prints as more than one piece, 'apart') lies as the app lays it, with the `LAY_IGNORED` note that says so
+ *   (`refused`, and among its `lying.notes`)
  */
-export function layPieces(pieces, U, orient = 'auto', { flat = null, soups = null } = {}) {
+export function layPieces(pieces, U, orient = 'auto', { flat = null, soups = null, lay = null } = {}) {
   const out = [];
   for (const piece of pieces) {
     const groups = !piece.parts
@@ -3676,7 +3733,27 @@ export function layPieces(pieces, U, orient = 'auto', { flat = null, soups = nul
       const index = out.length + 1;
       const own = g === home ? soup : null;
       const stats = statsWithSoup(g.stats, own);
-      out.push({ ...g, index, cell: piece.cell, from: piece.index, stats, soup: own, lying: chooseOrientation(stats, U, orient, { pieceIndex: index, flat }) });
+      const lying = chooseOrientation(stats, U, orient, { pieceIndex: index, flat });
+      const want = lay?.[piece.cell.join(',')] ?? null;
+      if (!want || piece.part) {
+        out.push({ ...g, index, cell: piece.cell, from: piece.index, stats, soup: own, lying });
+        continue;
+      }
+      // the side chosen by hand: the piece may lie no other way from here on, so its pin holes are shaped for it and
+      // its pegs and lips are given out for it, as for a side the app chose. One it cannot take is left to the app
+      const why = groups.length > 1 ? 'apart' : layRefused(stats, g.boxes, want, U);
+      if (why) {
+        const note = splitNote('LAY_IGNORED', { pieceIndex: index, down: want, why, lies: lying.lies });
+        out.push({ ...g, index, cell: piece.cell, from: piece.index, stats, soup: own, lying: { ...lying, notes: [...lying.notes, note] }, refused: note });
+        continue;
+      }
+      const held = { ...stats, allowed: [want] };
+      const chosen = chooseOrientation(held, U, orient, { pieceIndex: index, flat });
+      // that it does not lie as Lay pieces asks is no news: it lies as it was told
+      out.push({
+        ...g, index, cell: piece.cell, from: piece.index, stats: held, soup: own, chosen: want, free: stats.allowed, auto: lying,
+        lying: { ...chosen, notes: chosen.notes.filter((x) => x.code !== 'ORIENT_FALLBACK') },
+      });
     }
   }
   return out;
@@ -4072,7 +4149,9 @@ export function statsWithLip(stats, face, H = LIP_ALLOWANCE, boxes = null) {
  *   given already
  */
 export function apartMales(laid, U, orient = 'auto', { flat = null } = {}) {
-  const byIndex = new Map(laid.map((p) => [p.index, p]));
+  // a lip goes where it is best whatever side was chosen by hand for a piece: the piece is judged as the app would lay
+  // it, and lies as its lip needs (`layGrown` says so where that is not the side chosen)
+  const byIndex = new Map(laid.map((p) => [p.index, p.chosen ? { ...p, stats: { ...p.stats, allowed: p.free }, lying: p.auto } : p]));
   const near = (a, b) => Math.abs(a - b) <= 1e-6 * Math.max(1, Math.abs(a), Math.abs(b));
   // the lip a piece would carry, best first when compared in order: one at all, with clips or the twist-lock in their
   // place, height, clips, tongue
@@ -4735,7 +4814,10 @@ export function lipMale(quality, asWell = [true, true]) {
  * cut into lies on its cut face, as a lid that comes off does. A piece the
  * layout gave a way to lie for a lip or a lock that was then not built
  * (`lays`) keeps that way when it has pin holes (`dowels`): they were
- * shaped for it, and a note says so (`HOLES_KEEP_LAY`).
+ * shaped for it, and a note says so (`HOLES_KEEP_LAY`). A piece told by hand
+ * which side to lie on (`chosen`) keeps to it with its pegs; where a lip, a
+ * twist-lock or holes shaped for them lay it another way, they win and a
+ * note says the side chosen is not used (`LAY_IGNORED`).
  * @param {object[]} laid from `layPieces`
  * @param {{ pegs?: { sides: { piece: number, peg: boolean }[] }[], dowels?: { sides: { piece: number }[] }[],
  *   lays?: { piece: number, down: string }[], lips?: { axis: number, dir?: number, down?: string,
@@ -4746,14 +4828,46 @@ export function lipMale(quality, asWell = [true, true]) {
  * @returns {object[]} `chooseOrientation`'s answer per piece of `laid`, with `pegged: true` on those laid again with
  *   pegs and `lip: true` on those with a lip
  */
-export function layGrown(laid, { pegs = [], lips = [], locks = [], dowels = [], lays = [] } = {}, U, orient = 'auto', { flat = null } = {}) {
+export function layGrown(laid, layout = {}, U, orient = 'auto', { flat = null } = {}) {
+  const carried = carriedBy(layout);
+  return laid.map((p) => {
+    const { own, tongues, sockets, held, holed, stats } = carried(p);
+    if (!own.length && !tongues.length && !sockets.length && !holed) return p.lying;
+    const lip = tongues.length > 0;
+    const o = chooseOrientation(restingOnly(stats, p.boxes) ?? stats, U, orient, { pieceIndex: p.index, flat });
+    const steady = !p.lying.notes?.some((x) => x.code === 'PIECE_UNSTABLE');
+    const why = lip ? { lip: true } : own.length ? { pegs: true } : null;
+    const notes = o.notes
+      .filter((x) => !((lip || sockets.length || holed || p.chosen) && x.code === 'ORIENT_FALLBACK'))
+      .map((x) => (x.code === 'PIECE_UNSTABLE' && steady && why ? splitNote('PIECE_UNSTABLE', { pieceIndex: p.index, ...why }) : x));
+    // why it lies so is said, or it may be turned in the slicer and the round holes laid on their side after all
+    if (holed && o.down === held) notes.push(splitNote('HOLES_KEEP_LAY', { pieceIndex: p.index, lies: o.lies }));
+    // a side chosen by hand that the piece could not take is still said once it is laid again; and so is one that a
+    // lip, a twist-lock or the pin holes shaped for them took the place of
+    if (p.refused) notes.push(splitNote('LAY_IGNORED', { pieceIndex: p.index, down: p.refused.down, why: p.refused.why, lies: o.lies }));
+    else if (p.chosen && o.down !== p.chosen) notes.push(splitNote('LAY_IGNORED', { pieceIndex: p.index, down: p.chosen, why: lip ? 'lip' : own.length && !sockets.length && !holed ? 'pegs' : 'lock', lies: o.lies, joint: true }));
+    return { ...o, notes, ...(own.length ? { pegged: true } : {}), ...(lip ? { lip: true } : {}) };
+  });
+}
+
+/**
+ * What each laid piece carries of a layout (`layoutSplit`'s) that says how it may lie, as `layGrown` lays it again:
+ * `own` its built-in pegs, `tongues` the lips and twist-lock necks standing out of it, `sockets` the twist-locks whose
+ * socket is cut into it, `held` the way the layout laid it for a lip or a lock (null for none) and `holed` whether it
+ * keeps that way for its pin holes though the lip was not built, and `stats` its statistics with all of that in: its
+ * box grown by what stands out of it, and only the ways down they leave it.
+ * @param {object} layout `layoutSplit`'s `pegs`, `lips`, `locks`, `dowels` and `lays`
+ * @returns {(p: object, stats?: object) => { own: object[], tongues: object[], sockets: object[], held: string|null,
+ *   holed: boolean, stats: object }} for a piece of `layPieces`; `stats` in place of its own
+ */
+function carriedBy({ pegs = [], lips = [], locks = [], dowels = [], lays = [] } = {}) {
   const maleOf = (lip) => lip.sides?.find((s) => s.male)?.piece ?? lip.male;
   const faceOf = (lip) => (lip.down ? oppositeDir(lip.down) : `${lip.dir < 0 ? '-' : '+'}${AXES[lip.axis]}`);
   const twisted = (locks ?? []).filter((x) => x.kind === 'full');
   // a twist-lock's neck stands out of its piece as a lip would, the way its lip would have: in place of its cut's lip
   const necks = twisted.map((x) => ({ sides: [{ piece: x.sides[0].piece, male: true }], down: x.down, H: x.S.H }));
   const standing = [...(lips ?? []).filter((l) => !twisted.some((x) => x.cutId === l.cutId)), ...necks];
-  return laid.map((p) => {
+  return (p, given = p.stats) => {
     const own = (pegs ?? []).filter((g) => g.sides.some((s) => s.peg && s.piece === p.index));
     const tongues = standing.filter((l) => maleOf(l) === p.index && (l.H ?? LIP_ALLOWANCE) > 0);
     const sockets = twisted.filter((x) => x.sides.some((s) => s.role === 'part' && s.piece === p.index));
@@ -4762,27 +4876,114 @@ export function layGrown(laid, { pegs = [], lips = [], locks = [], dowels = [], 
     const held = (lays ?? []).find((x) => x.piece === p.index)?.down ?? null;
     const holed = Boolean(held) && held !== p.lying.down && !tongues.length && !sockets.length
       && (dowels ?? []).some((d) => d.sides.some((s) => s.piece === p.index));
-    if (!own.length && !tongues.length && !sockets.length && !holed) return p.lying;
     // a cut's lip may stand out of a piece on several faces (four posts cut across), all in the one plane: the box
     // takes in the tallest once, not each
     const out = new Map();
     for (const lip of tongues) out.set(faceOf(lip), Math.max(out.get(faceOf(lip)) ?? 0, lip.H ?? LIP_ALLOWANCE));
-    let stats = p.stats;
+    let stats = given;
     for (const [face, H] of out) stats = { ...lipGrown(stats, face, H), allowed: [oppositeDir(faceOf(tongues[0]))] };
     if (sockets.length) stats = { ...stats, allowed: [sockets[0].down] };
     else if (holed) stats = { ...stats, allowed: [held] };
     if (own.length) stats = statsWithPegs(stats, own);
-    const lip = tongues.length > 0;
-    const o = chooseOrientation(restingOnly(stats, p.boxes) ?? stats, U, orient, { pieceIndex: p.index, flat });
-    const steady = !p.lying.notes?.some((x) => x.code === 'PIECE_UNSTABLE');
-    const why = lip ? { lip: true } : own.length ? { pegs: true } : null;
-    const notes = o.notes
-      .filter((x) => !((lip || sockets.length || holed) && x.code === 'ORIENT_FALLBACK'))
-      .map((x) => (x.code === 'PIECE_UNSTABLE' && steady && why ? splitNote('PIECE_UNSTABLE', { pieceIndex: p.index, ...why }) : x));
-    // why it lies so is said, or it may be turned in the slicer and the round holes laid on their side after all
-    if (holed && o.down === held) notes.push(splitNote('HOLES_KEEP_LAY', { pieceIndex: p.index, lies: o.lies }));
-    return { ...o, notes, ...(own.length ? { pegged: true } : {}), ...(lip ? { lip: true } : {}) };
+    return { own, tongues, sockets, held, holed, stats, lipDown: tongues.length ? oppositeDir(faceOf(tongues[0])) : null };
+  };
+}
+
+/**
+ * The sides each piece may be told to lie on by hand, for the choice in the pieces list: every one of the six, with
+ * whether it is on offer and, where it is not, why not. A side is refused where the piece may only lie flat ('flat':
+ * a thin plate, a piece beside a dovetail seam) or stand as modelled ('stand': the piece a part comes out of), where a lip or a twist-lock neck stands out of it and must print
+ * standing up ('lip'), where a twist-lock's socket is cut into it or its pin holes were shaped for the way a
+ * take-apart cut laid it ('lock'), where its built-in pegs stand out of that side ('pegs'), where not every one of
+ * its shells would rest on the bed ('rest') and where it does not fit the printer that way ('bed'). A piece that is
+ * a part taken out, or one of several a box prints as, is not offered any (`why`: 'part', 'apart').
+ * @param {object[]} laid from `layPieces`
+ * @param {object} layout `layoutSplit`'s, as for `layGrown`
+ * @param {number[]} U the usable bed
+ * @param {{ parts?: { has: function }|null, lying?: object[]|null }} options `parts` the pieces of the cut stage that
+ *   are parts taken out, by number; `lying` how each piece lies in the end (`layGrown`), where that is known
+ * @returns {({ key: string, chosen: string|null, used: boolean, ways: { down: string, lies: string, ok: boolean,
+ *   why?: string, bed?: number, support?: number }[] }|{ key: null, why: 'part'|'apart' })[]} per piece of `laid`: `key`
+ *   its box ('i,j,k', what `split.lay` goes by), `chosen` the side chosen for it by hand, `used` whether it lies on
+ *   it (not where the piece could not take it, or what it carries lays it another way), and each way with how it would lie
+ *   (`liesOf`), how much of it would rest on the bed (`bed`, mm²) and how much would hang over it (`support`, mm²:
+ *   the faces flatter than 45° that face down, as the app counts them when it chooses)
+ */
+export function layWays(laid, layout = {}, U, { parts = null, lying = null } = {}) {
+  const carried = carriedBy(layout);
+  const perCell = new Map();
+  for (const p of laid) perCell.set(p.cell.join(','), (perCell.get(p.cell.join(',')) ?? 0) + 1);
+  return laid.map((p, i) => {
+    if (parts?.has(p.from)) return { key: null, why: 'part' };
+    const key = p.cell.join(',');
+    if (perCell.get(key) > 1) return { key: null, why: 'apart' };
+    const free = p.free ?? (p.stats.allowed?.length ? p.stats.allowed : DIR_KEYS);
+    const { own, tongues, sockets, held, stats, lipDown } = carried(p, { ...p.stats, allowed: [...free] });
+    const pegged = new Set(own.map((g) => `${g.dir > 0 ? '+' : '-'}${AXES[g.axis]}`));
+    const resting = restingOnly({ ...stats, allowed: [...DIR_KEYS] }, p.boxes)?.allowed ?? [];
+    const ways = DIR_KEYS.map((down) => {
+      const why = !free.includes(down) ? (free.length === 1 ? 'stand' : 'flat')
+        : tongues.length && down !== lipDown ? 'lip'
+          : sockets.length && down !== sockets[0].down ? 'lock'
+            : !tongues.length && !sockets.length && held && down !== held ? 'lock'
+              : pegged.has(down) ? 'pegs'
+                : !resting.includes(down) ? 'rest'
+                  : !layFits(stats, down, U) ? 'bed' : null;
+      const lies = liesOf(p.stats, down);
+      if (why) return { down, lies, ok: false, why };
+      return { down, lies, ok: true, bed: Math.round(p.stats.dirs[down].bed), support: Math.round(p.stats.dirs[down].support) };
+    });
+    const chosen = p.chosen ?? p.refused?.down ?? null;
+    return { key, chosen, used: Boolean(p.chosen) && (lying?.[i] ?? p.lying).down === p.chosen, ways };
   });
+}
+
+/** Why a side is not on offer for a piece to lie on (`layWays`' `why`), as its entry in the choice says it. */
+const LAY_REFUSED = Object.freeze({
+  flat: 'it has to lie flat (a thin plate, or one beside a dovetail joint)',
+  stand: 'a part comes off it, so it prints standing as modelled',
+  lip: 'its lip has to print standing up',
+  lock: 'its take-apart joint is made for another side',
+  pegs: 'its pegs stand out of that side',
+  rest: 'part of it would hang in the air',
+  bed: "it doesn't fit your printer",
+});
+
+/**
+ * The choice of the side a piece lies on, for its row in the pieces list, in plain words: first the app's own
+ * choice, then the six sides – each on offer with about how much of the piece would rest on the bed and how much of
+ * it would hang over it, as the app counts them when it chooses (the row's print check, made of the finished piece,
+ * has the last word), each refused with why. The side chosen by hand is the one picked, and stays to pick even
+ * where it is refused now. A piece that has no choice says why in its one entry.
+ * @param {object|null} lay a piece's `lay` (`layWays`)
+ * @param {string} down the side the piece lies on now
+ * @param {string|null} picked the side the document holds for it, where that is newer than `lay` (null: the app's)
+ * @param {{ current?: boolean }} options `current` false while the pieces are being worked out again
+ * @returns {{ key: string|null, chosen: string|null, tag: string, options: { value: string, text: string,
+ *   disabled?: true }[] }|null} `value` '' for the app's choice; `tag` what to say beside the choice: 'set by you', or
+ *   that it is not used where the pieces as worked out do not lie on it (the notes say why); null without `lay`
+ */
+export function layOptions(lay, down, picked = lay?.chosen ?? null, { current = true } = {}) {
+  if (!lay) return null;
+  if (!lay.key) {
+    const why = lay.why === 'part' ? 'a part that comes off prints one way' : 'this box prints as more than one piece';
+    return { key: null, chosen: null, tag: '', options: [{ value: '', text: `The app's choice (${why})` }] };
+  }
+  const name = (w) => `${LAY_SIDES[w.down][0].toUpperCase()}${LAY_SIDES[w.down].slice(1)}${w.lies === 'on a cut face' ? ' (a cut face)' : ''}`;
+  const own = lay.ways.find((w) => w.down === down);
+  const options = [{ value: '', text: picked || lay.chosen || !own ? "The app's choice" : `The app's choice: ${LAY_SIDES[down]}${own.lies === 'on a cut face' ? ' (a cut face)' : ''}` }];
+  for (const w of lay.ways) {
+    if (!w.ok) {
+      options.push({ value: w.down, text: `${name(w)} – not offered: ${LAY_REFUSED[w.why] ?? 'it cannot print that way'}`, ...(w.down === picked ? {} : { disabled: true }) });
+      continue;
+    }
+    const rests = w.bed < STEADY ? 'nothing flat on the bed' : `${areaWords(w.bed)} on the bed`;
+    const hangs = w.support < PRINT_CHECK.none ? 'little or no support' : w.support < 100 ? 'a little support' : `supports under ${areaWords(w.support)}`;
+    options.push({ value: w.down, text: `${name(w)} – ${rests}, ${hangs}` });
+  }
+  // what the document holds may be newer than the pieces: only a side the pieces were worked out for can be unused
+  const unused = picked && current && !(lay.chosen === picked && lay.used);
+  return { key: lay.key, chosen: picked, tag: !picked ? '' : unused ? 'set by you, but not used – see the notes' : 'set by you', options };
 }
 
 /**
@@ -5128,6 +5329,10 @@ const NOTE_LEVELS = Object.freeze({
   CONNECTORS_FILAMENT: 'info',
   HOLES_FLAT_TOP: 'info',
   HOLES_KEEP_LAY: 'info',
+  LAY_CHOSEN: 'info',
+  LAY_IGNORED: 'info',
+  LAYS_DROPPED: 'info',
+  LAY_WAITS: 'info',
   PEGS_SMALLER: 'info',
   PEGS_UPRIGHT: 'info',
   APART: 'info',
@@ -5233,6 +5438,28 @@ const NOTE_TEXT = {
   HOLES_FLAT_TOP: ({ letter, count = 0 }) => (count === 1
     ? `1 pin on cut ${letter} sits close to an edge or another hole: where its hole prints lying on its side it has a flat top instead of a point, to keep the wall round it thick. It still prints without supports.`
     : `${count} pins on cut ${letter} sit close to an edge or another hole: where their holes print lying on their side they have a flat top instead of a point, to keep the wall round them thick. They still print without supports.`),
+  LAY_CHOSEN: ({ pieces = [] }) => {
+    const many = pieces.length > 1;
+    return `${many ? `Pieces ${listOf(pieces)} lie` : `${pieceName(pieces[0])} lies`} on the side you chose in the pieces list: ${many ? 'their' : 'its'} pin holes and print check are made for that side, so print ${many ? 'them' : 'it'} as the ${many ? 'files lie' : 'file lies'}.`;
+  },
+  LAY_IGNORED: ({ pieceIndex, down, why, lies, joint = false }) => {
+    const reason = {
+      lip: 'its lip has to print standing up',
+      lock: 'its take-apart joint is made for another side',
+      pegs: 'its pegs stand out of that side',
+      flat: 'it has to lie flat (a thin plate, or one beside a dovetail joint)',
+      stand: 'a part comes off it, so it prints standing as modelled',
+      rest: 'part of it would hang in the air',
+      bed: "it doesn't fit your printer that way",
+      apart: 'its box now prints as more than one piece',
+    }[why] ?? 'it cannot print that way';
+    return `${pieceName(pieceIndex)} can't lie ${LAY_SIDES[down] ?? 'the way you chose'} as you chose: ${reason}. It lies ${lies}, ${joint ? 'as its joint needs' : "the app's choice"} – choose again in the pieces list if you like.`;
+  },
+  LAY_WAITS: ({ count = 1 }) => `A cut misses the model, or lies where another cut is, so the pieces are not the ones you chose ${count === 1 ? 'a side' : 'sides'} for: the ${count === 1 ? 'side' : 'sides'} chosen in the pieces list ${count === 1 ? 'is' : 'are'} not used until that cut is moved or removed.`,
+  LAYS_DROPPED: ({ count = 1, why = 'cuts' }) => {
+    const what = why === 'model' ? 'The model was turned, moved or resized' : 'The cuts changed';
+    return `${what}, so the pieces are no longer the same ones: the side you chose for ${count === 1 ? 'a piece' : `${count} pieces`} to lie on was dropped, and the app lays ${count === 1 ? 'it' : 'them'} again. Choose again in the pieces list if you like (Undo brings the choice back with the ${why === 'model' ? 'model as it was' : 'cuts as they were'}).`;
+  },
   HOLES_KEEP_LAY: ({ pieceIndex, lies }) => `${pieceName(pieceIndex)} lies ${lies}: its pin holes were made to print that way, so don't turn it in your slicer.`,
   PEGS_SMALLER: ({ letter, asked = null, pegSizes = [] }) => {
     const count = pegSizes.reduce((n, g) => n + g.count, 0);
@@ -5635,6 +5862,11 @@ const NOTE_TEXT = {
  * the cut that splits letters, when there is more than one); PART_SPANS_CUT `{ itemId, name, letter }`;
  * DOVETAIL_NOT_PLATE `{ letter, lying, pegs }` (`lying`: through a plate, but a piece beside it can't lie flat on it;
  * `pegs`: it has built-in pegs instead of pins);
+ * LAY_WAITS `{ count }` (sides chosen by hand that are not used while a cut misses or is merged);
+ * LAY_CHOSEN `{ pieces }` (the pieces lying on a side chosen by hand); LAYS_DROPPED `{ count, why }` (the page's own:
+ * the sides chosen by hand were dropped with the boxes they went by, `why` 'cuts' or 'model'); LAY_IGNORED `{ pieceIndex, down, why, lies,
+ * joint }` (a side chosen by hand that the piece cannot take: `why` 'flat', 'stand', 'rest', 'bed' or 'apart', and with `joint`
+ * 'lip', 'lock' or 'pegs': what it carries lays it another way);
  * ORIENT_FALLBACK `{ pieceIndex, mode, lies }`; HOLES_KEEP_LAY `{ pieceIndex, lies }` (a piece kept the way a lip or
  * a twist-lock that was not built laid it, as its pin holes were shaped for that); PRINT_CHECK `{ pieceIndex, whole,
  * auto, supports, steps, foot, layer, height }` (what the print check of a piece, or with `whole` of a model printed
@@ -5989,12 +6221,12 @@ function fitWords(fit) {
  * come apart are put together last, under a heading that says not to glue
  * them (or that nothing is glued, when no other cut is).
  * @param {{ name: string, pieces: { index: number, cell: number[], size: number[], lies: string, yaw?: number, fits?: boolean, shells?: number,
- *   part?: string, name?: string, lids?: string[], check?: object, holes?: object }[],
+ *   part?: string, name?: string, lids?: string[], check?: object, holes?: object, lay?: { used?: boolean } }[],
  *   seams: object[], pins?: { d: number, length: number, count: number, spares?: number, own?: boolean, sheets?: number, strip?: number }[],
  *   parts?: { name: string }[], clearance?: number, bed?: number[], printer?: { size: number[], margin: number, corner?: number[]|null }|null, steps?: object[],
  *   bridges?: number[], fit?: object|null }} plan
  *   `seams` as for `assemblySteps`; a piece that is a part taken out has its cut's id (`part`), its `name` and the
- *   cut's letter (`lids`); a piece's print check (`check`, printCheck.js `checkRow`) and its pin holes by how they print
+ *   cut's letter (`lids`); one lying on a side chosen by hand (`lay.used`, `layWays`) is said to lie so as chosen; a piece's print check (`check`, printCheck.js `checkRow`) and its pin holes by how they print
  *   (`holes`, `holeSummary`) are said in a clause on its line; `pins` one group per pin size (count without spares, `sheets` its pins files, `strip` the volume of the strips that hold them to the bed, when they get them); `bed` the usable bed (with the
  *   corner it keeps clear, the pieces that must be moved clear of it are told so); `printer` the printer itself, when
  *   known, for the heading (`corner` the sides of the corner it keeps clear); `bridges` the clips' bridges' lengths as built (each
@@ -6062,7 +6294,7 @@ export function howToGlueText(plan) {
     // what the print check found, one clause each; of its pin holes only what the heading does not say: those that
     // may need supports
     const checked = checkWords(p.check ?? null, p.holes ?? null, { fine: false });
-    out.push(`  ${pad(`piece ${p.index} of ${n}`, 12)}${pad(size1(p.size), width)}${pad(`lies ${p.lies}`, 0)}${extra.join(', ')}${checked.length ? ` – ${checked.join('; ')}` : ''}`);
+    out.push(`  ${pad(`piece ${p.index} of ${n}`, 12)}${pad(size1(p.size), width)}${pad(`lies ${p.lies}${p.lay?.used ? ', as you chose' : ''}`, 0)}${extra.join(', ')}${checked.length ? ` – ${checked.join('; ')}` : ''}`);
   });
   // the holes and the joints are shaped for the way each file lies, and the check above is of that way; spinning a
   // piece on the bed changes neither

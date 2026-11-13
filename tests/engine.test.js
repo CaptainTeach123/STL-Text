@@ -781,6 +781,10 @@ describe('a split that takes parts out', () => {
     ]);
     // the part's cell is past the grid, for its colour and number only
     expect(ex.pieces.map((p) => p.cell)).toEqual([[0, 0, 0], [0, 0, 1], [0, 0, 2]]);
+    // a part that comes off prints its one way: only the lantern itself can be told which side to lie on
+    expect(ex.pieces.map((p) => p.lay.key ?? p.lay.why)).toEqual(['0,0,0', 'part', 'part']);
+    // and the lantern they come out of stands as modelled: no other side is on offer
+    expect(ex.pieces[0].lay.ways.map((w) => (w.ok ? w.down : w.why))).toEqual(['-z', 'stand', 'stand', 'stand', 'stand', 'stand']);
     expect(ex.seams).toHaveLength(2);
     // the lock the table offered, built: the lid comes out turned 27° free, lifted from the lock's own lift
     expect(ex.seams[0]).toMatchObject({

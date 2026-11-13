@@ -16,7 +16,7 @@ import {
   CUT_TOLERANCE, FILAMENT, SPLIT_KEEP_TRIANGLES, SplitError, TO_PLANE, applyToSoup, assemblySteps, axisCuts, cellOfPoint,
   cellPiece, cutPlane, fitsBed, glueFileName, gridCandidates, howToGlueText, keptBits, layPieces, letterFor, normaliseSplit, partFileName, pieceFileName, pinsFileName,
   planCost, planGrid, planSamples, plateAxis, safeFileName, slabAxis, sizesFor, smallPieceNotes, soupCells, splitActive, splitNote, usableBed,
-  zipFileName, cellSupport, flatProbes, outlineColumns, textNotes, baseAxis, modelPlates, layGrown, pegAllowance, pegMales, pegSizeOf, pegSizesFor,
+  zipFileName, cellSupport, flatProbes, outlineColumns, textNotes, baseAxis, modelPlates, layGrown, layWays, pegAllowance, pegMales, pegSizeOf, pegSizesFor,
   pegSides, cellFits, uprightPegNotes, apartMales, cellSizes, clipHold, clipShape, lipSides, APART_HOLDS, LIP_ALLOWANCE, orientationStats, pieceHolding,
   applyMat4, transposeMat4, keepCrossed, keepsOf, keepsThrough, cornerPlaceNote, fitReachesCorner, bedCorner, capOf, slabCap, withinCap, wideKeeps, pickGroup,
   chooseOffsets, planEnds,
@@ -2583,7 +2583,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     if (!splitActive(split)) return null;
     if (base.kind !== 'none' && !base.current?.watertight) return { notes: [splitNote('SPLIT_UNAVAILABLE')] };
     if (!final.solid) return { notes: [] }; // nothing solid to cut: the unrepaired triangles are exported as they are
-    const { spec, cuts, parts, notes: listed, keeps = [] } = normaliseSplit(split, splitBounds(final));
+    const { spec, cuts, parts, notes: listed, keeps = [], lay = null } = normaliseSplit(split, splitBounds(final));
     // the parts that come off are taken out first: the cuts then cut the body that is left, as they would the model
     const parted = partStage(final, parts, cuts, spec, printing, progress);
     const given = parted.notes.length ? [...listed, ...parted.notes] : listed;
@@ -2598,7 +2598,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     progress?.('Choosing how each piece lies…');
     // how each piece lies, and which of a box's shells print apart because lying that way they would not rest on the bed
     const flat = slabOf(work);
-    const laid = layPieces(cut.pieces, U, spec.orient, { flat, soups: cut.fragments });
+    // a piece told by hand which side to lie on lies so from here on: its pin holes are laid out and drilled for that
+    // way up as for one the app chose (the way each piece prints up is in the drilling's key)
+    const laid = layPieces(cut.pieces, U, spec.orient, { flat, soups: cut.fragments, lay });
     const hl = printing?.layerHeight ?? 0.2;
     const drill = drillStage(work, cut, laid, { cuts, spec, joints: plan.joints, nozzle, hl, U, flat, parted: parted.carved ? parted : null }, progress);
     const lying = layGrown(laid, drill.layout, U, spec.orient, { flat }).map((o, i) => lowered(o, drill.heights?.get(laid[i].index)));
@@ -3158,6 +3160,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       ...(joint === 'pegs' ? { U, orient } : {}),
       ...(apart.length ? { apart: apart.map((c) => [c.id, c.apart.hold]), U, orient, hl } : {}),
       ...(locks.length ? { locks } : {}),
+      // a side chosen by hand holds its piece to it: which piece of a pair then carries the pegs follows
+      ...(laid.some((p) => p.chosen) ? { chosen: laid.map((p) => p.chosen ?? null) } : {}),
     };
     // the layer height is in it too, as far as it shapes a hole: the lift of a flat-topped teardrop's roof
     const key = `${cut.key}|drill:${stableKey({ joint, diameter, depth, clearance, count, labels, nozzle, lift: flatLift(hl), ups, groups, font: font?.key ?? null, ...onBed })}`;
@@ -3443,6 +3447,8 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     const bits = { ...kept, loose: kept.loose.map((l) => ({ ...keepOut(l), ...(spec.joint === 'pegs' ? { pegs: true } : {}) })) };
     // how each piece's pin holes print, the way it lies in its file
     const holes = new Map(holeSummary(laid.map((p, i) => ({ index: p.index, up: lying[i].up })), layout.seams).map((h) => [h.index, h]));
+    // the sides each piece may be told to lie on by hand, and the one it was
+    const offered = layWays(laid, layout, U, { parts: partOf, lying });
     const pieces = laid.map((p, i) => {
       const o = lying[i];
       // a cut's lip may stand out of a piece on more than one face: one entry a cut, its clips added up. What comes off
@@ -3484,6 +3490,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
         yaw: o.yaw,
         down: o.down,
         up: o.up,
+        lay: offered[i],
         dowels: layout.dowels.filter((d) => d.sides.some((s) => s.piece === p.index)).length,
         // its pin holes by how they print: standing up (round), lying with a pointed teardrop or a flat-topped one
         holes: { upright: holes.get(p.index).upright, pointed: holes.get(p.index).pointed, flat: holes.get(p.index).flat, round: holes.get(p.index).round },
@@ -3669,6 +3676,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       const held = laid[i].stats.allowed.length < 6 || o.pegged;
       notes.push(...o.notes.filter((x) => !(held && x.code === 'ORIENT_FALLBACK')));
     });
+    // the pieces that lie on a side chosen by hand, said once for them all
+    const byHand = laid.filter((p, i) => p.chosen && lying[i].down === p.chosen).map((p) => p.index);
+    if (byHand.length) notes.push(splitNote('LAY_CHOSEN', { pieces: byHand }));
     // on a printer that keeps a corner of its bed clear, the pieces that fit only beside or behind it
     const placed = cornerPlaceNote(pieces, U);
     if (placed) notes.push(placed);
@@ -3680,7 +3690,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     // what the print check found worth saying comes last, one note a piece at most; a piece told it has nothing flat
     // to stand on is not told of supports twice
     for (const p of pieces) {
-      const note = printCheckNote(p.check ?? null, { pieceIndex: p.index, auto: spec.orient === 'auto', unstable: notes.some((x) => x.code === 'PIECE_UNSTABLE' && x.pieceIndex === p.index) });
+      const note = printCheckNote(p.check ?? null, { pieceIndex: p.index, auto: spec.orient === 'auto' && !byHand.includes(p.index), unstable: notes.some((x) => x.code === 'PIECE_UNSTABLE' && x.pieceIndex === p.index) });
       if (note) notes.push(note);
     }
     // the peg size is the one the pieces have, as the summary says: a size asked for that no face took is none of theirs
@@ -4342,9 +4352,9 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
    * file. The cut is kept for the pieces view or the download that follows (pieces too dense to keep, for its next
    * call only, as ever). With `parted` (the part stage) the model is the body the parts leave, and the parts follow.
    */
-  function layCuts(final, items, cuts, spec, U, progress, parted = null) {
+  function layCuts(final, items, cuts, spec, U, progress, parted = null, lay = null) {
     const cut = cutStage(final, items, cuts, platesFor(final, cuts, spec), progress, parted, U);
-    return layPieces(cut.pieces, U, spec.orient, { flat: slabOf(final), soups: cut.fragments });
+    return layPieces(cut.pieces, U, spec.orient, { flat: slabOf(final), soups: cut.fragments, lay });
   }
 
   let sketch = null; // { base, solid, passthrough, itemBounds, split }: the model and the text's boxes, for a cheap measure
@@ -4421,14 +4431,14 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
   function measureCuts(final, items, split, U, progress) {
     progress?.('Measuring the cuts…');
     const bounds = splitBounds(final);
-    const { spec, cuts, notes, keeps = [] } = normaliseSplit(split, bounds);
+    const { spec, cuts, notes, keeps = [], lay = null } = normaliseSplit(split, bounds);
     const plan = platesFor(final, cuts, spec);
     // a dense model takes seconds to cut: its count waits for the pieces themselves
     let pieces = null;
     let laid = null;
     if (U && cuts.length && final.solid.numTri() <= Math.min(lodTriangles, splitKeepTriangles)) {
       try {
-        laid = layCuts(final, items, cuts, spec, U, progress);
+        laid = layCuts(final, items, cuts, spec, U, progress, null, lay);
         pieces = laid.map((p) => ({ cell: p.cell }));
       } catch {
         pieces = null; // the pieces view or the download says what is wrong

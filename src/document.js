@@ -73,6 +73,10 @@ export const SPLIT_DEFAULTS = Object.freeze({
   // the details kept whole, `keep: [{ id: 'k1', name, point, normal, box: { min, max } | null }]` (model mm: the click
   // and the box round the detail no cut may run through), is there only while it has one: an empty list is no part of
   // any key, so a split without one is the split it always was
+  // the side chosen by hand for a piece to lie on, `lay: { '0,1,0': '-x' }` (the piece's box between the cuts, counted
+  // along x, y and z, and the side of it that goes down: '-z' as in the model, '+z' upside down, '-x' | '+x' | '-y' |
+  // '+y' a side), is there only while some piece has one, as `keep` is; it is dropped when the boxes are no longer
+  // the same ones (`cellsKey`: a cut added, removed, turned or moved past another) or the model is moved
   joint: 'auto', // 'auto' | 'dowels' | 'dovetail' | 'none'
   diameter: 0, // mm: 0 = automatic | 1.75 (filament) | 3 | 4 | 5 | 6 | 8 | 10
   depth: 0, // mm into each piece: 0 = automatic | 3–30
@@ -292,6 +296,36 @@ const copyKeep = ({ id, name, point, normal, box }) => ({
 
 const keepNumber = (id) => Number(/^k(\d+)$/.exec(String(id))?.[1] ?? 0);
 
+/** The sides a piece may be told to lie on: the direction, in the model, of the side that goes down. */
+export const LAY_DOWNS = Object.freeze(['-z', '+z', '-x', '+x', '-y', '+y']);
+
+/** The sides chosen by hand as the document keeps them: its own object, only boxes and sides that can be; null for none. */
+const copyLay = (lay) => {
+  const out = {};
+  for (const [key, down] of Object.entries(lay && typeof lay === 'object' ? lay : {})) {
+    if (/^\d+,\d+,\d+$/.test(key) && LAY_DOWNS.includes(down)) out[key] = down;
+  }
+  return Object.keys(out).length ? out : null;
+};
+
+/**
+ * Which boxes a split's cuts make, as one key: the cuts across each axis in their order along it, by id. While it
+ * stays the same a box's number ('i,j,k') means the same box, wherever the cuts are dragged; a cut added, removed,
+ * turned to another axis or moved past another one changes it. A cut that takes out only a part makes no box.
+ * @param {{ cuts?: { id: string, position: number[], normal: number[], part?: object }[] }|null} split
+ * @returns {string}
+ */
+export function cellsKey(split) {
+  const by = [[], [], []];
+  for (const c of split?.cuts ?? []) {
+    if (c.part) continue;
+    const n = c.normal.map(Math.abs);
+    const axis = n.indexOf(Math.max(...n));
+    by[axis].push({ id: c.id, at: c.position[axis] });
+  }
+  return by.map((list) => list.sort((p, q) => p.at - q.at || String(p.id).localeCompare(String(q.id))).map((c) => c.id).join(',')).join('|');
+}
+
 /** One past the highest keep mark id in use. */
 const nextKeepId = (keep) => `k${1 + Math.max(0, ...keep.map((k) => keepNumber(k.id)))}`;
 
@@ -299,7 +333,8 @@ const nextKeepId = (keep) => `k${1 + Math.max(0, ...keep.map((k) => keepNumber(k
  * The split after `patch` (null switches it off): settings merged over the
  * current ones and the defaults, each cut copied, and a fresh id for any cut
  * without its own (a planned split arrives without ids). The details kept
- * whole are copied the same way, and an empty list of them is left out.
+ * whole are copied the same way, and an empty list of them is left out; so
+ * are the sides chosen by hand for pieces to lie on (`lay`).
  */
 function mergeSplit(current, patch) {
   if (!patch) return null;
@@ -323,6 +358,9 @@ function mergeSplit(current, patch) {
       return copyKeep({ ...mark, id });
     });
   }
+  const lay = copyLay(next.lay);
+  delete next.lay;
+  if (lay) next.lay = lay;
   return next;
 }
 
@@ -347,8 +385,11 @@ function transformKeeps(marks, matrix) {
   });
 }
 
-/** The split moved with the model: its cuts and the details it keeps whole. */
-const transformSplit = (split, matrix) => ({
+/**
+ * The split moved with the model: its cuts and the details it keeps whole. The sides chosen by hand for pieces to lie
+ * on are dropped: turned or resized, a piece is no longer the one the side was chosen for.
+ */
+const transformSplit = ({ lay, ...split }, matrix) => ({
   ...split,
   cuts: transformItems(split.cuts, matrix),
   ...(split.keep ? { keep: transformKeeps(split.keep, matrix) } : {}),
@@ -363,6 +404,7 @@ const clone = (state) => ({
     ...state.split,
     cuts: state.split.cuts.map((c) => ({ ...c, position: [...c.position], normal: [...c.normal], ...(c.part ? { part: { ...c.part } } : {}) })),
     ...(state.split.keep ? { keep: state.split.keep.map(copyKeep) } : {}),
+    ...(state.split.lay ? { lay: { ...state.split.lay } } : {}),
   },
 });
 
@@ -424,6 +466,11 @@ export class Document {
     mutate(next);
     // clean-up spots and covering items change the model itself, so anything about them is a new model version
     if (spotsKey(next.items) !== spotsKey(this.state.items) || coversKey(next.items) !== coversKey(this.state.items)) next.baseVersion += 1;
+    // the sides chosen by hand for pieces to lie on go by each piece's box: once the cuts make other boxes, a number
+    // would name another piece, so the choices are dropped (an undo brings them back with the cuts)
+    // – but not ones that arrive with the new cuts
+    const carried = next.split?.lay && JSON.stringify(next.split.lay) === JSON.stringify(this.state.split?.lay ?? null);
+    if (carried && cellsKey(next.split) !== cellsKey(this.state.split)) delete next.split.lay;
     this.state = next;
     this.#notify();
   }
@@ -671,6 +718,24 @@ export class Document {
     if (want.joint === cut.joint && want.hold === cut.hold) return;
     this.commit((s) => {
       s.split.cuts = s.split.cuts.map((c) => (c.id === id ? next(c) : c));
+    });
+  }
+
+  /**
+   * Choose the side a piece lies on (`down`: one of `LAY_DOWNS`, the direction in the model of the side that goes on
+   * the bed), or leave it to the app again (null). `key` is the piece's box between the cuts ('i,j,k'). One undo
+   * step; nothing when the piece has that already. The choice lasts while the cuts make the same boxes (`cellsKey`).
+   */
+  setPieceLay(key, down) {
+    if (!this.state.split || !/^\d+,\d+,\d+$/.test(String(key))) return;
+    const want = LAY_DOWNS.includes(down) ? down : null;
+    if ((this.state.split.lay?.[key] ?? null) === want) return;
+    this.commit((s) => {
+      const lay = { ...(s.split.lay ?? {}) };
+      if (want) lay[key] = want;
+      else delete lay[key];
+      if (Object.keys(lay).length) s.split.lay = lay;
+      else delete s.split.lay;
     });
   }
 

@@ -1381,6 +1381,28 @@ ul.plan#cutList {
   font-size: 0.92em;
 }
 
+/* the side a piece lies on, to choose, on the last line of its row */
+#pieceList .piece-lay {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 6px;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 0.92em;
+}
+/* as wide as the row leaves it, never wider: a long entry must not widen the list */
+#pieceList .piece-lay select {
+  flex: 1 1 0;
+  width: 0;
+  min-width: 9em;
+}
+#pieceList .piece-lay-own {
+  color: var(--accent);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
 /* under the pieces: what the whole job takes, and the suggestions for the slicer */
 .print-plan {
   margin-top: 6px;

@@ -1,5 +1,5 @@
 import { Matrix4, Vector3 } from 'three';
-import { Document, ITEM_DEFAULTS, SPLIT_DEFAULTS, baseMode, coversOf, createPart, createSpot, fontIds, frameOf, hasText, isPart, isSpot, itemLabel, maxSize, placeKey, shapeKey, spotsOf, stableKey, modelPlacementKey } from './document.js';
+import { Document, ITEM_DEFAULTS, SPLIT_DEFAULTS, baseMode, coversOf, createPart, createSpot, fontIds, frameOf, hasText, isPart, isSpot, itemLabel, maxSize, placeKey, shapeKey, spotsOf, stableKey, modelPlacementKey, cellsKey } from './document.js';
 import { planRebuild, removalSpotsFor, specForKind } from './rebuild.js';
 import { DECOR_KINDS, decorPartId, normaliseDecorSpec } from './decor.js';
 import { createEngineClient } from './engineClient.js';
@@ -18,7 +18,7 @@ import { BUNDLED_FONTS, canQueryLocalFonts, fetchBundledFont, listLocalFonts, lo
 import {
   BED_DEFAULTS, BED_PRESETS, FAST_PRESETS, FILAMENT, KEEP_LIMIT, PIECE_COLORS, PRESET_ALIASES, SPLIT_LIMITS, SPLIT_NOTE_CODES, axisCuts, bedCorner, bedSize, capOf, cellFits, cellSizes,
   clampLargest, cutPlane, fitPieces, formatSize, keepName, keepsOf, keepsThrough, letterFor, nextCut, noSeatWords, pegSizeOf, pieceColorIndex, pieceColors, planEnds,
-  presetOf, reachesCorner, sheetName, splitActive, splitNote, usableBed, wayStep, wideKeeps,
+  layOptions, presetOf, reachesCorner, sheetName, splitActive, splitNote, usableBed, wayStep, wideKeeps,
 } from './split.js';
 
 const $ = (id) => document.getElementById(id);
@@ -1195,6 +1195,7 @@ async function showResult(on, { keep = false } = {}) {
   const shapeFor = lastShapeKey;
   const splitFor = lastSplitKey;
   const split = activeSplit();
+  const cellsFor = cellsKey(split); // the boxes the pieces come from: a side chosen for one goes by its box
   if (split) setSplitPending(true);
   try {
     if (!(await syncBase())) return; // the model is still being re-derived for a newer change, which re-renders
@@ -1205,7 +1206,7 @@ async function showResult(on, { keep = false } = {}) {
     else viewer.setResult(r.display);
     // without pieces a split still has its say: every cut missed, or the model cannot be split
     lastPieces = split
-      ? { key: splitFor, content: requestedFor, pieces: r.pieces ?? [], seams: r.seams ?? [], grid: r.grid, diameter: r.diameter, pegSize: r.pegSize ?? null, clearance: split.clearance ?? null, measures: r.measures ?? null, notes: r.notes.filter(isSplitNote) }
+      ? { key: splitFor, content: requestedFor, cells: cellsFor, pieces: r.pieces ?? [], seams: r.seams ?? [], grid: r.grid, diameter: r.diameter, pegSize: r.pegSize ?? null, clearance: split.clearance ?? null, measures: r.measures ?? null, notes: r.notes.filter(isSplitNote) }
       : null;
     // a model shown whole is measured, for its print estimate in the Model card
     if (!r.pieces && r.measures?.whole) {
@@ -2978,6 +2979,10 @@ function renderPieces() {
       // the print check of the piece as its file lies: supports, step lines, what it stands on, its pin holes
       check: checkWords(p.check ?? null, p.holes ?? null),
       estimate: estimates.get(p.index) ?? [],
+      // the side it lies on, to choose: what the document holds shows at once, the new pieces follow
+      // pieces of other boxes than the cuts make now (a cut added since) are not to choose for: their numbers are not
+      lay: layOptions(p.lay ?? null, p.down, p.lay?.key ? doc.split?.lay?.[p.lay.key] ?? null : null, { current: piecesCurrent() }),
+      layOld: computed.cells !== cellsKey(doc.split),
     }));
   } else if (active) {
     // a box whose loose parts print apart (a bookcase's shelves between two cuts) says how many pieces it makes
@@ -3008,6 +3013,8 @@ function renderPieces() {
   viewer.setPieceHighlight(null);
   // as the view colours them: a box's second piece (a bit printed apart) a shade of its own
   const colours = pieceColors(rows);
+  // a side just chosen from the keyboard keeps its place: the list is drawn anew, and the choice is taken up again
+  const focused = list.contains(document.activeElement) ? document.activeElement.dataset.lay : null;
   list.replaceChildren(
     ...rows.map((row) => {
       const li = document.createElement('li');
@@ -3040,6 +3047,7 @@ function renderPieces() {
         estimate.textContent = `Estimate: ${row.estimate.join(' · ')}`;
         text.append(estimate);
       }
+      if (row.lay) text.append(layChoice(row));
       li.append(swatch, text);
       if (!row.predicted) {
         // a piece pointed at stands out, and the locks it has glow on it and on the piece each one holds
@@ -3055,6 +3063,49 @@ function renderPieces() {
       return li;
     }),
   );
+  if (focused) [...list.querySelectorAll('select[data-lay]')].find((s) => s.dataset.lay === focused)?.focus();
+}
+
+/**
+ * The choice of the side a piece lies on, on a line of its own under the piece: the app's choice, or one of the six
+ * sides – those the piece cannot take greyed out, each with why. A piece with no choice has the one entry that says so.
+ */
+function layChoice(row) {
+  const { key, chosen, options } = row.lay;
+  const label = document.createElement('label');
+  label.className = 'piece-lay';
+  label.title = 'Which side of this piece goes on the bed. Its pin holes are shaped for the side chosen here, so choose it here rather than turning the piece in your slicer.';
+  const select = document.createElement('select');
+  select.dataset.lay = key ?? `piece${row.index}`;
+  select.setAttribute('aria-label', `Side piece ${row.index} lies on`);
+  for (const o of options) {
+    const option = new Option(o.text, o.value);
+    option.disabled = !!o.disabled;
+    select.append(option);
+  }
+  select.value = chosen ?? '';
+  select.disabled = !key || !!row.layOld;
+  select.addEventListener('change', () => setPieceLay(key, select.value || null));
+  label.append('Lies on ', select);
+  if (row.lay.tag) {
+    const tag = document.createElement('span');
+    tag.className = 'piece-lay-own';
+    tag.textContent = row.lay.tag;
+    label.append(' ', tag);
+  }
+  return label;
+}
+
+/**
+ * Lay a piece on the side chosen for it (`down`; null hands it back to the app): the pieces are worked out again
+ * with its pin holes shaped for that side, and stay in view while they are.
+ */
+function setPieceLay(key, down) {
+  if (!$('resultToggle').checked) {
+    $('resultToggle').checked = true;
+    endAim();
+  }
+  doc.setPieceLay(key, down);
 }
 
 /** The print plan of the pieces last worked out (printPlan.js): the job's figures and what they are worked out for. */
@@ -3139,6 +3190,21 @@ const splitNoteActions = (() => {
   };
 })();
 
+let layHeld = { count: 0, cells: '', place: '' }; // the sides chosen by hand as the page last saw them, and what they went by
+let layDropped = null; // { count, why: 'cuts' | 'model' } the sides chosen by hand that were dropped, until it is read
+/**
+ * Whether the sides chosen by hand have just gone with the boxes they were chosen for (a cut added, removed or
+ * turned; the model moved), for the note that says so. Handed back to the app one by one, they are not dropped.
+ */
+function trackLay() {
+  const split = splitActive(doc.split) ? doc.split : null;
+  const now = { count: Object.keys(split?.lay ?? {}).length, cells: cellsKey(split), place: modelPlacementKey(doc.state.base) };
+  if (!split || now.count) layDropped = null;
+  else if (layHeld.count && now.cells !== layHeld.cells) layDropped = { count: layHeld.count, why: 'cuts' };
+  else if (layHeld.count && now.place !== layHeld.place) layDropped = { count: layHeld.count, why: 'model' };
+  layHeld = now;
+}
+
 let splitNotesShown = '';
 /** The split's notes: those of the pieces, or until they are worked out those of the last measure; and what a fit found. */
 function renderSplitNotes() {
@@ -3155,10 +3221,21 @@ function renderSplitNotes() {
     const own = notes.filter((n) => !(n.code === 'KEEP_CUT' && unkept.has(n.keepId)));
     notes = [...planNotes.notes.filter((n) => !pieced || (n.code !== 'BARELY_HELD' && n.code !== 'KEEP_KEPT' && n.code !== 'CORNER_PLACE')), ...own];
   }
+  // the sides chosen by hand that went with the boxes they were chosen for: said until it is read or chosen again
+  if (active && layDropped) notes = [splitNote('LAYS_DROPPED', layDropped), ...notes];
   const shown = JSON.stringify(notes.map((n) => [n.code, n.text]));
   if (shown === splitNotesShown) return;
   splitNotesShown = shown;
-  renderNotes($('splitNotes'), notes, splitNoteActions);
+  renderNotes($('splitNotes'), notes, {
+    ...splitNoteActions,
+    LAYS_DROPPED: () => ({
+      label: 'OK',
+      run: () => {
+        layDropped = null;
+        renderSplitNotes();
+      },
+    }),
+  });
 }
 
 /**
@@ -5201,10 +5278,16 @@ function renderSelectedInfo() {
   $('widthHint').textContent = width ? 'scales all lines' : '';
 }
 
-/** What the pieces depend on besides the content, as one key: the split, the printer, the nozzle and the pins' strip. */
-function splitKeyNow() {
-  return stableKey({ split: activeSplit(), bed: usableBed(bed), nozzle: printing.nozzle, pinStrip: pinHold.strip, ...largestOf() });
+/**
+ * What the pieces depend on besides the content, as one key: the split, the printer, the nozzle and the pins' strip.
+ * With `lay` false, without the sides chosen by hand for pieces to lie on: the same while only those change.
+ */
+function splitKeyNow({ lay = true } = {}) {
+  const split = activeSplit();
+  if (split && !lay) delete split.lay;
+  return stableKey({ split, bed: usableBed(bed), nozzle: printing.nozzle, pinStrip: pinHold.strip, ...largestOf() });
 }
+let lastCutsKey = null; // `splitKeyNow` without the sides chosen by hand, as of the last render
 
 function render() {
   const sel = doc.selected;
@@ -5217,7 +5300,13 @@ function render() {
   // the pieces also depend on the split, the printer and the nozzle – none of which is content the previews depend on
   const splitKey = splitKeyNow();
   const splitChanged = splitKey !== lastSplitKey;
+  // a side chosen for a piece moves no cut: what Fit to my printer said of the split, and the joint each cut got,
+  // still hold
+  const cutsKey = splitKeyNow({ lay: false });
+  if (splitChanged && cutsKey === lastCutsKey) for (const found of [planNotes, joined]) if (found?.key === lastSplitKey) found.key = splitKey;
+  lastCutsKey = cutsKey;
   lastSplitKey = splitKey;
+  trackLay();
   // selecting an item lets go of the cut, and an undo can take the cut away
   if (sel || !doc.split?.cuts.some((c) => c.id === selectedCutId)) selectedCutId = null;
   // placing a cut stops when an item is taken up instead, the model goes, or the cut being placed is gone or turned

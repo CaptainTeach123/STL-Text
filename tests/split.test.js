@@ -10,7 +10,7 @@ import { parseSTL, writeBinarySTL } from '../src/stl.js';
 import { geometryToManifold } from '../src/mesh.js';
 import {
   APART_HOLDS, DIRECTIONS, FILAMENT, SPLIT_DEFAULTS, dirAxis, TO_PLANE, cellSizes, cellSupport, cutPlane, fitPieces, fitsBed, isSymmetric, keepCrossed, orientationStats, pegSizesFor,
-  reachesCorner, sizesFor,
+  reachesCorner, sizesFor, oppositeDir,
 } from '../src/split.js';
 import { FACE, OVERHANG_NZ, PRINT_CHECK, faceKind, faceLean } from '../src/printCheck.js';
 import { adviseJob, estimateJob, gramsWords, planOptions, planSheetLines } from '../src/printPlan.js';
@@ -520,6 +520,184 @@ describe('how the pin holes print', () => {
       text: 'Piece 2 lies on a cut face: its pin holes were made to print that way, so don\'t turn it in your slicer.',
     });
     expect(r.notes.filter((x) => x.code === 'HOLES_KEEP_LAY')).toHaveLength(1);
+  });
+
+  it('a piece told which side to lie on has its pin holes drilled for that side, and with no side chosen every file is the very same', async () => {
+    const bar = cube([120, 40, 30]);
+    await load(bar, 'bar');
+    const base = await exportSplit(S({ labels: false }), { name: 'bar' });
+    // as the app lays them, both halves stand on their cut faces and the holes are round
+    expect(base.pieces.map((p) => [p.down, p.holes])).toEqual([['+x', { upright: 2, pointed: 0, flat: 0, round: 0 }], ['-x', { upright: 2, pointed: 0, flat: 0, round: 0 }]]);
+    expect(base.pieces.map((p) => [p.lay.key, p.lay.chosen, p.lay.ways.filter((w) => w.ok).length])).toEqual([['0,0,0', null, 6], ['1,0,0', null, 6]]);
+    expect(codes(base)).not.toContain('LAY_CHOSEN');
+    const bytes = (ex) => ex.files.map((f) => [f.name, f.stl ? Buffer.from(f.stl).toString('base64') : f.text]);
+    // no side chosen – none, an empty list, a box that is not there – every file is what it was, byte for byte
+    for (const lay of [{}, { '5,0,0': '-z' }, { '0,0,0': 'sideways' }]) {
+      expect(bytes(await exportSplit(S({ labels: false, lay }), { name: 'bar' })), JSON.stringify(lay)).toEqual(bytes(base));
+    }
+    // piece 1 laid flat as in the model: its holes lie on their side now, and are teardrops with the point up
+    const ex = await exportSplit(S({ labels: false, lay: { '0,0,0': '-z' } }), { name: 'bar' });
+    expect(ex.pieces[0]).toMatchObject({ down: '-z', up: '+z', lies: 'flat as modelled', size: [60, 40, 30], fits: true, lay: { key: '0,0,0', chosen: '-z', used: true } });
+    expect(ex.pieces[1]).toMatchObject({ down: '-x', lay: { chosen: null } });
+    expect(ex.pieces.map((p) => p.holes)).toEqual([{ upright: 0, pointed: 2, flat: 0, round: 0 }, { upright: 2, pointed: 0, flat: 0, round: 0 }]);
+    for (const d of dowelsOf(ex)) {
+      expect(d.sides[0]).toMatchObject({ piece: 1, tear: true, apex: [0, 0, 1] });
+      expect(d.sides[1]).toMatchObject({ piece: 2, tear: false });
+    }
+    expect(holesAgainstLay(ex)).toEqual({ wrong: [], count: 4 });
+    expectWalls(bar, ex);
+    // the same pins, moved in a little: a teardrop's point needs more room to the edge than a round hole
+    expect(dowelsOf(ex).map((d) => [d.d, d.depth])).toEqual(dowelsOf(base).map((d) => [d.d, d.depth]));
+    dowelsOf(ex).forEach((d, i) => {
+      const was = dowelsOf(base)[i].centre;
+      expect(Math.hypot(...d.centre.map((v, a) => v - was[a]))).toBeLessThan(1.5);
+      expect(Math.hypot(d.centre[1], d.centre[2])).toBeLessThan(Math.hypot(was[1], was[2]));
+    });
+    // its file lies flat on the bed, 60 × 40 × 30, with the teardrops cut in it: a little less plastic than with round holes
+    const [one, two] = piecesOf(ex);
+    const laid = boxOf(pieceSolid(one));
+    expect(laid.size.map((v) => Math.round(v * 100) / 100)).toEqual([60, 40, 30]);
+    expect(laid.min[2]).toBeCloseTo(0, 6);
+    const lost = volumeOfStl(piecesOf(base)[0].stl) - volumeOfStl(one.stl);
+    expect(lost).toBeGreaterThan(5);
+    expect(lost).toBeLessThan(120);
+    // put back by its matrix it is where it was in the model, and nothing of it sticks out
+    expect(overlap(assembled(one), bar)).toBeCloseTo(volumeOfStl(one.stl), 3);
+    // piece 2 has the same round holes, where the pins now are: as much plastic as before; the pins are the same bytes
+    expect(volumeOfStl(two.stl)).toBeCloseTo(volumeOfStl(piecesOf(base)[1].stl), 3);
+    expect(boxOf(pieceSolid(two)).size.map((v) => Math.round(v * 100) / 100)).toEqual([30, 40, 60]);
+    const pins = (x) => Buffer.from(x.files.find((f) => f.kind === 'pins').stl);
+    expect(pins(ex).equals(pins(base))).toBe(true);
+    expect(Buffer.from(one.stl).equals(Buffer.from(piecesOf(base)[0].stl))).toBe(false);
+    // the notes and the sheet say it: which piece lies as chosen, and how in its PRINT line
+    expect(noteOf(ex, 'LAY_CHOSEN')).toMatchObject({ level: 'info', pieces: [1], text: expect.stringMatching(/^Piece 1 lies on the side you chose in the pieces list/) });
+    const sheet = ex.files.find((f) => f.kind === 'text').text;
+    expect(sheet).toMatch(/piece 1 of 2\s+60\.0 × 40\.0 × 30\.0 mm\s+lies flat as modelled, as you chose\s+fits/);
+    expect(sheet).toMatch(/piece 2 of 2\s+30\.0 × 40\.0 × 60\.0 mm\s+lies on a cut face\s+fits/);
+    expect(base.files.find((f) => f.kind === 'text').text).toMatch(/piece 1 of 2\s+30\.0 × 40\.0 × 60\.0 mm\s+lies on a cut face\s+fits/);
+    expect(sheet).toContain('Print each piece lying the way its file lies');
+    // the side the app chose anyway, chosen by hand: the same holes and the same files, and it is told as chosen
+    const same = await exportSplit(S({ labels: false, lay: { '0,0,0': '+x' } }), { name: 'bar' });
+    expect(piecesOf(same).map((f) => Buffer.from(f.stl).equals(Buffer.from(piecesOf(base)[piecesOf(same).indexOf(f)].stl)))).toEqual([true, true]);
+    expect(same.pieces[0].lay.chosen).toBe('+x');
+    expect(noteOf(same, 'LAY_CHOSEN').pieces).toEqual([1]);
+    // the pieces view says the same as the download
+    const shown = await resultSplit(S({ labels: false, lay: { '0,0,0': '-z' } }));
+    expect(shown.pieces.map((p) => [p.down, p.lay.chosen])).toEqual([['-z', '-z'], ['-x', null]]);
+    // the print check and what the piece takes are of the piece as it lies now
+    expect(ex.pieces[0].check).toBeTruthy();
+    expect(ex.pieces[0].volume).toBeCloseTo(volumeOfStl(one.stl), 0);
+  });
+
+  it('whichever side is chosen for whichever piece, no hole that lies on its side is left round', async () => {
+    const { Manifold } = wasm;
+    // an L in three: pieces with holes along X and along Z
+    const ell = own(cube([120, 30, 30], [0, 0, 15]).add(cube([30, 30, 120], [-45, 0, 60])));
+    await load(ell, 'L');
+    const cuts = [cutAt(0, -20, 'c1'), cutAt(2, 40, 'c2')];
+    const auto = await resultSplit(S({ cuts, labels: false }));
+    expect(auto.pieces.every((p) => p.lay.key && p.lay.ways.length === 6)).toBe(true);
+    let tried = 0;
+    let lying = 0;
+    for (const p of auto.pieces) {
+      for (const way of p.lay.ways.filter((w) => w.ok)) {
+        const r = await resultSplit(S({ cuts, labels: false, lay: { [p.lay.key]: way.down } }));
+        const mine = r.pieces.find((q) => q.lay.key === p.lay.key);
+        expect([p.index, way.down, mine.down, mine.up, mine.lies]).toEqual([p.index, way.down, way.down, oppositeDir(way.down), way.lies]);
+        expect([p.index, way.down, holesAgainstLay(r).wrong]).toEqual([p.index, way.down, []]);
+        expect(r.pieces.map((q) => q.holes.round)).toEqual(r.pieces.map(() => 0));
+        // the pieces not chosen for lie as they did
+        for (const q of r.pieces) if (q !== mine) expect([q.index, q.down]).toEqual([q.index, auto.pieces.find((x) => x.lay.key === q.lay.key).down]);
+        expectWalls(ell, r);
+        tried++;
+        lying += mine.holes.pointed + mine.holes.flat;
+      }
+    }
+    expect(tried).toBeGreaterThanOrEqual(12);
+    expect(lying).toBeGreaterThan(10);
+    // a block in eight with a side chosen for every piece at once, the side across from the app's
+    await load(cube([120, 80, 90], [0, 0, 45]), 'block');
+    const eight = [cutAt(0, 0, 'c1'), cutAt(1, 0, 'c2'), cutAt(2, 45, 'c3')];
+    const first = await resultSplit(S({ cuts: eight, labels: false }));
+    const lay = Object.fromEntries(first.pieces.map((p, i) => [p.lay.key, ['-z', '+x', '-y', '+z', '-x', '+y', '-z', '+x'][i]]));
+    const all = await exportSplit(S({ cuts: eight, labels: false, lay }), { name: 'block' });
+    expect(all.pieces.map((p) => p.down)).toEqual(first.pieces.map((p) => lay[p.lay.key]));
+    const { wrong, count } = holesAgainstLay(all);
+    expect(wrong).toEqual([]);
+    expect(count).toBeGreaterThan(20);
+    expect(all.pieces.map((p) => p.holes.round)).toEqual(all.pieces.map(() => 0));
+    expect(noteOf(all, 'LAY_CHOSEN').pieces).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    // every file lies on the bed the way its row says, and put back they are the block
+    const files = piecesOf(all);
+    files.forEach((f, i) => {
+      const b = boxOf(pieceSolid(f));
+      expect(b.min[2]).toBeCloseTo(0, 6);
+      expect(b.size.map((v) => Math.round(v * 10) / 10)).toEqual(all.pieces[i].size.map((v) => Math.round(v * 10) / 10));
+    });
+    const back = own(Manifold.union(files.map(assembled)));
+    expect(back.volume()).toBeCloseTo(files.reduce((v, f) => v + volumeOfStl(f.stl), 0), 0);
+  });
+
+  it('a side a piece cannot take is not on offer, with why; chosen all the same, the app says so and lays it its own way', async () => {
+    // too tall for the printer on its end
+    await load(cube([300, 40, 30]), 'bar');
+    const low = [210, 210, 100];
+    const r = await resultSplit(S({ labels: false }), { bed: low });
+    const offered = (p) => Object.fromEntries(p.lay.ways.map((w) => [w.down, w.ok ? 'ok' : w.why]));
+    expect(r.pieces.map(offered)).toEqual([0, 1].map(() => ({ '-z': 'ok', '+z': 'ok', '-x': 'bed', '+x': 'bed', '-y': 'ok', '+y': 'ok' })));
+    const stale = await exportSplit(S({ labels: false, lay: { '0,0,0': '+x', '1,0,0': '-y' } }), { bed: low, name: 'bar' });
+    expect(stale.pieces.map((p) => [p.down, p.fits, p.lay.chosen, p.lay.used])).toEqual([[r.pieces[0].down, true, '+x', false], ['-y', true, '-y', true]]);
+    expect(noteOf(stale, 'LAY_IGNORED')).toMatchObject({
+      level: 'info', pieceIndex: 1, down: '+x', why: 'bed',
+      text: "Piece 1 can't lie on its right side as you chose: it doesn't fit your printer that way. It lies flat as modelled, the app's choice – choose again in the pieces list if you like.",
+    });
+    expect(noteOf(stale, 'LAY_CHOSEN').pieces).toEqual([2]);
+    expect(holesAgainstLay(stale).wrong).toEqual([]);
+    // piece 1's file is the one the app makes with no choice for it
+    const plain = await exportSplit(S({ labels: false, lay: { '1,0,0': '-y' } }), { bed: low, name: 'bar' });
+    expect(Buffer.from(piecesOf(stale)[0].stl).equals(Buffer.from(piecesOf(plain)[0].stl))).toBe(true);
+
+    // a lid that carries its cut's lip prints with the lip standing up: no other side is on offer, and one chosen
+    // before the cut came apart gives way to the lip, which stays the lip it was
+    await load(own(lidBoxSolid()), 'box');
+    const apart = { ...cutAt(2, 50, 'c1'), joint: 'apart', hold: 'snap' };
+    const lid = await resultSplit(S({ cuts: [apart], labels: false }));
+    expect(lid.seams[0]).toMatchObject({ male: 2, apart: { lip: true, clips: 4 } });
+    expect(offered(lid.pieces[1])).toEqual({ '-z': 'lip', '+z': 'ok', '-x': 'lip', '+x': 'lip', '-y': 'lip', '+y': 'lip' });
+    expect(Object.values(offered(lid.pieces[0])).every((w) => w === 'ok')).toBe(true);
+    const kept = await resultSplit(S({ cuts: [apart], labels: false, lay: { '0,0,1': '-z' } }));
+    expect(kept.seams[0]).toMatchObject({ male: 2, apart: { lip: true, clips: 4 } });
+    expect(kept.pieces[1]).toMatchObject({ down: '+z', lay: { chosen: '-z', used: false } });
+    expect(noteOf(kept, 'LAY_IGNORED')).toMatchObject({ pieceIndex: 2, down: '-z', why: 'lip', text: expect.stringContaining('its lip has to print standing up. It lies upside down, as its joint needs') });
+    expect(codes(kept)).not.toContain('LAY_CHOSEN');
+    // on the sheet the lid lies as its lip needs, and is not said to lie as chosen
+    const keptSheet = (await exportSplit(S({ cuts: [apart], labels: false, lay: { '0,0,1': '-z' } }), { name: 'box' })).files.find((f) => f.kind === 'text').text;
+    expect(keptSheet).toMatch(/piece 2 of 2 .*lies upside down {3}/);
+    expect(keptSheet).not.toMatch(/as you chose/);
+    // a cut that misses the model: the sides wait, the pieces lie as the app lays them, and a note says so
+    const missed = await resultSplit(S({ cuts: [apart, cutAt(0, 400, 'c2')], labels: false, lay: { '0,0,0': '+x' } }));
+    expect(missed.pieces.map((p) => [p.down, p.lay.chosen])).toEqual([['-z', null], ['+z', null]]);
+    expect(codes(missed)).toEqual(expect.arrayContaining(['CUT_MISSES', 'LAY_WAITS']));
+    expect(codes(missed)).not.toContain('LAY_CHOSEN');
+    // the box under it may be turned as you like, and the lip stays on the lid
+    const turned = await resultSplit(S({ cuts: [apart], labels: false, lay: { '0,0,0': '+x' } }));
+    expect(turned.pieces.map((p) => p.down)).toEqual(['+x', '+z']);
+    expect(turned.seams[0]).toMatchObject({ male: 2, apart: { lip: true, clips: 4 } });
+
+    // built-in pegs: not on the side they stand out of; a piece told to stay on that face hands them to the other one,
+    // though each piece prints the same way up as before
+    await load(cube([120, 40, 30]), 'bar');
+    const pegs = await resultSplit(S({ joint: 'pegs', labels: false }));
+    expect(pegs.pieces.map((p) => [p.down, p.pegs, p.sockets])).toEqual([['-z', 2, 0], ['-x', 0, 2]]);
+    expect(offered(pegs.pieces[0])).toEqual({ '-z': 'ok', '+z': 'ok', '-x': 'ok', '+x': 'pegs', '-y': 'ok', '+y': 'ok' });
+    const handed = await resultSplit(S({ joint: 'pegs', labels: false, lay: { '0,0,0': '+x' } }));
+    expect(handed.pieces.map((p) => [p.down, p.pegs, p.sockets])).toEqual([['+x', 0, 2], ['-z', 2, 0]]);
+    expect(offered(handed.pieces[0])['+x']).toBe('ok');
+    expect(codes(handed)).not.toContain('LAY_IGNORED');
+    // both told to stay on the cut face: neither can carry pegs, and the notes say the face is glued flat
+    const neither = await resultSplit(S({ joint: 'pegs', labels: false, lay: { '0,0,0': '+x', '1,0,0': '-x' } }));
+    expect(neither.pieces.map((p) => [p.down, p.pegs, p.sockets])).toEqual([['+x', 0, 0], ['-x', 0, 0]]);
+    expect(codes(neither)).toContain('CONNECTORS_DROPPED');
   });
 });
 
@@ -1236,6 +1414,8 @@ describe('planning pieces that really print', () => {
     const m = await client.planSplit([], version, { printing, split: moved, bed: BED, mode: 'measure' });
     expect(m.pieces.map((x) => x.cell[0])).toEqual([0, 1, 1, 2]);
     expect(ex.pieces.map((x) => [x.cell[0], x.shells, x.fits])).toEqual([[0, 1, true], [1, 1, true], [1, 2, true], [2, 1, true]]);
+    // the two pieces of the middle box cannot be told which side to lie on (a side goes by its box); the ends can
+    expect(ex.pieces.map((x) => x.lay.key ?? x.lay.why)).toEqual(['0,0,0', 'apart', 'apart', '2,0,0']);
     for (const f of files) {
       // every shell of every file starts on the bed (a sealed hollow would come back inside out, with no volume of its own)
       for (const shell of pieceSolid(f).decompose().map(own)) expect(shell.boundingBox().min[2], f.name).toBeCloseTo(0, 3);

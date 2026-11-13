@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Matrix4 } from 'three';
 import { APART_HOLDS, normaliseSplit } from '../src/split.js';
-import { CUT_HOLDS, Document, SPLIT_DEFAULTS, coversKey, coversOf, createItem, createPart, createSpot, fontIds, frameOf, hasText, isSpot, itemLabel, itemText, linesOf, maxSize, modelPlacementKey, placeKey, shapeKey, spotsKey, stableKey, transformItems } from '../src/document.js';
+import { CUT_HOLDS, Document, LAY_DOWNS, SPLIT_DEFAULTS, cellsKey, coversKey, coversOf, createItem, createPart, createSpot, fontIds, frameOf, hasText, isSpot, itemLabel, itemText, linesOf, maxSize, modelPlacementKey, placeKey, shapeKey, spotsKey, stableKey, transformItems } from '../src/document.js';
 
 describe('keys', () => {
   it('stableKey ignores key order and slider jitter', () => {
@@ -515,6 +515,119 @@ describe('split for printing', () => {
     expect(doc.split.cuts[0].position).toEqual([4, 0, 0]);
     expect(doc.state.baseVersion).toBe(v0);
     expect(modelPlacementKey(doc.base)).toBe(modelPlacementKey(null));
+  });
+});
+
+describe('the side a piece lies on, chosen by hand', () => {
+  const X = [1, 0, 0];
+  const Z = [0, 0, 1];
+
+  it('a side is chosen in one undo step, handed back to the app in another, and with none the split is the split it always was', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'bar');
+    doc.addCut({ position: [0, 0, 0], normal: X });
+    const before = JSON.stringify(doc.split);
+    const v0 = doc.state.baseVersion;
+    doc.setPieceLay('0,0,0', '-z');
+    expect(doc.split.lay).toEqual({ '0,0,0': '-z' });
+    expect(doc.history).toHaveLength(2);
+    doc.setPieceLay('0,0,0', '-z'); // the side it has: no step
+    doc.setPieceLay('1,0,0', null); // the app's already: no step
+    doc.setPieceLay('nonsense', '-z'); // no box
+    expect(doc.history).toHaveLength(2);
+    doc.setPieceLay('1,0,0', '+y');
+    doc.setPieceLay('0,0,0', 'sideways'); // no side: the app's choice again
+    expect(doc.split.lay).toEqual({ '1,0,0': '+y' });
+    doc.setPieceLay('1,0,0', null);
+    // the last one gone, the list goes too: the JSON and every key are what they were
+    expect('lay' in doc.split).toBe(false);
+    expect(JSON.stringify(doc.split)).toBe(before);
+    expect(stableKey(doc.split)).toBe(stableKey(JSON.parse(before)));
+    expect('lay' in normaliseSplit(doc.split)).toBe(false);
+    expect(doc.undo()).toBe(true);
+    expect(doc.split.lay).toEqual({ '1,0,0': '+y' });
+    // none of it is a new model version, and the six sides are the six directions
+    expect(doc.state.baseVersion).toBe(v0);
+    expect([...LAY_DOWNS].sort()).toEqual(['+x', '+y', '+z', '-x', '-y', '-z']);
+    // with no split there is nothing to choose for
+    const bare = new Document();
+    bare.setPieceLay('0,0,0', '-z');
+    expect(bare.split).toBeNull();
+  });
+
+  it('the choices stay while the cuts make the same boxes – dragged, set to come apart, the settings changed – and go when they do not', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'bar');
+    const a = doc.addCut({ position: [0, 0, 0], normal: X });
+    const b = doc.addCut({ position: [50, 0, 0], normal: X });
+    const lay = { '0,0,0': '-z', '2,0,0': '+x' };
+    const choose = () => {
+      doc.setPieceLay('0,0,0', '-z');
+      doc.setPieceLay('2,0,0', '+x');
+    };
+    choose();
+    // a cut dragged, one set to come apart, a setting changed, a detail kept whole: the boxes are the same ones
+    doc.updateCut(a, { position: [10, 0, 0] });
+    doc.setCutJoint(b, { hold: 'snap' });
+    doc.setSplit({ joint: 'dowels', diameter: 5 });
+    doc.addKeep({ point: [0, 0, 0], box: null });
+    expect(doc.split.lay).toEqual(lay);
+    // the history holds its own copy
+    doc.split.lay['0,0,0'] = '+z';
+    doc.undo();
+    expect(doc.split.lay).toEqual(lay);
+    // a cut dragged past the other one: the boxes change hands
+    doc.updateCut(a, { position: [60, 0, 0] });
+    expect('lay' in doc.split).toBe(false);
+    // and an undo brings the choices back with the cuts
+    doc.undo();
+    expect(doc.split.lay).toEqual(lay);
+    // a cut turned to another axis
+    doc.updateCut(a, { normal: Z });
+    expect('lay' in doc.split).toBe(false);
+    doc.undo();
+    // a cut removed, a cut added, the cuts replaced (Fit to my printer)
+    doc.removeCut(b);
+    expect('lay' in doc.split).toBe(false);
+    doc.undo();
+    doc.addCut({ position: [0, 0, 5], normal: Z });
+    expect('lay' in doc.split).toBe(false);
+    doc.undo();
+    doc.setSplit({ cuts: [{ position: [0, 0, 0], normal: X }] });
+    expect('lay' in doc.split).toBe(false);
+    doc.undo();
+    expect(doc.split.lay).toEqual(lay);
+    // a part taken out makes no box: the choices stay
+    doc.addCut({ position: [0, 0, 20], normal: Z, joint: 'apart', part: { r: 5, side: 1 } });
+    expect(doc.split.lay).toEqual(lay);
+    // the model turned or resized: a piece is no longer the one the side was chosen for
+    doc.transformBase(new Matrix4().makeRotationZ(Math.PI / 2));
+    expect('lay' in doc.split).toBe(false);
+    doc.undo();
+    expect(doc.split.lay).toEqual(lay);
+    doc.resetBase();
+    expect('lay' in doc.split).toBe(false);
+  });
+
+  it('cellsKey tells the boxes by the cuts across each axis in their order along it', () => {
+    const cut = (id, axis, at, extra = {}) => ({ id, position: [0, 1, 2].map((k) => (k === axis ? at : 7)), normal: [0, 1, 2].map((k) => (k === axis ? -1 : 0)), ...extra });
+    expect(cellsKey(null)).toBe('||');
+    expect(cellsKey({ cuts: [cut('c2', 0, 30), cut('c1', 0, -5), cut('c3', 2, 4)] })).toBe('c1,c2||c3');
+    // wherever they are dragged, while their order stays
+    expect(cellsKey({ cuts: [cut('c2', 0, 99), cut('c1', 0, 98), cut('c3', 2, -40)] })).toBe('c1,c2||c3');
+    expect(cellsKey({ cuts: [cut('c2', 0, 30), cut('c1', 0, 31), cut('c3', 2, 4)] })).toBe('c2,c1||c3');
+    // a part taken out is no plane of the grid
+    expect(cellsKey({ cuts: [cut('c1', 0, 0), cut('c2', 2, 9, { part: { r: 5, side: 1 } })] })).toBe('c1||');
+  });
+
+  it('a split given sides that cannot be keeps only those that can', () => {
+    const doc = new Document();
+    doc.setBase('stl', 'bar');
+    doc.setSplit({ cuts: [{ position: [0, 0, 0], normal: X }], lay: { '0,0,0': '-z', '1,0,0': 'down', 'a,b': '+x', '1,0': '-y' } });
+    // (sides that come with the cuts they go by stay, though the boxes are new)
+    expect(doc.split.lay).toEqual({ '0,0,0': '-z' });
+    doc.setSplit({ lay: { x: 1 } });
+    expect('lay' in doc.split).toBe(false);
   });
 });
 

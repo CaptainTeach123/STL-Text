@@ -17,6 +17,10 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const out = path.join(root, 'e2e', 'out');
 fs.mkdirSync(out, { recursive: true });
 
+// the lines under a piece in the pieces list that are not its own: its print check, its estimate, and the choice of
+// the side it lies on with its entries (a list's text includes them)
+const UNDER_PIECE = /^((Print check|Estimate): |Lies on$|The app's choice|As in the model|Upside down|On its (left side|right side|front|back)|set by you)/;
+
 let failures = 0;
 const check = (ok, label, extra = '') => {
   console.log(`${ok ? '  ok ' : ' FAIL'}  ${label}${extra ? `  (${extra})` : ''}`);
@@ -4465,7 +4469,7 @@ try {
     await settle();
     const big = await card();
     const [locking] = await partRows();
-    const stillPieces = { shown: await b.isChecked('#resultToggle'), pieces: (await b.locator('#pieceList').innerText()).split('\n').filter((line) => line && !/^(Print check|Estimate): /.test(line)) };
+    const stillPieces = { shown: await b.isChecked('#resultToggle'), pieces: (await b.locator('#pieceList').innerText()).split('\n').filter((line) => line && !UNDER_PIECE.test(line)) };
     check(
       (await size()) === '75.0 × 75.0 × 150.0' && locking.z === '86' && locking.d === '47.3' && locking.holds.find((h) => h.value === 'lock').checked &&
         !locking.holds.find((h) => h.value === 'lock').disabled && locking.meta === 'twist-lock, 3 lugs, 3 clicks – turn 27° · the handle stays',
@@ -4592,7 +4596,7 @@ try {
     await settle();
     await b.waitForTimeout(500);
     await settle();
-    const pieces = (await b.locator('#pieceList').innerText()).split('\n').filter((line) => line && !/^(Print check|Estimate): /.test(line));
+    const pieces = (await b.locator('#pieceList').innerText()).split('\n').filter((line) => line && !UNDER_PIECE.test(line));
     const notes = await b.locator('#splitNotes').innerText();
     check(
       pieces.length === 2 && /^1 · Lantern, with the handle · 75 × 75 × 150 mm · .* · twist-lock neck, 3 lugs$/.test(pieces[0]) &&
@@ -5389,7 +5393,7 @@ try {
           }
         );
       });
-    const piecesText = async () => (await s.locator('#pieceList').innerText()).split('\n').filter((line) => line && !/^(Print check|Estimate): /.test(line));
+    const piecesText = async () => (await s.locator('#pieceList').innerText()).split('\n').filter((line) => line && !UNDER_PIECE.test(line));
     await s.goto(url);
     await s.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
     await s.setInputFiles('#stlFile', seatFile);
@@ -6432,6 +6436,144 @@ try {
     );
     await small.close();
     check(printedProblems.length === 0, 'no page errors as printed', printedProblems.join(' | '));
+  }
+
+  // --- the side each piece lies on, chosen in the pieces list ---------------------------------------------------
+  {
+    const layFile = writeFixture('lay-bar.stl', soupOf(Manifold.cube([300, 40, 30], true)));
+    const ctx = await browser.newContext({ viewport: { width: 1400, height: 1000 }, acceptDownloads: true });
+    const q = await ctx.newPage();
+    const layProblems = [];
+    q.on('pageerror', (e) => layProblems.push(e.message));
+    q.on('console', (m) => m.type() === 'error' && layProblems.push(m.text()));
+    await q.goto(url);
+    const settle = async () => {
+      for (let i = 0; i < 2; i++) {
+        await q.waitForTimeout(60);
+        await q.waitForSelector('body[data-engine="idle"]', { timeout: 60000 });
+      }
+    };
+    /** Wait for the pieces worked out for the split as it is now. */
+    const worked = async () => {
+      await q.waitForFunction(() => document.querySelector('#pieceList li:not(.predicted)') && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 120000 });
+      await settle();
+    };
+    const rows = () =>
+      q.locator('#pieceList li').evaluateAll((els) =>
+        els.map((li) => {
+          const select = li.querySelector('.piece-lay select');
+          return {
+            text: li.querySelector('span:nth-child(2)').firstChild.textContent,
+            check: li.querySelector('.print-check')?.textContent ?? '',
+            estimate: li.querySelector('.print-estimate')?.textContent ?? '',
+            label: li.querySelector('.piece-lay')?.firstChild.textContent.trim() ?? null,
+            value: select?.value ?? null,
+            off: select?.disabled ?? null,
+            own: !!li.querySelector('.piece-lay-own'),
+            options: [...(select?.options ?? [])].map((o) => `${o.disabled ? '[off] ' : ''}${o.text}`),
+          };
+        }),
+      );
+    const notes = async () => (await q.locator('#splitNotes li .text').allInnerTexts()).join(' / ');
+    await settle();
+    await q.setInputFiles('#stlFile', layFile);
+    await q.waitForFunction(() => /^Split into \d+ pieces$/.test(document.querySelector('#modelNotes button')?.textContent ?? ''), null, { timeout: 60000 });
+    await q.click('#modelNotes button');
+    await worked();
+    const before = await rows();
+    check(
+      before.length === 2 && before.every((r) => r.label === 'Lies on' && r.value === '' && !r.off && !r.own && r.options.length === 7 && /^The app's choice: /.test(r.options[0])),
+      'each piece has a Lies on choice in its row, left at the app\'s choice, which says the side it lies on',
+      JSON.stringify(before.map((r) => [r.label, r.value, r.options[0]])),
+    );
+    check(
+      before[0].options.slice(1).map((o) => o.split(' – ')[0]).join(' | ') === 'As in the model | Upside down | On its left side | On its right side (a cut face) | On its front | On its back' &&
+        before[0].options.slice(1).every((o) => /on the bed, (little or no support|a little support|supports under about \d+ cm²)$/.test(o)),
+      'the six sides in plain words, each with how much rests on the bed and how much needs support',
+      before[0].options.slice(1).join(' | '),
+    );
+    check(/lies flat as modelled/.test(before[0].text) && /its 2 pin holes need no supports/.test(before[0].check), 'as the app lays it, piece 1 lies flat', `${before[0].text} ${before[0].check}`);
+    // piece 1 stood on its cut face: the row, its print check and its estimate are of the piece standing so
+    await q.selectOption('#pieceList li:nth-child(1) .piece-lay select', '+x');
+    await q.waitForFunction(() => document.querySelector('#pieceList li .piece-lay-own') && !document.querySelector('#pieceList').classList.contains('stale') && /on a cut face/.test(document.querySelector('#pieceList li').textContent), null, { timeout: 120000 });
+    await settle();
+    const stood = await rows();
+    check(
+      /lies on a cut face/.test(stood[0].text) && stood[0].value === '+x' && stood[0].own && stood[0].options[0] === "The app's choice" && / × 1\d\d(\.\d)? mm /.test(stood[0].text),
+      'choosing its right side stands piece 1 on its cut face: the row says so, marked "set by you"',
+      JSON.stringify([stood[0].text, stood[0].value, stood[0].own]),
+    );
+    check(
+      /^Print check: /.test(stood[0].check) && /its 2 pin holes need no supports/.test(stood[0].check) && /^Estimate: /.test(stood[0].estimate) && stood[0].check !== before[0].check,
+      'its print check and estimate lines are worked out again for that side',
+      `${before[0].check} → ${stood[0].check}`,
+    );
+    check(stood[1].text === before[1].text && stood[1].value === '' && !stood[1].own, 'piece 2 lies as it did', stood[1].text);
+    check(await q.isChecked('#resultToggle'), 'the pieces stay in view while they are worked out again');
+    check(/Piece 1 lies on the side you chose in the pieces list/.test(await notes()), 'the notes say piece 1 lies on the side chosen', (await notes()).slice(0, 200));
+    // as printed, piece 1 stands tall on the bed
+    await q.click('#asPrintedToggle');
+    await q.waitForTimeout(400);
+    await q.screenshot({ path: path.join(out, 'lay-as-printed.png') });
+    check(await q.isChecked('#asPrintedToggle'), 'As printed shows the pieces as they now lie');
+    await q.click('#asPrintedToggle');
+    // the download: piece 1's file stands 150 mm tall, and the sheet's PRINT line says how it lies
+    const [dl] = await Promise.all([q.waitForEvent('download'), q.click('#downloadBtn')]);
+    const layZip = path.join(out, 'lay-bar.zip');
+    await dl.saveAs(layZip);
+    await settle();
+    const entries = unzipSync(new Uint8Array(fs.readFileSync(layZip)));
+    const names = Object.keys(entries);
+    const sheetName = names.find((n) => /how-to-glue\.txt$/.test(n));
+    const sheetText = sheetName ? strFromU8(entries[sheetName]) : '';
+    check(/piece 1 of 2 .* lies on a cut face, as you chose/.test(sheetText) && /piece 2 of 2 .* lies flat as modelled {3}/.test(sheetText), "the sheet's PRINT lines say how each piece lies, and which as you chose", sheetText.split('\n').filter((l) => /piece \d of 2 .* lies/.test(l)).join(' / '));
+    const pieceName = names.find((n) => /piece-1-of-2\.stl$/.test(n));
+    const pieceFile = path.join(out, 'lay-piece-1.stl');
+    fs.writeFileSync(pieceFile, Buffer.from(entries[pieceName]));
+    const laid = inspectStl(pieceFile);
+    check(laid.max[2] - laid.min[2] > 140 && Math.abs(laid.min[2]) < 1e-3, "piece 1's file stands on its cut face", `${(laid.max[2] - laid.min[2]).toFixed(1)} mm tall`);
+    // a side the piece cannot take is greyed out, with why: built-in pegs stand out of piece 1's cut face
+    await q.selectOption('#pieceList li:nth-child(1) .piece-lay select', '');
+    await q.waitForFunction(() => !document.querySelector('#pieceList li .piece-lay-own') && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 120000 });
+    await settle();
+    const handed = await rows();
+    check(handed[0].value === '' && !handed[0].own && handed[0].text === before[0].text && !/you chose/.test(await notes()), "back at the app's choice, piece 1 lies as it did and nothing is said of it", handed[0].text);
+    await q.click('#splitSettings label:has(input[data-split="joint"][value="pegs"])');
+    await q.waitForFunction(() => /pegs/.test(document.querySelector('#pieceList').innerText) && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 120000 });
+    await settle();
+    const pegged = await rows();
+    const carrier = pegged.find((r) => / pegs?$/.test(r.text) || / pegs? · /.test(r.text)) ?? pegged[0];
+    check(
+      carrier.options.filter((o) => /^\[off\] /.test(o)).length === 1 && carrier.options.some((o) => /^\[off\] On its (left|right) side \(a cut face\) – not offered: its pegs stand out of that side$/.test(o)),
+      'the side a piece\'s built-in pegs stand out of is greyed out, with why',
+      carrier.options.filter((o) => /^\[off\]/.test(o)).join(' | '),
+    );
+    await q.click('#splitSettings label:has(input[data-split="joint"][value="auto"])');
+    await worked();
+    // the choice lasts while the cuts stay: dragging a cut keeps it, another cut drops it, with a note; Undo brings it back
+    await q.selectOption('#pieceList li:nth-child(2) .piece-lay select', '-y');
+    await q.waitForFunction(() => document.querySelector('#pieceList li:nth-child(2) .piece-lay-own') && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 120000 });
+    await settle();
+    await q.fill('#cutList input[data-cut-at]', '20');
+    await q.dispatchEvent('#cutList input[data-cut-at]', 'change');
+    await worked();
+    const dragged = await rows();
+    check(dragged[1].value === '-y' && dragged[1].own && /lies on its side/.test(dragged[1].text), 'moving the cut keeps the side chosen for piece 2', dragged[1].text);
+    await q.click('#addCutBtn');
+    await settle();
+    const dropped = await notes();
+    check(/^The cuts changed, so the pieces are no longer the same ones: the side you chose for a piece to lie on was dropped/.test(dropped), 'another cut drops the choice, and a note says so', dropped.slice(0, 160));
+    await worked();
+    const fresh = await rows();
+    check(fresh.length === 3 && fresh.every((r) => r.value === '' && !r.own), 'the three pieces are all laid by the app again', JSON.stringify(fresh.map((r) => [r.value, r.own])));
+    await q.click('#splitNotes li button:text-is("OK")');
+    check(!/The cuts changed/.test(await notes()), 'OK takes the note away');
+    await q.click('#undoBtn');
+    await worked();
+    const back = await rows();
+    check(back.length === 2 && back[1].value === '-y' && back[1].own, 'Undo brings the choice back with the cuts', JSON.stringify(back.map((r) => [r.value, r.own])));
+    check(layProblems.length === 0, 'no page errors while choosing how pieces lie', layProblems.join(' | '));
+    await ctx.close();
   }
 
   check(problems.length === 0, 'no console errors or exceptions (page or worker)', problems.join(' | '));

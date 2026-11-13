@@ -247,11 +247,8 @@ describe('holes and pins', () => {
     expect(boxes.map((c) => +c.size[1].toFixed(3))).toEqual([5, 5, 4, 4, 4, 4, 4].map((n) => +(n * 4.619397 + (n - 1) * 12 + 10).toFixed(3)));
     // the strips of two columns stay 2 mm apart, so each peels off on its own
     for (let i = 1; i < boxes.length; i++) expect(boxes[i].min[0] - boxes[i - 1].max[0]).toBeCloseTo(2, 6);
-    // what the strips take, as the print plan counts it: the slabs, a little over what they add to the pins
-    const added = held.volume() - bare.volume();
-    const counted = pinStripVolume(group, BED);
-    expect(counted).toBeGreaterThan(added);
-    expect(counted).toBeLessThan(1.1 * added);
+    // what the strips take, as the print plan counts it: just what they add to the pins
+    expect(pinStripVolume(group, BED) / (held.volume() - bare.volume())).toBeCloseTo(1, 3);
     // one pin gets a strip of its own
     const one = boxOf(own(pinSheet({ d: 6, length: 19, count: 1 }, BED, { strip: true })));
     expect(one.size.map((v) => +v.toFixed(3))).toEqual([29, 15.543, 5.543]);
@@ -283,6 +280,40 @@ describe('holes and pins', () => {
       expect(fitsBed(sheet.size, X1, { flat: 2 }).fits).toBe(true);
       expect(reachesCorner(sheet.size, 0, X1)).toBe(false);
     }
+  });
+
+  it('the plastic of the strips is counted without what the pins fill of them, thin pins and thick', () => {
+    // a thick pin's lowest 0.2 mm fills a wide band of its slab: counted whole, the slab would be a fifth too much
+    for (const [d, length, count] of [[3, 6, 9], [5, 16, 30], [6, 60, 4], [8, 26, 7], [10, 60, 5]]) {
+      const group = { d, length, count };
+      const added = own(pinSheet(group, BED, { strip: true })).volume() - own(pinSheet(group, [200, 210, 249])).volume();
+      expect(pinStripVolume(group, BED) / added).toBeCloseTo(1, 3);
+    }
+    const slab = (60 + 10) * (10 * Math.SQRT1_2 * 1.3066 + 10) * 0.2;
+    expect(pinStripVolume({ d: 10, length: 60, count: 1 }, BED)).toBeLessThan(0.85 * slab);
+  });
+
+  it('on a bed narrower than a pin and its strip, but deep enough, the sheet is laid out to be turned and fits', () => {
+    // Ø5 × 16 on its strip is 26 mm long: too long for a bed 20 mm wide, so its columns would not fit either way
+    const U = [20, 100, 100];
+    const held = pinsPerSheet({ d: 5, length: 16 }, U, { strip: true });
+    // laid out for the bed turned: three end to end along its 100 mm, and one row across its 20
+    expect(held.room).toEqual([100, 20, 100]);
+    expect(held.perSheet).toBe(3);
+    const full = boxOf(own(pinSheet({ d: 5, length: 16, count: held.perSheet }, held.room, { strip: true })));
+    expect(full.size[0]).toBeLessThanOrEqual(100 + 1e-6);
+    expect(full.size[1]).toBeLessThanOrEqual(20 + 1e-6);
+    expect(fitsBed(full.size, U, { flat: 2 }).fits).toBe(true);
+    // the bare pin fits the 20 mm as it lies: laid out as ever
+    expect(pinsPerSheet({ d: 5, length: 16 }, U)).toMatchObject({ room: U, perSheet: 6 });
+    // a bare pin too long for the width is turned the same way
+    const long = pinsPerSheet({ d: 5, length: 16 }, [12, 100, 100]);
+    expect(long).toMatchObject({ room: [100, 12, 100], perSheet: 4 });
+    expect(fitsBed(boxOf(own(pinSheet({ d: 5, length: 16, count: 4 }, long.room))).size, [12, 100, 100], { flat: 2 }).fits).toBe(true);
+    // too long either way: one pin a row, as before, and the bed's own room
+    expect(pinsPerSheet({ d: 5, length: 16 }, [12, 12, 100]).room).toEqual([12, 12, 100]);
+    // where it fits the width nothing changes, however much more the bed would take turned
+    expect(pinsPerSheet({ d: 5, length: 16 }, [30, 200, 100], { strip: true }).room).toEqual([30, 200, 100]);
   });
 
   it("the fit test's pin lies on the same strip when asked, and nothing else of the fit test changes", () => {

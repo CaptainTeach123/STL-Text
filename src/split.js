@@ -5212,7 +5212,7 @@ const NOTE_TEXT = {
     const spare = spares ? `, ${spares === 1 ? 'one spare' : `${spares} spares`}` : '';
     const files = sheets > 1 ? `the ${sheets} pins files` : 'the pins file';
     const held = strip
-      ? ` The pins come on a thin strip that holds them to the bed: print ${sheets > 1 ? 'each file' : 'it'} with a 0.2 mm first layer and no brim, where the file puts it (no auto-arrange), then peel the strip off and snap the pins out.`
+      ? ` The pins come on a thin strip that holds them to the bed: print ${sheets > 1 ? 'each file' : 'it'} as it loads, with the first layer set to 0.2 mm and no brim, and don't split it into separate parts in the slicer. Then peel the strip off, snap the pins out and trim off any edge of the strip left on a pin (a fingernail or a knife does it), so it slides into its hole.`
       : '';
     return `Print ${files} (${plural(count + spares, 'pin')}${spare}) lying flat – or use Ø${mm(diameter)} mm wooden dowels cut to ${mm(length)} mm.${held}`;
   },
@@ -6084,9 +6084,11 @@ export function howToGlueText(plan) {
       const files = g.sheets > 1 ? `, in ${g.sheets} pins files` : '';
       out.push(`  ${pad('pins', 12)}${g.count + spares} × Ø${mm(g.d)} × ${mm(g.length)} mm${spare}${files}, lying on a flat side, solid (4+ walls)`);
       if (g.strip > 0) {
-        // the strip is one first layer thick: a brim would weld it to its neighbours, and arranging would crowd them
-        out.push(`${indent}on a thin strip that holds them to the bed: print with a 0.2 mm first layer and no brim,`);
-        out.push(`${indent}where the file puts them (no auto-arrange); then peel the strip off and snap the pins out`);
+        // the strip is one first layer thick: a brim would weld it to its neighbours, and its columns split into
+        // parts of their own could be pushed together; it breaks off ragged, so what stays on a pin is trimmed
+        out.push(`${indent}on a thin strip that holds them to the bed: print the file as it loads, with the first layer set to`);
+        out.push(`${indent}0.2 mm and no brim, and don't split it into separate parts; then peel the strip off, snap the pins`);
+        out.push(`${indent}out and trim off any edge of the strip left on a pin, so it slides into its hole`);
       }
       out.push(`${indent}or Ø${mm(g.d)} mm wooden dowels cut to ${mm(g.length)} mm`);
     }

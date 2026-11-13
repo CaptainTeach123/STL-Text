@@ -100,7 +100,9 @@ const LABEL_SMALLEST = 3;
 /**
  * The gap between pins on a sheet (mm), along a row and between rows: wide enough that a 5 mm brim round each pin
  * (Bambu Studio's "Outer brim only": 5 mm, 0.1 mm off the part) stays clear of its neighbour's, that a string pulled
- * across it breaks off instead of webbing two pins together, and that the part fan's air gets between them.
+ * across it breaks off instead of webbing two pins together, and that the part fan's air gets between them. On the
+ * holding strip (`PIN_STRIP`) no brim is added and the strip fills the gap along a column: the gap stays as it is so
+ * that the pins lie exactly where they do without the strip.
  */
 const PIN_GAP = 12;
 /**
@@ -542,13 +544,16 @@ function lyingPinBox(d, length) {
  * more pins: a sheet can be any shape, so it need not be moved by hand.
  * With the holding strip (`PIN_STRIP`) the pins keep its reach from every
  * side of that room, so the strip fits too: a sheet holds fewer pins where
- * the last row or column no longer fits.
+ * the last row or column no longer fits. Where a pin (with its strip) is
+ * too long for the room's width but not for its depth, the sheet is laid
+ * out for the room turned a quarter: it is turned on the bed as one pin
+ * too long for the width is, and so fits it.
  * @param {{ d: number, length: number }} group
  * @param {number[]} U the usable bed
  * @param {{ strip?: boolean }} [options] `strip`: the pins stand on the holding strip
  * @returns {{ perSheet: number, size: number[], room: number[] }} `size` the box of a sheet of one pin as laid (the
  *   pin's own without the strip); `room` the room the sheet is laid out in (for `pinSheet`), the bed's own without a
- *   corner
+ *   corner, its width and depth changed over where the sheet is to be turned
  */
 export function pinsPerSheet({ d, length }, U, { strip = false } = {}) {
   const b = lyingPinBox(d, length);
@@ -560,7 +565,9 @@ export function pinsPerSheet({ d, length }, U, { strip = false } = {}) {
     ? [[Math.max(1, U[0] - 2 * corner[0]), U[1]], [U[0], Math.max(1, U[1] - 2 * corner[1])]]
     : [[U[0], U[1]]];
   let best = null;
-  for (const [w, h] of rooms) {
+  for (const [rw, rh] of rooms) {
+    // a pin too long for the width that fits the depth: the sheet laid out for the room turned
+    const [w, h] = one[0] + edge > rw + 1e-9 && one[0] + edge <= rh + 1e-9 ? [rh, rw] : [rw, rh];
     const perRow = Math.max(1, Math.floor((w - edge + PIN_GAP) / (one[0] + PIN_GAP)));
     const rows = Math.max(1, Math.floor((h - edge + PIN_GAP) / (one[1] + PIN_GAP)));
     if (!best || perRow * rows > best.perSheet) best = { perSheet: perRow * rows, room: [w, h, U[2]] };
@@ -613,21 +620,30 @@ export function pinSheet({ d, length, count }, U = null, { strip = false } = {})
 }
 
 /**
- * About how much plastic the holding strips of a pins file take (mm³): the slabs `pinSheet` lays under its columns,
- * the little of each that a pin's own lowest 0.2 mm already fills counted too (a few parts in a hundred).
+ * How much plastic the holding strips of a pins file take (mm³): the slabs `pinSheet` lays under its columns, less
+ * what each pin's own lowest 0.2 mm already fills of them (up to a fifth of the slab under a thick pin).
  * @param {{ d: number, length: number, count: number }} group
  * @param {number[]|null} U the room it is laid out in, as `pinSheet`'s
  * @returns {number}
  */
 export function pinStripVolume({ d, length, count }, U = null) {
-  const b = lyingPinBox(d, length);
-  const [sx, sy] = [b.max[0] - b.min[0], b.max[1] - b.min[1]];
   const { reach, thick } = PIN_STRIP;
+  const t = scope();
+  let b;
+  let inSlab; // what one pin fills of its slab
+  try {
+    const one = t.add(lyingPin({ r: d / 2, L: length, e: Math.min(0.4, 0.1 * d) }));
+    b = boxOf(one);
+    inSlab = t.add(one.trimByPlane([0, 0, -1], -(b.min[2] + thick))).volume();
+  } finally {
+    t.dispose();
+  }
+  const [sx, sy] = [b.max[0] - b.min[0], b.max[1] - b.min[1]];
   const perRow = Math.max(1, Math.floor(((U?.[0] ?? 200) - 2 * reach + PIN_GAP) / (sx + PIN_GAP)));
   let volume = 0;
   for (let col = 0; col < Math.min(count, perRow); col++) {
     const n = Math.ceil((count - col) / perRow); // the pins in this column
-    volume += (sx + 2 * reach) * (n * sy + (n - 1) * PIN_GAP + 2 * reach) * thick;
+    volume += (sx + 2 * reach) * (n * sy + (n - 1) * PIN_GAP + 2 * reach) * thick - n * inSlab;
   }
   return volume;
 }

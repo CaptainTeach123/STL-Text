@@ -4723,9 +4723,10 @@ async function downloadFitTest() {
     const lock = r.apart === 'lock'
       ? `${checks.length ? ' The lid' : ' the lid'} should lock onto the box and come off only with a firm pull – too stiff to open, raise the clearance by 0.05 mm; too loose, lower it.`
       : '';
-    // its pin lies on the same thin strip as the pins of the pins file
-    const held = r.strip ? ' The pin comes on a thin strip that holds it to the bed: print with a 0.2 mm first layer and no brim, then peel the strip off and snap the pin out.' : '';
-    setStatus(`Downloaded ${file.name} (${file.kb} KB).${tried}${lock}${rings}${held}`, 'ok');
+    // its pin lies on the same thin strip as the pins of the pins file: said before what to check, as a pin with an
+    // edge of the strip left on it is tight in its hole whatever the clearance
+    const held = r.strip ? ' The pin comes on a thin strip that holds it to the bed: print with the first layer set to 0.2 mm and no brim, then peel the strip off, snap the pin out and trim off any edge of the strip left on it.' : '';
+    setStatus(`Downloaded ${file.name} (${file.kb} KB).${held}${tried}${lock}${rings}`, 'ok');
   } catch (err) {
     setStatus(friendly(err), 'error');
   } finally {
@@ -5200,6 +5201,11 @@ function renderSelectedInfo() {
   $('widthHint').textContent = width ? 'scales all lines' : '';
 }
 
+/** What the pieces depend on besides the content, as one key: the split, the printer, the nozzle and the pins' strip. */
+function splitKeyNow() {
+  return stableKey({ split: activeSplit(), bed: usableBed(bed), nozzle: printing.nozzle, pinStrip: pinHold.strip, ...largestOf() });
+}
+
 function render() {
   const sel = doc.selected;
   const contentKey = stableKey({ items: doc.items, base: doc.state.baseVersion, printing });
@@ -5209,7 +5215,7 @@ function render() {
   const shapeKey = stableKey({ items: doc.items, base: doc.state.baseVersion, nozzle: printing.nozzle });
   lastShapeKey = shapeKey;
   // the pieces also depend on the split, the printer and the nozzle – none of which is content the previews depend on
-  const splitKey = stableKey({ split: activeSplit(), bed: usableBed(bed), nozzle: printing.nozzle, pinStrip: pinHold.strip, ...largestOf() });
+  const splitKey = splitKeyNow();
   const splitChanged = splitKey !== lastSplitKey;
   lastSplitKey = splitKey;
   // selecting an item lets go of the cut, and an undo can take the cut away
@@ -5430,8 +5436,12 @@ function bindControls() {
   // the strip under printed pins: remembered, and the pieces list, the pins files and the fit test follow
   $('pinStrip').checked = pinHold.strip;
   $('pinStrip').addEventListener('change', () => {
+    const before = lastSplitKey;
     pinHold.strip = $('pinStrip').checked;
     saveSettings();
+    // the strip moves no cut: what Fit to my printer said of the split, and the joint each cut got, still hold
+    const after = splitKeyNow();
+    for (const found of [planNotes, joined]) if (found?.key === before) found.key = after;
     render();
   });
 

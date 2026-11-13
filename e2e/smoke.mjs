@@ -880,6 +880,14 @@ try {
     await page.click('#splitFitBtn');
     await idle();
     check(/already fits your printer/.test(await splitNotes()), 'Fit to my printer on a model that fits says so', await splitNotes());
+    // the strip under printed pins moves no cut: what Fit to my printer said stays in the card when it is unticked
+    await page.evaluate(() => (document.querySelector('#printing').open = true));
+    await page.uncheck('#pinStrip');
+    await idle();
+    const saidBare = await splitNotes();
+    await page.check('#pinStrip');
+    await idle();
+    check(/already fits your printer/.test(saidBare) && /already fits your printer/.test(await splitNotes()), 'and still says so when the strip under printed pins is turned off and on again', saidBare);
 
     // a model that couldn't be repaired at all can't be split, so its download doesn't send you to step 6
     const sheetFile = path.join(splitOut, 'sheet.stl');
@@ -1090,12 +1098,12 @@ try {
     await page.dispatchEvent('#planInfill', 'change');
     check(/^Downloaded long-bar-text-2-pieces\.zip .*: 2 pieces, 3 pins/.test(await status()), 'the status line says what the zip holds', await status());
     check(
-      glueSheet.includes('on a thin strip that holds them to the bed: print with a 0.2 mm first layer and no brim,') && glueSheet.includes('then peel the strip off and snap the pins out'),
+      glueSheet.includes('on a thin strip that holds them to the bed: print the file as it loads, with the first layer set to') && glueSheet.includes("0.2 mm and no brim, and don't split it into separate parts; then peel the strip off, snap the pins") && glueSheet.includes('out and trim off any edge of the strip left on a pin, so it slides into its hole'),
       'the glue sheet says how to print the pins on their strip and get them off it',
       glueSheet.split('\n').filter((t) => /strip/.test(t)).join(' | '),
     );
     const stripNote = (await page.locator('#splitNotes li').allInnerTexts()).find((t) => /Print the pins file/.test(t)) ?? '';
-    check(/The pins come on a thin strip that holds them to the bed: print it with a 0\.2 mm first layer and no brim, .* then peel the strip off and snap the pins out\./.test(stripNote), 'and so does the note about the pins file', stripNote);
+    check(/The pins come on a thin strip that holds them to the bed: print it as it loads, with the first layer set to 0\.2 mm and no brim, and don't split it into separate parts in the slicer\. Then peel the strip off, snap the pins out and trim off any edge of the strip left on a pin .*, so it slides into its hole\./.test(stripNote), 'and so does the note about the pins file', stripNote);
 
     // Printing: Hold printed pins down with a thin strip – on to start with; off, the pins lie on the bed on their own
     await page.evaluate(() => (document.querySelector('#printing').open = true));
@@ -1369,7 +1377,11 @@ try {
     const pinTest = await fitTest('long-bar-fit-test.stl');
     // the pin lies on its strip: 5.54 mm high, 19 + 10 long and 5.54 + 10 wide
     const pinShell = pinTest.shells.filter((e) => Math.abs(e[0] - 5.54) < 0.05 && Math.abs(e[1] - 15.54) < 0.05 && Math.abs(e[2] - 29) < 0.05);
-    check(/peel the strip off and snap the pin out\.$/.test(pinTest.status), 'the fit test says its pin comes on a strip to peel off', pinTest.status);
+    check(
+      /peel the strip off, snap the pin out and trim off any edge of the strip left on it\. Print it and check that .* too tight: raise Clearance/.test(pinTest.status),
+      'the fit test says its pin comes on a strip to peel off and trim, before it says what to do about a tight pin',
+      pinTest.status,
+    );
     check(/the Ø6 mm pin slides into both holes/.test(pinTest.status) && !/tab/.test(pinTest.status) && pinShell.length === 1, 'the fit test has the Ø6 pin the pieces use, not a Ø5 one, on its strip', `${pinTest.shells.map((e) => e.map((v) => v.toFixed(1)).join('×')).join(', ')} | ${pinTest.status}`);
     // Glue only: nothing is drilled or engraved, so what is about holes and labels is off
     await page.click('#splitSettings label:has(input[data-split="joint"][value="none"])');

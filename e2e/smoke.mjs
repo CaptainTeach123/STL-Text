@@ -6800,7 +6800,7 @@ try {
     const flat = await rows();
     check(flat[0].ticked === false && flat[0].text === before[0].text && flat[0].check === before[0].check && !/is tipped/.test(await notes()), 'unticked, piece 1 lies flat again with its step lines', JSON.stringify([flat[0].text, flat[0].check]));
     // two more shapes, each on a page of its own: the first piece's tick box, its print check and the notes
-    const tipOn = async (name, solid, ticked) => {
+    const tipOn = async (name, solid, ticked, { apart = false, piece = 1 } = {}) => {
       const file = writeFixture(`${name}.stl`, soupOf(solid));
       solid.delete();
       const r = await ctx.newPage();
@@ -6825,6 +6825,10 @@ try {
       await calm();
       await r.click('#addCutBtn');
       await calm();
+      if (apart) {
+        await r.click('#cutList li:first-child label.cut-apart');
+        await calm();
+      }
       await r.evaluate(() => {
         const el = document.querySelector('[data-split="orient"]');
         el.value = 'model';
@@ -6838,7 +6842,8 @@ try {
         await r.waitForFunction(() => /^tipped – needs supports/.test(document.querySelector('#pieceList li:nth-child(1) .piece-tip .piece-lay-own')?.textContent ?? '') && !document.querySelector('#pieceList').classList.contains('stale'), null, { timeout: 120000 });
         await calm();
       }
-      const row = await r.locator('#pieceList li:nth-child(1)').evaluate((li) => ({
+      const row = await r.locator(`#pieceList li:nth-child(${piece})`).evaluate((li) => ({
+        text: li.textContent,
         off: li.querySelector('.piece-tip input')?.disabled ?? null,
         tip: li.querySelector('.piece-tip span')?.textContent ?? null,
         check: li.querySelector('.print-check')?.textContent ?? '',
@@ -6862,6 +6867,14 @@ try {
       roofed.row.off === true && /^Can't be tipped to print its big face level: tipped, other big faces on top would still lean/.test(roofed.row.tip ?? ''),
       'a shallow roof is not offered the tip: its box is greyed out and says the other side would still lean',
       JSON.stringify(roofed.row),
+    );
+    // the lid of a cut that comes apart: the groove its lip fits into opens onto the bed, and supports would fill it
+    const lean = 80 * Math.tan((4 * Math.PI) / 180);
+    const lid = await tipOn('tiplid', Manifold.hull([[-40, 0, 0], [40, 0, 0], [-40, 80, 0], [40, 80, 0], [-40, 0, 120], [40, 0, 120], [-40, 80, 120 + lean], [40, 80, 120 + lean]]), false, { apart: true, piece: 2 });
+    check(
+      /comes off at A/.test(lid.row.text) && lid.row.off === true && /^Can't be tipped to print its big face level: the lip of its take-apart joint fits into it, and the groove for that lip is shaped to print the way it lies, without supports$/.test(lid.row.tip ?? ''),
+      'the lid of a cut that comes apart is not offered the tip: its box is greyed out and says the groove for the lip prints the way it lies',
+      JSON.stringify(lid.row),
     );
     check(tipProblems.length === 0, 'no page errors while tipping pieces', tipProblems.join(' | '));
     await ctx.close();

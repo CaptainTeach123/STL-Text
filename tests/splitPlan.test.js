@@ -2186,7 +2186,11 @@ describe('a piece tipped so that its big leaning face prints level', () => {
     expect(tipWays(layPieces(halves(), U, 'auto', { lay: { '0,0,0': '-z' } }), {})[0]).toEqual({ key: '0,0,0', why: null });
     // a lip or a twist-lock's neck, the piece with the lock's socket, pin holes kept for a lip that was not built
     const lip = { cutId: 'c1', axis: 0, dir: 1, male: 0, down: '-x', H: 6, sides: [{ piece: 1, male: true }, { piece: 2, male: false }] };
-    expect(tipWays(laid, { lips: [lip] }).map((w) => w.why)).toEqual(['lip', null]);
+    // the piece across a lip holds its groove and the catches of its clips, which supports would fill
+    expect(tipWays(laid, { lips: [lip] }).map((w) => w.why)).toEqual(['lip', 'groove']);
+    expect(tipWays(laid, { lips: [{ ...lip, male: 1, sides: [{ piece: 1, male: false }, { piece: 2, male: true }] }] }).map((w) => w.why)).toEqual(['groove', 'lip']);
+    // a lip that was not built (no height) leaves both pieces free
+    expect(tipWays(laid, { lips: [{ ...lip, H: 0 }] }).map((w) => w.why)).toEqual([null, null]);
     const lock = { kind: 'full', cutId: 'c1', down: '-x', S: { H: 2.4 }, sides: [{ piece: 1, role: 'body' }, { piece: 2, role: 'part' }] };
     expect(tipWays(laid, { lips: [{ ...lip, twist: true }], locks: [lock] }).map((w) => w.why)).toEqual(['lip', 'lock']);
     const dowels = [{ sides: [{ piece: 1 }, { piece: 2 }] }];
@@ -2205,7 +2209,7 @@ describe('a piece tipped so that its big leaning face prints level', () => {
   });
 
   it('every reason is said in plain words', () => {
-    for (const why of ['flat', 'stand', 'lip', 'lock', 'pegs', 'parts', 'apart', 'none', 'steep', 'foot', 'bed', 'steps', 'supports', 'tall', 'unknown']) {
+    for (const why of ['flat', 'stand', 'lip', 'lock', 'groove', 'pegs', 'parts', 'apart', 'none', 'steep', 'foot', 'bed', 'steps', 'supports', 'tall', 'unknown']) {
       const words = tipRefusedWords(why, { angle: 10, area: 4000, extra: 5200 });
       expect(words, why).toMatch(/^[a-z]/);
       expect(words, why).not.toMatch(/undefined|NaN/);

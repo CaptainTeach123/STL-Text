@@ -3554,13 +3554,21 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
       }
       return out;
     };
+    // whether the cut face a piece lies on is one that comes apart: on supports it is rough, but it is not a glue face
+    const liesLoose = (p, o) => {
+      const a = dirAxis(o.down);
+      const mid = (p.bbox.min[a] + p.bbox.max[a]) / 2;
+      const under = cuts.filter((c) => c.axis === a && p.cuts.includes(c.id) && (o.down[0] === '-' ? c.at < mid : c.at > mid))
+        .sort((x, y) => Math.abs(x.at - mid) - Math.abs(y.at - mid))[0];
+      return Boolean(under?.apart);
+    };
     // a piece's tick box for it: one asked to be tipped says whether it is, and why not; one not asked is offered
     // it where its check finds such a face, greyed out with the reason where it cannot be
     const tipRow = (p, i) => {
       const { key, why } = tippable[i];
       if (!key) return null;
       const t = tips?.get(i);
-      if (t) return { key, asked: true, used: t.ok, ...(t.ok ? { turn: t.turn, rest: t.rest, holes: tipHoles(p, lying[i]) } : { why: t.why }), ...(t.angle != null ? { angle: t.angle, area: t.area } : {}), ...(t.extra ? { extra: t.extra } : {}) };
+      if (t) return { key, asked: true, used: t.ok, ...(t.ok ? { turn: t.turn, rest: t.rest, holes: tipHoles(p, lying[i]), ...(liesLoose(p, lying[i]) ? { loose: true } : {}) } : { why: t.why }), ...(t.angle != null ? { angle: t.angle, area: t.area } : {}), ...(t.extra ? { extra: t.extra } : {}) };
       const check = checks?.get(p.index) ?? null;
       const face = why === 'apart' ? null : levelFace(check, hl);
       if (!face) return null;
@@ -3812,7 +3820,7 @@ export function createEngine({ wasm, lodTriangles = LOD_TRIANGLES, lodTolerance 
     for (const p of pieces) {
       // a piece tipped in its file is told what the tip costs, all in one note; one asked to be and not tipped, why
       if (p.tip?.used && p.check) {
-        notes.push(splitNote('PIECE_TIPPED', { pieceIndex: p.index, angle: p.tip.angle, area: p.tip.area, check: p.check, rest: p.tip.rest, holes: p.tip.holes }));
+        notes.push(splitNote('PIECE_TIPPED', { pieceIndex: p.index, angle: p.tip.angle, area: p.tip.area, check: p.check, rest: p.tip.rest, holes: p.tip.holes, ...(p.tip.loose ? { loose: true } : {}) }));
         continue;
       }
       if (p.tip?.asked && !p.tip.used) notes.push(splitNote('TIP_REFUSED', { pieceIndex: p.index, why: p.tip.why, ...(p.tip.angle != null ? { angle: p.tip.angle, area: p.tip.area } : {}), ...(p.tip.extra ? { extra: p.tip.extra } : {}) }));

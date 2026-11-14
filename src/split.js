@@ -5154,7 +5154,9 @@ export function layWays(laid, layout = {}, U, { parts = null, lying = null, pegs
  * Whether each laid piece may be tipped in its file so that a big leaning face of it prints level, as far as the
  * layout tells: a piece is not tipped where it may only lie flat ('flat': a thin plate, a piece beside a dovetail
  * seam) or stand as modelled ('stand'), where a lip or a twist-lock neck stands out of it ('lip'), where a
- * twist-lock's socket is cut into it or its pin holes keep the way a take-apart cut laid it ('lock'), where it
+ * twist-lock's socket is cut into it or its pin holes keep the way a take-apart cut laid it ('lock'), where a lip
+ * fits into it ('groove': the lip's groove and the catches of its clips open onto the bed the way it lies, and are
+ * shaped to print so without supports – tipped, the supports it then needs would fill them), where it
  * carries built-in pegs or has sockets for them ('pegs': they are shaped to print the way it lies) and where it is
  * more than one part, each of which has to rest on the bed ('parts'). A part taken out, and a piece of a box that
  * prints as several, is not offered it at all – but the first piece of such a box keeps its `key`, so that a tip
@@ -5181,8 +5183,10 @@ export function tipWays(laid, layout = {}, { parts = null } = {}) {
     const free = p.free ?? (p.stats.allowed?.length ? p.stats.allowed : DIR_KEYS);
     const { own, tongues, sockets, holed } = carried(p);
     const socketed = (layout.pegs ?? []).some((g) => g.sides.some((x) => !x.peg && x.piece === p.index));
+    // the piece a built lip fits into: the other side of the lip of a cut that comes apart
+    const grooved = (layout.lips ?? []).some((l) => (l.H ?? LIP_ALLOWANCE) > 0 && (l.sides ?? []).some((x) => !x.male && x.piece === p.index));
     const why = free.length === 1 ? 'stand' : free.length < DIR_KEYS.length ? 'flat'
-      : tongues.length ? 'lip' : sockets.length || holed ? 'lock'
+      : tongues.length ? 'lip' : sockets.length || holed ? 'lock' : grooved ? 'groove'
         : own.length || socketed ? 'pegs' : p.shells > 1 ? 'parts' : null;
     return { key, why };
   });
@@ -5201,6 +5205,7 @@ export function tipRefusedWords(why, { angle = 0, area = 0, extra = 0 } = {}) {
     case 'stand': return 'a part comes off it, so it prints standing as modelled';
     case 'lip': return 'its lip has to print standing straight up';
     case 'lock': return 'its take-apart joint is made to print the way it lies';
+    case 'groove': return 'the lip of its take-apart joint fits into it, and the groove for that lip is shaped to print the way it lies, without supports';
     case 'pegs': return 'its built-in pegs and their sockets are shaped to print the way it lies';
     case 'parts': return 'it is more than one part, and each has to rest on the bed';
     case 'apart': return 'that part of the model prints as more than one piece';
@@ -5779,7 +5784,7 @@ const NOTE_TEXT = {
     const what = why === 'model' ? 'The model was turned, moved or resized' : 'The cuts changed';
     return `${what}, so the pieces are no longer the same ones: the side you chose for ${count === 1 ? 'a piece' : `${count} pieces`} to lie on was dropped, and the app lays ${count === 1 ? 'it' : 'them'} again. Choose again in the pieces list if you like (Undo brings the choice back with the ${why === 'model' ? 'model as it was' : 'cuts as they were'}).`;
   },
-  PIECE_TIPPED: ({ pieceIndex, angle, area, check, rest, holes }) => tipNoteWords(pieceName(pieceIndex), { angle, area, check, rest, holes }),
+  PIECE_TIPPED: ({ pieceIndex, angle, area, check, rest, holes, loose }) => tipNoteWords(pieceName(pieceIndex), { angle, area, check, rest, holes, loose }),
   TIP_REFUSED: ({ pieceIndex, why, ...of }) => `${pieceName(pieceIndex)} is not tipped, though you asked for it in the pieces list: ${tipRefusedWords(why, of)}. It prints as it lies – untick "Tip this piece" for it to clear this note.`,
   TIP_WAITS: ({ count = 1 }) => `A cut misses the model, or lies where another cut is, so the pieces are not the ones you asked to tip: ${count === 1 ? 'the piece is' : 'they are'} not tipped until that cut is moved or removed.`,
   TIPS_DROPPED: ({ count = 1, why = 'cuts' }) => {
@@ -6199,9 +6204,10 @@ const NOTE_TEXT = {
  * the sides chosen by hand were dropped with the boxes they went by, `why` 'cuts' or 'model'); LAY_IGNORED `{ pieceIndex, down, why, lies,
  * joint }` (a side chosen by hand that the piece cannot take: `why` 'flat', 'stand', 'rest', 'bed' or 'apart', and with `joint`
  * 'lip', 'lock' or 'pegs': what it carries lays it another way);
- * PIECE_TIPPED `{ pieceIndex, angle, area, check, rest, holes }` (a piece tipped in its file so that a big leaning
+ * PIECE_TIPPED `{ pieceIndex, angle, area, check, rest, holes, loose }` (a piece tipped in its file so that a big leaning
  * face prints level: by how many degrees, the face's area, the tipped piece's print check, whether it rests on an
- * 'edge' or a 'corner', and its pin holes: `lying`, `upright`, and `down` those that open onto the bed); TIP_REFUSED `{ pieceIndex, why,
+ * 'edge' or a 'corner', its pin holes: `lying`, `upright`, and `down` those that open onto the bed, and `loose`
+ * where the cut face it lay on is one that comes apart, so is not glued); TIP_REFUSED `{ pieceIndex, why,
  * angle, area, extra }` (a piece asked to be tipped that is not: `tipRefusedWords`); TIP_WAITS `{ count }` (pieces
  * asked to be tipped that are not while a cut misses or is merged); TIPS_DROPPED `{ count, why }` (the page's own, as
  * LAYS_DROPPED);
@@ -6646,7 +6652,10 @@ export function howToGlueText(plan) {
     out.push(`  For ${many ? 'them' : 'it'}, turn off auto-orient in your slicer and do not use "lay on face"; turn supports on${plate ? ' (on build plate only is enough)' : ''}${corners.length === tipped.length ? '' : ' and add a brim'}.`);
     if (corners.length) out.push(`  ${corners.length > 1 ? `Pieces ${listOf(corners)} touch` : `Piece ${corners[0]} touches`} the bed at one corner only, so the supports carry ${corners.length > 1 ? 'them' : 'it'}: a raft holds ${corners.length > 1 ? 'them' : 'it'} better than a brim.`);
     // what a tipped piece lay on prints on supports now: where that is a glue face, it wants sanding
-    const rough = tipped.filter((p) => p.check?.supports.seam >= PRINT_CHECK.none).map((p) => p.index);
+    const rough = tipped.filter((p) => p.check?.supports.seam >= PRINT_CHECK.none && !p.tip.loose).map((p) => p.index);
+    // the face of a cut that comes apart is not glued: sanded, the two pieces close well
+    const apart = tipped.filter((p) => p.check?.supports.seam >= PRINT_CHECK.none && p.tip.loose).map((p) => p.index);
+    if (apart.length) out.push(`  The cut face under ${apart.length > 1 ? `pieces ${listOf(apart)}` : `piece ${apart[0]}`} prints on supports and comes out rough: sand it lightly so that it closes well on the piece it comes off. Do not glue it.`);
     if (rough.length) out.push(`  The glue face under ${rough.length > 1 ? `pieces ${listOf(rough)}` : `piece ${rough[0]}`} prints on supports and comes out rough: sand it lightly before you glue it.`);
     // its pin holes that open onto the bed lean with it, and were not shaped for that
     const open = tipped.filter((p) => p.tip.holes?.down > 0).map((p) => p.index);

@@ -1125,6 +1125,11 @@ describe('tipping a piece so that its big leaning face prints level', () => {
     expect(seam.supports.seam).toBe(seam.supports.area);
     expect(checkWords(seam, { upright: 2 }, { tip: true })).toEqual(['needs supports: about 80 cm², under a glue face, standing on the bed', 'rests on an edge: add a brim, 5 mm wide', 'its 2 pin holes need no supports']);
     expect(tipNoteWords('Piece 1', { angle: 3, area: 8011, check: seam })).toContain('That is a glue face: on supports it prints rough and may want light sanding before you glue it.');
+    // the face of a cut that comes apart is no glue face: it is the piece's cut face, sanded so that the two close
+    expect(checkWords(seam, null, { tip: { loose: true } })[0]).toBe('needs supports: about 80 cm², under its cut face, standing on the bed');
+    const loose = tipNoteWords('Piece 1', { angle: 3, area: 8011, check: seam, loose: true });
+    expect(loose).toContain('That is its cut face, where it meets the piece it comes off: on supports it prints rough and may want light sanding so that the two close well. It is not glued.');
+    expect(loose).not.toMatch(/glue face|before you glue/);
     // supports that would stand on the piece itself want supports everywhere
     const onPiece = { ...row, supports: { ...row.supports, piece: row.supports.area, bed: 0 } };
     expect(tipNoteWords('Piece 1', { angle: 3, area: 8011, check: onPiece })).toContain('turn supports on (everywhere, not only on the build plate)');

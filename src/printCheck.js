@@ -926,10 +926,14 @@ function standWords(s, whole = false) {
   return s.bed < 0.1 * s.area ? `standing on ${itself}` : `some standing on ${itself}`;
 }
 
-/** Whether what the supports hold up is a glue face: mostly, partly or not at all (''). */
-function seamWords(s) {
-  if (s.seam >= 0.9 * s.area) return 'under a glue face';
-  return s.seam >= Math.max(PRINT_CHECK.none, 0.1 * s.area) ? 'partly under a glue face' : '';
+/**
+ * Whether what the supports hold up is a glue face: mostly, partly or not at all (''). The face of a cut that comes
+ * apart (`loose`) is never glued, and is called the piece's cut face.
+ */
+function seamWords(s, loose = false) {
+  const face = loose ? 'its cut face' : 'a glue face';
+  if (s.seam >= 0.9 * s.area) return `under ${face}`;
+  return s.seam >= Math.max(PRINT_CHECK.none, 0.1 * s.area) ? `partly under ${face}` : '';
 }
 
 /**
@@ -941,10 +945,11 @@ function seamWords(s) {
  * @param {object|null} row from `checkRow`
  * @param {{ upright?: number, pointed?: number, flat?: number, round?: number }|null} holes the piece's pin holes by
  *   how they print (split.js `holeSummary`)
- * @param {{ fine?: boolean, tip?: boolean|{ rest?: 'edge'|'corner', holes?: { down?: number } } }} say `fine: false`
- *   leaves out the clause for pin holes that all print without supports, where that is said once for all the pieces
- *   (the sheet's heading); `tip` for a piece that is tipped: what it rests on (`rest`) and how many of its pin
- *   holes open onto the bed (`holes.down`), as its row has them
+ * @param {{ fine?: boolean, tip?: boolean|{ rest?: 'edge'|'corner', holes?: { down?: number }, loose?: boolean } }} say
+ *   `fine: false` leaves out the clause for pin holes that all print without supports, where that is said once for
+ *   all the pieces (the sheet's heading); `tip` for a piece that is tipped: what it rests on (`rest`), how many of
+ *   its pin holes open onto the bed (`holes.down`) and whether the cut face it lay on is one that comes apart
+ *   (`loose`: not a glue face), as its row has them
  * @returns {string[]} empty without a check and without holes
  */
 export function checkWords(row, holes = null, { fine = true, tip = false } = {}) {
@@ -952,7 +957,7 @@ export function checkWords(row, holes = null, { fine = true, tip = false } = {})
   if (row) {
     const s = row.supports;
     if (s.area < PRINT_CHECK.none) out.push('no supports needed');
-    else out.push(`${tip ? 'needs' : 'may need'} supports: ${[areaWords(s.area), seamWords(s), standWords(s)].filter(Boolean).join(', ')}`);
+    else out.push(`${tip ? 'needs' : 'may need'} supports: ${[areaWords(s.area), seamWords(s, Boolean(tip && tip.loose)), standWords(s)].filter(Boolean).join(', ')}`);
     if ((s.span ?? 0) >= PRINT_CHECK.none) out.push(`bridges a level span of about ${s.reach} mm`);
     const top = row.steps.find((f) => f.facing === 'up');
     if (top) out.push(`step lines ${everyWords(top.every)} on a big face on top`);
@@ -988,12 +993,13 @@ const tipBrim = (row) => row.foot.brim || PRINT_CHECK.brim;
  * piece, and must be kept free of supports.
  * @param {string} who "Piece 3"
  * @param {{ angle: number, area: number, check: object, rest?: 'edge'|'corner', holes?: { lying?: number,
- *   upright?: number, down?: number }|null }} fields the angle it is tipped by (degrees), the area of the face that
- *   prints level (mm²), the tipped piece's check (`checkRow`), whether it rests on an edge or on one corner, and
- *   its pin holes: how many lie on their side, how many stand upright, and how many of those open onto the bed
+ *   upright?: number, down?: number }|null, loose?: boolean }} fields the angle it is tipped by (degrees), the area
+ *   of the face that prints level (mm²), the tipped piece's check (`checkRow`), whether it rests on an edge or on
+ *   one corner, its pin holes: how many lie on their side, how many stand upright, and how many of those open onto
+ *   the bed, and whether the cut face it lay on is one that comes apart (`loose`): that one is not glued
  * @returns {string}
  */
-export function tipNoteWords(who, { angle = 0, area = 0, check = null, rest = 'edge', holes = null }) {
+export function tipNoteWords(who, { angle = 0, area = 0, check = null, rest = 'edge', holes = null, loose = false }) {
   const out = [`${who} is tipped ${angleWords(angle)}° in its file so that its big face on top (${areaWords(area)}) prints level, without step lines.`];
   if (!check) return out[0];
   const s = check.supports;
@@ -1001,7 +1007,8 @@ export function tipNoteWords(who, { angle = 0, area = 0, check = null, rest = 'e
   const rests = check.foot.flat ? `rests on ${areaWords(check.foot.contact)} of the bed` : corner ? 'rests on one corner' : 'rests on an edge';
   if (s.area >= PRINT_CHECK.none) {
     out.push(`What that costs: it no longer lies flat – it ${rests}, and ${areaWords(s.area)} under it prints on supports, ${standWords(s)}.`);
-    if (s.seam >= PRINT_CHECK.none) out.push(`${s.seam >= 0.9 * s.area ? 'That is a glue face' : `${areaWords(s.seam)} of that is a glue face`}: on supports it prints rough and may want light sanding before you glue it.`);
+    if (s.seam >= PRINT_CHECK.none && loose) out.push(`${s.seam >= 0.9 * s.area ? 'That is its cut face, where it meets the piece it comes off' : `${areaWords(s.seam)} of that is its cut face, where it meets the piece it comes off`}: on supports it prints rough and may want light sanding so that the two close well. It is not glued.`);
+    else if (s.seam >= PRINT_CHECK.none) out.push(`${s.seam >= 0.9 * s.area ? 'That is a glue face' : `${areaWords(s.seam)} of that is a glue face`}: on supports it prints rough and may want light sanding before you glue it.`);
   } else out.push(`What that costs: it no longer lies flat – it ${rests}.`);
   const where = s.piece < 0.1 * s.area ? '"on build plate only" is enough' : 'everywhere, not only on the build plate';
   // on one corner a brim has next to nothing to hold: the supports carry the piece

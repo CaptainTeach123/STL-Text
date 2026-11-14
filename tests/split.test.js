@@ -4684,6 +4684,36 @@ describe('tipping a piece so that its big leaning face prints level', () => {
     expect(note).toMatch(/and add a brim about \d+ mm wide\. Untick "Tip this piece" in the pieces list to print it flat again, with the step lines\.$/);
   });
 
+  it('a lid that comes off a flat cut may be tipped, and its cut face is not called a glue face', async () => {
+    // a lid stepped in 2 mm just over the cut leaves no room for a lip: the cut comes apart flat, with no groove to fill
+    const rise = 86 * Math.tan(rad(4));
+    const top = own(wasm.Manifold.hull([[-58, -43, 22], [58, -43, 22], [-58, 43, 22], [58, 43, 22], [-58, -43, 50], [58, -43, 50], [-58, 43, 50 + rise], [58, 43, 50 + rise]]));
+    await load(own(wasm.Manifold.union([cube([120, 90, 22], [0, 0, 11]), top])), 'tin');
+    const tin = (p) => S({ cuts: [{ ...cutAt(2, 20), joint: 'apart', hold: 'lift' }], labels: false, ...p });
+    const base = await exportSplit(tin(), { name: 'tin' });
+    expect(base.seams[0].apart).toMatchObject({ lip: false, flat: 1 });
+    expect(base.pieces[1]).toMatchObject({ lies: 'on a cut face', tip: { key: '0,0,1', asked: false, used: false } });
+    expect(base.pieces[1].tip.why).toBeUndefined();
+    const ex = await exportSplit(tin({ tip: { '0,0,1': true } }), { name: 'tin' });
+    const lid = ex.pieces[1];
+    expect(lid.tip).toMatchObject({ used: true, loose: true, angle: expect.closeTo(4, 4) });
+    expect(lid.check.supports.seam).toBeGreaterThan(0.9 * lid.check.supports.area);
+    expect(checkWords(lid.check, lid.holes, { tip: lid.tip })[0]).toMatch(/^needs supports: about \d+ cm², under its cut face, standing on the bed$/);
+    const note = ex.notes.find((n) => n.code === 'PIECE_TIPPED').text;
+    expect(note).toContain('That is its cut face, where it meets the piece it comes off: on supports it prints rough and may want light sanding so that the two close well. It is not glued.');
+    expect(sheetOf(ex)).toContain('  The cut face under piece 2 prints on supports and comes out rough: sand it lightly so that it closes well on the piece it comes off. Do not glue it.');
+    expect(sheetOf(ex)).toMatch(/lies on a cut face, tipped 4° {3}fits – needs supports: about \d+ cm², under its cut face, standing on the bed/);
+    for (const words of [note, sheetOf(ex).split('PRINT PLAN')[0]]) expect(words).not.toMatch(/glue face|before you glue/);
+    // the other piece's file is what it was
+    expect(Buffer.from(ex.files[0].stl).equals(Buffer.from(base.files[0].stl))).toBe(true);
+    // a glued cut in its place keeps the glue-face words
+    const glued = await exportSplit(S({ cuts: [cutAt(2, 20)], labels: false, joint: 'none', tip: { '0,0,1': true } }), { name: 'tin' });
+    expect(glued.pieces[1].tip).toMatchObject({ used: true });
+    expect(glued.pieces[1].tip.loose).toBeUndefined();
+    expect(glued.notes.find((n) => n.code === 'PIECE_TIPPED').text).toContain('That is a glue face: on supports it prints rough and may want light sanding before you glue it.');
+    expect(sheetOf(glued)).toContain('  The glue face under piece 2 prints on supports and comes out rough: sand it lightly before you glue it.');
+  });
+
   it('is refused, with the reason, where the piece would print worse or break a rule – and the files stay as they were', async () => {
     const refused = (ex, index = 1) => ex.notes.find((n) => n.code === 'TIP_REFUSED' && n.pieceIndex === index);
     const same = async (split, options, why, words) => {
@@ -4719,6 +4749,28 @@ describe('tipping a piece so that its big leaning face prints level', () => {
     await load(own(wasm.Manifold.union([own(wasm.Manifold.cylinder(10, 90, 90, 96)), own(own(wasm.Manifold.cylinder(90 * Math.tan(rad(5)), 90, 0, 96)).translate([0, 0, 10]))])), 'cone');
     const cone = await exportSplit(flat(), { name: 'cone' });
     for (const p of cone.pieces) expect(tipOption(p.tip)).toMatchObject({ checked: false, disabled: true, text: expect.stringContaining('other big faces on top would still lean') });
+    // the lid of a cut that comes apart lies on its cut face, with the groove for the lip (and the catches of its
+    // clips) open onto the bed: the supports a tip asks for would fill them, so it is greyed out before it is asked
+    // for, and refused where it was asked for before
+    const lean = 90 * Math.tan(rad(5));
+    await load(own(wasm.Manifold.hull([[-60, -45, 0], [60, -45, 0], [-60, 45, 0], [60, 45, 0], [-60, -45, 40], [60, -45, 40], [-60, 45, 40 + lean], [60, 45, 40 + lean]])), 'tin');
+    const grooveWords = 'the lip of its take-apart joint fits into it, and the groove for that lip is shaped to print the way it lies, without supports';
+    for (const hold of ['lift', 'snap', 'lock']) {
+      const tin = (p) => S({ cuts: [{ ...cutAt(2, 20), joint: 'apart', hold }], labels: false, ...p });
+      const base = await exportSplit(tin(), { name: 'tin' });
+      expect(base.seams[0].apart, hold).toMatchObject({ lip: true });
+      const lid = base.pieces.find((p) => p.lies === 'on a cut face');
+      expect(lid.tip, hold).toMatchObject({ key: '0,0,1', asked: false, used: false, why: 'groove' });
+      expect(tipOption(lid.tip), hold).toEqual({ key: '0,0,1', checked: false, disabled: true, text: `Can't be tipped to print its big face level: ${grooveWords}`, tag: '' });
+      // the piece the lip stands out of has no leaning face on top, and no offer either
+      for (const p of base.pieces) expect(tipOption(p.tip)?.disabled ?? true, hold).toBe(true);
+      const ex = await exportSplit(tin({ tip: { '0,0,1': true } }), { name: 'tin' });
+      expect(refused(ex, lid.index), hold).toMatchObject({ level: 'info', why: 'groove', text: `Piece ${lid.index} is not tipped, though you asked for it in the pieces list: ${grooveWords}. It prints as it lies – untick "Tip this piece" for it to clear this note.` });
+      expect(codes(ex), hold).not.toContain('PIECE_TIPPED');
+      expect(bytes(ex).filter(([name]) => !/how-to/.test(name)), hold).toEqual(bytes(base).filter(([name]) => !/how-to/.test(name)));
+      expect(sheetOf(ex), hold).toBe(sheetOf(base));
+      expect(sheetOf(ex), hold).not.toMatch(/tipped/i);
+    }
     // a piece that stands on little as it lies: a post with a leaning top
     await load(own(wasm.Manifold.hull([[-12, -12, 0], [12, -12, 0], [-12, 12, 0], [12, 12, 0], [-12, -12, 300], [12, -12, 300], [-12, 12, 302], [12, 12, 302]])), 'post');
     const post = (p) => S({ cuts: [cutAt(2, 150)], labels: false, orient: 'model', ...p });
